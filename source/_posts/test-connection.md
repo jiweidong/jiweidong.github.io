@@ -1,2 +1,0 @@
-# test
-connection ok
