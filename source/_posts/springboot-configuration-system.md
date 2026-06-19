@@ -8,7 +8,7 @@ tags:
   - Spring
   - SpringBoot
   - 配置管理
-  - @ConfigurationProperties
+  - "@ConfigurationProperties"
   - Profile
 ---
 
