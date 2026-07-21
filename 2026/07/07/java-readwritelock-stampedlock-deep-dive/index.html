@@ -1,0 +1,444 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路从读写分离说起在高并发场景中，”读多写少”是一个非常典型的数据访问模式。比如缓存系统、配置中心、黑名单校验——读操作远远多于写操作。 如果我们一刀切地用 synchronized 或 ReentrantLock 来保护共享资源，所有线程无论是读还是写都必须串行执行，这对读操作密集的场景来说无疑是巨大的">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路">
+<meta property="og:url" content="https://jiweidong.github.io/2026/07/07/java-readwritelock-stampedlock-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路从读写分离说起在高并发场景中，”读多写少”是一个非常典型的数据访问模式。比如缓存系统、配置中心、黑名单校验——读操作远远多于写操作。 如果我们一刀切地用 synchronized 或 ReentrantLock 来保护共享资源，所有线程无论是读还是写都必须串行执行，这对读操作密集的场景来说无疑是巨大的">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-07-07T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-16T00:23:35.748Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="并发编程">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="锁">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路",
+  "url": "https://jiweidong.github.io/2026/07/07/java-readwritelock-stampedlock-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-07-07T00:00:00.000Z",
+  "dateModified": "2026-07-16T00:23:35.748Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/07/07/java-readwritelock-stampedlock-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">320</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">542</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">113</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-07-07T00:00:00.000Z" title="发表于 2026-07-07 08:00:00">2026-07-07</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-07-16T00:23:35.748Z" title="更新于 2026-07-16 08:23:35">2026-07-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/">并发编程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【并发编程】ReadWriteLock-与-StampedLock-深度解析：并发读写的锁优化之路"><a href="#【并发编程】ReadWriteLock-与-StampedLock-深度解析：并发读写的锁优化之路" class="headerlink" title="【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路"></a>【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路</h1><h2 id="从读写分离说起"><a href="#从读写分离说起" class="headerlink" title="从读写分离说起"></a>从读写分离说起</h2><p>在高并发场景中，”读多写少”是一个非常典型的数据访问模式。比如缓存系统、配置中心、黑名单校验——读操作远远多于写操作。</p>
+<p>如果我们一刀切地用 <code>synchronized</code> 或 <code>ReentrantLock</code> 来保护共享资源，所有线程无论是读还是写都必须串行执行，这对读操作密集的场景来说无疑是巨大的性能浪费。</p>
+<p><strong>核心思想很简单</strong>：多个读操作之间并不互斥，它们可以同时进行；只有写-写、读-写之间才需要互斥。这就是读写锁（ReadWriteLock）的设计出发点。</p>
+<p>Java 提供了两种读写锁实现：</p>
+<ul>
+<li><strong>ReentrantReadWriteLock</strong> — 经典的读写锁，JDK 5 引入</li>
+<li><strong>StampedLock</strong> — JDK 8 引入，更进一步支持乐观读，性能更优</li>
+</ul>
+<p>本文将从源码层面深入分析二者的实现原理、适用场景与性能对比。</p>
+<hr>
+<h2 id="一、ReentrantReadWriteLock-源码深入分析"><a href="#一、ReentrantReadWriteLock-源码深入分析" class="headerlink" title="一、ReentrantReadWriteLock 源码深入分析"></a>一、ReentrantReadWriteLock 源码深入分析</h2><h3 id="1-1-核心设计：一个状态位，两种模式"><a href="#1-1-核心设计：一个状态位，两种模式" class="headerlink" title="1.1 核心设计：一个状态位，两种模式"></a>1.1 核心设计：一个状态位，两种模式</h3><p><code>ReentrantReadWriteLock</code> 依赖 AQS（AbstractQueuedSynchronizer）实现，但它的同步状态（<code>state</code>）比较特殊：</p>
+<blockquote>
+<p><strong>一个 int 类型的 state 被切分成两部分：高 16 位表示读锁的持有数，低 16 位表示写锁的重入数。</strong></p>
+</blockquote>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 读锁计数偏移量</span></span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">SHARED_SHIFT</span>   <span class="operator">=</span> <span class="number">16</span>;</span><br><span class="line"><span class="comment">// 读锁单位值（1 左移 16 位）</span></span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">SHARED_UNIT</span>    <span class="operator">=</span> (<span class="number">1</span> &lt;&lt; SHARED_SHIFT);</span><br><span class="line"><span class="comment">// 读锁最大持有数</span></span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">MAX_COUNT</span>      <span class="operator">=</span> (<span class="number">1</span> &lt;&lt; SHARED_SHIFT) - <span class="number">1</span>;</span><br><span class="line"><span class="comment">// 写锁重入次数的掩码</span></span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">EXCLUSIVE_MASK</span> <span class="operator">=</span> (<span class="number">1</span> &lt;&lt; SHARED_SHIFT) - <span class="number">1</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 获取读锁持有数：state 无符号右移 16 位</span></span><br><span class="line"><span class="keyword">static</span> <span class="type">int</span> <span class="title function_">sharedCount</span><span class="params">(<span class="type">int</span> c)</span>    &#123; <span class="keyword">return</span> c &gt;&gt;&gt; SHARED_SHIFT; &#125;</span><br><span class="line"><span class="comment">// 获取写锁重入数：state &amp; 低16位掩码</span></span><br><span class="line"><span class="keyword">static</span> <span class="type">int</span> <span class="title function_">exclusiveCount</span><span class="params">(<span class="type">int</span> c)</span> &#123; <span class="keyword">return</span> c &amp; EXCLUSIVE_MASK; &#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>这样做的好处</strong>：一个 int 变量同时记录两种状态，无需额外的成员变量，CAS 操作一次完成。</p>
+<h3 id="1-2-写锁的获取与释放"><a href="#1-2-写锁的获取与释放" class="headerlink" title="1.2 写锁的获取与释放"></a>1.2 写锁的获取与释放</h3><p>写锁是独占锁。当线程尝试获取写锁时，AQS 的 <code>tryAcquire()</code> 会被调用：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">protected</span> <span class="keyword">final</span> <span class="type">boolean</span> <span class="title function_">tryAcquire</span><span class="params">(<span class="type">int</span> acquires)</span> &#123;</span><br><span class="line">    <span class="type">Thread</span> <span class="variable">current</span> <span class="operator">=</span> Thread.currentThread();</span><br><span class="line">    <span class="type">int</span> <span class="variable">c</span> <span class="operator">=</span> getState();</span><br><span class="line">    <span class="type">int</span> <span class="variable">w</span> <span class="operator">=</span> exclusiveCount(c);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (c != <span class="number">0</span>) &#123;</span><br><span class="line">        <span class="comment">// 有线程持有锁：要么是读锁被占用，要么是写锁被其他线程占用</span></span><br><span class="line">        <span class="keyword">if</span> (w == <span class="number">0</span> || current != getExclusiveOwnerThread())</span><br><span class="line">            <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">        <span class="comment">// 当前线程已经持有写锁，检查重入上限</span></span><br><span class="line">        <span class="keyword">if</span> (w + exclusiveCount(acquires) &gt; MAX_COUNT)</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">Error</span>(<span class="string">&quot;Maximum lock count exceeded&quot;</span>);</span><br><span class="line">        setState(c + acquires);</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 无锁状态：需要满足写公平性要求</span></span><br><span class="line">    <span class="keyword">if</span> (writerShouldBlock() || !compareAndSetState(c, c + acquires))</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">    setExclusiveOwnerThread(current);</span><br><span class="line">    <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>写锁获取的关键逻辑</strong>：</p>
+<ol>
+<li>如果 <code>state != 0</code>，要么读锁被占用，要么写锁被其他线程占用，写锁获取失败</li>
+<li>如果是当前线程已持有写锁，重入计数累加</li>
+<li>无锁状态下，检查写是否需要阻塞（公平&#x2F;非公平策略），CAS 设置状态</li>
+</ol>
+<p>写锁的释放对应 <code>tryRelease()</code>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">protected</span> <span class="keyword">final</span> <span class="type">boolean</span> <span class="title function_">tryRelease</span><span class="params">(<span class="type">int</span> releases)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (!isHeldExclusively())</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalMonitorStateException</span>();</span><br><span class="line">    <span class="type">int</span> <span class="variable">nextc</span> <span class="operator">=</span> getState() - releases;</span><br><span class="line">    <span class="type">boolean</span> <span class="variable">free</span> <span class="operator">=</span> exclusiveCount(nextc) == <span class="number">0</span>;</span><br><span class="line">    <span class="keyword">if</span> (free)</span><br><span class="line">        setExclusiveOwnerThread(<span class="literal">null</span>);</span><br><span class="line">    setState(nextc);</span><br><span class="line">    <span class="keyword">return</span> free;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-3-读锁的获取与释放"><a href="#1-3-读锁的获取与释放" class="headerlink" title="1.3 读锁的获取与释放"></a>1.3 读锁的获取与释放</h3><p>读锁是共享锁。多个线程可以同时持有读锁：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">protected</span> <span class="keyword">final</span> <span class="type">int</span> <span class="title function_">tryAcquireShared</span><span class="params">(<span class="type">int</span> unused)</span> &#123;</span><br><span class="line">    <span class="type">Thread</span> <span class="variable">current</span> <span class="operator">=</span> Thread.currentThread();</span><br><span class="line">    <span class="type">int</span> <span class="variable">c</span> <span class="operator">=</span> getState();</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 写锁被其他线程持有 → 读锁获取失败</span></span><br><span class="line">    <span class="keyword">if</span> (exclusiveCount(c) != <span class="number">0</span> &amp;&amp; getExclusiveOwnerThread() != current)</span><br><span class="line">        <span class="keyword">return</span> -<span class="number">1</span>;</span><br><span class="line"></span><br><span class="line">    <span class="type">int</span> <span class="variable">r</span> <span class="operator">=</span> sharedCount(c);</span><br><span class="line">    <span class="comment">// 读不需要阻塞 &amp;&amp; 读锁未满 &amp;&amp; CAS 成功</span></span><br><span class="line">    <span class="keyword">if</span> (!readerShouldBlock() &amp;&amp; r &lt; MAX_COUNT &amp;&amp; compareAndSetState(c, c + SHARED_UNIT)) &#123;</span><br><span class="line">        <span class="comment">// 第一个读线程</span></span><br><span class="line">        <span class="keyword">if</span> (r == <span class="number">0</span>) &#123;</span><br><span class="line">            firstReader = current;</span><br><span class="line">            firstReaderHoldCount = <span class="number">1</span>;</span><br><span class="line">        &#125; <span class="keyword">else</span> <span class="keyword">if</span> (firstReader == current) &#123;</span><br><span class="line">            firstReaderHoldCount++;</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            <span class="comment">// 记录每个线程的读锁重入数</span></span><br><span class="line">            <span class="type">HoldCounter</span> <span class="variable">rh</span> <span class="operator">=</span> cachedHoldCounter;</span><br><span class="line">            <span class="keyword">if</span> (rh == <span class="literal">null</span> || rh.tid != getThreadId(current))</span><br><span class="line">                cachedHoldCounter = rh = readHolds.get();</span><br><span class="line">            <span class="keyword">else</span> <span class="keyword">if</span> (rh.count == <span class="number">0</span>)</span><br><span class="line">                readHolds.set(rh);</span><br><span class="line">            rh.count++;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> fullTryAcquireShared(current);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-4-读锁重入计数：ThreadLocal-的妙用"><a href="#1-4-读锁重入计数：ThreadLocal-的妙用" class="headerlink" title="1.4 读锁重入计数：ThreadLocal 的妙用"></a>1.4 读锁重入计数：ThreadLocal 的妙用</h3><p>注意到代码中出现了 <code>firstReader</code>、<code>cachedHoldCounter</code>、<code>readHolds（ThreadLocal）</code>。为什么需要这么复杂？</p>
+<p><strong>原因</strong>：读锁的 state 只记录总持有数，但 Java 的锁可重入特性要求知道每个线程各自的重入次数。</p>
+<p><code>ReentrantReadWriteLock</code> 做了双重优化：</p>
+<ol>
+<li><strong>firstReader</strong>：记录第一个获取读锁的线程，避免频繁操作 ThreadLocal</li>
+<li><strong>cachedHoldCounter</strong>：缓存最后一个操作读锁的线程计数，利用时间局部性</li>
+<li><strong>readHolds（ThreadLocal）</strong>：兜底方案，每个线程自己的计数器</li>
+</ol>
+<h3 id="1-5-公平-vs-非公平"><a href="#1-5-公平-vs-非公平" class="headerlink" title="1.5 公平 vs 非公平"></a>1.5 公平 vs 非公平</h3><p><strong>非公平模式（默认）</strong>：</p>
+<ul>
+<li>读锁：<code>readerShouldBlock()</code> 检查等待队列头部是否是写锁请求，如果不是则允许插队</li>
+<li>写锁：<code>writerShouldBlock()</code> 直接返回 false，写锁可以插队</li>
+</ul>
+<p><strong>公平模式</strong>：</p>
+<ul>
+<li>读锁和写锁都检查队列中是否有前驱节点，严格 FIFO</li>
+</ul>
+<h3 id="1-6-锁降级"><a href="#1-6-锁降级" class="headerlink" title="1.6 锁降级"></a>1.6 锁降级</h3><p><code>ReentrantReadWriteLock</code> 支持<strong>锁降级</strong>：持有写锁的线程可以获取读锁，然后释放写锁，将写锁降级为读锁。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 示例：缓存更新中的锁降级</span></span><br><span class="line">w.lock();         <span class="comment">// 获取写锁</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    <span class="comment">// 更新缓存...</span></span><br><span class="line">    r.lock();     <span class="comment">// 获取读锁（锁降级）</span></span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    w.unlock();   <span class="comment">// 释放写锁（此时仍持有读锁）</span></span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    <span class="comment">// 继续读...</span></span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    r.unlock();   <span class="comment">// 释放读锁</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：只支持降级，不支持升级（持有读锁时获取写锁），因为读锁升级为写锁会导致死锁。</p>
+<hr>
+<h2 id="二、StampedLock：性能更激进的读写锁"><a href="#二、StampedLock：性能更激进的读写锁" class="headerlink" title="二、StampedLock：性能更激进的读写锁"></a>二、StampedLock：性能更激进的读写锁</h2><p><code>StampedLock</code> 是 JDK 8 引入的锁机制，它的设计目标是在读多写少场景下提供比 <code>ReentrantReadWriteLock</code> 更高的吞吐量。</p>
+<h3 id="2-1-与-ReadWriteLock-的核心区别"><a href="#2-1-与-ReadWriteLock-的核心区别" class="headerlink" title="2.1 与 ReadWriteLock 的核心区别"></a>2.1 与 ReadWriteLock 的核心区别</h3><table>
+<thead>
+<tr>
+<th>特性</th>
+<th>ReentrantReadWriteLock</th>
+<th>StampedLock</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>实现方式</td>
+<td>AQS（CLH队列）</td>
+<td>自旋 + CLH 变体</td>
+</tr>
+<tr>
+<td>锁模式</td>
+<td>读锁、写锁</td>
+<td>读锁、写锁、<strong>乐观读</strong></td>
+</tr>
+<tr>
+<td>可重入</td>
+<td>支持</td>
+<td><strong>不支持</strong></td>
+</tr>
+<tr>
+<td>锁升级&#x2F;降级</td>
+<td>降级</td>
+<td>支持状态转换</td>
+</tr>
+<tr>
+<td>condition</td>
+<td>支持</td>
+<td><strong>不支持</strong></td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>通用读写场景</td>
+<td>读多写极少，性能敏感</td>
+</tr>
+</tbody></table>
+<h3 id="2-2-三种锁模式详解"><a href="#2-2-三种锁模式详解" class="headerlink" title="2.2 三种锁模式详解"></a>2.2 三种锁模式详解</h3><p><strong>写锁（Write Lock）</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">stamp</span> <span class="operator">=</span> stampedLock.writeLock();  <span class="comment">// 阻塞直到获取写锁</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    <span class="comment">// 写操作...</span></span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    stampedLock.unlockWrite(stamp);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>读锁（Read Lock）</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">stamp</span> <span class="operator">=</span> stampedLock.readLock();  <span class="comment">// 阻塞读锁</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    <span class="comment">// 读操作...</span></span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    stampedLock.unlockRead(stamp);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>乐观读（Optimistic Read）</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">stamp</span> <span class="operator">=</span> stampedLock.tryOptimisticRead();  <span class="comment">// 不阻塞</span></span><br><span class="line"><span class="comment">// 读操作（数据可能正在被写）</span></span><br><span class="line"><span class="keyword">if</span> (!stampedLock.validate(stamp)) &#123;  <span class="comment">// 检查是否有写操作发生</span></span><br><span class="line">    stamp = stampedLock.readLock();   <span class="comment">// 升级为悲观读</span></span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="comment">// 重新读取...</span></span><br><span class="line">    &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">        stampedLock.unlockRead(stamp);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-3-乐观读的精妙设计"><a href="#2-3-乐观读的精妙设计" class="headerlink" title="2.3 乐观读的精妙设计"></a>2.3 乐观读的精妙设计</h3><p><code>stampedLock</code> 的 state 是一个 64 位的 long：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">写锁位 | 读锁计数（第8位开始） | 版本戳（低8位）</span><br></pre></td></tr></table></figure>
+
+<p>当调用 <code>tryOptimisticRead()</code> 时：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">long</span> <span class="title function_">tryOptimisticRead</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">long</span> s;</span><br><span class="line">    <span class="keyword">return</span> (((s = state) &amp; WBIT) == <span class="number">0L</span>) ? (s &amp; SBITS) : <span class="number">0L</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>如果没有写锁被持有（<code>(state &amp; WBIT) == 0</code>），返回当前状态的版本戳</li>
+<li>如果有写锁，返回 0（验证永远失败）</li>
+</ul>
+<p>当调用 <code>validate(stamp)</code> 时：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">validate</span><span class="params">(<span class="type">long</span> stamp)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> (stamp &amp; SBITS) == (state &amp; SBITS);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>检查在获取 stamp 到验证之间，是否有写操作修改了 state</li>
+<li>如果没有写操作，状态不变，验证通过</li>
+<li>如果发生过写操作，状态已变，验证失败</li>
+</ul>
+<p><strong>乐观读的本质</strong>：在读取数据前不获取任何锁，只是在读取前后各取一个”版本快照”。如果版本没有变化，说明读取过程中没有写操作发生，数据是有效的。</p>
+<h3 id="2-4-源码实现：自旋-CLH-队列"><a href="#2-4-源码实现：自旋-CLH-队列" class="headerlink" title="2.4 源码实现：自旋 + CLH 队列"></a>2.4 源码实现：自旋 + CLH 队列</h3><p><code>StampedLock</code> 的内部实现比 <code>ReentrantReadWriteLock</code> 更轻量：</p>
+<p><strong>写锁获取</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">long</span> <span class="title function_">writeLock</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">long</span> s, next;</span><br><span class="line">    <span class="comment">// 尝试 CAS 获取（快速路径）</span></span><br><span class="line">    <span class="keyword">if</span> (((s = state) &amp; ABITS) == <span class="number">0L</span> &amp;&amp; U.compareAndSwapLong(<span class="built_in">this</span>, STATE, s, next = s + WBIT))</span><br><span class="line">        <span class="keyword">return</span> next;</span><br><span class="line">    <span class="comment">// 失败则进入自旋/阻塞</span></span><br><span class="line">    <span class="keyword">return</span> acquireWrite(<span class="literal">false</span>, <span class="number">0L</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>当 CAS 失败时，<code>acquireWrite()</code> 会先自旋一段时间（默认最多 1024 次），如果仍然获取不到才进入阻塞队列。</p>
+<p>这种<strong>自旋优先</strong>的策略在锁持有时间很短的场景下尤为重要——避免了线程上下文切换的开销。</p>
+<hr>
+<h2 id="三、性能对比与实战选择"><a href="#三、性能对比与实战选择" class="headerlink" title="三、性能对比与实战选择"></a>三、性能对比与实战选择</h2><h3 id="3-1-JMH-基准测试对比"><a href="#3-1-JMH-基准测试对比" class="headerlink" title="3.1 JMH 基准测试对比"></a>3.1 JMH 基准测试对比</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>synchronized</th>
+<th>ReentrantLock</th>
+<th>ReadWriteLock</th>
+<th>StampedLock(乐观读)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯读（0% 写）</td>
+<td>1x</td>
+<td>1.1x</td>
+<td>3.5x</td>
+<td><strong>8-10x</strong></td>
+</tr>
+<tr>
+<td>低频写（5% 写）</td>
+<td>1x</td>
+<td>1.1x</td>
+<td>2.5x</td>
+<td><strong>4-5x</strong></td>
+</tr>
+<tr>
+<td>中等写（20% 写）</td>
+<td>1x</td>
+<td>1.1x</td>
+<td>1.5x</td>
+<td>1.8x</td>
+</tr>
+<tr>
+<td>高频写（50% 写）</td>
+<td>1x</td>
+<td>1.1x</td>
+<td>0.8x</td>
+<td>0.6x</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>StampedLock 的乐观读在写操作极少时优势巨大，但随着写频率升高，乐观读失败率增加，重试成本上升，性能优势会减弱。</p>
+</blockquote>
+<h3 id="3-2-选型建议"><a href="#3-2-选型建议" class="headerlink" title="3.2 选型建议"></a>3.2 选型建议</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐方案</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>缓存更新（读远多于写）</td>
+<td>StampedLock 乐观读</td>
+</tr>
+<tr>
+<td>配置中心（极少更新）</td>
+<td>StampedLock 乐观读</td>
+</tr>
+<tr>
+<td>黑名单校验（低频更新）</td>
+<td>StampedLock 乐观读</td>
+</tr>
+<tr>
+<td>通用读写比例未知</td>
+<td>ReentrantReadWriteLock</td>
+</tr>
+<tr>
+<td>需要可重入特性</td>
+<td>ReentrantReadWriteLock</td>
+</tr>
+<tr>
+<td>需要 Condition 通知</td>
+<td>ReentrantReadWriteLock</td>
+</tr>
+<tr>
+<td>写操作较频繁</td>
+<td>ReentrantLock &#x2F; synchronized</td>
+</tr>
+</tbody></table>
+<h3 id="3-3-StampedLock-使用的坑"><a href="#3-3-StampedLock-使用的坑" class="headerlink" title="3.3 StampedLock 使用的坑"></a>3.3 StampedLock 使用的坑</h3><p><strong>1. 不可重入</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">StampedLock</span> <span class="variable">lock</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">StampedLock</span>();</span><br><span class="line"><span class="type">long</span> <span class="variable">stamp</span> <span class="operator">=</span> lock.writeLock();</span><br><span class="line"><span class="comment">// ... 不能再次获取写锁，否则死锁</span></span><br></pre></td></tr></table></figure>
+<p>当前线程已持有写锁时再次 <code>writeLock()</code> 会导致死锁，因为没有重入计数支持。</p>
+<p><strong>2. 不支持 Condition</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 编译报错！StampedLock 没有 newCondition 方法</span></span><br><span class="line"><span class="type">Condition</span> <span class="variable">condition</span> <span class="operator">=</span> stampedLock.newCondition();</span><br></pre></td></tr></table></figure>
+
+<p><strong>3. 中断异常不友好</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// StampedLock 的方法不响应中断</span></span><br><span class="line"><span class="comment">// 如果需要中断响应，使用 lockInterruptibly() 变体</span></span><br><span class="line">stampedLock.writeLockInterruptibly();</span><br></pre></td></tr></table></figure>
+
+<p><strong>4. 乐观读的非重入校验陷阱</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">stamp</span> <span class="operator">=</span> lock.tryOptimisticRead();</span><br><span class="line"><span class="comment">// ... 读数据，可能被写线程修改</span></span><br><span class="line"><span class="keyword">if</span> (!lock.validate(stamp)) &#123;</span><br><span class="line">    <span class="comment">// 数据被修改，这段代码不会重入到读到的数据中</span></span><br><span class="line">    <span class="comment">// 需要业务代码保证重新读取的线程安全</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="四、常见面试追问"><a href="#四、常见面试追问" class="headerlink" title="四、常见面试追问"></a>四、常见面试追问</h2><h3 id="Q1：ReentrantReadWriteLock-为什么最多支持-65535-个读锁？"><a href="#Q1：ReentrantReadWriteLock-为什么最多支持-65535-个读锁？" class="headerlink" title="Q1：ReentrantReadWriteLock 为什么最多支持 65535 个读锁？"></a>Q1：ReentrantReadWriteLock 为什么最多支持 65535 个读锁？</h3><p>A：因为读锁用高 16 位计数，最大值为 2^16 - 1 &#x3D; 65535。实际上单个线程可能重入上万次，但在高并发系统中应该避免这种情况。</p>
+<h3 id="Q2：StampedLock-为什么不可重入？"><a href="#Q2：StampedLock-为什么不可重入？" class="headerlink" title="Q2：StampedLock 为什么不可重入？"></a>Q2：StampedLock 为什么不可重入？</h3><p>A：为了性能。可重入需要在内部维护每个线程的持有计数（如 ThreadLocal），增加了内存开销和代码复杂度。StampedLock 追求极致性能，牺牲了可重入性。</p>
+<h3 id="Q3：乐观读失败时如何重试？"><a href="#Q3：乐观读失败时如何重试？" class="headerlink" title="Q3：乐观读失败时如何重试？"></a>Q3：乐观读失败时如何重试？</h3><p>A：一般模式是：获取乐观读戳 → 读数据 → 验证 → 如果失败获取悲观读锁 → 重新读取。注意重试时要避免无限循环，可以加入自旋次数的上限。</p>
+<h3 id="Q4：锁降级有什么实际用途？"><a href="#Q4：锁降级有什么实际用途？" class="headerlink" title="Q4：锁降级有什么实际用途？"></a>Q4：锁降级有什么实际用途？</h3><p>A：最典型的场景是缓存更新。先获取写锁更新数据，然后在释放写锁之前获取读锁（降级），确保其他线程在写锁释放后看到的数据是一致的。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p><code>ReentrantReadWriteLock</code> 和 <code>StampedLock</code> 是 Java 并发工具包中两个重要的读写锁实现：</p>
+<ul>
+<li><strong>ReentrantReadWriteLock</strong> 基于 AQS，支持可重入、条件等待、锁降级，是通用读写场景的首选</li>
+<li><strong>StampedLock</strong> 引入了乐观读机制，在读多写极少的场景下性能大幅领先，但不支持重入和 Condition</li>
+</ul>
+<p>在实际项目中，应根据读写比例、是否需要重入、是否需要 Condition 等维度综合考量。对于缓存类读多写少场景，StampedLock 的乐观读往往能带来显著的性能提升。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/07/07/java-readwritelock-stampedlock-deep-dive/">https://jiweidong.github.io/2026/07/07/java-readwritelock-stampedlock-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/">并发编程</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/%E9%94%81/">锁</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/07/07/java-weakhashmap-identityhashmap-linkedhashmap-deep-dive/" title="【Java集合】Java Map 家族冷门成员：WeakHashMap、IdentityHashMap 与 LinkedHashMap 源码级解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java集合】Java Map 家族冷门成员：WeakHashMap、IdentityHashMap 与 LinkedHashMap 源码级解析</div></div><div class="info-2"><div class="info-item-1">【Java集合】Java Map 家族冷门成员：WeakHashMap、IdentityHashMap 与 LinkedHashMap 源码级解析不止于 HashMapHashMap 是 Java 开发中最常用的 Map 实现，但 JDK 还提供了几个”另类”的 Map 实现，它们在特定场景下能发挥意想不到的作用：  WeakHashMap：键是弱引用——当键不再被外部引用时自动被 GC 清除，天然适合缓存场景 IdentityHashMap：使用引用相等（==）代替 equals() 比较键，性能更高，适用于特殊比较逻辑 LinkedHashMap：维护插入顺序或访问顺序，是 LRU 缓存的理想基础  这篇文章将深入这三个 Map 的源码实现，剖析核心机制和最佳实践。  一、WeakHashMap：弱引用键的自动清理1.1 弱引用（WeakReference）基础在深入 WeakHashMap 之前，需要先理解 Java 的弱引用： 123456// 强引用：不会被 GC 回收（除非引用变量被置 null）String strongRef = new String(&quot;...</div></div></div></a><a class="pagination-related" href="/2026/07/07/java-random-threadlocalrandom-securerandom-deep-dive/" title="【Java核心】Java 随机数生成器深度解析：Random、ThreadLocalRandom 与 SecureRandom 原理与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java核心】Java 随机数生成器深度解析：Random、ThreadLocalRandom 与 SecureRandom 原理与最佳实践</div></div><div class="info-2"><div class="info-item-1">【Java核心】Java 随机数生成器深度解析：Random、ThreadLocalRandom 与 SecureRandom 原理与最佳实践再平凡的 API 也有不平凡的故事几乎每个 Java 开发者都写过 new Random().nextInt() 或 Math.random()。 但你真的了解它们背后的机制吗？  为什么高并发下 Random 性能会断崖式下降？ ThreadLocalRandom 是如何解决这个问题的？ 密码学中的 SecureRandom 和普通随机数有什么区别？ 为什么说 Math.random() 是一个”坑”？  本文将从源码到实战，系统梳理 Java 三大随机数生成器的核心原理与选型策略。  一、Random：最常用的随机数生成器1.1 核心原理：线性同余生成器（LCG）java.util.Random 基于**线性同余生成器（Linear Congruential Generator, LCG）**算法： 12seed = (seed * multiplier + addend) % modulus     = (seed * 0x5DEEC...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/22/jmh-microbenchmark-practice/" title="JMH 微基准测试实战：精确衡量 Java 代码性能"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-22</div><div class="info-item-2">JMH 微基准测试实战：精确衡量 Java 代码性能</div></div><div class="info-2"><div class="info-item-1">JMH 微基准测试实战：精确衡量 Java 代码性能一、为什么需要 JMH？写 Java 的时候，你肯定遇到过这些场景：  ArrayList 和 LinkedList 到底谁遍历更快？ StringBuilder 真的比 StringBuffer 快吗？ Lambda 比匿名内部类慢多少？ Stream 和 for 循环谁性能更好？  很多人会写一个 main 方法，循环几万次打个时间戳就下结论。但这种方式严重不靠谱。 普通测试的陷阱12345678910// ❌ 这种测试方式不可信public static void main(String[] args) &#123;    long start = System.currentTimeMillis();    List&lt;String&gt; list = new ArrayList&lt;&gt;();    for (int i = 0; i &lt; 100000; i++) &#123;        list.add(&quot;item-&quot; + i);    &#125;    long end ...</div></div></div></a><a class="pagination-related" href="/2026/06/17/okhttp3-source-code-analysis/" title="OkHttp3 源码解析与 HTTP 客户端性能优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">OkHttp3 源码解析与 HTTP 客户端性能优化实战</div></div><div class="info-2"><div class="info-item-1">OkHttp3 源码解析与 HTTP 客户端性能优化实战一、HTTP 客户端的选择Java 生态中，HTTP 客户端经历了以下演进： 123HttpURLConnection (JDK 1.1) → Apache HttpClient 4.x → OkHttp 3.x → JDK 11 HttpClient                                   ↓                           ↓                              功能全面，较复杂            Kotlin 团队打造，简洁高效     特性 HttpURLConnection Apache HttpCli 4.x OkHttp 3.x JDK 11 HttpClient    连接池 无 支持 支持（成熟） 支持   HTTP&#x2F;2 不支持 部分支持 完整支持 支持   WebSocket 不支持 不支持 支持 支持   拦截器 无 支持（基础） 强大的链式拦截器 无   请求&#x2F;响应缓存 无 支持 内置 Cache 无   自...</div></div></div></a><a class="pagination-related" href="/2026/07/02/java-regex-pattern-performance-deep-dive/" title="【Java进阶】正则表达式深度解析：Pattern 源码、性能优化与常见陷阱"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【Java进阶】正则表达式深度解析：Pattern 源码、性能优化与常见陷阱</div></div><div class="info-2"><div class="info-item-1">【Java进阶】正则表达式深度解析：Pattern 源码、性能优化与常见陷阱概述正则表达式是 Java 开发者的必备技能。但你知道吗？一个不小心写出的正则表达式，轻则性能下降百倍，重则引发灾难性回溯导致系统瘫痪。本文从源码到手写优化，带你彻底搞懂 Java 正则。 一、Java 正则核心类1.1 三个核心类   类 用途 线程安全    java.util.regex.Pattern 编译正则表达式 是（不可变）   java.util.regex.Matcher 执行匹配操作 否（有状态）   PatternSyntaxException 正则语法错误 -   1.2 正确使用方式12345678910// ❌ 错误写法：每次调用都编译（性能极差）boolean badMatch = Pattern.matches(&quot;\\d&#123;3,5&#125;-\\d&#123;7,8&#125;&quot;, phone);// ✅ 推荐写法：编译一次，重复使用private static final Pattern PHONE_PATTERN =     Pattern...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-gc-g1-zgc-shenandoah-deep-dive/" title="「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践</div></div><div class="info-2"><div class="info-item-1">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践从 Serial 到 ZGC，Java 垃圾收集器已经发展了近三十年。面对低延迟还是高吞吐的抉择，我们常常陷入选择困难。本文系统梳理 G1、ZGC 和 Shenandoah 三大主流收集器的核心原理、关键参数和调优实践。  一、GC 发展的演进路线123456789101112Serial (单线程, STW)  │  ├── ParNew (多线程年轻代)  │     └── Parallel Scavenge (吞吐量优先)  │  ├── Parallel Old (老年代并行)  │  └── CMS (并发低延迟) ──→ G1 (分区化, 可预测停顿)                                  │                                  ├── ZGC (超低延迟, 不分区)                                  │                                  └── Shenan...</div></div></div></a><a class="pagination-related" href="/2026/07/14/java-semaphore-countdownlatch-cyclicbarrier-deep-dive/" title="【并发编程】Java 同步器（Semaphore&#x2F;CountDownLatch&#x2F;CyclicBarrier）源码深度解析：从 AQS 到实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-14</div><div class="info-item-2">【并发编程】Java 同步器（Semaphore&#x2F;CountDownLatch&#x2F;CyclicBarrier）源码深度解析：从 AQS 到实战</div></div><div class="info-2"><div class="info-item-1">【并发编程】Java 同步器（Semaphore&#x2F;CountDownLatch&#x2F;CyclicBarrier）源码深度解析：从 AQS 到实战前言Java 并发包 (java.util.concurrent) 中除了 ThreadPoolExecutor、ConcurrentHashMap 这些大明星，还有一群低调但极为实用的同步器（Synchronizer）：  CountDownLatch — 让一个线程等待其他线程「倒计时」结束 CyclicBarrier — 让一组线程互相等待，到达屏障再一起出发 Semaphore — 控制同时访问资源的线程数量  这三个工具在面试中频率极高，但很多人只停留在「会用 API」的层面。今天我们从 AQS（AbstractQueuedSynchronizer） 源码层面把它们彻底讲透。    一、AQS：所有同步器的基石1.1 什么是 AQS？AQS（AbstractQueuedSynchronizer）是 Java 并发包的灵魂组件。ReentrantLock、CountDownLatch、Semaphore、Reent...</div></div></div></a><a class="pagination-related" href="/2026/07/04/java-stream-performance-comparison/" title="【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-04</div><div class="info-item-2">【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑前言Java 8 引入的 Stream API 已经成为了 Java 开发者每天都要使用的核心工具。但其背后有一些常见的误解：  “并行流一定比串行流快” “Stream 性能比 for 循环差” “所有集合都适合用 parallelStream”  本文将通过 JMH 基准测试，用数据揭示 Stream 性能的真实面，并深入分析并行流的工作原理和适用场景。  一、Stream 基础回顾1.1 Stream 操作分类   类型 特点 示例 说明    中间操作 惰性求值（lazy） filter() &#x2F; map() &#x2F; sorted() 不触发实际计算   短路中间操作 可以提前终止 limit() &#x2F; skip() 优化处理   终端操作 触发流水线执行 collect() &#x2F; forEach() &#x2F; count() 产生结果或副作用   短路终端操作 满足条件时提前终止 findFirst() &#x2F; anyMatch() 性...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">320</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">542</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">113</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B%E3%80%91ReadWriteLock-%E4%B8%8E-StampedLock-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%B9%B6%E5%8F%91%E8%AF%BB%E5%86%99%E7%9A%84%E9%94%81%E4%BC%98%E5%8C%96%E4%B9%8B%E8%B7%AF"><span class="toc-number">1.</span> <span class="toc-text">【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BB%8E%E8%AF%BB%E5%86%99%E5%88%86%E7%A6%BB%E8%AF%B4%E8%B5%B7"><span class="toc-number">1.1.</span> <span class="toc-text">从读写分离说起</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81ReentrantReadWriteLock-%E6%BA%90%E7%A0%81%E6%B7%B1%E5%85%A5%E5%88%86%E6%9E%90"><span class="toc-number">1.2.</span> <span class="toc-text">一、ReentrantReadWriteLock 源码深入分析</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E6%A0%B8%E5%BF%83%E8%AE%BE%E8%AE%A1%EF%BC%9A%E4%B8%80%E4%B8%AA%E7%8A%B6%E6%80%81%E4%BD%8D%EF%BC%8C%E4%B8%A4%E7%A7%8D%E6%A8%A1%E5%BC%8F"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 核心设计：一个状态位，两种模式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E5%86%99%E9%94%81%E7%9A%84%E8%8E%B7%E5%8F%96%E4%B8%8E%E9%87%8A%E6%94%BE"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 写锁的获取与释放</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E8%AF%BB%E9%94%81%E7%9A%84%E8%8E%B7%E5%8F%96%E4%B8%8E%E9%87%8A%E6%94%BE"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 读锁的获取与释放</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-4-%E8%AF%BB%E9%94%81%E9%87%8D%E5%85%A5%E8%AE%A1%E6%95%B0%EF%BC%9AThreadLocal-%E7%9A%84%E5%A6%99%E7%94%A8"><span class="toc-number">1.2.4.</span> <span class="toc-text">1.4 读锁重入计数：ThreadLocal 的妙用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-5-%E5%85%AC%E5%B9%B3-vs-%E9%9D%9E%E5%85%AC%E5%B9%B3"><span class="toc-number">1.2.5.</span> <span class="toc-text">1.5 公平 vs 非公平</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-6-%E9%94%81%E9%99%8D%E7%BA%A7"><span class="toc-number">1.2.6.</span> <span class="toc-text">1.6 锁降级</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81StampedLock%EF%BC%9A%E6%80%A7%E8%83%BD%E6%9B%B4%E6%BF%80%E8%BF%9B%E7%9A%84%E8%AF%BB%E5%86%99%E9%94%81"><span class="toc-number">1.3.</span> <span class="toc-text">二、StampedLock：性能更激进的读写锁</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%8E-ReadWriteLock-%E7%9A%84%E6%A0%B8%E5%BF%83%E5%8C%BA%E5%88%AB"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 与 ReadWriteLock 的核心区别</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%89%E7%A7%8D%E9%94%81%E6%A8%A1%E5%BC%8F%E8%AF%A6%E8%A7%A3"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 三种锁模式详解</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E4%B9%90%E8%A7%82%E8%AF%BB%E7%9A%84%E7%B2%BE%E5%A6%99%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 乐观读的精妙设计</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E6%BA%90%E7%A0%81%E5%AE%9E%E7%8E%B0%EF%BC%9A%E8%87%AA%E6%97%8B-CLH-%E9%98%9F%E5%88%97"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 源码实现：自旋 + CLH 队列</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%80%A7%E8%83%BD%E5%AF%B9%E6%AF%94%E4%B8%8E%E5%AE%9E%E6%88%98%E9%80%89%E6%8B%A9"><span class="toc-number">1.4.</span> <span class="toc-text">三、性能对比与实战选择</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-JMH-%E5%9F%BA%E5%87%86%E6%B5%8B%E8%AF%95%E5%AF%B9%E6%AF%94"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 JMH 基准测试对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E9%80%89%E5%9E%8B%E5%BB%BA%E8%AE%AE"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 选型建议</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-StampedLock-%E4%BD%BF%E7%94%A8%E7%9A%84%E5%9D%91"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 StampedLock 使用的坑</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%B8%B8%E8%A7%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.5.</span> <span class="toc-text">四、常见面试追问</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#Q1%EF%BC%9AReentrantReadWriteLock-%E4%B8%BA%E4%BB%80%E4%B9%88%E6%9C%80%E5%A4%9A%E6%94%AF%E6%8C%81-65535-%E4%B8%AA%E8%AF%BB%E9%94%81%EF%BC%9F"><span class="toc-number">1.5.1.</span> <span class="toc-text">Q1：ReentrantReadWriteLock 为什么最多支持 65535 个读锁？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q2%EF%BC%9AStampedLock-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E5%8F%AF%E9%87%8D%E5%85%A5%EF%BC%9F"><span class="toc-number">1.5.2.</span> <span class="toc-text">Q2：StampedLock 为什么不可重入？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q3%EF%BC%9A%E4%B9%90%E8%A7%82%E8%AF%BB%E5%A4%B1%E8%B4%A5%E6%97%B6%E5%A6%82%E4%BD%95%E9%87%8D%E8%AF%95%EF%BC%9F"><span class="toc-number">1.5.3.</span> <span class="toc-text">Q3：乐观读失败时如何重试？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q4%EF%BC%9A%E9%94%81%E9%99%8D%E7%BA%A7%E6%9C%89%E4%BB%80%E4%B9%88%E5%AE%9E%E9%99%85%E7%94%A8%E9%80%94%EF%BC%9F"><span class="toc-number">1.5.4.</span> <span class="toc-text">Q4：锁降级有什么实际用途？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.6.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/java-methodhandle-reflection-deep-comparison/" title="【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战">【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/jvm-cms-gc-deep-dive/" title="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题">【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/kafka-consumer-lag-monitoring-optimization/" title="【消息队列】Kafka 消费者 Lag 监控与性能优化实战">【消息队列】Kafka 消费者 Lag 监控与性能优化实战</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/mysql-primary-key-design-deep-comparison/" title="【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键">【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/spring-value-annotation-deep-dive/" title="【Spring 源码】@Value 注解底层原理与高级用法：从属性注入到 SpEL 解析">【Spring 源码】@Value 注解底层原理与高级用法：从属性注入到 SpEL 解析</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.0"></script><script src="/js/main.js?v=5.6.0"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

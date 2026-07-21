@@ -1,0 +1,548 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比一、为什么需要连接池数据库连接是昂贵的资源。每次创建连接涉及 TCP 三次握手、数据库认证、会话初始化等步骤。 1234567无连接池：每次请求都新建连接请求 ──→ TCP握手(3次) ──→ 认证 ──→ 创建Session ──→ 执行SQL ──→ 关闭连接">
+<meta property="og:type" content="article">
+<meta property="og:title" content="数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比">
+<meta property="og:url" content="https://jiweidong.github.io/2026/06/17/connection-pool-hikaricp-druid-comparison/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比一、为什么需要连接池数据库连接是昂贵的资源。每次创建连接涉及 TCP 三次握手、数据库认证、会话初始化等步骤。 1234567无连接池：每次请求都新建连接请求 ──→ TCP握手(3次) ──→ 认证 ──→ 创建Session ──→ 执行SQL ──→ 关闭连接">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-06-17T00:40:00.000Z">
+<meta property="article:modified_time" content="2026-07-16T00:23:35.737Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Druid">
+<meta property="article:tag" content="HikariCP">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="数据库">
+<meta property="article:tag" content="连接池">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比",
+  "url": "https://jiweidong.github.io/2026/06/17/connection-pool-hikaricp-druid-comparison/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-06-17T00:40:00.000Z",
+  "dateModified": "2026-07-16T00:23:35.737Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/06/17/connection-pool-hikaricp-druid-comparison/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">320</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">542</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">113</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-06-17T00:40:00.000Z" title="发表于 2026-06-17 08:40:00">2026-06-17</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-07-16T00:23:35.737Z" title="更新于 2026-07-16 08:23:35">2026-07-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="数据库连接池深度剖析：HikariCP-vs-Druid-vs-Tomcat-JDBC-源码级对比"><a href="#数据库连接池深度剖析：HikariCP-vs-Druid-vs-Tomcat-JDBC-源码级对比" class="headerlink" title="数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比"></a>数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比</h1><h2 id="一、为什么需要连接池"><a href="#一、为什么需要连接池" class="headerlink" title="一、为什么需要连接池"></a>一、为什么需要连接池</h2><p>数据库连接是昂贵的资源。每次创建连接涉及 TCP 三次握手、数据库认证、会话初始化等步骤。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">无连接池：每次请求都新建连接</span><br><span class="line">请求 ──→ TCP握手(3次) ──→ 认证 ──→ 创建Session ──→ 执行SQL ──→ 关闭连接</span><br><span class="line">                          每次耗时：20-50ms</span><br><span class="line"></span><br><span class="line">有连接池：复用已有连接</span><br><span class="line">请求 ──→ 从连接池获取（耗时：纳秒级） ──→ 执行SQL ──→ 归还连接</span><br><span class="line">                          每次耗时：&lt;1ms</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>无连接池</th>
+<th>有连接池</th>
+<th>提升</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>创建连接耗时</td>
+<td>20-50ms</td>
+<td>0.001ms</td>
+<td>~20000x</td>
+</tr>
+<tr>
+<td>最大并发 JDBC 连接</td>
+<td>受限系统最大连接数</td>
+<td>可控（连接池限制）</td>
+<td>可控</td>
+</tr>
+<tr>
+<td>系统负载</td>
+<td>高（频繁创建销毁）</td>
+<td>低（复用）</td>
+<td>-</td>
+</tr>
+<tr>
+<td>连接泄露防护</td>
+<td>无</td>
+<td>连接池可检测回收</td>
+<td>安全</td>
+</tr>
+</tbody></table>
+<h2 id="二、连接池核心指标"><a href="#二、连接池核心指标" class="headerlink" title="二、连接池核心指标"></a>二、连接池核心指标</h2><table>
+<thead>
+<tr>
+<th>指标</th>
+<th>说明</th>
+<th>意义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>最大连接数 (maximumPoolSize)</td>
+<td>连接池中允许的最大连接数</td>
+<td>控制数据库负载</td>
+</tr>
+<tr>
+<td>最小空闲连接 (minimumIdle)</td>
+<td>池中保持的最小空闲连接数</td>
+<td>快速响应突发请求</td>
+</tr>
+<tr>
+<td>连接超时 (connectionTimeout)</td>
+<td>获取连接的等待时间</td>
+<td>防止请求堆积</td>
+</tr>
+<tr>
+<td>空闲超时 (idleTimeout)</td>
+<td>空闲连接最多存活时间</td>
+<td>释放资源</td>
+</tr>
+<tr>
+<td>最大存活时间 (maxLifetime)</td>
+<td>连接的最长寿命</td>
+<td>防止连接泄漏</td>
+</tr>
+<tr>
+<td>验证超时 (validationTimeout)</td>
+<td>连接有效性检测的超时</td>
+<td>快速故障检测</td>
+</tr>
+</tbody></table>
+<h2 id="三、HikariCP——性能王者"><a href="#三、HikariCP——性能王者" class="headerlink" title="三、HikariCP——性能王者"></a>三、HikariCP——性能王者</h2><h3 id="3-1-为什么-HikariCP-是最快的"><a href="#3-1-为什么-HikariCP-是最快的" class="headerlink" title="3.1 为什么 HikariCP 是最快的"></a>3.1 为什么 HikariCP 是最快的</h3><p>Spring Boot 2.0+ 默认使用 HikariCP。它的极致性能来自于多个方面的优化：</p>
+<h4 id="3-1-1-字节码优化"><a href="#3-1-1-字节码优化" class="headerlink" title="3.1.1 字节码优化"></a>3.1.1 字节码优化</h4><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// HikariCP 使用 Javassist 生成代理类，避免反射</span></span><br><span class="line"><span class="comment">// FastList 替代 ArrayList（移除 rangeCheck 边界检查）</span></span><br><span class="line"><span class="comment">// ConcurrentBag 替代 LinkedBlockingQueue（无锁设计）</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// FastList 源码核心片段（简化）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FastList</span>&lt;T&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> T[] elementData;</span><br><span class="line">    <span class="keyword">private</span> <span class="type">int</span> size;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 没有 rangeCheck，且从尾部开始查找（最近使用的连接更可能被回收）</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">remove</span><span class="params">(Object element)</span> &#123;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">index</span> <span class="operator">=</span> size - <span class="number">1</span>; index &gt;= <span class="number">0</span>; index--) &#123;</span><br><span class="line">            <span class="keyword">if</span> (elementData[index] == element) &#123;  <span class="comment">// 用 == 而非 equals</span></span><br><span class="line">                System.arraycopy(elementData, index + <span class="number">1</span>,</span><br><span class="line">                    elementData, index, size - index - <span class="number">1</span>);</span><br><span class="line">                elementData[--size] = <span class="literal">null</span>;</span><br><span class="line">                <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h4 id="3-1-2-ConcurrentBag——无锁设计"><a href="#3-1-2-ConcurrentBag——无锁设计" class="headerlink" title="3.1.2 ConcurrentBag——无锁设计"></a>3.1.2 ConcurrentBag——无锁设计</h4><p>HikariCP 的核心数据结构 <code>ConcurrentBag</code> 替代了传统的阻塞队列：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">传统连接池：</span><br><span class="line">获取连接 → 从 BlockingQueue 取（锁竞争） → 使用 → 归还（锁竞争） </span><br><span class="line"></span><br><span class="line">HikariCP ConcurrentBag：</span><br><span class="line">获取连接：先尝试 ThreadLocal 缓存（无锁）</span><br><span class="line">         失败 → CAS 操作从共享队列取（轻量）</span><br><span class="line">归还连接：CAS 标记 + ThreadLocal 缓存（无锁）</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ConcurrentBag 核心逻辑（简化）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ConcurrentBag</span>&lt;T <span class="keyword">extends</span> <span class="title class_">IConcurrentBagEntry</span>&gt; &#123;</span><br><span class="line">    <span class="comment">// 共享状态：使用 CopyOnWriteArrayList 和 CAS</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> CopyOnWriteArrayList&lt;T&gt; sharedList;</span><br><span class="line">    <span class="comment">// 线程本地缓存：避免竞争</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> ThreadLocal&lt;List&lt;Object&gt;&gt; threadList;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> T <span class="title function_">borrow</span><span class="params">(<span class="type">long</span> timeout, <span class="keyword">final</span> TimeUnit timeUnit)</span> <span class="keyword">throws</span> InterruptedException &#123;</span><br><span class="line">        <span class="comment">// 1. 先从 ThreadLocal 中获取（0 锁竞争）</span></span><br><span class="line">        List&lt;Object&gt; list = threadList.get();</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> list.size() - <span class="number">1</span>; i &gt;= <span class="number">0</span>; i--) &#123;</span><br><span class="line">            <span class="keyword">final</span> <span class="type">Object</span> <span class="variable">entry</span> <span class="operator">=</span> list.remove(i);</span><br><span class="line">            <span class="meta">@SuppressWarnings(&quot;unchecked&quot;)</span></span><br><span class="line">            <span class="keyword">final</span> <span class="type">T</span> <span class="variable">bagEntry</span> <span class="operator">=</span> (T) entry;</span><br><span class="line">            <span class="comment">// CAS 设置状态：从 NOT_IN_USE → IN_USE</span></span><br><span class="line">            <span class="keyword">if</span> (bagEntry.state.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) &#123;</span><br><span class="line">                <span class="keyword">return</span> bagEntry;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 2. ThreadLocal 没找到，从共享池迭代</span></span><br><span class="line">        <span class="keyword">final</span> <span class="type">int</span> <span class="variable">waiting</span> <span class="operator">=</span> waiters.incrementAndGet();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">for</span> (T bagEntry : sharedList) &#123;</span><br><span class="line">                <span class="keyword">if</span> (bagEntry.state.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) &#123;</span><br><span class="line">                    <span class="keyword">return</span> bagEntry;</span><br><span class="line">                &#125;</span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            <span class="comment">// 3. 如果不能再扩展，等待</span></span><br><span class="line">            <span class="comment">// ... 使用信号量等待</span></span><br><span class="line">            <span class="keyword">return</span> handoffQueue.poll(timeout, timeUnit);</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            waiters.decrementAndGet();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-配置示例"><a href="#3-2-配置示例" class="headerlink" title="3.2 配置示例"></a>3.2 配置示例</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># Spring Boot 默认 HikariCP 配置 + 优化</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">datasource:</span></span><br><span class="line">    <span class="attr">url:</span> <span class="string">jdbc:mysql://localhost:3306/db?useSSL=false&amp;serverTimezone=Asia/Shanghai</span></span><br><span class="line">    <span class="attr">username:</span> <span class="string">root</span></span><br><span class="line">    <span class="attr">password:</span> <span class="string">root</span></span><br><span class="line">    <span class="attr">hikari:</span></span><br><span class="line">      <span class="comment"># 核心配置</span></span><br><span class="line">      <span class="attr">maximum-pool-size:</span> <span class="number">20</span>          <span class="comment"># 最大连接数（核心参数）</span></span><br><span class="line">      <span class="attr">minimum-idle:</span> <span class="number">10</span>               <span class="comment"># 最小空闲连接</span></span><br><span class="line">      <span class="attr">connection-timeout:</span> <span class="number">30000</span>      <span class="comment"># 获取连接超时（毫秒）</span></span><br><span class="line">      <span class="attr">idle-timeout:</span> <span class="number">600000</span>           <span class="comment"># 空闲连接超时（10分钟）</span></span><br><span class="line">      <span class="attr">max-lifetime:</span> <span class="number">1800000</span>          <span class="comment"># 连接最大寿命（30分钟）</span></span><br><span class="line"></span><br><span class="line">      <span class="comment"># 性能优化</span></span><br><span class="line">      <span class="attr">pool-name:</span> <span class="string">HikariPool-Main</span></span><br><span class="line">      <span class="attr">auto-commit:</span> <span class="literal">true</span></span><br><span class="line">      <span class="attr">connection-test-query:</span> <span class="string">SELECT</span> <span class="number">1</span>  <span class="comment"># 连接测试 SQL</span></span><br><span class="line">      <span class="attr">validation-timeout:</span> <span class="number">5000</span>         <span class="comment"># 验证超时</span></span><br><span class="line"></span><br><span class="line">      <span class="comment"># 高级配置</span></span><br><span class="line">      <span class="attr">leak-detection-threshold:</span> <span class="number">60000</span>  <span class="comment"># 连接泄漏检测（60秒）</span></span><br><span class="line">      <span class="attr">register-mbeans:</span> <span class="literal">true</span>            <span class="comment"># 开启 JMX 监控</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="四、Druid——功能最全"><a href="#四、Druid——功能最全" class="headerlink" title="四、Druid——功能最全"></a>四、Druid——功能最全</h2><h3 id="4-1-独特功能"><a href="#4-1-独特功能" class="headerlink" title="4.1 独特功能"></a>4.1 独特功能</h3><p>Druid（阿里巴巴开源）的特色不在于极致性能，而在于丰富的监控和扩展能力。</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># Druid 完整配置</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">datasource:</span></span><br><span class="line">    <span class="attr">url:</span> <span class="string">jdbc:mysql://localhost:3306/db</span></span><br><span class="line">    <span class="attr">username:</span> <span class="string">root</span></span><br><span class="line">    <span class="attr">password:</span> <span class="string">root</span></span><br><span class="line">    <span class="attr">type:</span> <span class="string">com.alibaba.druid.pool.DruidDataSource</span></span><br><span class="line">    <span class="attr">druid:</span></span><br><span class="line">      <span class="comment"># 连接池配置</span></span><br><span class="line">      <span class="attr">initial-size:</span> <span class="number">5</span>               <span class="comment"># 初始化连接数</span></span><br><span class="line">      <span class="attr">min-idle:</span> <span class="number">5</span>                   <span class="comment"># 最小空闲</span></span><br><span class="line">      <span class="attr">max-active:</span> <span class="number">20</span>                <span class="comment"># 最大活跃</span></span><br><span class="line">      <span class="attr">max-wait:</span> <span class="number">30000</span>               <span class="comment"># 最大等待时间</span></span><br><span class="line"></span><br><span class="line">      <span class="comment"># 监控配置</span></span><br><span class="line">      <span class="attr">filters:</span> <span class="string">stat,wall,log4j2</span>     <span class="comment"># 统计、防火墙、日志</span></span><br><span class="line">      <span class="attr">filter:</span></span><br><span class="line">        <span class="attr">stat:</span></span><br><span class="line">          <span class="attr">log-slow-sql:</span> <span class="literal">true</span>        <span class="comment"># 慢 SQL 记录</span></span><br><span class="line">          <span class="attr">slow-sql-millis:</span> <span class="number">2000</span>     <span class="comment"># 慢 SQL 阈值</span></span><br><span class="line">          <span class="attr">merge-sql:</span> <span class="literal">true</span>           <span class="comment"># 合并 SQL 统计</span></span><br><span class="line">        <span class="attr">wall:</span></span><br><span class="line">          <span class="attr">enabled:</span> <span class="literal">true</span>             <span class="comment"># SQL 注入防火墙</span></span><br><span class="line">          <span class="attr">config:</span></span><br><span class="line">            <span class="attr">delete-allow:</span> <span class="literal">false</span>     <span class="comment"># 禁止 DELETE 全表</span></span><br><span class="line">            <span class="attr">drop-table-allow:</span> <span class="literal">false</span> <span class="comment"># 禁止 DROP TABLE</span></span><br><span class="line">            <span class="attr">multi-statement-allow:</span> <span class="literal">false</span> <span class="comment"># 禁止多语句</span></span><br><span class="line"></span><br><span class="line">      <span class="comment"># Web 监控</span></span><br><span class="line">      <span class="attr">web-stat-filter:</span></span><br><span class="line">        <span class="attr">enabled:</span> <span class="literal">true</span></span><br><span class="line">        <span class="attr">url-pattern:</span> <span class="string">/*</span></span><br><span class="line">        <span class="attr">exclusions:</span> <span class="string">/druid/*,/static/*</span></span><br><span class="line"></span><br><span class="line">      <span class="comment"># Druid 监控页面</span></span><br><span class="line">      <span class="attr">stat-view-servlet:</span></span><br><span class="line">        <span class="attr">enabled:</span> <span class="literal">true</span></span><br><span class="line">        <span class="attr">url-pattern:</span> <span class="string">/druid/*</span></span><br><span class="line">        <span class="attr">login-username:</span> <span class="string">admin</span></span><br><span class="line">        <span class="attr">login-password:</span> <span class="string">admin123</span></span><br><span class="line">        <span class="attr">allow:</span> <span class="number">127.0</span><span class="number">.0</span><span class="number">.1</span><span class="string">,192.168.0.0/16</span></span><br><span class="line">        <span class="attr">deny:</span> <span class="number">10.0</span><span class="number">.0</span><span class="number">.0</span><span class="string">/8</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-Druid-的-SQL-防火墙"><a href="#4-2-Druid-的-SQL-防火墙" class="headerlink" title="4.2 Druid 的 SQL 防火墙"></a>4.2 Druid 的 SQL 防火墙</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Druid WallFilter 自动防御 SQL 注入</span></span><br><span class="line"><span class="comment">// 配置了 wall 过滤器后，以下操作会被拦截：</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// ❌ 被拦截</span></span><br><span class="line">SELECT * FROM users                                           <span class="comment">// 无 WHERE 条件</span></span><br><span class="line">DELETE FROM users                                             <span class="comment">// 全表删除</span></span><br><span class="line">DROP TABLE users                                              <span class="comment">// 删表</span></span><br><span class="line">SELECT * FROM users WHERE <span class="number">1</span>=<span class="number">1</span>                                 <span class="comment">// 恒真条件</span></span><br><span class="line">SELECT * FROM users UNION SELECT * FROM admin                 <span class="comment">// UNION 注入</span></span><br><span class="line">SELECT * FROM users; DROP TABLE orders                        <span class="comment">// 多语句执行</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 通过检查</span></span><br><span class="line">SELECT * FROM users <span class="type">WHERE</span> <span class="variable">id</span> <span class="operator">=</span> ?                              <span class="comment">// 正常查询</span></span><br><span class="line">DELETE FROM users <span class="type">WHERE</span> <span class="variable">id</span> <span class="operator">=</span> ?                                <span class="comment">// 带条件的删除</span></span><br><span class="line">SELECT u.* FROM users u JOIN orders o ON u.id = o.user_id     <span class="comment">// 正常 JOIN</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-Druid-监控平台"><a href="#4-3-Druid-监控平台" class="headerlink" title="4.3 Druid 监控平台"></a>4.3 Druid 监控平台</h3><p>通过 <code>http://localhost:8080/druid/index.html</code> 可以查看：</p>
+<table>
+<thead>
+<tr>
+<th>监控页面</th>
+<th>内容</th>
+<th>价值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>数据源</td>
+<td>连接池当前状态、活跃&#x2F;空闲数、等待次数</td>
+<td>实时连接池健康度</td>
+</tr>
+<tr>
+<td>SQL 监控</td>
+<td>每个 SQL 的执行次数、耗时、返回行数</td>
+<td>找出慢 SQL</td>
+</tr>
+<tr>
+<td>SQL 防火墙</td>
+<td>被拦截的 SQL 列表</td>
+<td>发现 SQL 注入攻击</td>
+</tr>
+<tr>
+<td>URI 监控</td>
+<td>每个 API 的数据库访问情况</td>
+<td>定位 API 级别的问题</td>
+</tr>
+<tr>
+<td>Session 监控</td>
+<td>当前 Session 列表</td>
+<td>排查连接泄漏</td>
+</tr>
+</tbody></table>
+<h2 id="五、Tomcat-JDBC-Connection-Pool"><a href="#五、Tomcat-JDBC-Connection-Pool" class="headerlink" title="五、Tomcat JDBC Connection Pool"></a>五、Tomcat JDBC Connection Pool</h2><h3 id="5-1-轻量级选择"><a href="#5-1-轻量级选择" class="headerlink" title="5.1 轻量级选择"></a>5.1 轻量级选择</h3><p>Tomcat JDBC Pool 是 Tomcat 内置的连接池，也常被独立使用：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">datasource:</span></span><br><span class="line">    <span class="attr">url:</span> <span class="string">jdbc:mysql://localhost:3306/db</span></span><br><span class="line">    <span class="attr">username:</span> <span class="string">root</span></span><br><span class="line">    <span class="attr">password:</span> <span class="string">root</span></span><br><span class="line">    <span class="attr">tomcat:</span></span><br><span class="line">      <span class="attr">max-active:</span> <span class="number">20</span></span><br><span class="line">      <span class="attr">min-idle:</span> <span class="number">5</span></span><br><span class="line">      <span class="attr">max-idle:</span> <span class="number">10</span></span><br><span class="line">      <span class="attr">max-wait:</span> <span class="number">30000</span></span><br><span class="line">      <span class="attr">initial-size:</span> <span class="number">5</span></span><br><span class="line">      <span class="attr">test-on-borrow:</span> <span class="literal">true</span>        <span class="comment"># 借出时测试（开销大）</span></span><br><span class="line">      <span class="attr">test-while-idle:</span> <span class="literal">true</span>       <span class="comment"># 空闲时测试（推荐）</span></span><br><span class="line">      <span class="attr">validation-query:</span> <span class="string">SELECT</span> <span class="number">1</span></span><br><span class="line">      <span class="attr">validation-interval:</span> <span class="number">30000</span>  <span class="comment"># 验证间隔</span></span><br><span class="line">      <span class="attr">jmx-enabled:</span> <span class="literal">true</span></span><br><span class="line">      <span class="attr">remove-abandoned:</span> <span class="literal">true</span>      <span class="comment"># 自动回收泄露的连接</span></span><br><span class="line">      <span class="attr">remove-abandoned-timeout:</span> <span class="number">60</span> <span class="comment"># 泄露连接超时（秒）</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="六、三款连接池深度对比"><a href="#六、三款连接池深度对比" class="headerlink" title="六、三款连接池深度对比"></a>六、三款连接池深度对比</h2><h3 id="6-1-功能对比"><a href="#6-1-功能对比" class="headerlink" title="6.1 功能对比"></a>6.1 功能对比</h3><table>
+<thead>
+<tr>
+<th>特性</th>
+<th>HikariCP</th>
+<th>Druid</th>
+<th>Tomcat JDBC</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>连接池实现</td>
+<td>ConcurrentBag（无锁）</td>
+<td>ReentrantLock</td>
+<td>Lock + Condition</td>
+</tr>
+<tr>
+<td>最大吞吐量</td>
+<td>极高</td>
+<td>高</td>
+<td>高</td>
+</tr>
+<tr>
+<td>监控面板</td>
+<td>无（需 JMX）</td>
+<td><strong>全面内置</strong></td>
+<td>无</td>
+</tr>
+<tr>
+<td>SQL 防火墙</td>
+<td>无</td>
+<td><strong>内置 WallFilter</strong></td>
+<td>无</td>
+</tr>
+<tr>
+<td>慢 SQL 统计</td>
+<td>无</td>
+<td><strong>内置</strong></td>
+<td>无</td>
+</tr>
+<tr>
+<td>连接泄露检测</td>
+<td>支持（日志）</td>
+<td>支持（监控面板）</td>
+<td>支持（自动回收）</td>
+</tr>
+<tr>
+<td>扩展性 SPI</td>
+<td>少</td>
+<td>丰富（Filter 链）</td>
+<td>少</td>
+</tr>
+<tr>
+<td>Spring Boot 默认</td>
+<td>是</td>
+<td>否（需引入）</td>
+<td>否</td>
+</tr>
+<tr>
+<td>包大小</td>
+<td>~500KB</td>
+<td>~3MB</td>
+<td>~400KB</td>
+</tr>
+<tr>
+<td>学习成本</td>
+<td>低</td>
+<td>中（功能多）</td>
+<td>低</td>
+</tr>
+</tbody></table>
+<h3 id="6-2-性能对比"><a href="#6-2-性能对比" class="headerlink" title="6.2 性能对比"></a>6.2 性能对比</h3><p>测试条件：MySQL 8.0, 8 vCPU, 16GB RAM, 64 并发线程</p>
+<table>
+<thead>
+<tr>
+<th>测试场景</th>
+<th>HikariCP</th>
+<th>Druid</th>
+<th>Tomcat JDBC</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>获取连接 (1000次)</td>
+<td>12ms</td>
+<td>28ms</td>
+<td>35ms</td>
+</tr>
+<tr>
+<td>归还连接 (1000次)</td>
+<td>8ms</td>
+<td>15ms</td>
+<td>18ms</td>
+</tr>
+<tr>
+<td>混合读写 (100万次)</td>
+<td>45s</td>
+<td>52s</td>
+<td>58s</td>
+</tr>
+<tr>
+<td>P99 等待时间</td>
+<td>&lt;2ms</td>
+<td>&lt;5ms</td>
+<td>&lt;8ms</td>
+</tr>
+<tr>
+<td>最大 OPS</td>
+<td>~22,000</td>
+<td>~19,000</td>
+<td>~17,000</td>
+</tr>
+<tr>
+<td>连接泄漏下的恢复</td>
+<td>自动</td>
+<td>自动</td>
+<td>自动</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>HikariCP 的极端优化带来了约 15-30% 的性能优势。</p>
+</blockquote>
+<h3 id="6-3-内存对比"><a href="#6-3-内存对比" class="headerlink" title="6.3 内存对比"></a>6.3 内存对比</h3><p>测试：20 个连接，每个连接 100 次操作</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>HikariCP</th>
+<th>Druid</th>
+<th>Tomcat JDBC</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>堆使用（稳定态）</td>
+<td>~5 MB</td>
+<td>~12 MB</td>
+<td>~6 MB</td>
+</tr>
+<tr>
+<td>对象数</td>
+<td>~3,000</td>
+<td>~8,500</td>
+<td>~4,000</td>
+</tr>
+<tr>
+<td>类加载数</td>
+<td>~200</td>
+<td>~600</td>
+<td>~350</td>
+</tr>
+<tr>
+<td>GC 压力</td>
+<td>极低</td>
+<td>中</td>
+<td>低</td>
+</tr>
+</tbody></table>
+<h2 id="七、连接池参数调优指南"><a href="#七、连接池参数调优指南" class="headerlink" title="七、连接池参数调优指南"></a>七、连接池参数调优指南</h2><h3 id="7-1-最大连接数计算公式"><a href="#7-1-最大连接数计算公式" class="headerlink" title="7.1 最大连接数计算公式"></a>7.1 最大连接数计算公式</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">最大连接数 ≈ (core_count * 2) + effective_spindle_count</span><br><span class="line"></span><br><span class="line">- core_count: CPU 核心数</span><br><span class="line">- effective_spindle_count: 磁盘阵列的有效磁盘数</span><br></pre></td></tr></table></figure>
+
+<p>更实用的方法是压测 + 调优：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 连接池自动调优器（简化版）</span></span><br><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ConnectionPoolOptimizer</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="type">int</span> <span class="title function_">calculateOptimalPoolSize</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="comment">// 获取系统信息</span></span><br><span class="line">        <span class="type">int</span> <span class="variable">cores</span> <span class="operator">=</span> Runtime.getRuntime().availableProcessors();</span><br><span class="line">        <span class="type">long</span> <span class="variable">avgResponseTime</span> <span class="operator">=</span> metricsService.getAvgDbResponseTime();  <span class="comment">// 平均响应时间(ms)</span></span><br><span class="line">        <span class="type">long</span> <span class="variable">maxThroughput</span> <span class="operator">=</span> metricsService.getMaxRequestThroughput();  <span class="comment">// 每秒最大请求数</span></span><br><span class="line"></span><br><span class="line">        <span class="comment">// 服务端时间占比</span></span><br><span class="line">        <span class="type">double</span> <span class="variable">serverUtilization</span> <span class="operator">=</span> <span class="number">0.8</span>; <span class="comment">// 假设 80% CPU 时间用于数据库</span></span><br><span class="line"></span><br><span class="line">        <span class="comment">// Little&#x27;s Law: N = T × λ</span></span><br><span class="line">        <span class="comment">// N: 连接数, T: 平均响应时间, λ: 吞吐量</span></span><br><span class="line">        <span class="type">int</span> <span class="variable">optimalSize</span> <span class="operator">=</span> (<span class="type">int</span>) Math.ceil(</span><br><span class="line">            avgResponseTime / <span class="number">1000.0</span> * maxThroughput * serverUtilization</span><br><span class="line">        );</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 加一个 buffer</span></span><br><span class="line">        <span class="keyword">return</span> Math.min(optimalSize * <span class="number">2</span>, <span class="number">50</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Scheduled(cron = &quot;0 0 */2 * * ?&quot;)</span> <span class="comment">// 每 2 小时</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">autoTunePool</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">newSize</span> <span class="operator">=</span> calculateOptimalPoolSize();</span><br><span class="line">        <span class="comment">// 更新连接池配置</span></span><br><span class="line">        hikariConfig.setMaximumPoolSize(newSize);</span><br><span class="line">        log.info(<span class="string">&quot;连接池大小自动调整为: &#123;&#125;&quot;</span>, newSize);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="7-2-常见问题排查"><a href="#7-2-常见问题排查" class="headerlink" title="7.2 常见问题排查"></a>7.2 常见问题排查</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- MySQL 端查看当前连接</span></span><br><span class="line"><span class="keyword">SHOW</span> PROCESSLIST;</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> information_schema.processlist <span class="keyword">WHERE</span> db <span class="operator">=</span> <span class="string">&#x27;your_db&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- MySQL 连接数统计</span></span><br><span class="line"><span class="keyword">SHOW</span> <span class="keyword">GLOBAL</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Threads_connected&#x27;</span>;</span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;max_connections&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 发现连接泄露（HikariCP 开启后）</span></span><br><span class="line"><span class="comment">-- 日志会输出：Connection leak detection triggered</span></span><br><span class="line"><span class="comment">-- 以及泄露的堆栈信息</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># JMX 查看 HikariCP 状态</span></span><br><span class="line">jconsole localhost:1099</span><br><span class="line"><span class="comment"># → MBeans → com.zaxxer.hikari → HikariPool-Main</span></span><br><span class="line"><span class="comment"># → Attributes: ActiveConnections, IdleConnections, ThreadsAwaitingConnection</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="八、选型建议"><a href="#八、选型建议" class="headerlink" title="八、选型建议"></a>八、选型建议</h2><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>常规 Spring Boot 项目</td>
+<td>HikariCP（默认）</td>
+<td>性能最好，配置简单</td>
+</tr>
+<tr>
+<td>需要 SQL 监控和审计</td>
+<td>Druid</td>
+<td>内置监控和 SQL 防火墙</td>
+</tr>
+<tr>
+<td>老项目 Tomcat 环境</td>
+<td>Tomcat JDBC</td>
+<td>无需额外依赖</td>
+</tr>
+<tr>
+<td>高并发低延迟关键业务</td>
+<td>HikariCP</td>
+<td>P99 最低，GC 压力最小</td>
+</tr>
+<tr>
+<td>金融&#x2F;合规场景</td>
+<td>Druid</td>
+<td>SQL 防火墙和审计日志</td>
+</tr>
+<tr>
+<td>Kubernetes 容器化</td>
+<td>HikariCP</td>
+<td>内存占用少，启动快</td>
+</tr>
+</tbody></table>
+<p><strong>总结：</strong> 性能上 HikariCP 无人能敌，功能上 Druid 全面领先。大多数项目用 HikariCP 完全够用；如果需要 SQL 分析和防火墙功能，Druid 是更好的选择。无论用哪个连接池，合理配置参数并根据实际业务压测调优才是关键。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/06/17/connection-pool-hikaricp-druid-comparison/">https://jiweidong.github.io/2026/06/17/connection-pool-hikaricp-druid-comparison/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><a class="post-meta__tags" href="/tags/%E8%BF%9E%E6%8E%A5%E6%B1%A0/">连接池</a><a class="post-meta__tags" href="/tags/HikariCP/">HikariCP</a><a class="post-meta__tags" href="/tags/Druid/">Druid</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/06/17/okhttp3-source-code-analysis/" title="OkHttp3 源码解析与 HTTP 客户端性能优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">OkHttp3 源码解析与 HTTP 客户端性能优化实战</div></div><div class="info-2"><div class="info-item-1">OkHttp3 源码解析与 HTTP 客户端性能优化实战一、HTTP 客户端的选择Java 生态中，HTTP 客户端经历了以下演进： 123HttpURLConnection (JDK 1.1) → Apache HttpClient 4.x → OkHttp 3.x → JDK 11 HttpClient                                   ↓                           ↓                              功能全面，较复杂            Kotlin 团队打造，简洁高效     特性 HttpURLConnection Apache HttpCli 4.x OkHttp 3.x JDK 11 HttpClient    连接池 无 支持 支持（成熟） 支持   HTTP&#x2F;2 不支持 部分支持 完整支持 支持   WebSocket 不支持 不支持 支持 支持   拦截器 无 支持（基础） 强大的链式拦截器 无   请求&#x2F;响应缓存 无 支持 内置 Cache 无   自...</div></div></div></a><a class="pagination-related" href="/2026/06/17/spring-batch-enterprise-practice/" title="Spring Batch 批处理框架：从入门到企业级任务调度"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">Spring Batch 批处理框架：从入门到企业级任务调度</div></div><div class="info-2"><div class="info-item-1">Spring Batch 批处理框架：从入门到企业级任务调度一、为什么需要批处理框架企业应用中大量场景涉及批量数据处理：    场景 数据量 频率 要求    每日对账单生成 100万+ 交易记录 每日凌晨 零差错、可重跑   数据迁移 千万级记录 一次性 断点续传、性能可控   报表计算 百万级聚合 每小时 稳定可靠、可追溯   短信&#x2F;邮件批量发送 10万+ 定时 失败重试、跳过错误   不使用框架硬编码的痛点：  没有断点续传：处理到一半失败就得重头再来 没有跳过机制：一条数据错误整个 Job 卡死 缺少管理能力：无法查看 Job 执行状态和日志 性能不可控：一次性把所有数据加载到内存  Spring Batch 正是为应对这些挑战而生的批处理框架。 二、Spring Batch 核心架构2.1 三层架构12345678910┌─────────────────────────────────────────────┐│             Application Layer               ││   (业务逻辑：Reader/Processor/W...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/16/postgresql-performance-ha/" title="PostgreSQL 性能优化与高可用架构实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-16</div><div class="info-item-2">PostgreSQL 性能优化与高可用架构实战</div></div><div class="info-2"><div class="info-item-1">一、PostgreSQL 性能调优PostgreSQL 性能调优不是一蹴而就的，它是一个持续迭代的过程。本文将从配置参数、索引类型、查询优化、分区表等维度深入探讨。 1.1 核心配置参数调优PostgreSQL 的默认配置是为小型开发环境设计的。生产环境必须根据硬件资源进行针对性调整。 关键参数对比表   参数 默认值 优化建议 说明    shared_buffers 128MB 物理内存的 25%（不超过 8GB 时建议 25%，超过 8GB 建议 8GB 固定） 共享缓冲区，不是总缓冲区大小   effective_cache_size 4GB 物理内存的 50%~75% 帮助优化器判断索引扫描成本   work_mem 4MB 16MB~64MB（根据并发连接数调整） 排序、Hash 等操作使用的内存，⚠️ 注意：total = work_mem * max_connections   maintenance_work_mem 64MB 1GB~2GB VACUUM、CREATE INDEX 等维护操作   wal_buffers 16MB 16MB~64MB（write...</div></div></div></a><a class="pagination-related" href="/2026/06/29/java-serialization-mechanism-comparison/" title="Java 序列化机制全面对比：Native、Kryo、ProtoBuf 与 JSON 序列化选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-29</div><div class="info-item-2">Java 序列化机制全面对比：Native、Kryo、ProtoBuf 与 JSON 序列化选型</div></div><div class="info-2"><div class="info-item-1">Java 序列化机制全面对比：Native、Kryo、ProtoBuf 与 JSON 序列化选型面试官：说一下 Java 序列化与反序列化的原理？序列化（Serialization）是将 Java 对象转换成字节序列的过程，反序列化（Deserialization）是反向重建对象的过程。 核心接口1234// Serializable 只是一个标记接口public interface Serializable &#123;    // 没有任何方法&#125;  当一个类实现了 Serializable，JVM 在序列化时会自动遍历对象图（包括所有引用的对象），将这个对象及其依赖全部写入字节流。 序列化 ID：serialVersionUID123456public class User implements Serializable &#123;    private static final long serialVersionUID = 1L; // 必须显式指定！    private String name;    private int age;    // ...&...</div></div></div></a><a class="pagination-related" href="/2026/07/04/java-stream-performance-comparison/" title="【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-04</div><div class="info-item-2">【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑前言Java 8 引入的 Stream API 已经成为了 Java 开发者每天都要使用的核心工具。但其背后有一些常见的误解：  “并行流一定比串行流快” “Stream 性能比 for 循环差” “所有集合都适合用 parallelStream”  本文将通过 JMH 基准测试，用数据揭示 Stream 性能的真实面，并深入分析并行流的工作原理和适用场景。  一、Stream 基础回顾1.1 Stream 操作分类   类型 特点 示例 说明    中间操作 惰性求值（lazy） filter() &#x2F; map() &#x2F; sorted() 不触发实际计算   短路中间操作 可以提前终止 limit() &#x2F; skip() 优化处理   终端操作 触发流水线执行 collect() &#x2F; forEach() &#x2F; count() 产生结果或副作用   短路终端操作 满足条件时提前终止 findFirst() &#x2F; anyMatch() 性...</div></div></div></a><a class="pagination-related" href="/2026/06/22/jmh-microbenchmark-practice/" title="JMH 微基准测试实战：精确衡量 Java 代码性能"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-22</div><div class="info-item-2">JMH 微基准测试实战：精确衡量 Java 代码性能</div></div><div class="info-2"><div class="info-item-1">JMH 微基准测试实战：精确衡量 Java 代码性能一、为什么需要 JMH？写 Java 的时候，你肯定遇到过这些场景：  ArrayList 和 LinkedList 到底谁遍历更快？ StringBuilder 真的比 StringBuffer 快吗？ Lambda 比匿名内部类慢多少？ Stream 和 for 循环谁性能更好？  很多人会写一个 main 方法，循环几万次打个时间戳就下结论。但这种方式严重不靠谱。 普通测试的陷阱12345678910// ❌ 这种测试方式不可信public static void main(String[] args) &#123;    long start = System.currentTimeMillis();    List&lt;String&gt; list = new ArrayList&lt;&gt;();    for (int i = 0; i &lt; 100000; i++) &#123;        list.add(&quot;item-&quot; + i);    &#125;    long end ...</div></div></div></a><a class="pagination-related" href="/2026/07/01/java-jit-compiler-deep-dive/" title="【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除</div></div><div class="info-2"><div class="info-item-1">【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除前言很多 Java 开发者知道 JVM 有「解释执行」和「编译执行」两种模式，但真正理解 JIT（Just-In-Time）即时编译 的人并不多。JIT 是 JVM 性能的核心引擎，它背后的逃逸分析、栈上分配、标量替换和锁消除等技术，能在 不写一行优化代码的情况下，让你的程序自动跑得更快。 本文从原理到实践，深度解析 JIT 编译的核心优化技术。  一、解释执行 vs 编译执行   模式 原理 速度 启动时间    解释执行 逐行翻译字节码 慢 快   JIT 编译 将热点代码编译为机器码 快 较慢（需预热）   混合模式（默认）：JVM 先用解释器快速启动，同时用 热点检测 识别高频执行的方法，交给 JIT 编译为机器码。 123# 查看 JVM 运行模式java -version# 输出包含：Mixed Mode   二、HotSpot 的两大编译器C1（Client Compiler） 编译速度快，优化程度低 适用于客户端应用或启动阶段 对应参数：-client  C2（Server Compil...</div></div></div></a><a class="pagination-related" href="/2026/07/17/java-thread-dump-analysis-troubleshooting/" title="【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-17</div><div class="info-item-2">【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位引言：为什么需要线程 Dump？线上 Java 应用出现以下问题时，线程 Dump 是你最有力的武器：  ❌ CPU 100% —— 哪个线程在狂转？ ❌ 系统卡死&#x2F;无响应 —— 线程在等什么？ ❌ 死锁 —— 哪些线程互相等待？ ❌ 请求堆积 —— 线程池是否耗尽了？ ❌ 接口响应慢 —— 是卡在 I&#x2F;O 还是业务逻辑？  线程 Dump（又称线程快照、Thread Dump）就是 JVM 在某个时刻对所有线程状态的”快照”。它是非侵入式的，对生产环境几乎没有影响，是排查线上问题的首选手段。 一、获取线程 Dump 的 5 种方式1.1 jstack（最常用）1234567# 先找到 Java 进程IDjps -l# 或ps aux | grep java# 获取线程 Dumpjstack -l &lt;pid&gt; &gt; threaddump.txt  参数说明：  -l：显示锁信息（LockInfo），分析死锁必加 -e：显示详细信息  1.2 jcmd（JDK 8+ 推荐）12#...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">320</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">542</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">113</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E5%BA%93%E8%BF%9E%E6%8E%A5%E6%B1%A0%E6%B7%B1%E5%BA%A6%E5%89%96%E6%9E%90%EF%BC%9AHikariCP-vs-Druid-vs-Tomcat-JDBC-%E6%BA%90%E7%A0%81%E7%BA%A7%E5%AF%B9%E6%AF%94"><span class="toc-number">1.</span> <span class="toc-text">数据库连接池深度剖析：HikariCP vs Druid vs Tomcat JDBC 源码级对比</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E8%BF%9E%E6%8E%A5%E6%B1%A0"><span class="toc-number">1.1.</span> <span class="toc-text">一、为什么需要连接池</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E8%BF%9E%E6%8E%A5%E6%B1%A0%E6%A0%B8%E5%BF%83%E6%8C%87%E6%A0%87"><span class="toc-number">1.2.</span> <span class="toc-text">二、连接池核心指标</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81HikariCP%E2%80%94%E2%80%94%E6%80%A7%E8%83%BD%E7%8E%8B%E8%80%85"><span class="toc-number">1.3.</span> <span class="toc-text">三、HikariCP——性能王者</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%BA%E4%BB%80%E4%B9%88-HikariCP-%E6%98%AF%E6%9C%80%E5%BF%AB%E7%9A%84"><span class="toc-number">1.3.1.</span> <span class="toc-text">3.1 为什么 HikariCP 是最快的</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#3-1-1-%E5%AD%97%E8%8A%82%E7%A0%81%E4%BC%98%E5%8C%96"><span class="toc-number">1.3.1.1.</span> <span class="toc-text">3.1.1 字节码优化</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#3-1-2-ConcurrentBag%E2%80%94%E2%80%94%E6%97%A0%E9%94%81%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.3.1.2.</span> <span class="toc-text">3.1.2 ConcurrentBag——无锁设计</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E9%85%8D%E7%BD%AE%E7%A4%BA%E4%BE%8B"><span class="toc-number">1.3.2.</span> <span class="toc-text">3.2 配置示例</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Druid%E2%80%94%E2%80%94%E5%8A%9F%E8%83%BD%E6%9C%80%E5%85%A8"><span class="toc-number">1.4.</span> <span class="toc-text">四、Druid——功能最全</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E7%8B%AC%E7%89%B9%E5%8A%9F%E8%83%BD"><span class="toc-number">1.4.1.</span> <span class="toc-text">4.1 独特功能</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-Druid-%E7%9A%84-SQL-%E9%98%B2%E7%81%AB%E5%A2%99"><span class="toc-number">1.4.2.</span> <span class="toc-text">4.2 Druid 的 SQL 防火墙</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-Druid-%E7%9B%91%E6%8E%A7%E5%B9%B3%E5%8F%B0"><span class="toc-number">1.4.3.</span> <span class="toc-text">4.3 Druid 监控平台</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81Tomcat-JDBC-Connection-Pool"><span class="toc-number">1.5.</span> <span class="toc-text">五、Tomcat JDBC Connection Pool</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E8%BD%BB%E9%87%8F%E7%BA%A7%E9%80%89%E6%8B%A9"><span class="toc-number">1.5.1.</span> <span class="toc-text">5.1 轻量级选择</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%89%E6%AC%BE%E8%BF%9E%E6%8E%A5%E6%B1%A0%E6%B7%B1%E5%BA%A6%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.</span> <span class="toc-text">六、三款连接池深度对比</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%8A%9F%E8%83%BD%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.1.</span> <span class="toc-text">6.1 功能对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E6%80%A7%E8%83%BD%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.2.</span> <span class="toc-text">6.2 性能对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%86%85%E5%AD%98%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.3.</span> <span class="toc-text">6.3 内存对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E8%BF%9E%E6%8E%A5%E6%B1%A0%E5%8F%82%E6%95%B0%E8%B0%83%E4%BC%98%E6%8C%87%E5%8D%97"><span class="toc-number">1.7.</span> <span class="toc-text">七、连接池参数调优指南</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-%E6%9C%80%E5%A4%A7%E8%BF%9E%E6%8E%A5%E6%95%B0%E8%AE%A1%E7%AE%97%E5%85%AC%E5%BC%8F"><span class="toc-number">1.7.1.</span> <span class="toc-text">7.1 最大连接数计算公式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-2-%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98%E6%8E%92%E6%9F%A5"><span class="toc-number">1.7.2.</span> <span class="toc-text">7.2 常见问题排查</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%80%89%E5%9E%8B%E5%BB%BA%E8%AE%AE"><span class="toc-number">1.8.</span> <span class="toc-text">八、选型建议</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/java-methodhandle-reflection-deep-comparison/" title="【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战">【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/jvm-cms-gc-deep-dive/" title="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题">【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/kafka-consumer-lag-monitoring-optimization/" title="【消息队列】Kafka 消费者 Lag 监控与性能优化实战">【消息队列】Kafka 消费者 Lag 监控与性能优化实战</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/mysql-primary-key-design-deep-comparison/" title="【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键">【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/spring-value-annotation-deep-dive/" title="【Spring 源码】@Value 注解底层原理与高级用法：从属性注入到 SpEL 解析">【Spring 源码】@Value 注解底层原理与高级用法：从属性注入到 SpEL 解析</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.0"></script><script src="/js/main.js?v=5.6.0"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

@@ -1,0 +1,440 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题前言 面试官：”CMS 垃圾收集器的工作流程是怎样的？它有哪些优缺点？为什么在 JDK 9 中被标记为 Deprecated？”  CMS（Concurrent Mark Sweep）曾是 Java 服务端应用中最主流的垃圾收集器，它首次实现了”并发收集”这一里程碑式的特性。虽然现如今已被 G1 和 ZGC 取代，但理解 CMS 的">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题">
+<meta property="og:url" content="https://jiweidong.github.io/2026/07/21/jvm-cms-gc-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题前言 面试官：”CMS 垃圾收集器的工作流程是怎样的？它有哪些优缺点？为什么在 JDK 9 中被标记为 Deprecated？”  CMS（Concurrent Mark Sweep）曾是 Java 服务端应用中最主流的垃圾收集器，它首次实现了”并发收集”这一里程碑式的特性。虽然现如今已被 G1 和 ZGC 取代，但理解 CMS 的">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-07-21T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-21T00:15:08.982Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="垃圾回收">
+<meta property="article:tag" content="性能优化">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题",
+  "url": "https://jiweidong.github.io/2026/07/21/jvm-cms-gc-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-07-21T00:00:00.000Z",
+  "dateModified": "2026-07-21T00:15:08.982Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/07/21/jvm-cms-gc-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">320</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">542</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">113</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-07-21T00:15:08.982Z" title="更新于 2026-07-21 08:15:08">2026-07-21</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM/">JVM</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-原理】CMS-垃圾收集器深度解析：从并发标记到碎片化问题"><a href="#【JVM-原理】CMS-垃圾收集器深度解析：从并发标记到碎片化问题" class="headerlink" title="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题"></a>【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><blockquote>
+<p>面试官：”CMS 垃圾收集器的工作流程是怎样的？它有哪些优缺点？为什么在 JDK 9 中被标记为 Deprecated？”</p>
+</blockquote>
+<p>CMS（Concurrent Mark Sweep）曾是 Java 服务端应用中最主流的垃圾收集器，它首次实现了”并发收集”这一里程碑式的特性。虽然现如今已被 G1 和 ZGC 取代，但理解 CMS 的设计思想对于掌握 JVM GC 的发展脉络依然至关重要。</p>
+<hr>
+<h2 id="一、CMS-诞生的背景"><a href="#一、CMS-诞生的背景" class="headerlink" title="一、CMS 诞生的背景"></a>一、CMS 诞生的背景</h2><p>在 CMS 出现之前，HotSpot 的主要 GC 方案是：</p>
+<table>
+<thead>
+<tr>
+<th>收集器</th>
+<th>适用场景</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Serial</strong></td>
+<td>单线程客户端</td>
+<td>Stop-The-World（STW）暂停时间长</td>
+</tr>
+<tr>
+<td><strong>Parallel Scavenge（PS）</strong></td>
+<td>多线程吞吐优先</td>
+<td>关注吞吐量，但 GC 时仍会 STW</td>
+</tr>
+<tr>
+<td><strong>Parallel Old</strong></td>
+<td>老年代并行收集</td>
+<td>Parallel Scavenge 的老年代搭档</td>
+</tr>
+</tbody></table>
+<p>这些收集器在 GC 时都会完全暂停应用线程。对于响应时间敏感的应用（如 Web 服务器、交易系统），长时间的 STW 是不可接受的。</p>
+<p><strong>CMS 的核心理念：</strong> 让 GC 线程和用户线程尽可能同时工作，最大限度地减少 STW 时间。</p>
+<hr>
+<h2 id="二、CMS-的工作流程：四次阶段详解"><a href="#二、CMS-的工作流程：四次阶段详解" class="headerlink" title="二、CMS 的工作流程：四次阶段详解"></a>二、CMS 的工作流程：四次阶段详解</h2><p>CMS 将 GC 过程拆分为四个阶段：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐</span><br><span class="line">│ 初始标记     │ →  │ 并发标记     │ →  │ 重新标记     │ →  │ 并发清除     │</span><br><span class="line">│ (STW)       │    │ (并发)      │    │ (STW)       │    │ (并发)      │</span><br><span class="line">│ 时间：极短    │    │ 时间：最长    │    │ 时间：较短    │    │ 时间：较长    │</span><br><span class="line">└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘</span><br><span class="line">     ↓                  ↓                  ↓                  ↓</span><br><span class="line">  标记 GC Roots      追踪存活对象       修正并发期间       回收死亡对象</span><br><span class="line">  直接引用的对象                        产生变化的对象       的内存空间</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-1-阶段一：初始标记（Initial-Mark）——-STW"><a href="#2-1-阶段一：初始标记（Initial-Mark）——-STW" class="headerlink" title="2.1 阶段一：初始标记（Initial Mark）—— STW"></a>2.1 阶段一：初始标记（Initial Mark）—— STW</h3><p><strong>目标：</strong> 标记所有 GC Roots 直接引用的对象。</p>
+<p><strong>什么是 GC Roots？</strong></p>
+<ul>
+<li>虚拟机栈（栈帧中的本地变量表）引用的对象</li>
+<li>方法区中类静态属性引用的对象</li>
+<li>方法区中常量引用的对象</li>
+<li>本地方法栈中 JNI 引用的对象</li>
+<li>活跃线程（Thread 对象）</li>
+</ul>
+<p>这一步需要 STW，但因为只标记直接引用，不遍历引用链，<strong>时间非常短</strong>（通常几毫秒）。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 以下对象会被初始标记标记到</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">UserService</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="type">UserCache</span> <span class="variable">cache</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">UserCache</span>(); <span class="comment">// 静态引用 → GC Root</span></span><br><span class="line">    </span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">process</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">User</span> <span class="variable">user</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">User</span>();       <span class="comment">// 局部变量 → GC Root</span></span><br><span class="line">        <span class="type">Thread</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>();      <span class="comment">// 活跃线程 → GC Root</span></span><br><span class="line">        <span class="comment">// ...</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-2-阶段二：并发标记（Concurrent-Mark）——-无-STW"><a href="#2-2-阶段二：并发标记（Concurrent-Mark）——-无-STW" class="headerlink" title="2.2 阶段二：并发标记（Concurrent Mark）—— 无 STW"></a>2.2 阶段二：并发标记（Concurrent Mark）—— 无 STW</h3><p><strong>目标：</strong> 从初始标记的结果出发，遍历所有存活对象。</p>
+<p>这是 CMS 中最耗时但不需要 STW 的阶段。GC 线程和用户线程并行执行：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">用户线程 ──[ 修改引用 ]──[ 分配对象 ]──[ 修改引用 ]──[ 分配对象 ]──</span><br><span class="line">GC 线程  ─────[ 标记对象A ]────[ 标记对象B ]────[ 标记对象C ]────</span><br></pre></td></tr></table></figure>
+
+<p><strong>并发标记带来的问题：</strong> 用户线程在 GC 标记过程中不断改变对象的引用关系，导致<strong>并发标记三色问题</strong>。</p>
+<h3 id="2-3-三色标记算法"><a href="#2-3-三色标记算法" class="headerlink" title="2.3 三色标记算法"></a>2.3 三色标记算法</h3><p>在并发标记中，JVM 使用三色标记（Tri-Color Marking）算法管理对象状态：</p>
+<table>
+<thead>
+<tr>
+<th>颜色</th>
+<th>含义</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>白色</strong></td>
+<td>未被标记，可能被回收</td>
+<td>尚未访问到</td>
+</tr>
+<tr>
+<td><strong>灰色</strong></td>
+<td>已标记，但成员变量尚未被扫描</td>
+<td>待扫描</td>
+</tr>
+<tr>
+<td><strong>黑色</strong></td>
+<td>自身和所有成员变量均已标记</td>
+<td>安全存活</td>
+</tr>
+</tbody></table>
+<p><strong>并发标记可能出现的致命错误：</strong></p>
+<p>假设有对象 A（黑色，标记完成）、B（灰色，待扫描）、C（白色，未标记）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">场景：A → B → C（A 持有 B，B 持有 C）</span><br><span class="line">1. 黑色 A 已经扫描完，认为自己是安全的</span><br><span class="line">2. 灰色 B 被扫描 → 发现持有 C → 准备标记 C</span><br><span class="line">3. 用户线程将 A.B = C 修改为 A.B = null（B 不再引用 C）</span><br><span class="line">4. 用户线程又将另外一个 D 的引用指向 C：D.C = C</span><br><span class="line">5. 最终 C 的引用被切断又恢复，但 A 已经是黑色，不会再扫描</span><br><span class="line">6. B 也不再引用 C，B 扫描时不会标记 C</span><br><span class="line">7. 结果：C 存活但被当作垃圾回收 → **程序崩溃**</span><br></pre></td></tr></table></figure>
+
+<p><strong>CMS 的解决方案——增量更新（Incremental Update）：</strong></p>
+<p>当黑色对象插入了一个指向白色对象的新引用时，将这个<strong>黑色对象重新标记为灰色</strong>（放入待扫描集合）。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">A(黑) → 插入 C(白) 引用 → A 被标记为灰色 → 重新扫描 A</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>这就是为什么 CMS 第三个阶段需要<strong>重新标记（Remark）</strong>。</p>
+</blockquote>
+<h3 id="2-4-阶段三：重新标记（Remark）——-STW"><a href="#2-4-阶段三：重新标记（Remark）——-STW" class="headerlink" title="2.4 阶段三：重新标记（Remark）—— STW"></a>2.4 阶段三：重新标记（Remark）—— STW</h3><p><strong>目标：</strong> 修正并发标记期间因用户线程继续运行而产生的变动。</p>
+<p>这个阶段需要 STW，但<strong>比并发标记快得多</strong>（通过增量更新只需要重新扫描被标记为灰色的对象）。</p>
+<p><strong>优化技巧：</strong> 在 Remark 前触发一次 Young GC（<code>-XX:+CMSScavengeBeforeRemark</code>），减少需要扫描的对象数量，加快 Remark 速度。</p>
+<h3 id="2-5-阶段四：并发清除（Concurrent-Sweep）——-无-STW"><a href="#2-5-阶段四：并发清除（Concurrent-Sweep）——-无-STW" class="headerlink" title="2.5 阶段四：并发清除（Concurrent Sweep）—— 无 STW"></a>2.5 阶段四：并发清除（Concurrent Sweep）—— 无 STW</h3><p><strong>目标：</strong> 回收被标记为死亡的对象所占用的内存空间。</p>
+<p>这一阶段 GC 线程与用户线程并发执行，<strong>不 STW</strong>。</p>
+<p>但注意：CMS 采用的”标记-清除”算法（Mark-Sweep），<strong>不是”标记-整理”（Mark-Compact）</strong>，因此会产生<strong>内存碎片</strong>。</p>
+<hr>
+<h2 id="三、CMS-的内存碎片问题"><a href="#三、CMS-的内存碎片问题" class="headerlink" title="三、CMS 的内存碎片问题"></a>三、CMS 的内存碎片问题</h2><h3 id="3-1-碎片产生的原因"><a href="#3-1-碎片产生的原因" class="headerlink" title="3.1 碎片产生的原因"></a>3.1 碎片产生的原因</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">初始内存布局：[对象A(16KB)][对象B(8KB)][对象C(20KB)][空闲]</span><br><span class="line">                                                      </span><br><span class="line">并发清除后(回收了A和C)：[空闲(16KB)][对象B(8KB)][空闲(20KB)]</span><br><span class="line">                                                       </span><br><span class="line">第三次分配时(需要25KB的连续空间)：❌ 无法分配（没有足够大的连续空间）</span><br></pre></td></tr></table></figure>
+
+<p>清除后剩余的空间是<strong>不连续</strong>的，就像一个千疮百孔的瑞士奶酪。</p>
+<h3 id="3-2-碎片引发的后果"><a href="#3-2-碎片引发的后果" class="headerlink" title="3.2 碎片引发的后果"></a>3.2 碎片引发的后果</h3><p>当需要分配一个大对象时，虽总空闲空间足够，但没有连续空间可用。此时 JVM 会：</p>
+<ol>
+<li>触发 <strong>Full GC</strong>（Serial Old 收集老年代，STW 时间很长）</li>
+<li>进行标记-整理，压缩碎片</li>
+<li>应用暂停时间暴增</li>
+</ol>
+<h3 id="3-3-碎片化监控与缓解"><a href="#3-3-碎片化监控与缓解" class="headerlink" title="3.3 碎片化监控与缓解"></a>3.3 碎片化监控与缓解</h3><p><strong>监控方式：</strong> 查看 GC 日志中的碎片率</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"># JVM 参数，打印 GC 详情</span><br><span class="line">-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log</span><br><span class="line"></span><br><span class="line"># 日志中关注 Promotion Failed 和 Concurrent Mode Failure</span><br><span class="line">2026-07-21T08:15:30.123+0800: [Full GC (Allocation Failure) ...</span><br></pre></td></tr></table></figure>
+
+<p><strong>核心参数：</strong></p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>-XX:+UseCMSCompactAtFullCollection</code></td>
+<td>Full GC 时开启碎片整理（默认开启）</td>
+</tr>
+<tr>
+<td><code>-XX:CMSFullGCsBeforeCompaction=5</code></td>
+<td>每 N 次 Full GC 做一次碎片整理</td>
+</tr>
+<tr>
+<td><code>-XX:+CMSParallelRemarkEnabled</code></td>
+<td>并行化 Remark 阶段（JDK 7+ 默认开启）</td>
+</tr>
+<tr>
+<td><code>-XX:+CMSScavengeBeforeRemark</code></td>
+<td>Remark 前触发 Young GC</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="四、CMS-的经典故障场景"><a href="#四、CMS-的经典故障场景" class="headerlink" title="四、CMS 的经典故障场景"></a>四、CMS 的经典故障场景</h2><h3 id="4-1-Concurrent-Mode-Failure"><a href="#4-1-Concurrent-Mode-Failure" class="headerlink" title="4.1 Concurrent Mode Failure"></a>4.1 Concurrent Mode Failure</h3><p><strong>现象：</strong> GC 日志中出现 <code>Concurrent Mode Failure</code>，随后触发 Full GC（Serial Old 收集）。</p>
+<p><strong>原因：</strong> CMS 并发标记&#x2F;清除期间，用户线程仍在分配对象。当老年代空间即将耗尽，但 CMS 还没有完成回收时，JVM 会暂停所有线程，使用 Serial Old 进行 Full GC。</p>
+<p><strong>解决方案：</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 提前触发 CMS（默认老年代使用率达到 92% 时触发 CMS GC）</span></span><br><span class="line">-XX:CMSInitiatingOccupancyFraction=70</span><br><span class="line">-XX:+UseCMSInitiatingOccupancyOnly  <span class="comment"># 只使用设定的阈值，不开启动态调整</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-Promotion-Failed"><a href="#4-2-Promotion-Failed" class="headerlink" title="4.2 Promotion Failed"></a>4.2 Promotion Failed</h3><p><strong>现象：</strong> Young GC 后的存活对象晋升到老年代时，因碎片导致分配失败。</p>
+<p><strong>原因：</strong> 老年代碎片化严重，虽有足够总空间，但无连续空间容纳晋升对象。</p>
+<p><strong>解决方案：</strong></p>
+<ul>
+<li>增大老年代空间（<code>-Xmx</code> 调大）</li>
+<li>增大 Survivor 区大小，减少提前晋升</li>
+<li>配合 <code>-XX:+UseCMSCompactAtFullCollection</code> 做碎片整理</li>
+</ul>
+<h3 id="4-3-CMS-GC-耗时过长"><a href="#4-3-CMS-GC-耗时过长" class="headerlink" title="4.3 CMS GC 耗时过长"></a>4.3 CMS GC 耗时过长</h3><p><strong>现象：</strong> CMS 各阶段总耗时数秒，影响应用响应时间。</p>
+<p><strong>排查思路：</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">CMS GC 耗时 = 初始标记时间 + 并发标记时间 + 重新标记时间 + 并发清除时间</span><br><span class="line"></span><br><span class="line">初始标记耗时短（几ms）→ 看 GC Roots 数量</span><br><span class="line">重新标记耗时长 → 检查是否有大量对象引用变动</span><br><span class="line">并发标记耗时长 → 老年代对象数量过多</span><br><span class="line">并发清除耗时长 → 老年代碎片严重</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、CMS-与其他收集器的对比"><a href="#五、CMS-与其他收集器的对比" class="headerlink" title="五、CMS 与其他收集器的对比"></a>五、CMS 与其他收集器的对比</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>CMS</th>
+<th>G1</th>
+<th>Parallel GC</th>
+<th>ZGC</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>目标</strong></td>
+<td>低延迟</td>
+<td>可预测暂停</td>
+<td>高吞吐</td>
+<td>超低延迟</td>
+</tr>
+<tr>
+<td><strong>算法</strong></td>
+<td>标记-清除</td>
+<td>标记-整理+Region</td>
+<td>标记-整理</td>
+<td>染色指针+读屏障</td>
+</tr>
+<tr>
+<td><strong>STW 时间</strong></td>
+<td>毫秒~百毫秒</td>
+<td>可配置（默认 200ms）</td>
+<td>秒级</td>
+<td>&lt;10ms</td>
+</tr>
+<tr>
+<td><strong>并发阶段</strong></td>
+<td>并发标记+清除</td>
+<td>并发标记</td>
+<td>无</td>
+<td>几乎全部并发</td>
+</tr>
+<tr>
+<td><strong>内存碎片</strong></td>
+<td>❌ 严重</td>
+<td>✅ Region 级管理</td>
+<td>✅ 整理</td>
+<td>✅ 无</td>
+</tr>
+<tr>
+<td><strong>JDK 版本</strong></td>
+<td>JDK 6-8(主流)</td>
+<td>JDK 9+(默认)</td>
+<td>全版本</td>
+<td>JDK 15+(生产)</td>
+</tr>
+<tr>
+<td><strong>堆大小</strong></td>
+<td>中小堆(4-8GB)</td>
+<td>中大型堆(4-64GB)</td>
+<td>大堆</td>
+<td>超大堆(64GB+)</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="六、CMS-被废弃的真正原因"><a href="#六、CMS-被废弃的真正原因" class="headerlink" title="六、CMS 被废弃的真正原因"></a>六、CMS 被废弃的真正原因</h2><p>JDK 9 将 CMS 标记为 <code>@Deprecated</code>，JDK 14 正式移除，根本原因包括：</p>
+<ol>
+<li><strong>碎片化问题</strong>：标记-清除算法天生碎片化，长运行后会频繁触发 Full GC</li>
+<li><strong>CPU 敏感</strong>：并发标记阶段与用户线程争抢 CPU，在高负载下性能下降明显</li>
+<li><strong>停顿不可控</strong>：Concurrent Mode Failure 导致无法预期的长暂停</li>
+<li><strong>G1 成熟</strong>：G1 提供了更好的停顿预测能力和 Region 级的内存管理</li>
+</ol>
+<p><strong>迁移建议：</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">JDK 8 + CMS (-XX:+UseConcMarkSweepGC)</span><br><span class="line">    ↓</span><br><span class="line">JDK 11 + G1 (默认GC，设置 MaxGCPauseMillis=200)</span><br><span class="line">    ↓</span><br><span class="line">JDK 17 + ZGC (-XX:+UseZGC) 或 Shenandoah</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="面试常问追问"><a href="#面试常问追问" class="headerlink" title="面试常问追问"></a>面试常问追问</h2><p><strong>Q：CMS 的增量更新（Incremental Update）和 G1 的 SATB（Snapshot At The Beginning）有什么区别？</strong><br>A：CMS 在并发标记时发现黑色对象插入新引用会标记该对象为灰色，称为增量更新。G1 采用 SATB，在并发标记开始时拍快照，只记录并发期间被<strong>删除</strong>的引用。SATB 更高效（不需要重新扫描所有对象），但会产生浮动垃圾。</p>
+<p><strong>Q：CMS 日志中看到 “promotion failed” 怎么办？</strong><br>A：通常是碎片导致。① 调大 <code>-XX:CMSInitiatingOccupancyFraction</code> 降低触发阈值，提前 GC；② 增大老年代空间；③ 考虑升级到 G1。</p>
+<p><strong>Q：为什么说 CMS 对 CPU 资源敏感？</strong><br>A：并发阶段 GC 线程和用户线程共享 CPU，如果应用本身已接近 CPU 瓶颈，CMS 会进一步拖慢业务处理，导致生产消费失衡。</p>
+<p><strong>Q：生产环境 JDK 8 还在用 CMS，要不要升级？</strong><br>A：如果 GC 停顿可以接受（几十毫秒），且堆不大，可以继续用。但如果堆 &gt; 6GB 或 GC 停顿超过 200ms，建议升级到 JDK 17+ 使用 G1 或 ZGC。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/07/21/jvm-cms-gc-deep-dive/">https://jiweidong.github.io/2026/07/21/jvm-cms-gc-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/">垃圾回收</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/07/21/kafka-consumer-lag-monitoring-optimization/" title="【消息队列】Kafka 消费者 Lag 监控与性能优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【消息队列】Kafka 消费者 Lag 监控与性能优化实战</div></div><div class="info-2"><div class="info-item-1">【消息队列】Kafka 消费者 Lag 监控与性能优化实战前言 面试官：”线上 Kafka 消费者出现大量 Lag（消费延迟），你怎么排查和优化？”  Kafka 在消息队列领域以高吞吐著称，但实际生产环境中消费者 Lag 时有发生——业务高峰期处理不过来、消费者线程卡死、Rebalance 频繁……本文从 Lag 的本质出发，深入监控手段和优化策略，帮你系统性解决 Lag 问题。  一、什么是消费者 Lag？1.1 核心概念Kafka 的 Lag（消费滞后）定义非常简单： 1Lag = 分区最新消息偏移量（LEO） - 消费者当前消费位置（Consumer Offset）  当一个分区的 LEO 为 1000，消费者已提交的 offset 为 800，那么 Lag &#x3D; 200。 1.2 Lag 意味着什么？   Lag 状态 含义 严重程度    Lag ≈ 0 消费者处理速度 &gt;&#x3D; 生产速度 ✅ 健康   Lag 持续增长 消费者处理速度 &lt; 生产速度 ⚠️ 有问题   Lag 偶尔小幅波动 网络抖动或 GC 暂停 ✅ 正常   Lag 突然飙...</div></div></div></a><a class="pagination-related" href="/2026/07/21/java-methodhandle-reflection-deep-comparison/" title="【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战前言 面试官：”你知道 Java 的 MethodHandle（方法句柄）吗？它和反射有什么区别？为什么 Spring、MyBatis 等框架都开始使用 MethodHandle？”  JDK 7 引入 java.lang.invoke 包，MethodHandle 作为”轻量级反射”登上了舞台。但直到 JDK 17+，MethodHandle 才真正在 Lambda 表达式、序列化、框架底层大放异彩。本文将彻底讲清 MethodHandle 的原理、与反射的对比以及如何替代反射完成动态调用。  一、什么是 MethodHandle？1.1 官方定义 A method handle is a typed, directly executable reference to an underlying method, constructor, field, or similar low-level operation, with optional transformations of argume...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/30/java-memory-leak-investigation-guide/" title="Java 内存泄漏排查全攻略：从堆转储到 MAT 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战</div></div><div class="info-2"><div class="info-item-1">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战一、内存泄漏 vs 内存溢出先理清两个概念：    概念 定义 表现    内存泄漏（Memory Leak） 无用对象持续被引用，GC 无法回收 占用逐渐增加，最终 OOM   内存溢出（OOM） 对象需要内存但堆空间不足 直接抛出 OutOfMemoryError   泄漏是溢出的原因之一，但不是唯一原因（也可能是对象过多、堆太小等）。 二、Java 内存泄漏的典型模式2.1 静态集合类最常见的内存泄漏——static 集合的生命周期 &#x3D; 应用生命周期： 12345678public class CacheManager &#123;    // ❌ 静态 HashMap 永远不会被回收    private static Map&lt;String, Object&gt; cache = new HashMap&lt;&gt;();        public static void addData(String key, Object data) &#123;        cache.put(key, da...</div></div></div></a><a class="pagination-related" href="/2026/06/30/jit-compilation-optimization-deep-dive/" title="JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除</div></div><div class="info-2"><div class="info-item-1">JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除面试官：你的代码为什么越跑越快？说说 JIT 的编译优化很多 Java 开发者都会遇到一个现象：同样的代码，刚启动时很慢，跑一会儿就快了。这背后的魔法就是 JIT（Just-In-Time）即时编译。 本文将从字节码到机器码，深入解析 JIT 编译器的三大核心优化：方法内联、逃逸分析、锁消除。 一、JIT 编译器概述1.1 从解释执行到编译执行Java 代码的执行经历了三个阶段： 1234源代码 (.java) → 字节码 (.class) → 机器码                      ↓              解释器逐行执行（慢）              或 JIT 编译为机器码（快）   解释执行：启动快，但每条指令都要翻译 编译执行：将热点代码编译为本地机器码，直接执行  1.2 Client Compiler vs Server CompilerHotSpot JVM 内置了两种 JIT 编译器：    特性 C1 (Client) C2 (Server)    编译速度 快 慢   优化程度 基本...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-gc-g1-zgc-shenandoah-deep-dive/" title="「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践</div></div><div class="info-2"><div class="info-item-1">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践从 Serial 到 ZGC，Java 垃圾收集器已经发展了近三十年。面对低延迟还是高吞吐的抉择，我们常常陷入选择困难。本文系统梳理 G1、ZGC 和 Shenandoah 三大主流收集器的核心原理、关键参数和调优实践。  一、GC 发展的演进路线123456789101112Serial (单线程, STW)  │  ├── ParNew (多线程年轻代)  │     └── Parallel Scavenge (吞吐量优先)  │  ├── Parallel Old (老年代并行)  │  └── CMS (并发低延迟) ──→ G1 (分区化, 可预测停顿)                                  │                                  ├── ZGC (超低延迟, 不分区)                                  │                                  └── Shenan...</div></div></div></a><a class="pagination-related" href="/2026/07/01/java-jit-compiler-deep-dive/" title="【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除</div></div><div class="info-2"><div class="info-item-1">【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除前言很多 Java 开发者知道 JVM 有「解释执行」和「编译执行」两种模式，但真正理解 JIT（Just-In-Time）即时编译 的人并不多。JIT 是 JVM 性能的核心引擎，它背后的逃逸分析、栈上分配、标量替换和锁消除等技术，能在 不写一行优化代码的情况下，让你的程序自动跑得更快。 本文从原理到实践，深度解析 JIT 编译的核心优化技术。  一、解释执行 vs 编译执行   模式 原理 速度 启动时间    解释执行 逐行翻译字节码 慢 快   JIT 编译 将热点代码编译为机器码 快 较慢（需预热）   混合模式（默认）：JVM 先用解释器快速启动，同时用 热点检测 识别高频执行的方法，交给 JIT 编译为机器码。 123# 查看 JVM 运行模式java -version# 输出包含：Mixed Mode   二、HotSpot 的两大编译器C1（Client Compiler） 编译速度快，优化程度低 适用于客户端应用或启动阶段 对应参数：-client  C2（Server Compil...</div></div></div></a><a class="pagination-related" href="/2026/06/23/java-object-memory-layout-guide/" title="Java 对象内存布局深度解析：对象头、Mark Word、指针压缩与 JOL 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-23</div><div class="info-item-2">Java 对象内存布局深度解析：对象头、Mark Word、指针压缩与 JOL 实战</div></div><div class="info-2"><div class="info-item-1">Java 对象内存布局深度解析：对象头、Mark Word、指针压缩与 JOL 实战面试官：一个 Object 对象在内存中占多少字节？“8 字节？16 字节？” —— 能准确回答这个问题的 Java 开发者不超过 20%。 一、Java 对象的内存布局一个 Java 对象在堆内存中分为三部分： 123456789┌──────────────────────────────────────────────┐│              对象头 (Object Header)           ││  ├─ Mark Word (标记字)                        ││  └─ klass pointer (类型指针)                  │├──────────────────────────────────────────────┤│              实例数据 (Instance Data)          │├──────────────────────────────────────────────┤│           ...</div></div></div></a><a class="pagination-related" href="/2026/07/04/mysql-online-ddl-comparison/" title="【数据库实战】MySQL Online DDL 方案深度对比：pt-osc、gh-ost 与原生 DDL"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-04</div><div class="info-item-2">【数据库实战】MySQL Online DDL 方案深度对比：pt-osc、gh-ost 与原生 DDL</div></div><div class="info-2"><div class="info-item-1">【数据库实战】MySQL Online DDL 方案深度对比：pt-osc、gh-ost 与原生 DDL背景在生产环境中，随着业务演进，我们经常需要对大表执行 DDL 操作——加字段、建索引、改列类型等。对于百万甚至千万级的大表，直接在原表上执行 ALTER TABLE 会导致表锁、主从延迟、甚至拖垮数据库。如何在不影响线上服务的前提下安全执行 DDL，是每个 DBA 和后端工程师必须掌握的技能。 目前业界主流方案有三种：  MySQL 原生 Online DDL（MySQL 5.6+ 引入） pt-online-schema-change（Percona Toolkit） gh-ost（GitHub 出品，无触发器方案）  本文将从原理、流程、锁策略、性能、适用场景等方面对三者进行全面对比。  一、MySQL 原生 Online DDL1.1 原理与演进MySQL 5.6 引入了 Online DDL（ALGORITHM=INPLACE），打破了早期版本中 DDL 必须 copy table 加只读锁的限制。 MySQL 8.0 进一步增强了 Online DDL 的能力：  ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">320</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">542</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">113</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%8E%9F%E7%90%86%E3%80%91CMS-%E5%9E%83%E5%9C%BE%E6%94%B6%E9%9B%86%E5%99%A8%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E5%B9%B6%E5%8F%91%E6%A0%87%E8%AE%B0%E5%88%B0%E7%A2%8E%E7%89%87%E5%8C%96%E9%97%AE%E9%A2%98"><span class="toc-number">1.</span> <span class="toc-text">【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81CMS-%E8%AF%9E%E7%94%9F%E7%9A%84%E8%83%8C%E6%99%AF"><span class="toc-number">1.2.</span> <span class="toc-text">一、CMS 诞生的背景</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81CMS-%E7%9A%84%E5%B7%A5%E4%BD%9C%E6%B5%81%E7%A8%8B%EF%BC%9A%E5%9B%9B%E6%AC%A1%E9%98%B6%E6%AE%B5%E8%AF%A6%E8%A7%A3"><span class="toc-number">1.3.</span> <span class="toc-text">二、CMS 的工作流程：四次阶段详解</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E9%98%B6%E6%AE%B5%E4%B8%80%EF%BC%9A%E5%88%9D%E5%A7%8B%E6%A0%87%E8%AE%B0%EF%BC%88Initial-Mark%EF%BC%89%E2%80%94%E2%80%94-STW"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 阶段一：初始标记（Initial Mark）—— STW</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E9%98%B6%E6%AE%B5%E4%BA%8C%EF%BC%9A%E5%B9%B6%E5%8F%91%E6%A0%87%E8%AE%B0%EF%BC%88Concurrent-Mark%EF%BC%89%E2%80%94%E2%80%94-%E6%97%A0-STW"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 阶段二：并发标记（Concurrent Mark）—— 无 STW</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E4%B8%89%E8%89%B2%E6%A0%87%E8%AE%B0%E7%AE%97%E6%B3%95"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 三色标记算法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E9%98%B6%E6%AE%B5%E4%B8%89%EF%BC%9A%E9%87%8D%E6%96%B0%E6%A0%87%E8%AE%B0%EF%BC%88Remark%EF%BC%89%E2%80%94%E2%80%94-STW"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 阶段三：重新标记（Remark）—— STW</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-%E9%98%B6%E6%AE%B5%E5%9B%9B%EF%BC%9A%E5%B9%B6%E5%8F%91%E6%B8%85%E9%99%A4%EF%BC%88Concurrent-Sweep%EF%BC%89%E2%80%94%E2%80%94-%E6%97%A0-STW"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 阶段四：并发清除（Concurrent Sweep）—— 无 STW</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81CMS-%E7%9A%84%E5%86%85%E5%AD%98%E7%A2%8E%E7%89%87%E9%97%AE%E9%A2%98"><span class="toc-number">1.4.</span> <span class="toc-text">三、CMS 的内存碎片问题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E7%A2%8E%E7%89%87%E4%BA%A7%E7%94%9F%E7%9A%84%E5%8E%9F%E5%9B%A0"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 碎片产生的原因</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E7%A2%8E%E7%89%87%E5%BC%95%E5%8F%91%E7%9A%84%E5%90%8E%E6%9E%9C"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 碎片引发的后果</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E7%A2%8E%E7%89%87%E5%8C%96%E7%9B%91%E6%8E%A7%E4%B8%8E%E7%BC%93%E8%A7%A3"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 碎片化监控与缓解</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81CMS-%E7%9A%84%E7%BB%8F%E5%85%B8%E6%95%85%E9%9A%9C%E5%9C%BA%E6%99%AF"><span class="toc-number">1.5.</span> <span class="toc-text">四、CMS 的经典故障场景</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-Concurrent-Mode-Failure"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 Concurrent Mode Failure</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-Promotion-Failed"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 Promotion Failed</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-CMS-GC-%E8%80%97%E6%97%B6%E8%BF%87%E9%95%BF"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 CMS GC 耗时过长</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81CMS-%E4%B8%8E%E5%85%B6%E4%BB%96%E6%94%B6%E9%9B%86%E5%99%A8%E7%9A%84%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.</span> <span class="toc-text">五、CMS 与其他收集器的对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81CMS-%E8%A2%AB%E5%BA%9F%E5%BC%83%E7%9A%84%E7%9C%9F%E6%AD%A3%E5%8E%9F%E5%9B%A0"><span class="toc-number">1.7.</span> <span class="toc-text">六、CMS 被废弃的真正原因</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%B8%B8%E9%97%AE%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">面试常问追问</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/java-methodhandle-reflection-deep-comparison/" title="【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战">【Java 进阶】MethodHandle 原理与反射深度对比：方法句柄的底层机制与实战</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/jvm-cms-gc-deep-dive/" title="【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题">【JVM 原理】CMS 垃圾收集器深度解析：从并发标记到碎片化问题</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/kafka-consumer-lag-monitoring-optimization/" title="【消息队列】Kafka 消费者 Lag 监控与性能优化实战">【消息队列】Kafka 消费者 Lag 监控与性能优化实战</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/mysql-primary-key-design-deep-comparison/" title="【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键">【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/21/spring-value-annotation-deep-dive/" title="【Spring 源码】@Value 注解底层原理与高级用法：从属性注入到 SpEL 解析">【Spring 源码】@Value 注解底层原理与高级用法：从属性注入到 SpEL 解析</a><time datetime="2026-07-21T00:00:00.000Z" title="发表于 2026-07-21 08:00:00">2026-07-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.0"></script><script src="/js/main.js?v=5.6.0"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
