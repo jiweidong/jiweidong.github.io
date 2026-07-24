@@ -1,0 +1,356 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析前言在高并发场景下，很多开发者会下意识地关注锁竞争、线程上下文切换等显性性能瓶颈，却忽略了一个「看不见的杀手」——伪共享（False Sharing）。这个问题隐藏在 CPU 缓存体系之中，即使你的代码没有使用任何锁，多个线程操作看似独立的数据，也可能因为共享同一个缓存行而导致性能断崖式下跌。 本文将深入">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析">
+<meta property="og:url" content="https://jiweidong.github.io/2026/07/24/java-false-sharing-cache-line-padding/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析前言在高并发场景下，很多开发者会下意识地关注锁竞争、线程上下文切换等显性性能瓶颈，却忽略了一个「看不见的杀手」——伪共享（False Sharing）。这个问题隐藏在 CPU 缓存体系之中，即使你的代码没有使用任何锁，多个线程操作看似独立的数据，也可能因为共享同一个缓存行而导致性能断崖式下跌。 本文将深入">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-07-24T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-24T00:12:21.074Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="性能优化">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析",
+  "url": "https://jiweidong.github.io/2026/07/24/java-false-sharing-cache-line-padding/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-07-24T00:00:00.000Z",
+  "dateModified": "2026-07-24T00:12:21.074Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/07/24/java-false-sharing-cache-line-padding/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">335</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">119</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-07-24T00:12:21.074Z" title="更新于 2026-07-24 08:12:21">2026-07-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-进阶】Java-伪共享（False-Sharing）与-CPU-缓存行填充深度解析"><a href="#【Java-进阶】Java-伪共享（False-Sharing）与-CPU-缓存行填充深度解析" class="headerlink" title="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析"></a>【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>在高并发场景下，很多开发者会下意识地关注锁竞争、线程上下文切换等显性性能瓶颈，却忽略了一个「看不见的杀手」——<strong>伪共享（False Sharing）</strong>。这个问题隐藏在 CPU 缓存体系之中，即使你的代码没有使用任何锁，多个线程操作看似独立的数据，也可能因为共享同一个缓存行而导致性能断崖式下跌。</p>
+<p>本文将深入剖析伪共享的原理、检测手段与解决方案，帮助你在高并发场景中写出真正高性能的代码。</p>
+<hr>
+<h2 id="一、从-CPU-缓存体系说起"><a href="#一、从-CPU-缓存体系说起" class="headerlink" title="一、从 CPU 缓存体系说起"></a>一、从 CPU 缓存体系说起</h2><h3 id="1-1-缓存层级结构"><a href="#1-1-缓存层级结构" class="headerlink" title="1.1 缓存层级结构"></a>1.1 缓存层级结构</h3><p>现代 CPU 的运算速度远超内存访问速度，为了弥合这个差距，CPU 引入了多级缓存：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">CPU Core 0          CPU Core 1</span><br><span class="line">┌─────────┐        ┌─────────┐</span><br><span class="line">│  L1/L2  │        │  L1/L2  │</span><br><span class="line">│  私有   │        │  私有   │</span><br><span class="line">└────┬────┘        └────┬────┘</span><br><span class="line">     │                   │</span><br><span class="line">     └───────┬───────────┘</span><br><span class="line">             │</span><br><span class="line">     ┌───────┴───────────┐</span><br><span class="line">     │   L3 Cache (共享)  │</span><br><span class="line">     └───────┬───────────┘</span><br><span class="line">             │</span><br><span class="line">     ┌───────┴───────────┐</span><br><span class="line">     │     主内存 (RAM)    │</span><br><span class="line">     └───────────────────┘</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-2-缓存行（Cache-Line）"><a href="#1-2-缓存行（Cache-Line）" class="headerlink" title="1.2 缓存行（Cache Line）"></a>1.2 缓存行（Cache Line）</h3><p>CPU 缓存的最小操作单元不是字节，而是<strong>缓存行（Cache Line）</strong>。在大多数 x86 架构中，一个缓存行的大小为 <strong>64 字节</strong>。</p>
+<p>这意味着：当你读取一个 4 字节的 int 变量时，CPU 实际上会加载其相邻的 64 字节数据到缓存中。</p>
+<h3 id="1-3-MESI-缓存一致性协议"><a href="#1-3-MESI-缓存一致性协议" class="headerlink" title="1.3 MESI 缓存一致性协议"></a>1.3 MESI 缓存一致性协议</h3><p>当多个核心同时缓存了同一内存区域的数据时，必须保证一致性。MESI 协议定义了四种缓存行状态：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>含义</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>M (Modified)</td>
+<td>修改</td>
+<td>该缓存行已被修改，与主存不一致</td>
+</tr>
+<tr>
+<td>E (Exclusive)</td>
+<td>独占</td>
+<td>仅当前核心持有该缓存行，且与主存一致</td>
+</tr>
+<tr>
+<td>S (Shared)</td>
+<td>共享</td>
+<td>多个核心持有该缓存行，且与主存一致</td>
+</tr>
+<tr>
+<td>I (Invalid)</td>
+<td>失效</td>
+<td>该缓存行已失效，需要重新加载</td>
+</tr>
+</tbody></table>
+<p>当一个核心修改了自己的缓存行，其他核心中对应的缓存行会被标记为 <strong>Invalid</strong>，下次访问时必须重新从内存加载，这个过程称为<strong>缓存一致性消息传递</strong>，代价极高。</p>
+<hr>
+<h2 id="二、什么是伪共享（False-Sharing）？"><a href="#二、什么是伪共享（False-Sharing）？" class="headerlink" title="二、什么是伪共享（False Sharing）？"></a>二、什么是伪共享（False Sharing）？</h2><h3 id="2-1-定义"><a href="#2-1-定义" class="headerlink" title="2.1 定义"></a>2.1 定义</h3><p><strong>伪共享</strong>是指：多个线程操作<strong>不同的变量</strong>，但这些变量恰好位于<strong>同一个缓存行</strong>中。当一个线程修改了自己的变量，会导致整个缓存行失效，其他线程不得不重新加载缓存行，即使它们访问的是完全不相关的数据。</p>
+<p>用一句话概括：<strong>逻辑上不共享，物理上被迫共享。</strong></p>
+<h3 id="2-2-伪共享的代价"><a href="#2-2-伪共享的代价" class="headerlink" title="2.2 伪共享的代价"></a>2.2 伪共享的代价</h3><p>来看一个经典的 Benchmark 场景：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FalseSharingExample</span> &#123;</span><br><span class="line">    </span><br><span class="line">    <span class="comment">// 两个 volatile long 变量，很可能在同一个缓存行</span></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">SharedData</span> &#123;</span><br><span class="line">        <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">a</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">        <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">b</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">SharedData</span> <span class="variable">data</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">SharedData</span>();</span><br><span class="line">        </span><br><span class="line">        <span class="type">Thread</span> <span class="variable">t1</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">            <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; <span class="number">100_000_000</span>; i++) &#123;</span><br><span class="line">                data.a++;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;);</span><br><span class="line">        </span><br><span class="line">        <span class="type">Thread</span> <span class="variable">t2</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">            <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; <span class="number">100_000_000</span>; i++) &#123;</span><br><span class="line">                data.b++;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;);</span><br><span class="line">        </span><br><span class="line">        <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">        t1.start(); t2.start();</span><br><span class="line">        t1.join(); t2.join();</span><br><span class="line">        <span class="type">long</span> <span class="variable">end</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">        </span><br><span class="line">        System.out.println(<span class="string">&quot;耗时: &quot;</span> + (end - start) + <span class="string">&quot;ms&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这段代码中，<code>t1</code> 只操作 <code>data.a</code>，<code>t2</code> 只操作 <code>data.b</code>，看似完全没有数据竞争。但由于 <code>a</code> 和 <code>b</code> 紧挨着存储在内存中（位于同一缓存行），<code>t1</code> 修改 <code>a</code> 会让 <code>t2</code> 的缓存行失效，<code>t2</code> 修改 <code>b</code> 又会让 <code>t1</code> 的缓存行失效，导致大量的缓存一致性消息传递。</p>
+<p>在我本机测试结果：</p>
+<ul>
+<li>有伪共享：<strong>~4200ms</strong></li>
+<li>消除伪共享后：<strong>~800ms</strong></li>
+</ul>
+<p>性能差距 <strong>5 倍以上</strong>！</p>
+<hr>
+<h2 id="三、如何检测伪共享？"><a href="#三、如何检测伪共享？" class="headerlink" title="三、如何检测伪共享？"></a>三、如何检测伪共享？</h2><h3 id="3-1-perf-工具（Linux）"><a href="#3-1-perf-工具（Linux）" class="headerlink" title="3.1 perf 工具（Linux）"></a>3.1 perf 工具（Linux）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 使用 perf 观察缓存失效事件</span></span><br><span class="line">perf <span class="built_in">stat</span> -e cache-misses,cache-references,L1-dcache-load-misses java FalseSharingExample</span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>cache-misses</code> 比例异常高（超过 10%），可能存在伪共享问题。</p>
+<h3 id="3-2-Java-工具方法"><a href="#3-2-Java-工具方法" class="headerlink" title="3.2 Java 工具方法"></a>3.2 Java 工具方法</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 获取缓存行大小（通常为 64）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="type">long</span> <span class="title function_">getCacheLineSize</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> <span class="number">64</span>; <span class="comment">// x86 架构固定 64 字节</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 估算对象地址偏移</span></span><br><span class="line"><span class="comment">// 使用 Unsafe 或 JOL（Java Object Layout）</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-3-使用-JOL-查看对象内存布局"><a href="#3-3-使用-JOL-查看对象内存布局" class="headerlink" title="3.3 使用 JOL 查看对象内存布局"></a>3.3 使用 JOL 查看对象内存布局</h3><figure class="highlight xml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="tag">&lt;<span class="name">dependency</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">groupId</span>&gt;</span>org.openjdk.jol<span class="tag">&lt;/<span class="name">groupId</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">artifactId</span>&gt;</span>jol-core<span class="tag">&lt;/<span class="name">artifactId</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">version</span>&gt;</span>0.17<span class="tag">&lt;/<span class="name">version</span>&gt;</span></span><br><span class="line"><span class="tag">&lt;/<span class="name">dependency</span>&gt;</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">System.out.println(ClassLayout.parseClass(SharedData.class).toPrintable());</span><br></pre></td></tr></table></figure>
+
+<p>输出示例：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">SharedData object internals:</span><br><span class="line"> OFFSET  SIZE    TYPE DESCRIPTION                    VALUE</span><br><span class="line">      0    12         (object header: mark + class)  </span><br><span class="line">     12     4         (alignment/padding gap)        </span><br><span class="line">     16     8   long  SharedData.a                  0</span><br><span class="line">     24     8   long  SharedData.b                  0</span><br><span class="line">     32     8         (loss due to the next object alignment)</span><br></pre></td></tr></table></figure>
+
+<p>可以看到，<code>a</code> 和 <code>b</code> 之间仅间隔 8 字节，明显在同一个 64 字节缓存行中。</p>
+<hr>
+<h2 id="四、消除伪共享的解决方案"><a href="#四、消除伪共享的解决方案" class="headerlink" title="四、消除伪共享的解决方案"></a>四、消除伪共享的解决方案</h2><h3 id="4-1-缓存行填充（Padding）"><a href="#4-1-缓存行填充（Padding）" class="headerlink" title="4.1 缓存行填充（Padding）"></a>4.1 缓存行填充（Padding）</h3><p>最经典的方案是通过填充字节，确保每个变量独占一个缓存行：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">class</span> <span class="title class_">PaddedCounter</span> &#123;</span><br><span class="line">    <span class="comment">// 每个 volatile 变量前填充 56 字节（64 - 8），确保独占缓存行</span></span><br><span class="line">    <span class="keyword">volatile</span> <span class="type">long</span> value;</span><br><span class="line">    <span class="comment">// 填充到 64 字节以上，保证不和相邻变量共享缓存行</span></span><br><span class="line">    <span class="type">long</span> p1, p2, p3, p4, p5, p6, p7; <span class="comment">// 7 * 8 = 56 字节</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>更精确的做法：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FalseSharingPadding</span> &#123;</span><br><span class="line">    </span><br><span class="line">    <span class="meta">@jdk</span>.internal.vm.annotation.Contended  <span class="comment">// Java 8+ 可用</span></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">ContendedCounter</span> &#123;</span><br><span class="line">        <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">value</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="comment">// 手动填充版本</span></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">PaddedCounter</span> &#123;</span><br><span class="line">        <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">value</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">        <span class="type">long</span> p1, p2, p3, p4, p5, p6, p7; <span class="comment">// 56 字节填充</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-Contended-注解"><a href="#4-2-Contended-注解" class="headerlink" title="4.2 @Contended 注解"></a>4.2 @Contended 注解</h3><p>从 Java 8 开始，JDK 提供了 <code>@jdk.internal.vm.annotation.Contended</code> 注解（或 <code>sun.misc.Contended</code>），可以自动为字段添加填充：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">import</span> jdk.internal.vm.annotation.Contended;</span><br><span class="line"></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">SharedCounters</span> &#123;</span><br><span class="line">    </span><br><span class="line">    <span class="meta">@Contended</span></span><br><span class="line">    <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">counter1</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">    </span><br><span class="line">    <span class="meta">@Contended</span>  </span><br><span class="line">    <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">counter2</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：使用 <code>@Contended</code> 需要开启 JVM 参数：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-XX:-RestrictContended</span><br></pre></td></tr></table></figure>
+
+<p>默认情况下，<code>@Contended</code> 只在 JDK 内部使用，需要通过该参数解除限制。</p>
+<h3 id="4-3-Disruptor-框架的实践"><a href="#4-3-Disruptor-框架的实践" class="headerlink" title="4.3 Disruptor 框架的实践"></a>4.3 Disruptor 框架的实践</h3><p>高性能队列框架 <strong>LMAX Disruptor</strong> 是消除伪共享的经典案例。其 RingBuffer 中的 Sequence 类就使用了缓存行填充：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">class</span> <span class="title class_">LhsPadding</span> &#123;</span><br><span class="line">    <span class="keyword">protected</span> <span class="type">long</span> p1, p2, p3, p4, p5, p6, p7;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">Value</span> <span class="keyword">extends</span> <span class="title class_">LhsPadding</span> &#123;</span><br><span class="line">    <span class="keyword">protected</span> <span class="keyword">volatile</span> <span class="type">long</span> value;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">RhsPadding</span> <span class="keyword">extends</span> <span class="title class_">Value</span> &#123;</span><br><span class="line">    <span class="keyword">protected</span> <span class="type">long</span> p9, p10, p11, p12, p13, p14, p15;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">Sequence</span> <span class="keyword">extends</span> <span class="title class_">RhsPadding</span> &#123;</span><br><span class="line">    <span class="comment">// 通过继承链确保 value 前后都有 56 字节填充</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-4-Java-代码中如何正确实现"><a href="#4-4-Java-代码中如何正确实现" class="headerlink" title="4.4 Java 代码中如何正确实现"></a>4.4 Java 代码中如何正确实现</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">CacheLinePaddingDemo</span> &#123;</span><br><span class="line">    </span><br><span class="line">    <span class="comment">// 方法一：继承式填充（推荐）</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">Padding</span> &#123;</span><br><span class="line">        <span class="keyword">public</span> <span class="type">long</span> p1, p2, p3, p4, p5, p6, p7;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">Counter</span> <span class="keyword">extends</span> <span class="title class_">Padding</span> &#123;</span><br><span class="line">        <span class="keyword">public</span> <span class="keyword">volatile</span> <span class="type">long</span> <span class="variable">value</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">        <span class="comment">// 继承了 p1-p7，value 后还需要填充</span></span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">PaddedCounter</span> <span class="keyword">extends</span> <span class="title class_">Counter</span> &#123;</span><br><span class="line">        <span class="keyword">public</span> <span class="type">long</span> p9, p10, p11, p12, p13, p14, p15;</span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="comment">// 方法二：数组元素填充</span></span><br><span class="line">    <span class="comment">// 对于数组，通过增加空洞来隔离</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">StripedLong</span> &#123;</span><br><span class="line">        <span class="comment">// 每个元素占用 8 字节，数组连续存储</span></span><br><span class="line">        <span class="comment">// 使用 (8 + 64) 的步长访问</span></span><br><span class="line">    &#125;</span><br><span class="line">    </span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        PaddedCounter[] counters = <span class="keyword">new</span> <span class="title class_">PaddedCounter</span>[<span class="number">2</span>];</span><br><span class="line">        counters[<span class="number">0</span>] = <span class="keyword">new</span> <span class="title class_">PaddedCounter</span>();</span><br><span class="line">        counters[<span class="number">1</span>] = <span class="keyword">new</span> <span class="title class_">PaddedCounter</span>();</span><br><span class="line">        </span><br><span class="line">        <span class="comment">// 测试：两个线程各自操作独立的 counter</span></span><br><span class="line">        <span class="type">Thread</span> <span class="variable">t1</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">            <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; <span class="number">100_000_000</span>; i++) &#123;</span><br><span class="line">                counters[<span class="number">0</span>].value++;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;);</span><br><span class="line">        </span><br><span class="line">        <span class="type">Thread</span> <span class="variable">t2</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">            <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; <span class="number">100_000_000</span>; i++) &#123;</span><br><span class="line">                counters[<span class="number">1</span>].value++;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;);</span><br><span class="line">        </span><br><span class="line">        <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">        t1.start(); t2.start();</span><br><span class="line">        t1.join(); t2.join();</span><br><span class="line">        System.out.println(<span class="string">&quot;填充后耗时: &quot;</span> + (System.currentTimeMillis() - start) + <span class="string">&quot;ms&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、JDK-源码中的伪共享消除"><a href="#五、JDK-源码中的伪共享消除" class="headerlink" title="五、JDK 源码中的伪共享消除"></a>五、JDK 源码中的伪共享消除</h2><p>JDK 源码多处使用了缓存行填充技巧：</p>
+<h3 id="5-1-Exchanger"><a href="#5-1-Exchanger" class="headerlink" title="5.1 Exchanger"></a>5.1 Exchanger</h3><p><code>java.util.concurrent.Exchanger</code> 中的 <code>Node</code> 类就使用了缓存行填充：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@jdk</span>.internal.vm.annotation.Contended</span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">Node</span> &#123;</span><br><span class="line">    <span class="comment">// ...</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-ConcurrentHashMap"><a href="#5-2-ConcurrentHashMap" class="headerlink" title="5.2 ConcurrentHashMap"></a>5.2 ConcurrentHashMap</h3><p><code>ConcurrentHashMap</code> 中的 <code>CounterCell</code> 类也使用了 <code>@Contended</code> 注解来避免伪共享：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@jdk</span>.internal.vm.annotation.Contended</span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">CounterCell</span> &#123;</span><br><span class="line">    <span class="keyword">volatile</span> <span class="type">long</span> value;</span><br><span class="line">    CounterCell(<span class="type">long</span> x) &#123; value = x; &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-ThreadPoolExecutor"><a href="#5-3-ThreadPoolExecutor" class="headerlink" title="5.3 ThreadPoolExecutor"></a>5.3 ThreadPoolExecutor</h3><p><code>ThreadPoolExecutor</code> 中的 <code>Worker</code> 类继承了 <code>AbstractQueuedSynchronizer</code>，而 AQS 内部也大量使用了对齐技术来保证高性能。</p>
+<h3 id="5-4-LongAdder"><a href="#5-4-LongAdder" class="headerlink" title="5.4 LongAdder"></a>5.4 LongAdder</h3><p><code>LongAdder</code>（以及 <code>Striped64</code>）是 Java 8 引入的高性能计数器，它通过 <code>@Contended</code> 注解确保每个 Cell 独占缓存行：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@jdk</span>.internal.vm.annotation.Contended</span><br><span class="line"><span class="keyword">static</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">Cell</span> &#123;</span><br><span class="line">    <span class="keyword">volatile</span> <span class="type">long</span> value;</span><br><span class="line">    Cell(<span class="type">long</span> x) &#123; value = x; &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这是 <strong>LongAdder 在高并发下性能远超 AtomicLong</strong> 的重要原因之一。</p>
+<hr>
+<h2 id="六、面试高频追问"><a href="#六、面试高频追问" class="headerlink" title="六、面试高频追问"></a>六、面试高频追问</h2><h3 id="Q1：伪共享和竞态条件是一回事吗？"><a href="#Q1：伪共享和竞态条件是一回事吗？" class="headerlink" title="Q1：伪共享和竞态条件是一回事吗？"></a>Q1：伪共享和竞态条件是一回事吗？</h3><p><strong>不是。</strong> 竞态条件是指多个线程同时访问同一数据且至少有一个在写，导致结果依赖执行时序。伪共享是多个线程操作<strong>不同的</strong>数据，但因缓存的物理特性导致性能下降。伪共享不会导致数据错误，只会导致性能问题。</p>
+<h3 id="Q2：volatile-和伪共享有什么关系？"><a href="#Q2：volatile-和伪共享有什么关系？" class="headerlink" title="Q2：volatile 和伪共享有什么关系？"></a>Q2：volatile 和伪共享有什么关系？</h3><p><code>volatile</code> 变量每次读写都直接操作主存（通过内存屏障），缓存一致性协议会在 volatile 写后使其他核心的缓存行失效。因此 <strong>volatile 变量是伪共享的高风险区</strong>。</p>
+<h3 id="Q3：Java-17-21-之后还需要手动填充吗？"><a href="#Q3：Java-17-21-之后还需要手动填充吗？" class="headerlink" title="Q3：Java 17&#x2F;21 之后还需要手动填充吗？"></a>Q3：Java 17&#x2F;21 之后还需要手动填充吗？</h3><p>JDK 内部已经大量使用了 <code>@Contended</code>，但在<strong>你自己的业务代码中</strong>，如果出现多线程频繁写不同但相邻的字段，仍然需要考虑。JDK 不会自动为你的 POJO 添加填充。</p>
+<h3 id="Q4：填充多少字节才够？"><a href="#Q4：填充多少字节才够？" class="headerlink" title="Q4：填充多少字节才够？"></a>Q4：填充多少字节才够？</h3><p>x86 架构缓存行为 64 字节。一个 long 占 8 字节，因此需要填充 56 字节。但更安全的做法是填充 <strong>64 字节以上</strong>（因为对象头也会占空间），或者直接使用 <code>@Contended</code> 让 JVM 帮你处理。</p>
+<h3 id="Q5：什么时候该关注伪共享？"><a href="#Q5：什么时候该关注伪共享？" class="headerlink" title="Q5：什么时候该关注伪共享？"></a>Q5：什么时候该关注伪共享？</h3><p>当满足以下条件时，值得关注：</p>
+<ul>
+<li>多线程并发写</li>
+<li>多个线程写<strong>相邻</strong>的变量</li>
+<li>变量被 <code>volatile</code> 修饰（或使用 <code>Atomic*</code> 类）</li>
+<li>性能敏感场景（每秒数十万次以上的写入）</li>
+</ul>
+<hr>
+<h2 id="七、总结"><a href="#七、总结" class="headerlink" title="七、总结"></a>七、总结</h2><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>手动填充字段</td>
+<td>兼容性好，无额外依赖</td>
+<td>代码冗余，需要精确计算</td>
+</tr>
+<tr>
+<td>@Contended 注解</td>
+<td>简洁自动，JDK 官方方案</td>
+<td>需要 JVM 参数开启限制</td>
+</tr>
+<tr>
+<td>继承式填充（如 Disruptor）</td>
+<td>结构清晰，JDK 版本无关</td>
+<td>类层次深</td>
+</tr>
+<tr>
+<td>数组空洞（Striping）</td>
+<td>适合大量元素</td>
+<td>内存占用增大</td>
+</tr>
+</tbody></table>
+<p>消除伪共享是极致性能优化的必修课。对于大多数业务系统来说，它不是首要瓶颈，但对于<strong>高频交易、实时计算、消息中间件</strong>等追求极致性能的场景，理解和解决伪共享问题，可能是你压测曲线最后那 20% 提升的关键。</p>
+<hr>
+<p><em>本文基于 x86-64 架构，不同 CPU 架构的缓存行大小可能不同（如 ARM 为 64 字节，某些 PowerPC 为 128 字节），请根据实际情况调整。</em></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/07/24/java-false-sharing-cache-line-padding/">https://jiweidong.github.io/2026/07/24/java-false-sharing-cache-line-padding/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 System.gc() 产生千丝万缕的联系。 本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：  System.gc() 到底做了什么 JVM 在什么情况下会自动触发 GC -XX:+DisableExplicitGC 和其它 GC 相关参数的作用 DirectBuffer 回收与 System.gc() 的关系 如何正确进行 GC 调优   一、System.gc() 调用链全解析1.1 从 Java 代码到 JVM 实现先看一个最简单的调用链： 1234...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-application-architecture-evolution-guide/" title="【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃</div></div><div class="info-2"><div class="info-item-1">【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃前言「我们用的还是单体应用，是不是太落后了？」 这是我在技术群里经常看到的问题。实际上，架构没有银弹，单体有单体的问题，微服务有微服务的痛点，云原生也有它特定的适用场景。真正的高手，不是选最新的架构，而是为当前业务阶段选择最合适的架构。 本文将以 Java 技术栈为线索，梳理从单体架构到云原生的完整演进路径，分析每个阶段的痛点、解决方案和最佳实践，帮助你：  理解每种架构的本质问题和核心优势 知道什么时候该「升级」到下一阶段 掌握每个阶段的关键技术选型   一、第一阶段：单体架构（Monolithic Architecture）1.1 架构形态123456789101112131415┌─────────────────────────────────────┐│           单体应用 (WAR/JAR)          ││  ┌──────────┬──────────┬──────────┐ ││  │ 用户模块  │ 订单模块  │ 商品模块  │ ││  ├──────────┼───────...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/21/java-jmm-volatile-happens-before/" title="【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了</div></div><div class="info-2"><div class="info-item-1">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了面试官：说说什么是 JMM（Java 内存模型）？JMM（Java Memory Model） 是一个抽象的概念，它定义了一套规则和规范，用来屏蔽不同硬件和操作系统的内存访问差异，确保 Java 程序在各种平台上都能达到内存访问的一致性。  JMM 的核心围绕着三个特性展开：原子性（Atomicity）、可见性（Visibility）、有序性（Ordering）。  为什么需要 JMM？现代 CPU 采用多级缓存架构（L1&#x2F;L2&#x2F;L3 Cache）来加速数据访问，但这也带来了缓存一致性问题。每个 CPU 核心有自己私有的缓存，当多个线程在不同核心上运行时，它们看到的共享变量值可能不一致。 1234567891011121314151617┌─────────────────────────────────────────┐│               Java 线程                   ││   ┌──────────┐     ┌──────────┐...</div></div></div></a><a class="pagination-related" href="/2026/07/19/java-varhandle-deep-dive/" title="【Java 9+】VarHandle 变量句柄深度解析：从 Unsafe 到安全的内存操作"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-19</div><div class="info-item-2">【Java 9+】VarHandle 变量句柄深度解析：从 Unsafe 到安全的内存操作</div></div><div class="info-2"><div class="info-item-1">【Java 9+】VarHandle 变量句柄深度解析：从 Unsafe 到安全的内存操作一、引言：为什么需要 VarHandle？在 Java 9 之前，如果需要进行精细化的内存操作（比如原子性地更新对象字段、以 volatile 语义读写数组元素），开发者只有两个选择：  java.util.concurrent.atomic 包 —— 局限性大，只能操作包装类（AtomicInteger、AtomicReference 等），无法直接操作普通对象字段或数组元素 sun.misc.Unsafe —— 万能但危险，属于内部 API，在不同 JDK 版本之间可能变动，且被官方反复警告不要使用  Java 9 引入了 java.lang.invoke.VarHandle，旨在提供一个安全、高效、标准化的替代方案。 VarHandle 是什么？ VarHandle 是对变量（对象字段、静态字段或数组元素）的动态强类型引用。它允许以精细化的内存排序语义（如 volatile、acquire&#x2F;release、opaque）对这些变量进行读写和原子操作。  简单说：VarHand...</div></div></div></a><a class="pagination-related" href="/2026/06/30/java-memory-leak-investigation-guide/" title="Java 内存泄漏排查全攻略：从堆转储到 MAT 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战</div></div><div class="info-2"><div class="info-item-1">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战一、内存泄漏 vs 内存溢出先理清两个概念：    概念 定义 表现    内存泄漏（Memory Leak） 无用对象持续被引用，GC 无法回收 占用逐渐增加，最终 OOM   内存溢出（OOM） 对象需要内存但堆空间不足 直接抛出 OutOfMemoryError   泄漏是溢出的原因之一，但不是唯一原因（也可能是对象过多、堆太小等）。 二、Java 内存泄漏的典型模式2.1 静态集合类最常见的内存泄漏——static 集合的生命周期 &#x3D; 应用生命周期： 12345678public class CacheManager &#123;    // ❌ 静态 HashMap 永远不会被回收    private static Map&lt;String, Object&gt; cache = new HashMap&lt;&gt;();        public static void addData(String key, Object data) &#123;        cache.put(key, da...</div></div></div></a><a class="pagination-related" href="/2026/06/30/jit-compilation-optimization-deep-dive/" title="JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除</div></div><div class="info-2"><div class="info-item-1">JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除面试官：你的代码为什么越跑越快？说说 JIT 的编译优化很多 Java 开发者都会遇到一个现象：同样的代码，刚启动时很慢，跑一会儿就快了。这背后的魔法就是 JIT（Just-In-Time）即时编译。 本文将从字节码到机器码，深入解析 JIT 编译器的三大核心优化：方法内联、逃逸分析、锁消除。 一、JIT 编译器概述1.1 从解释执行到编译执行Java 代码的执行经历了三个阶段： 1234源代码 (.java) → 字节码 (.class) → 机器码                      ↓              解释器逐行执行（慢）              或 JIT 编译为机器码（快）   解释执行：启动快，但每条指令都要翻译 编译执行：将热点代码编译为本地机器码，直接执行  1.2 Client Compiler vs Server CompilerHotSpot JVM 内置了两种 JIT 编译器：    特性 C1 (Client) C2 (Server)    编译速度 快 慢   优化程度 基本...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 System.gc() 产生千丝万缕的联系。 本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：  System.gc() 到底做了什么 JVM 在什么情况下会自动触发 GC -XX:+DisableExplicitGC 和其它 GC 相关参数的作用 DirectBuffer 回收与 System.gc() 的关系 如何正确进行 GC 调优   一、System.gc() 调用链全解析1.1 从 Java 代码到 JVM 实现先看一个最简单的调用链： 1234...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-synchronized-lock-upgrade-deep-dive/" title="「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析</div></div><div class="info-2"><div class="info-item-1">「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析面试开场面试官：你平时用 synchronized 做同步吗？知道它的锁升级机制吗？ 我：synchronized 在 JDK 6 之后引入了锁升级（锁膨胀）机制，不再是早期的纯重量级锁。锁的状态会从无锁 → 偏向锁 → 轻量级锁 → 重量级锁，且方向不可逆。 这是一道非常经典的并发面试题，几乎涵盖了 JVM、对象头、Mark Word、CAS、操作系统互斥量等多个知识点。今天就彻底把它讲透。  一、锁升级的背景：JDK 6 之前的 synchronized在 JDK 6 之前，synchronized 的实现依赖于操作系统的 Mutex Lock（互斥量），每次加锁&#x2F;解锁都需要从用户态切换到内核态，这个切换成本非常高。因此早期大家都说 synchronized 是”重量级锁”，性能不如 java.util.concurrent 包中的 Lock。 JDK 6 对 synchronized 做了大量优化，引入了一系列的锁优化技术：    优化技术 说明    偏向锁（Biased Lock...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">335</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">119</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-%E8%BF%9B%E9%98%B6%E3%80%91Java-%E4%BC%AA%E5%85%B1%E4%BA%AB%EF%BC%88False-Sharing%EF%BC%89%E4%B8%8E-CPU-%E7%BC%93%E5%AD%98%E8%A1%8C%E5%A1%AB%E5%85%85%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%BB%8E-CPU-%E7%BC%93%E5%AD%98%E4%BD%93%E7%B3%BB%E8%AF%B4%E8%B5%B7"><span class="toc-number">1.2.</span> <span class="toc-text">一、从 CPU 缓存体系说起</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E7%BC%93%E5%AD%98%E5%B1%82%E7%BA%A7%E7%BB%93%E6%9E%84"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 缓存层级结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E7%BC%93%E5%AD%98%E8%A1%8C%EF%BC%88Cache-Line%EF%BC%89"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 缓存行（Cache Line）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-MESI-%E7%BC%93%E5%AD%98%E4%B8%80%E8%87%B4%E6%80%A7%E5%8D%8F%E8%AE%AE"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 MESI 缓存一致性协议</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%BB%80%E4%B9%88%E6%98%AF%E4%BC%AA%E5%85%B1%E4%BA%AB%EF%BC%88False-Sharing%EF%BC%89%EF%BC%9F"><span class="toc-number">1.3.</span> <span class="toc-text">二、什么是伪共享（False Sharing）？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%AE%9A%E4%B9%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 定义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%BC%AA%E5%85%B1%E4%BA%AB%E7%9A%84%E4%BB%A3%E4%BB%B7"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 伪共享的代价</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%A6%82%E4%BD%95%E6%A3%80%E6%B5%8B%E4%BC%AA%E5%85%B1%E4%BA%AB%EF%BC%9F"><span class="toc-number">1.4.</span> <span class="toc-text">三、如何检测伪共享？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-perf-%E5%B7%A5%E5%85%B7%EF%BC%88Linux%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 perf 工具（Linux）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-Java-%E5%B7%A5%E5%85%B7%E6%96%B9%E6%B3%95"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 Java 工具方法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E4%BD%BF%E7%94%A8-JOL-%E6%9F%A5%E7%9C%8B%E5%AF%B9%E8%B1%A1%E5%86%85%E5%AD%98%E5%B8%83%E5%B1%80"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 使用 JOL 查看对象内存布局</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%B6%88%E9%99%A4%E4%BC%AA%E5%85%B1%E4%BA%AB%E7%9A%84%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88"><span class="toc-number">1.5.</span> <span class="toc-text">四、消除伪共享的解决方案</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E7%BC%93%E5%AD%98%E8%A1%8C%E5%A1%AB%E5%85%85%EF%BC%88Padding%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 缓存行填充（Padding）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-Contended-%E6%B3%A8%E8%A7%A3"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 @Contended 注解</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-Disruptor-%E6%A1%86%E6%9E%B6%E7%9A%84%E5%AE%9E%E8%B7%B5"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 Disruptor 框架的实践</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-Java-%E4%BB%A3%E7%A0%81%E4%B8%AD%E5%A6%82%E4%BD%95%E6%AD%A3%E7%A1%AE%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 Java 代码中如何正确实现</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81JDK-%E6%BA%90%E7%A0%81%E4%B8%AD%E7%9A%84%E4%BC%AA%E5%85%B1%E4%BA%AB%E6%B6%88%E9%99%A4"><span class="toc-number">1.6.</span> <span class="toc-text">五、JDK 源码中的伪共享消除</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-Exchanger"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 Exchanger</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-ConcurrentHashMap"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 ConcurrentHashMap</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-ThreadPoolExecutor"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 ThreadPoolExecutor</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-LongAdder"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 LongAdder</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试高频追问</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#Q1%EF%BC%9A%E4%BC%AA%E5%85%B1%E4%BA%AB%E5%92%8C%E7%AB%9E%E6%80%81%E6%9D%A1%E4%BB%B6%E6%98%AF%E4%B8%80%E5%9B%9E%E4%BA%8B%E5%90%97%EF%BC%9F"><span class="toc-number">1.7.1.</span> <span class="toc-text">Q1：伪共享和竞态条件是一回事吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q2%EF%BC%9Avolatile-%E5%92%8C%E4%BC%AA%E5%85%B1%E4%BA%AB%E6%9C%89%E4%BB%80%E4%B9%88%E5%85%B3%E7%B3%BB%EF%BC%9F"><span class="toc-number">1.7.2.</span> <span class="toc-text">Q2：volatile 和伪共享有什么关系？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q3%EF%BC%9AJava-17-21-%E4%B9%8B%E5%90%8E%E8%BF%98%E9%9C%80%E8%A6%81%E6%89%8B%E5%8A%A8%E5%A1%AB%E5%85%85%E5%90%97%EF%BC%9F"><span class="toc-number">1.7.3.</span> <span class="toc-text">Q3：Java 17&#x2F;21 之后还需要手动填充吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q4%EF%BC%9A%E5%A1%AB%E5%85%85%E5%A4%9A%E5%B0%91%E5%AD%97%E8%8A%82%E6%89%8D%E5%A4%9F%EF%BC%9F"><span class="toc-number">1.7.4.</span> <span class="toc-text">Q4：填充多少字节才够？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q5%EF%BC%9A%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E8%AF%A5%E5%85%B3%E6%B3%A8%E4%BC%AA%E5%85%B1%E4%BA%AB%EF%BC%9F"><span class="toc-number">1.7.5.</span> <span class="toc-text">Q5：什么时候该关注伪共享？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/java-application-architecture-evolution-guide/" title="【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃">【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/java-false-sharing-cache-line-padding/" title="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/spring-cloud-gateway-oauth2-resource-server-practice/" title="【Spring Cloud 实战】Spring Cloud Gateway 集成 OAuth2 资源服务器实战">【Spring Cloud 实战】Spring Cloud Gateway 集成 OAuth2 资源服务器实战</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.0"></script><script src="/js/main.js?v=5.6.0"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

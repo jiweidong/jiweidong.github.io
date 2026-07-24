@@ -1,0 +1,430 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节">
+<meta property="og:url" content="https://jiweidong.github.io/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-07-24T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-24T00:15:29.732Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="GC">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="性能优化">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节",
+  "url": "https://jiweidong.github.io/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-07-24T00:00:00.000Z",
+  "dateModified": "2026-07-24T00:15:29.732Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.0"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">335</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">119</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-07-24T00:15:29.732Z" title="更新于 2026-07-24 08:15:29">2026-07-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM/">JVM</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-实战】System-gc-与-GC-触发机制深度解析：从显式调用到自适应调节"><a href="#【JVM-实战】System-gc-与-GC-触发机制深度解析：从显式调用到自适应调节" class="headerlink" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"></a>【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>在 Java 面试中，一个经典问题：「<code>System.gc()</code> 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。</p>
+<p>更关键的是，<strong>生产环境一个不经意的 <code>System.gc()</code> 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩</strong>。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 <code>System.gc()</code> 产生千丝万缕的联系。</p>
+<p>本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：</p>
+<ul>
+<li><code>System.gc()</code> 到底做了什么</li>
+<li>JVM 在什么情况下会自动触发 GC</li>
+<li><code>-XX:+DisableExplicitGC</code> 和其它 GC 相关参数的作用</li>
+<li>DirectBuffer 回收与 <code>System.gc()</code> 的关系</li>
+<li>如何正确进行 GC 调优</li>
+</ul>
+<hr>
+<h2 id="一、System-gc-调用链全解析"><a href="#一、System-gc-调用链全解析" class="headerlink" title="一、System.gc() 调用链全解析"></a>一、System.gc() 调用链全解析</h2><h3 id="1-1-从-Java-代码到-JVM-实现"><a href="#1-1-从-Java-代码到-JVM-实现" class="headerlink" title="1.1 从 Java 代码到 JVM 实现"></a>1.1 从 Java 代码到 JVM 实现</h3><p>先看一个最简单的调用链：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// java.lang.System.gc()</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">gc</span><span class="params">()</span> &#123;</span><br><span class="line">    Runtime.getRuntime().gc();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// java.lang.Runtime.gc()</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">native</span> <span class="keyword">void</span> <span class="title function_">gc</span><span class="params">()</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这是一个 <strong>native 方法</strong>，对应 JVM 的 C++ 实现：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// hotspot/src/share/vm/prims/jvm.cpp</span></span><br><span class="line"><span class="built_in">JVM_ENTRY_NO_ENV</span>(<span class="type">void</span>, <span class="built_in">JVM_GC</span>(<span class="type">void</span>))</span><br><span class="line">  <span class="built_in">JVMWrapper</span>(<span class="string">&quot;JVM_GC&quot;</span>);</span><br><span class="line">  <span class="keyword">if</span> (!Universe::<span class="built_in">heap</span>()-&gt;<span class="built_in">is_gc_active</span>()) &#123;</span><br><span class="line">    Universe::<span class="built_in">heap</span>()-&gt;<span class="built_in">collect</span>(GCCause::_java_lang_system_gc);</span><br><span class="line">  &#125;</span><br><span class="line">JVM_END</span><br></pre></td></tr></table></figure>
+
+<p>关键点：</p>
+<ul>
+<li>如果 GC 正在进行中，调用会被忽略</li>
+<li>真正触发的是 <code>heap-&gt;collect()</code>，参数为 <code>_java_lang_system_gc</code></li>
+</ul>
+<h3 id="1-2-不同-GC-实现器的处理"><a href="#1-2-不同-GC-实现器的处理" class="headerlink" title="1.2 不同 GC 实现器的处理"></a>1.2 不同 GC 实现器的处理</h3><h4 id="G1-GC"><a href="#G1-GC" class="headerlink" title="G1 GC"></a>G1 GC</h4><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// g1CollectedHeap.cpp</span></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">G1CollectedHeap::collect</span><span class="params">(GCCause::Cause cause)</span> </span>&#123;</span><br><span class="line">  <span class="keyword">if</span> (<span class="built_in">should_do_concurrent_full_gc</span>(cause)) &#123;</span><br><span class="line">    <span class="built_in">collector_state</span>()-&gt;<span class="built_in">set_initiate_conc_mark_if_possible</span>(<span class="literal">true</span>);</span><br><span class="line">    <span class="comment">// 启动并发标记循环</span></span><br><span class="line">    <span class="built_in">schedule_concurrent_full_gc</span>();</span><br><span class="line">  &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">    <span class="comment">// 否则触发 STW Full GC</span></span><br><span class="line">    VM_G1CollectFull <span class="built_in">op</span>(gc_count_before, cause);</span><br><span class="line">    VMThread::<span class="built_in">execute</span>(&amp;op);</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>当使用 <code>System.gc()</code> 时，G1 默认会执行<strong>并发 Full GC</strong>（即并发标记 + 混合回收），而非 STW Full GC。这是 G1 比 CMS 更友好的地方。</p>
+<p>但注意：可以通过 <code>-XX:+ExplicitGCInvokesConcurrent</code> 等参数改变行为。</p>
+<h4 id="CMS-GC"><a href="#CMS-GC" class="headerlink" title="CMS GC"></a>CMS GC</h4><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// concurrentMarkSweepGeneration.cpp</span></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">CMSCollector::collect</span><span class="params">(GCCause::Cause cause)</span> </span>&#123;</span><br><span class="line">  <span class="keyword">if</span> (cause == GCCause::_java_lang_system_gc) &#123;</span><br><span class="line">    <span class="keyword">if</span> (ExplicitGCInvokesConcurrent) &#123;</span><br><span class="line">      <span class="comment">// 并发模式</span></span><br><span class="line">      <span class="built_in">start_concurrent_gc</span>();</span><br><span class="line">    &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">      <span class="comment">// STW Full GC</span></span><br><span class="line">      <span class="built_in">do_full_collection</span>();</span><br><span class="line">    &#125;</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>CMS 下默认执行 <strong>STW Full GC</strong>，这也是为什么 CMS 下 <code>System.gc()</code> 的代价极高。</p>
+<h4 id="ZGC-Shenandoah"><a href="#ZGC-Shenandoah" class="headerlink" title="ZGC &#x2F; Shenandoah"></a>ZGC &#x2F; Shenandoah</h4><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ZGC 处理</span></span><br><span class="line"><span class="function"><span class="type">void</span> <span class="title">ZCollectedHeap::collect</span><span class="params">(GCCause::Cause cause)</span> </span>&#123;</span><br><span class="line">  <span class="keyword">if</span> (cause == GCCause::_java_lang_system_gc) &#123;</span><br><span class="line">    <span class="comment">// ZGC 的 System.gc 也是并发执行</span></span><br><span class="line">    ZHeap::<span class="built_in">heap</span>()-&gt;<span class="built_in">collect</span>();</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>ZGC 和 Shenandoah 的 <code>System.gc()</code> 也是并发执行的，不会出现长时间的 STW。</p>
+<h3 id="1-3-是否立即执行？"><a href="#1-3-是否立即执行？" class="headerlink" title="1.3 是否立即执行？"></a>1.3 是否立即执行？</h3><p><code>System.gc()</code> 调用后的流程：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">System.gc()</span><br><span class="line">  → Runtime.gc()</span><br><span class="line">    → JVM_GC (C++ entry)</span><br><span class="line">      → heap-&gt;collect(_java_lang_system_gc)</span><br><span class="line">        → 向 VMThread 提交 GC Operation</span><br><span class="line">          → VMThread 在安全点执行该 Operation</span><br><span class="line">            → 等待所有线程到达安全点</span><br><span class="line">              → 执行 GC</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键结论</strong>：<code>System.gc()</code> <strong>不是立即执行</strong> GC。它向 VMThread 提交了一个 GC 请求，VMThread 需要在<strong>所有线程到达安全点（Safepoint）后</strong>才会执行 GC。但在多数情况下，这个等待时间非常短，通常在毫秒级别。</p>
+<hr>
+<h2 id="二、JVM-自动触发-GC-的时机"><a href="#二、JVM-自动触发-GC-的时机" class="headerlink" title="二、JVM 自动触发 GC 的时机"></a>二、JVM 自动触发 GC 的时机</h2><h3 id="2-1-年轻代-GC-触发"><a href="#2-1-年轻代-GC-触发" class="headerlink" title="2.1 年轻代 GC 触发"></a>2.1 年轻代 GC 触发</h3><table>
+<thead>
+<tr>
+<th>触发条件</th>
+<th>说明</th>
+<th>频率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Eden 区满</td>
+<td>新对象分配失败时触发</td>
+<td>高频</td>
+</tr>
+<tr>
+<td>代码主动调用 System.gc()</td>
+<td>显式触发</td>
+<td>低频</td>
+</tr>
+<tr>
+<td>分配大量大对象</td>
+<td>直接进入老年代前可能触发</td>
+<td>中频</td>
+</tr>
+</tbody></table>
+<h3 id="2-2-老年代-GC-Full-GC-触发"><a href="#2-2-老年代-GC-Full-GC-触发" class="headerlink" title="2.2 老年代 GC &#x2F; Full GC 触发"></a>2.2 老年代 GC &#x2F; Full GC 触发</h3><table>
+<thead>
+<tr>
+<th>触发条件</th>
+<th>说明</th>
+<th>GC 类型</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>老年代空间不足</td>
+<td>晋升对象放不下</td>
+<td>Full GC &#x2F; Concurrent</td>
+</tr>
+<tr>
+<td>Concurrent Mode Failure</td>
+<td>CMS 回收速度跟不上</td>
+<td>STW Full GC</td>
+</tr>
+<tr>
+<td>Promotion Failed</td>
+<td>晋升时老年代空间不够</td>
+<td>Full GC</td>
+</tr>
+<tr>
+<td>元空间（Metaspace）不足</td>
+<td>类加载过多触发</td>
+<td>Full GC</td>
+</tr>
+<tr>
+<td>Humongous Allocation（G1）</td>
+<td>大对象分配失败</td>
+<td>Full GC &#x2F; Concurrent</td>
+</tr>
+<tr>
+<td>System.gc()</td>
+<td>显式调用</td>
+<td>取决于 GC 类型</td>
+</tr>
+<tr>
+<td>GC 自适应调节</td>
+<td>Ergonomics 自动触发</td>
+<td>取决于策略</td>
+</tr>
+</tbody></table>
+<h3 id="2-3-分配失败（Allocation-Failure）"><a href="#2-3-分配失败（Allocation-Failure）" class="headerlink" title="2.3 分配失败（Allocation Failure）"></a>2.3 分配失败（Allocation Failure）</h3><p>这是最常见的 GC 触发原因：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 以 G1 为例</span></span><br><span class="line"><span class="function">HeapWord* <span class="title">G1CollectedHeap::mem_allocate</span><span class="params">(<span class="type">size_t</span> size)</span> </span>&#123;</span><br><span class="line">  <span class="keyword">if</span> (size &gt; humongous_object_threshold) &#123;</span><br><span class="line">    <span class="keyword">return</span> <span class="built_in">humongous_obj_allocate</span>(size);</span><br><span class="line">  &#125;</span><br><span class="line">  </span><br><span class="line">  <span class="comment">// 尝试在当前线程的 PLAB 分配</span></span><br><span class="line">  HeapWord* result = <span class="built_in">allocate_from_plab</span>(size);</span><br><span class="line">  <span class="keyword">if</span> (result != <span class="literal">NULL</span>) <span class="keyword">return</span> result;</span><br><span class="line">  </span><br><span class="line">  <span class="comment">// 尝试在 Regions 中分配</span></span><br><span class="line">  result = <span class="built_in">allocate_in_region</span>(size);</span><br><span class="line">  <span class="keyword">if</span> (result != <span class="literal">NULL</span>) <span class="keyword">return</span> result;</span><br><span class="line">  </span><br><span class="line">  <span class="comment">// 分配失败 → 触发 GC</span></span><br><span class="line">  <span class="keyword">return</span> <span class="built_in">attempt_allocation_at_safepoint</span>(size);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-4-GC-Ergonomics（自适应调节）"><a href="#2-4-GC-Ergonomics（自适应调节）" class="headerlink" title="2.4 GC Ergonomics（自适应调节）"></a>2.4 GC Ergonomics（自适应调节）</h3><p>JVM 会根据以下指标动态调整 GC 行为：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 目标参数</span></span><br><span class="line">-XX:GCTimeRatio=9              <span class="comment"># 期望 GC 时间占比 ≤ 10% (1/(1+9))</span></span><br><span class="line">-XX:MaxGCPauseMillis=200       <span class="comment"># 期望最大 GC 暂停时间 200ms</span></span><br><span class="line">-XX:AdaptiveSizePolicyWeight=90 <span class="comment"># 历史权重</span></span><br></pre></td></tr></table></figure>
+
+<p>当实际 GC 表现偏离目标时，JVM 会自动调整堆大小、代大小比例、晋升阈值等。</p>
+<p>迭代规则：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">如果 GC 暂停时间 &gt; MaxGCPauseMillis：</span><br><span class="line">  → 减小新生代大小（减少 Minor GC 耗时）</span><br><span class="line">如果 GC 时间占比 &gt; 目标值：</span><br><span class="line">  → 增大堆空间（降低 GC 频率）</span><br><span class="line">如果晋升失败频繁：</span><br><span class="line">  → 增大晋升阈值 TenuringThreshold</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、DisableExplicitGC-与生产实践"><a href="#三、DisableExplicitGC-与生产实践" class="headerlink" title="三、DisableExplicitGC 与生产实践"></a>三、DisableExplicitGC 与生产实践</h2><h3 id="3-1-XX-DisableExplicitGC"><a href="#3-1-XX-DisableExplicitGC" class="headerlink" title="3.1 -XX:+DisableExplicitGC"></a>3.1 -XX:+DisableExplicitGC</h3><p>这个参数让 <code>System.gc()</code> 变成<strong>空操作</strong>：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">JVM_ENTRY_NO_ENV</span>(<span class="type">void</span>, <span class="built_in">JVM_GC</span>(<span class="type">void</span>))</span><br><span class="line">  <span class="built_in">JVMWrapper</span>(<span class="string">&quot;JVM_GC&quot;</span>);</span><br><span class="line">  <span class="keyword">if</span> (!DisableExplicitGC) &#123;    <span class="comment">// ← 这里！</span></span><br><span class="line">    <span class="keyword">if</span> (!Universe::<span class="built_in">heap</span>()-&gt;<span class="built_in">is_gc_active</span>()) &#123;</span><br><span class="line">      Universe::<span class="built_in">heap</span>()-&gt;<span class="built_in">collect</span>(GCCause::_java_lang_system_gc);</span><br><span class="line">    &#125;</span><br><span class="line">  &#125;</span><br><span class="line">JVM_END</span><br></pre></td></tr></table></figure>
+
+<p><strong>生产环境几乎必配！</strong> 但有一个重要的例外——<strong>DirectBuffer 回收</strong>。</p>
+<h3 id="3-2-DirectBuffer-的回收陷阱"><a href="#3-2-DirectBuffer-的回收陷阱" class="headerlink" title="3.2 DirectBuffer 的回收陷阱"></a>3.2 DirectBuffer 的回收陷阱</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// java.nio.Bits</span></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">Bits</span> &#123;</span><br><span class="line">    <span class="keyword">static</span> <span class="type">boolean</span> <span class="title function_">tryReserveMemory</span><span class="params">(<span class="type">long</span> size)</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">totalCap</span> <span class="operator">=</span> totalCapacity.get();</span><br><span class="line">        <span class="keyword">if</span> (totalCap + size &gt; maxMemory) &#123;</span><br><span class="line">            <span class="comment">// 尝试通过 System.gc() 触发 DirectBuffer 回收</span></span><br><span class="line">            System.gc();</span><br><span class="line">            <span class="comment">// 等待 100ms</span></span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                Thread.sleep(<span class="number">100</span>);</span><br><span class="line">            &#125; <span class="keyword">catch</span> (InterruptedException x) &#123;</span><br><span class="line">                <span class="comment">// ...</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// ...</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>问题</strong>：DirectBuffer 分配时，如果容量不足，会调用 <code>System.gc()</code> 来回收不可达的 DirectBuffer。如果加了 <code>-XX:+DisableExplicitGC</code>，这段代码就失效了。</p>
+<p><strong>解决方案</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 方案一：使用 -XX:+ExplicitGCInvokesConcurrent 替代</span></span><br><span class="line">-XX:+ExplicitGCInvokesConcurrent</span><br><span class="line"></span><br><span class="line"><span class="comment"># 方案二：不显式禁用，而是用以下参数限制</span></span><br><span class="line">-XX:+ExplicitGCInvokesConcurrentAndUnloadsClasses</span><br><span class="line"></span><br><span class="line"><span class="comment"># 方案三（推荐）：设置 DirectBuffer 上限并单独监控</span></span><br><span class="line">-XX:MaxDirectMemorySize=512m</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-3-Netty-中的-DirectBuffer-管理"><a href="#3-3-Netty-中的-DirectBuffer-管理" class="headerlink" title="3.3 Netty 中的 DirectBuffer 管理"></a>3.3 Netty 中的 DirectBuffer 管理</h3><p>Netty 对 DirectBuffer 有完善的管理机制，不依赖 <code>System.gc()</code>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Netty 的 PlatformDependent</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">freeDirectBuffer</span><span class="params">(ByteBuffer buffer)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (buffer != <span class="literal">null</span> &amp;&amp; buffer.isDirect()) &#123;</span><br><span class="line">        <span class="comment">// 通过 Cleaner 直接回收</span></span><br><span class="line">        <span class="type">Cleaner</span> <span class="variable">cleaner</span> <span class="operator">=</span> ((DirectBuffer) buffer).cleaner();</span><br><span class="line">        <span class="keyword">if</span> (cleaner != <span class="literal">null</span>) &#123;</span><br><span class="line">            cleaner.clean();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>但 Netty 在分配 DirectBuffer 时，仍然会尝试 <code>System.gc()</code> 兜底：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Netty 的 ByteBufAllocator 实现</span></span><br><span class="line">ByteBuf <span class="title function_">allocateDirect</span><span class="params">(<span class="type">int</span> initialCapacity, <span class="type">int</span> maxCapacity)</span> &#123;</span><br><span class="line">    <span class="comment">// 先尝试分配</span></span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">UnpooledDirectByteBuf</span>(..., initialCapacity, maxCapacity);</span><br><span class="line">    &#125; <span class="keyword">catch</span> (OutOfMemoryError e) &#123;</span><br><span class="line">        <span class="comment">// 分配失败，尝试触发 GC 后重试</span></span><br><span class="line">        System.gc();</span><br><span class="line">        <span class="comment">// ...</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>所以如果完全禁用 <code>System.gc()</code>，Netty 在某些极端情况下可能分配失败。</p>
+<hr>
+<h2 id="四、生产环境-GC-触发调优实战"><a href="#四、生产环境-GC-触发调优实战" class="headerlink" title="四、生产环境 GC 触发调优实战"></a>四、生产环境 GC 触发调优实战</h2><h3 id="4-1-关键-JVM-参数"><a href="#4-1-关键-JVM-参数" class="headerlink" title="4.1 关键 JVM 参数"></a>4.1 关键 JVM 参数</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># GC 触发相关</span></span><br><span class="line">-XX:+DisableExplicitGC              <span class="comment"># 禁用 System.gc()</span></span><br><span class="line">-XX:+ExplicitGCInvokesConcurrent    <span class="comment"># System.gc() 使用并发模式（G1/CMS）</span></span><br><span class="line">-XX:+ExplicitGCInvokesConcurrentAndUnloadsClasses</span><br><span class="line"></span><br><span class="line"><span class="comment"># 打印 GC 日志</span></span><br><span class="line">-XX:+PrintGCDetails</span><br><span class="line">-XX:+PrintGCDateStamps</span><br><span class="line">-Xloggc:/path/to/gc.log</span><br><span class="line"></span><br><span class="line"><span class="comment"># 自适应调节</span></span><br><span class="line">-XX:+UseAdaptiveSizePolicy          <span class="comment"># 自适应大小策略（默认开启）</span></span><br><span class="line">-XX:GCTimeRatio=19                  <span class="comment"># 期望 GC ≤ 5%</span></span><br><span class="line">-XX:MaxGCPauseMillis=200            <span class="comment"># 期望最大暂停</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-常见问题排查"><a href="#4-2-常见问题排查" class="headerlink" title="4.2 常见问题排查"></a>4.2 常见问题排查</h3><p><strong>场景一：Full GC 频繁</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">[Full GC 2026-07-24T10:15:30.123+0800 </span><br><span class="line">  1209.234: [Metaspace: 520000K-&gt;510000K(1024000K)], </span><br><span class="line">  0.987 secs]</span><br></pre></td></tr></table></figure>
+
+<p>可能原因：元空间（Metaspace）不足，类加载过多。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 查看加载的类</span></span><br><span class="line">jstat -class &lt;pid&gt;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 分析类加载器泄漏</span></span><br><span class="line">jmap -clstats &lt;pid&gt; | grep -v <span class="string">&quot;sun\|java\|jdk&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>场景二：System.gc() 导致频繁 Full GC</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 查看 GC 原因</span></span><br><span class="line">jstat -gccause &lt;pid&gt; 1000</span><br><span class="line"></span><br><span class="line"><span class="comment"># 如果是 _java_lang_system_gc 导致</span></span><br><span class="line"><span class="comment"># → 排查代码中是否有 System.gc()</span></span><br><span class="line"><span class="comment"># → 排查是否使用了 NIO DirectBuffer</span></span><br><span class="line"><span class="comment"># → 加上 DisableExplicitGC 或 ExplicitGCInvokesConcurrent</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>场景三：GC 自适应导致的不稳定</strong></p>
+<p>观察日志中的 <code> Ergonomics</code> 关键字：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">[GC ergonomics (G1 Young pause time) </span><br><span class="line">  predicted: 201.00ms, target: 200.00ms]</span><br></pre></td></tr></table></figure>
+
+<p>JVM 在频繁调整堆大小，说明初始参数设置不合理。</p>
+<hr>
+<h2 id="五、面试高频追问"><a href="#五、面试高频追问" class="headerlink" title="五、面试高频追问"></a>五、面试高频追问</h2><h3 id="Q1：System-gc-一定会触发-Full-GC-吗？"><a href="#Q1：System-gc-一定会触发-Full-GC-吗？" class="headerlink" title="Q1：System.gc() 一定会触发 Full GC 吗？"></a>Q1：System.gc() 一定会触发 Full GC 吗？</h3><p><strong>不一定。</strong> 取决于 GC 实现器和 JVM 参数：</p>
+<ul>
+<li>G1 默认执行<strong>并发标记周期</strong>（非 STW Full GC）</li>
+<li>CMS 默认执行 <strong>STW Full GC</strong>（除非 <code>ExplicitGCInvokesConcurrent</code>）</li>
+<li>ZGC&#x2F;Shenandoah 也是<strong>并发执行</strong></li>
+<li>如果 <code>-XX:+DisableExplicitGC</code> 则什么都不做</li>
+</ul>
+<h3 id="Q2：为什么-Netty-NIO-建议保留-System-gc-？"><a href="#Q2：为什么-Netty-NIO-建议保留-System-gc-？" class="headerlink" title="Q2：为什么 Netty &#x2F; NIO 建议保留 System.gc()？"></a>Q2：为什么 Netty &#x2F; NIO 建议保留 System.gc()？</h3><p>因为 DirectBuffer 的 <code>Cleaner</code> 回收依赖 JVM 的 Reference Handler 线程，但该线程优先级较低，回收不及时。<code>System.gc()</code> 作为一种<strong>兜底机制</strong>，强制触发引用处理。</p>
+<h3 id="Q3：-XX-DisableExplicitGC-的利与弊？"><a href="#Q3：-XX-DisableExplicitGC-的利与弊？" class="headerlink" title="Q3：-XX:+DisableExplicitGC 的利与弊？"></a>Q3：-XX:+DisableExplicitGC 的利与弊？</h3><table>
+<thead>
+<tr>
+<th>利</th>
+<th>弊</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>防止第三方库盲目调用 <code>System.gc()</code></td>
+<td>DirectBuffer 可能回收不及时</td>
+</tr>
+<tr>
+<td>减少不必要的 Full GC</td>
+<td>Netty 分配 DirectBuffer 可能失败</td>
+</tr>
+<tr>
+<td>提升服务稳定性</td>
+<td>需要额外监控 DirectBuffer 使用</td>
+</tr>
+</tbody></table>
+<h3 id="Q4：如何监控并预防-Full-GC？"><a href="#Q4：如何监控并预防-Full-GC？" class="headerlink" title="Q4：如何监控并预防 Full GC？"></a>Q4：如何监控并预防 Full GC？</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 开启 GC 日志</span></span><br><span class="line">-verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:/tmp/gc.log</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. 使用 JMX 监控</span></span><br><span class="line">jstat -gcutil &lt;pid&gt; 1000</span><br><span class="line"><span class="comment"># S0  S1  E   O   M   CCS  YGC  YGCT  FGC  FGCT</span></span><br><span class="line"><span class="comment"># 0.00 0.00 45.2 68.5 92.3 85.2 12   0.234 3    1.245</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. 告警条件</span></span><br><span class="line"><span class="comment"># - Full GC 频率 &gt; 1次/小时</span></span><br><span class="line"><span class="comment"># - Full GC 耗时 &gt; 2秒</span></span><br><span class="line"><span class="comment"># - GC 时间占比 &gt; 10%</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、总结"><a href="#六、总结" class="headerlink" title="六、总结"></a>六、总结</h2><table>
+<thead>
+<tr>
+<th>知识点</th>
+<th>关键结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>System.gc() 执行时机</td>
+<td>提交 GC Operation 到 VMThread，在安全点执行</td>
+</tr>
+<tr>
+<td>是否立即执行</td>
+<td>否，需等待安全点（通常很快）</td>
+</tr>
+<tr>
+<td>是否触发 Full GC</td>
+<td>取决于 GC 实现器和参数</td>
+</tr>
+<tr>
+<td>DisableExplicitGC</td>
+<td>生产环境建议开启，但要注意 DirectBuffer 影响</td>
+</tr>
+<tr>
+<td>自动 GC 触发</td>
+<td>Allocation Failure &gt; 自适应 &gt; 元空间不足</td>
+</tr>
+<tr>
+<td>最佳实践</td>
+<td>使用 ExplicitGCInvokesConcurrent 替代完全禁用</td>
+</tr>
+</tbody></table>
+<p>如果你在面试中遇到「System.gc()」相关的问题，能把上面这些底层机制讲清楚，就足以展现对 JVM 的深入理解了。而在生产环境中，正确处理显式 GC 调用、合理配置 GC 参数，是保障服务稳定运行的关键一环。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/">https://jiweidong.github.io/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/GC/">GC</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战前言Redis 作为内存数据库，其所有数据都存储在内存中。当写入速度超过内存容量时，Redis 必须决定应该删除哪些数据——这就是内存淘汰策略（Eviction Policy）。选错淘汰策略可能导致缓存命中率断崖式下跌、大量请求穿透到数据库，甚至引发雪崩。 很多开发者只知道 allkeys-lru 或 volatile-ttl 这些名字，但面试官一旦追问”Redis 的近似 LRU 和标准 LRU 有什么区别？””LFU 的 counter 是如何衰减的？”，就容易答不上来。 本文将对 Redis 的 8 种淘汰策略进行深度解析，从源码层面揭秘近 LRU&#x2F;LFU 的实现，并通过实战案例帮你做出最佳选择。  一、Redis 内存淘汰机制总览1.1 触发条件当以下条件满足时，Redis 会触发内存淘汰： 12345# 设置最大内存（默认不限制）maxmemory 4gb# 达到 maxmemory 后，Redis 会尝试淘汰数据# 如果无法释放足够内存，写入操作会返回 OOM 错...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-false-sharing-cache-line-padding/" title="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析前言在高并发场景下，很多开发者会下意识地关注锁竞争、线程上下文切换等显性性能瓶颈，却忽略了一个「看不见的杀手」——伪共享（False Sharing）。这个问题隐藏在 CPU 缓存体系之中，即使你的代码没有使用任何锁，多个线程操作看似独立的数据，也可能因为共享同一个缓存行而导致性能断崖式下跌。 本文将深入剖析伪共享的原理、检测手段与解决方案，帮助你在高并发场景中写出真正高性能的代码。  一、从 CPU 缓存体系说起1.1 缓存层级结构现代 CPU 的运算速度远超内存访问速度，为了弥合这个差距，CPU 引入了多级缓存： 123456789101112131415CPU Core 0          CPU Core 1┌─────────┐        ┌─────────┐│  L1/L2  │        │  L1/L2  ││  私有   │        │  私有   │└────┬────┘        └────┬────┘     │               ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/28/java-gc-g1-zgc-shenandoah-deep-dive/" title="「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践</div></div><div class="info-2"><div class="info-item-1">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践从 Serial 到 ZGC，Java 垃圾收集器已经发展了近三十年。面对低延迟还是高吞吐的抉择，我们常常陷入选择困难。本文系统梳理 G1、ZGC 和 Shenandoah 三大主流收集器的核心原理、关键参数和调优实践。  一、GC 发展的演进路线123456789101112Serial (单线程, STW)  │  ├── ParNew (多线程年轻代)  │     └── Parallel Scavenge (吞吐量优先)  │  ├── Parallel Old (老年代并行)  │  └── CMS (并发低延迟) ──→ G1 (分区化, 可预测停顿)                                  │                                  ├── ZGC (超低延迟, 不分区)                                  │                                  └── Shenan...</div></div></div></a><a class="pagination-related" href="/2026/06/30/java-memory-leak-investigation-guide/" title="Java 内存泄漏排查全攻略：从堆转储到 MAT 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战</div></div><div class="info-2"><div class="info-item-1">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战一、内存泄漏 vs 内存溢出先理清两个概念：    概念 定义 表现    内存泄漏（Memory Leak） 无用对象持续被引用，GC 无法回收 占用逐渐增加，最终 OOM   内存溢出（OOM） 对象需要内存但堆空间不足 直接抛出 OutOfMemoryError   泄漏是溢出的原因之一，但不是唯一原因（也可能是对象过多、堆太小等）。 二、Java 内存泄漏的典型模式2.1 静态集合类最常见的内存泄漏——static 集合的生命周期 &#x3D; 应用生命周期： 12345678public class CacheManager &#123;    // ❌ 静态 HashMap 永远不会被回收    private static Map&lt;String, Object&gt; cache = new HashMap&lt;&gt;();        public static void addData(String key, Object data) &#123;        cache.put(key, da...</div></div></div></a><a class="pagination-related" href="/2026/06/11/jvm-memory-gc/" title="JVM 内存模型与垃圾回收机制全面解读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">JVM 内存模型与垃圾回收机制全面解读</div></div><div class="info-2"><div class="info-item-1">前言JVM 是 Java 跨平台的基石，也是面试中的”必考题”。理解 JVM 内存模型和 GC 机制，不仅能帮你通过面试，更是解决线上 OOM、CPU 飙升、GC 频繁等问题的必备技能。  一、JVM 内存区域划分1.1 整体架构12345678910111213┌─────────────────────────────────────────────────┐│               JVM 内存结构                        ││  ┌───────────────────┐  ┌─────────────────────┐  ││  │    堆 (Heap)      │  │    元空间 (MetaSpace) │  ││  │  - 新生代          │  │  - 类元信息          │  ││  │    · Eden          │  │  - 运行时常量池      │  ││  │    · S0 / S1       │  │                     │  ││  │  - 老年代    ...</div></div></div></a><a class="pagination-related" href="/2026/06/15/java-performance-tuning/" title="Java 性能调优实战：从 JVM 到代码优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-15</div><div class="info-item-2">Java 性能调优实战：从 JVM 到代码优化</div></div><div class="info-2"><div class="info-item-1">Java 性能调优实战：从 JVM 到代码优化 性能调优是后端工程师的核心技能。本文从 JVM 内存调优、GC 优化、代码微优化、工具使用四个维度，系统梳理 Java 性能调优的方法论和实战技巧。  一、性能调优方法论1.1 调优原则12345调优 ≠ 炫技，请遵循以下原则：1. 先测量，后优化（没有数据就没有真相）2. 避免过早优化（大部分瓶颈不在你想象的地方）3. 从全局出发（不要为了局部性能牺牲整体）4. 以业务指标为准（TP99、吞吐量、可用性）  1.2 性能指标   指标 含义 黄金法则    TP99 99% 的请求在 Xms 内完成 互联网服务 &lt; 200ms   TP999 99.9% 的请求在 Xms 内完成 &lt; 1s   QPS&#x2F;TPS 每秒查询&#x2F;事务数 越高越好   GC 暂停 垃圾回收导致的停顿 单次 &lt; 50ms   内存占用 堆内存使用量 不频繁 Full GC   CPU 使用率 CPU 繁忙程度 平均 &lt; 80%   IO 等待 磁盘&#x2F;网络 IO 等待时间 越低越好   二、JVM 内存调优2...</div></div></div></a><a class="pagination-related" href="/2026/06/17/jvm-production-tuning-practice/" title="JVM 生产环境性能调优实战：案例、工具与参数精讲"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">JVM 生产环境性能调优实战：案例、工具与参数精讲</div></div><div class="info-2"><div class="info-item-1">JVM 生产环境性能调优实战：案例、工具与参数精讲一、JVM 调优的本质JVM 调优的核心目标不是”把 GC 延迟降到 0”——这是不可能的。真正的目标是在可用资源范围内，找到 GC 频率、GC 停顿时间和吞吐量之间的最优平衡。 1.1 调优三角12345678910111213      吞吐量      ▲     /|\    / | \   /  |  \  /   |   \ /    |    \────────────► 低延迟      \       \        \         ▼       内存占用  三种指标互斥：不能既要吞吐高、又要延迟低、还要内存省。    场景 优先级排序 调优方向    在线交易系统 延迟 &gt; 吞吐 &gt; 内存 G1 &#x2F; ZGC，减少 STW   批处理系统 吞吐 &gt; 内存 &gt; 延迟 Parallel GC，拉大堆内存   流式计算 吞吐 &gt; 延迟 &gt; 内存 G1 &#x2F; Parallel，调优新生代   微服务（边缘） 内存 &gt; 延迟 &gt; 吞吐 减小堆内存，Z...</div></div></div></a><a class="pagination-related" href="/2026/07/22/java-vector-api-simd-deep-dive/" title="【Java 进阶】Java Vector API 深度解析：SIMD 向量化计算原理与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-22</div><div class="info-item-2">【Java 进阶】Java Vector API 深度解析：SIMD 向量化计算原理与实战</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java Vector API 深度解析：SIMD 向量化计算原理与实战一、从一道性能题说起假设我们需要计算两个数组的点积（Dot Product）： 12345678// 朴素实现float dotProduct(float[] a, float[] b) &#123;    float sum = 0;    for (int i = 0; i &lt; a.length; i++) &#123;        sum += a[i] * b[i];  // 每次循环只处理一个元素    &#125;    return sum;&#125;  这段代码每次循环只处理一个浮点数乘法。而现代 CPU 的 SIMD（Single Instruction, Multiple Data）指令集——如 AVX-512——一条指令就能同时处理 16 个 float！如果我们能用上这个能力，理论上能获得 16 倍的加速。 这就是 Java Vector API（JEP 426，孵化器 → 预览 → 正式）要做的事情。 二、SIMD 与向量计算基础2.1 什么是 SIMD？...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">335</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">548</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">119</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%AE%9E%E6%88%98%E3%80%91System-gc-%E4%B8%8E-GC-%E8%A7%A6%E5%8F%91%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E6%98%BE%E5%BC%8F%E8%B0%83%E7%94%A8%E5%88%B0%E8%87%AA%E9%80%82%E5%BA%94%E8%B0%83%E8%8A%82"><span class="toc-number">1.</span> <span class="toc-text">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81System-gc-%E8%B0%83%E7%94%A8%E9%93%BE%E5%85%A8%E8%A7%A3%E6%9E%90"><span class="toc-number">1.2.</span> <span class="toc-text">一、System.gc() 调用链全解析</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E4%BB%8E-Java-%E4%BB%A3%E7%A0%81%E5%88%B0-JVM-%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 从 Java 代码到 JVM 实现</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E4%B8%8D%E5%90%8C-GC-%E5%AE%9E%E7%8E%B0%E5%99%A8%E7%9A%84%E5%A4%84%E7%90%86"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 不同 GC 实现器的处理</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#G1-GC"><span class="toc-number">1.2.2.1.</span> <span class="toc-text">G1 GC</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#CMS-GC"><span class="toc-number">1.2.2.2.</span> <span class="toc-text">CMS GC</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#ZGC-Shenandoah"><span class="toc-number">1.2.2.3.</span> <span class="toc-text">ZGC &#x2F; Shenandoah</span></a></li></ol></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E6%98%AF%E5%90%A6%E7%AB%8B%E5%8D%B3%E6%89%A7%E8%A1%8C%EF%BC%9F"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 是否立即执行？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81JVM-%E8%87%AA%E5%8A%A8%E8%A7%A6%E5%8F%91-GC-%E7%9A%84%E6%97%B6%E6%9C%BA"><span class="toc-number">1.3.</span> <span class="toc-text">二、JVM 自动触发 GC 的时机</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%B9%B4%E8%BD%BB%E4%BB%A3-GC-%E8%A7%A6%E5%8F%91"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 年轻代 GC 触发</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E8%80%81%E5%B9%B4%E4%BB%A3-GC-Full-GC-%E8%A7%A6%E5%8F%91"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 老年代 GC &#x2F; Full GC 触发</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%88%86%E9%85%8D%E5%A4%B1%E8%B4%A5%EF%BC%88Allocation-Failure%EF%BC%89"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 分配失败（Allocation Failure）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-GC-Ergonomics%EF%BC%88%E8%87%AA%E9%80%82%E5%BA%94%E8%B0%83%E8%8A%82%EF%BC%89"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 GC Ergonomics（自适应调节）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81DisableExplicitGC-%E4%B8%8E%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5"><span class="toc-number">1.4.</span> <span class="toc-text">三、DisableExplicitGC 与生产实践</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-XX-DisableExplicitGC"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 -XX:+DisableExplicitGC</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-DirectBuffer-%E7%9A%84%E5%9B%9E%E6%94%B6%E9%99%B7%E9%98%B1"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 DirectBuffer 的回收陷阱</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-Netty-%E4%B8%AD%E7%9A%84-DirectBuffer-%E7%AE%A1%E7%90%86"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 Netty 中的 DirectBuffer 管理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E7%94%9F%E4%BA%A7%E7%8E%AF%E5%A2%83-GC-%E8%A7%A6%E5%8F%91%E8%B0%83%E4%BC%98%E5%AE%9E%E6%88%98"><span class="toc-number">1.5.</span> <span class="toc-text">四、生产环境 GC 触发调优实战</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%85%B3%E9%94%AE-JVM-%E5%8F%82%E6%95%B0"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 关键 JVM 参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98%E6%8E%92%E6%9F%A5"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 常见问题排查</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.6.</span> <span class="toc-text">五、面试高频追问</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#Q1%EF%BC%9ASystem-gc-%E4%B8%80%E5%AE%9A%E4%BC%9A%E8%A7%A6%E5%8F%91-Full-GC-%E5%90%97%EF%BC%9F"><span class="toc-number">1.6.1.</span> <span class="toc-text">Q1：System.gc() 一定会触发 Full GC 吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q2%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88-Netty-NIO-%E5%BB%BA%E8%AE%AE%E4%BF%9D%E7%95%99-System-gc-%EF%BC%9F"><span class="toc-number">1.6.2.</span> <span class="toc-text">Q2：为什么 Netty &#x2F; NIO 建议保留 System.gc()？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q3%EF%BC%9A-XX-DisableExplicitGC-%E7%9A%84%E5%88%A9%E4%B8%8E%E5%BC%8A%EF%BC%9F"><span class="toc-number">1.6.3.</span> <span class="toc-text">Q3：-XX:+DisableExplicitGC 的利与弊？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q4%EF%BC%9A%E5%A6%82%E4%BD%95%E7%9B%91%E6%8E%A7%E5%B9%B6%E9%A2%84%E9%98%B2-Full-GC%EF%BC%9F"><span class="toc-number">1.6.4.</span> <span class="toc-text">Q4：如何监控并预防 Full GC？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.7.</span> <span class="toc-text">六、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/java-application-architecture-evolution-guide/" title="【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃">【系统设计】Java 应用架构演进之路：从单体架构到云原生的四次飞跃</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/java-false-sharing-cache-line-padding/" title="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/24/spring-cloud-gateway-oauth2-resource-server-practice/" title="【Spring Cloud 实战】Spring Cloud Gateway 集成 OAuth2 资源服务器实战">【Spring Cloud 实战】Spring Cloud Gateway 集成 OAuth2 资源服务器实战</a><time datetime="2026-07-24T00:00:00.000Z" title="发表于 2026-07-24 08:00:00">2026-07-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.0"></script><script src="/js/main.js?v=5.6.0"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
