@@ -6,8 +6,6 @@ tags:
   - 注解
   - SPI
   - 元注解
-  - @Inherited
-  - ServiceLoader
 categories: Java基础
 author: 东哥
 ---
