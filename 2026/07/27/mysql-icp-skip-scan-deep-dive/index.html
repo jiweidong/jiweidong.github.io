@@ -1,0 +1,416 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战前言在日常 SQL 优化中，索引下推（Index Condition Pushdown，简称 ICP）和索引跳跃扫描（Index Skip Scan）是 MySQL 5.6 &#x2F; 8.0 引入的两大重要优化特性。很多开发者知道它们的名字，但对其底层原理、适用场景和限制条件却一知半解。 本文将从执行">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/07/27/mysql-icp-skip-scan-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战前言在日常 SQL 优化中，索引下推（Index Condition Pushdown，简称 ICP）和索引跳跃扫描（Index Skip Scan）是 MySQL 5.6 &#x2F; 8.0 引入的两大重要优化特性。很多开发者知道它们的名字，但对其底层原理、适用场景和限制条件却一知半解。 本文将从执行">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-07-27T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-07-27T00:25:03.736Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="ICP">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="Skip Scan">
+<meta property="article:tag" content="索引优化">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战",
+  "url": "https://jiweidong.github.io/2026/07/27/mysql-icp-skip-scan-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-07-27T00:00:00.000Z",
+  "dateModified": "2026-07-27T00:25:03.736Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/07/27/mysql-icp-skip-scan-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">352</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">580</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">120</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-07-27T00:00:00.000Z" title="发表于 2026-07-27 08:00:00">2026-07-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-07-27T00:25:03.736Z" title="更新于 2026-07-27 08:25:03">2026-07-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/%E6%95%B0%E6%8D%AE%E5%BA%93%E4%BC%98%E5%8C%96/">数据库优化</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip-Scan）深度解析：从原理到实战"><a href="#【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip-Scan）深度解析：从原理到实战" class="headerlink" title="【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战"></a>【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>在日常 SQL 优化中，索引下推（Index Condition Pushdown，简称 ICP）和索引跳跃扫描（Index Skip Scan）是 MySQL 5.6 &#x2F; 8.0 引入的两大重要优化特性。很多开发者知道它们的名字，但对其底层原理、适用场景和限制条件却一知半解。</p>
+<p>本文将从<strong>执行计划分析 → 源码级原理 → 实战案例</strong>三个维度，彻底搞懂这两个优化特性。</p>
+<hr>
+<h2 id="一、索引下推（ICP）"><a href="#一、索引下推（ICP）" class="headerlink" title="一、索引下推（ICP）"></a>一、索引下推（ICP）</h2><h3 id="1-1-什么是索引下推？"><a href="#1-1-什么是索引下推？" class="headerlink" title="1.1 什么是索引下推？"></a>1.1 什么是索引下推？</h3><p>在没有 ICP 之前，MySQL 在使用<strong>二级索引</strong>进行查询时，存储引擎层（InnoDB）只根据索引列条件来定位记录，然后将完整行记录返回到 Server 层，Server 层再对剩余的 WHERE 条件进行过滤。</p>
+<p>有了 ICP 之后，MySQL 将部分 WHERE 条件下推到<strong>存储引擎层</strong>，在读取索引记录时就直接进行条件过滤，减少了回表次数和数据传输量。</p>
+
+
+<h3 id="1-2-ICP-的适用条件"><a href="#1-2-ICP-的适用条件" class="headerlink" title="1.2 ICP 的适用条件"></a>1.2 ICP 的适用条件</h3><table>
+<thead>
+<tr>
+<th>条件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>存储引擎</td>
+<td>InnoDB 和 MyISAM 支持（主要是 InnoDB）</td>
+</tr>
+<tr>
+<td>索引类型</td>
+<td><strong>二级索引</strong>（辅助索引），<strong>聚簇索引无效</strong></td>
+</tr>
+<tr>
+<td>WHERE 条件</td>
+<td>必须能部分用索引过滤，部分不能</td>
+</tr>
+<tr>
+<td>查询类型</td>
+<td>range、ref、eq_ref、ref_or_null 等</td>
+</tr>
+<tr>
+<td>不支持情况</td>
+<td>子查询条件、非 INNODB 表、全文索引</td>
+</tr>
+<tr>
+<td>MySQL版本</td>
+<td>&gt;&#x3D; 5.6</td>
+</tr>
+</tbody></table>
+<h3 id="1-3-深入原理：ICP-是如何实现的？"><a href="#1-3-深入原理：ICP-是如何实现的？" class="headerlink" title="1.3 深入原理：ICP 是如何实现的？"></a>1.3 深入原理：ICP 是如何实现的？</h3><p>假设有如下表和索引：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE TABLE</span> `employees` (</span><br><span class="line">  `id` <span class="type">int</span> <span class="keyword">NOT NULL</span> AUTO_INCREMENT,</span><br><span class="line">  `name` <span class="type">varchar</span>(<span class="number">50</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `age` <span class="type">int</span> <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `dept` <span class="type">varchar</span>(<span class="number">20</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `salary` <span class="type">decimal</span>(<span class="number">10</span>,<span class="number">2</span>) <span class="keyword">DEFAULT</span> <span class="keyword">NULL</span>,</span><br><span class="line">  <span class="keyword">PRIMARY KEY</span> (`id`),</span><br><span class="line">  KEY `idx_name_age` (`name`, `age`)</span><br><span class="line">) ENGINE<span class="operator">=</span>InnoDB;</span><br></pre></td></tr></table></figure>
+
+<p>执行查询：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> employees </span><br><span class="line"><span class="keyword">WHERE</span> name <span class="keyword">LIKE</span> <span class="string">&#x27;张%&#x27;</span> <span class="keyword">AND</span> age <span class="operator">&gt;</span> <span class="number">30</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>无 ICP 的执行流程（MySQL 5.5）：</strong></p>
+<ol>
+<li>存储引擎使用 idx_name_age 索引找到 name LIKE ‘张%’ 的记录</li>
+<li><strong>回表</strong>获取完整行数据</li>
+<li>返回 Server 层</li>
+<li>Server 层对 age &gt; 30 进行过滤</li>
+<li>将满足条件的行返回客户端</li>
+</ol>
+<p><strong>有 ICP 的执行流程（MySQL 5.6+）：</strong></p>
+<ol>
+<li>存储引擎使用 idx_name_age 索引找到 name LIKE ‘张%’ 的记录</li>
+<li>直接在索引层面判断 age &gt; 30（<strong>索引已包含 age 列</strong>）</li>
+<li>只对满足 age &gt; 30 的记录进行回表</li>
+<li>回表后直接返回 Server 层，不再额外过滤</li>
+</ol>
+<p><strong>关键差异</strong>：ICP 将过滤从 Server 层下推到存储引擎层，在索引数据上直接做过滤，<strong>减少回表次数</strong>。</p>
+<h3 id="1-4-ICP-源码层面的实现机制"><a href="#1-4-ICP-源码层面的实现机制" class="headerlink" title="1.4 ICP 源码层面的实现机制"></a>1.4 ICP 源码层面的实现机制</h3><p>在 MySQL 源码中（sql&#x2F;ha_innodb.cc），ICP 通过 <code>row_search_mvcc()</code> 函数实现：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">row_search_mvcc():</span><br><span class="line">  → 遍历 B+ 树索引页</span><br><span class="line">  → 对于每条索引记录，调用 idx_cond_check() </span><br><span class="line">  → 如果索引条件不满足，直接跳过（无需回表）</span><br><span class="line">  → 只有满足条件的记录才进入回表流程</span><br></pre></td></tr></table></figure>
+
+<p>关键接口是 <code>set_hp_key_equal_filters()</code> 和 <code>push_cond_to_handler()</code>，Server 层将 WHERE 条件下推到 handler 层。</p>
+<h3 id="1-5-ICP-实战案例分析"><a href="#1-5-ICP-实战案例分析" class="headerlink" title="1.5 ICP 实战案例分析"></a>1.5 ICP 实战案例分析</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- ICP 适用场景（使用二级索引且部分条件无法用索引覆盖）</span></span><br><span class="line">EXPLAIN <span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> employees </span><br><span class="line"><span class="keyword">WHERE</span> name <span class="keyword">LIKE</span> <span class="string">&#x27;张%&#x27;</span> <span class="keyword">AND</span> age <span class="operator">&gt;</span> <span class="number">30</span> <span class="keyword">AND</span> salary <span class="operator">&gt;</span> <span class="number">10000</span>;</span><br></pre></td></tr></table></figure>
+
+<p>查看执行计划：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">id | select_type | table     | type | key          | Extra</span><br><span class="line">1  | SIMPLE      | employees | ref  | idx_name_age | Using index condition</span><br></pre></td></tr></table></figure>
+
+<p><code>Using index condition</code> 就表示使用了 ICP。</p>
+<p>再看一个<strong>不适用</strong>的例子：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 主键查询不会触发 ICP（因为主键就是聚簇索引，不需要回表）</span></span><br><span class="line">EXPLAIN <span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> employees <span class="keyword">WHERE</span> id <span class="operator">&gt;</span> <span class="number">100</span> <span class="keyword">AND</span> age <span class="operator">&gt;</span> <span class="number">30</span>;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">id | select_type | table     | type | key  | Extra</span><br><span class="line">1  | SIMPLE      | employees | range| PRIMARY | Using where</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-6-如何关闭-ICP？"><a href="#1-6-如何关闭-ICP？" class="headerlink" title="1.6 如何关闭 ICP？"></a>1.6 如何关闭 ICP？</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 会话级别关闭</span></span><br><span class="line"><span class="keyword">SET</span> optimizer_switch <span class="operator">=</span> <span class="string">&#x27;index_condition_pushdown=off&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 查询当前状态</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;optimizer_switch&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、索引跳跃扫描（Index-Skip-Scan）"><a href="#二、索引跳跃扫描（Index-Skip-Scan）" class="headerlink" title="二、索引跳跃扫描（Index Skip Scan）"></a>二、索引跳跃扫描（Index Skip Scan）</h2><h3 id="2-1-什么是-Skip-Scan？"><a href="#2-1-什么是-Skip-Scan？" class="headerlink" title="2.1 什么是 Skip Scan？"></a>2.1 什么是 Skip Scan？</h3><p>Skip Scan 是 MySQL 8.0.13 引入的优化特性。它允许 MySQL 在<strong>复合索引的非最左前缀列</strong>上进行范围扫描，而不需要 WHERE 条件必须包含索引的最左列。</p>
+<p>传统认知中，复合索引<code>(a, b, c)</code>遵循<strong>最左前缀原则</strong>——如果 WHERE 条件没有用到 a，则无法使用该索引。Skip Scan 改变了这一点。</p>
+<h3 id="2-2-Skip-Scan-的底层原理"><a href="#2-2-Skip-Scan-的底层原理" class="headerlink" title="2.2 Skip Scan 的底层原理"></a>2.2 Skip Scan 的底层原理</h3><p>Skip Scan 的核心思想是：<strong>将复合索引的前缀列的所有不重复值枚举出来，然后对每个值执行一次 range 扫描</strong>。</p>
+<p>以索引 <code>(a, b)</code> 为例，执行 <code>WHERE b &gt; 10</code>：</p>
+<ol>
+<li><strong>获取 distinct a 值</strong>：扫描索引，找出 a 列的所有不重复值（如 a&#x3D;1, a&#x3D;2, a&#x3D;3）</li>
+<li><strong>对每个 a 值进行 range 扫描</strong>：分别执行 <code>WHERE a=1 AND b&gt;10</code>、<code>WHERE a=2 AND b&gt;10</code>、<code>WHERE a=3 AND b&gt;10</code></li>
+<li><strong>合并结果</strong>：将各次扫描结果合并返回</li>
+</ol>
+<h3 id="2-3-Skip-Scan-的工作流程"><a href="#2-3-Skip-Scan-的工作流程" class="headerlink" title="2.3 Skip Scan 的工作流程"></a>2.3 Skip Scan 的工作流程</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE TABLE</span> `orders` (</span><br><span class="line">  `id` <span class="type">int</span> <span class="keyword">NOT NULL</span> AUTO_INCREMENT,</span><br><span class="line">  `user_id` <span class="type">int</span> <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `status` tinyint <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `create_time` datetime <span class="keyword">NOT NULL</span>,</span><br><span class="line">  <span class="keyword">PRIMARY KEY</span> (`id`),</span><br><span class="line">  KEY `idx_user_status` (`user_id`, `status`, `create_time`)</span><br><span class="line">) ENGINE<span class="operator">=</span>InnoDB;</span><br></pre></td></tr></table></figure>
+
+<p>执行查询：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders </span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> create_time <span class="operator">&gt;</span> <span class="string">&#x27;2026-01-01&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>传统上，缺少 <code>user_id</code> 条件无法使用 <code>idx_user_status</code> 索引，只能全表扫描。但有了 Skip Scan：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">id | select_type | table  | type  | key              | Extra</span><br><span class="line">1  | SIMPLE      | orders | range | idx_user_status  | Using index for skip scan</span><br></pre></td></tr></table></figure>
+
+<p><code>Using index for skip scan</code> 就是 Skip Scan 的标志。</p>
+<h3 id="2-4-Skip-Scan-的执行计划分析"><a href="#2-4-Skip-Scan-的执行计划分析" class="headerlink" title="2.4 Skip Scan 的执行计划分析"></a>2.4 Skip Scan 的执行计划分析</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 查看 Skip Scan 的执行计划细节</span></span><br><span class="line">EXPLAIN FORMAT<span class="operator">=</span>TREE</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders </span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> create_time <span class="operator">&gt;</span> <span class="string">&#x27;2026-01-01&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>输出示例：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">-&gt; Filter: ((orders.status = 1) and (orders.create_time &gt; TIMESTAMP&#x27;2026-01-01 00:00:00&#x27;))  (cost=12.35 rows=68)</span><br><span class="line">    -&gt; Index skip scan on orders using idx_user_status, with index condition: ((orders.status = 1) and (orders.create_time &gt; TIMESTAMP&#x27;2026-01-01 00:00:00&#x27;))  (cost=12.35 rows=68)</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-5-Skip-Scan-与全表扫描的性能对比"><a href="#2-5-Skip-Scan-与全表扫描的性能对比" class="headerlink" title="2.5 Skip Scan 与全表扫描的性能对比"></a>2.5 Skip Scan 与全表扫描的性能对比</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>全表扫描</th>
+<th>Skip Scan</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>数据量 100 万，user_id 分布均匀（1000个不同值）</td>
+<td>扫描 100 万行</td>
+<td>扫描 1000 × (每个user_id下约5条) &#x3D; 5000 行</td>
+</tr>
+<tr>
+<td>需要回表？</td>
+<td>不涉及索引</td>
+<td>需要针对每个匹配行回表</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>小表</td>
+<td>大表 + 前缀列基数不高</td>
+</tr>
+</tbody></table>
+<p><strong>核心要点</strong>：Skip Scan 适合<strong>前缀列（user_id）的基数（distinct 值）不太大</strong>的场景。如果 user_id 有 10 万个不同值，那就要做 10 万次 range 扫描，反而比全表扫描更慢。</p>
+<h3 id="2-6-Skip-Scan-的限制条件"><a href="#2-6-Skip-Scan-的限制条件" class="headerlink" title="2.6 Skip Scan 的限制条件"></a>2.6 Skip Scan 的限制条件</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- ❌ 不支持：查询条件无法形成完整的 range 扫描</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="keyword">IN</span> (<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>);  <span class="comment">-- 可能不会触发</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- ❌ 不支持：前缀列使用了范围条件</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> user_id <span class="operator">&gt;</span> <span class="number">100</span> <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span>; <span class="comment">-- 前缀列已经是范围</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- ❌ 不支持：表太小，优化器认为全表扫描更优</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- ❌ 不支持：前缀列是唯一索引的一部分</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>官方文档</strong>中 Skip Scan 的要求：</p>
+<ol>
+<li>表必须至少有一个<strong>复合索引</strong></li>
+<li>查询条件中<strong>不能</strong>包含索引的最左前缀列</li>
+<li>查询必须能分解成多次范围扫描</li>
+<li>聚合函数 <code>MIN()</code> &#x2F; <code>MAX()</code> 也可触发 Skip Scan</li>
+</ol>
+<h3 id="2-7-Skip-Scan-实战：何时该用何时不该用"><a href="#2-7-Skip-Scan-实战：何时该用何时不该用" class="headerlink" title="2.7 Skip Scan 实战：何时该用何时不该用"></a>2.7 Skip Scan 实战：何时该用何时不该用</h3><p><strong>✅ 推荐使用：</strong></p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- user_id 只有几十个不同值，但表有几百万行</span></span><br><span class="line"><span class="comment">-- 直接全表扫描太慢，Skip Scan 效果显著</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders </span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">2</span> <span class="keyword">AND</span> create_time <span class="keyword">BETWEEN</span> <span class="string">&#x27;2026-06-01&#x27;</span> <span class="keyword">AND</span> <span class="string">&#x27;2026-06-30&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>❌ 不推荐：</strong></p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- user_id 有百万个不同值（几乎唯一），Skip Scan 要做百万次 range 扫描</span></span><br><span class="line"><span class="comment">-- 此时加一个 (status, create_time) 的联合索引更好</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders </span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> create_time <span class="operator">&gt;</span> <span class="string">&#x27;2026-01-01&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-8-如何控制-Skip-Scan？"><a href="#2-8-如何控制-Skip-Scan？" class="headerlink" title="2.8 如何控制 Skip Scan？"></a>2.8 如何控制 Skip Scan？</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 关闭 Skip Scan</span></span><br><span class="line"><span class="keyword">SET</span> optimizer_switch <span class="operator">=</span> <span class="string">&#x27;skip_scan=off&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 强制使用索引（可避免优化器选择 Skip Scan）</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders FORCE INDEX (idx_user_status)</span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> create_time <span class="operator">&gt;</span> <span class="string">&#x27;2026-01-01&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 忽略索引（强制全表扫描）</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders IGNORE INDEX (idx_user_status)</span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> create_time <span class="operator">&gt;</span> <span class="string">&#x27;2026-01-01&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、ICP-与-Skip-Scan-对比总结"><a href="#三、ICP-与-Skip-Scan-对比总结" class="headerlink" title="三、ICP 与 Skip Scan 对比总结"></a>三、ICP 与 Skip Scan 对比总结</h2><table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>ICP</th>
+<th>Skip Scan</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>引入版本</td>
+<td>MySQL 5.6</td>
+<td>MySQL 8.0.13</td>
+</tr>
+<tr>
+<td>核心作用</td>
+<td>减少回表次数</td>
+<td>跳过最左前缀限制</td>
+</tr>
+<tr>
+<td>执行计划标记</td>
+<td><code>Using index condition</code></td>
+<td><code>Using index for skip scan</code></td>
+</tr>
+<tr>
+<td>底层机制</td>
+<td>条件下推到引擎层</td>
+<td>枚举前缀列值做多次range扫描</td>
+</tr>
+<tr>
+<td>适用索引</td>
+<td>二级索引</td>
+<td>复合索引（缺最左列）</td>
+</tr>
+<tr>
+<td>性能提升点</td>
+<td>减少回表 IO</td>
+<td>避免全表扫描</td>
+</tr>
+<tr>
+<td>不支持场景</td>
+<td>聚簇索引、子查询条件</td>
+<td>前缀列基数高、前缀列有范围条件</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="四、面试高频问题"><a href="#四、面试高频问题" class="headerlink" title="四、面试高频问题"></a>四、面试高频问题</h2><h3 id="Q1：如何判断一条-SQL-是否使用了-ICP？"><a href="#Q1：如何判断一条-SQL-是否使用了-ICP？" class="headerlink" title="Q1：如何判断一条 SQL 是否使用了 ICP？"></a>Q1：如何判断一条 SQL 是否使用了 ICP？</h3><p>看 EXPLAIN 的 Extra 列是否显示 <code>Using index condition</code>。</p>
+<h3 id="Q2：ICP-对覆盖索引有效吗？"><a href="#Q2：ICP-对覆盖索引有效吗？" class="headerlink" title="Q2：ICP 对覆盖索引有效吗？"></a>Q2：ICP 对覆盖索引有效吗？</h3><p>如果查询已经是覆盖索引（Extra 显示 <code>Using index</code>），那 ICP 没有额外收益——因为本来就不需要回表，ICP 减少回表的前提不存在。</p>
+<p>但如果是 <code>Using index; Using index condition</code> 共存的情况，说明部分数据从索引覆盖，部分需要回表，ICP 仍有作用。</p>
+<h3 id="Q3：Skip-Scan-一定能提升性能吗？"><a href="#Q3：Skip-Scan-一定能提升性能吗？" class="headerlink" title="Q3：Skip Scan 一定能提升性能吗？"></a>Q3：Skip Scan 一定能提升性能吗？</h3><p>不一定。如果前缀列的 distinct 值太多（如 UUID 类型的前缀列），Skip Scan 会退化。它最适用于<strong>前缀列基数低、表数据量大</strong>的场景。</p>
+<h3 id="Q4：如何查看-ICP-和-Skip-Scan-的实际执行次数？"><a href="#Q4：如何查看-ICP-和-Skip-Scan-的实际执行次数？" class="headerlink" title="Q4：如何查看 ICP 和 Skip Scan 的实际执行次数？"></a>Q4：如何查看 ICP 和 Skip Scan 的实际执行次数？</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- ICP</span></span><br><span class="line"><span class="keyword">SHOW</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Handler_icp_attempts&#x27;</span>;</span><br><span class="line"><span class="keyword">SHOW</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Handler_icp_match&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- Skip Scan（暂无精确计数器，通过性能对比衡量）</span></span><br><span class="line"><span class="keyword">SHOW</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Handler_read%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、总结"><a href="#五、总结" class="headerlink" title="五、总结"></a>五、总结</h2><ul>
+<li><strong>ICP</strong> — 将索引条件下的过滤从 Server 层下推到存储引擎层，减少回表次数。适合二级索引 + 部分条件可用索引过滤的场景</li>
+<li><strong>Skip Scan</strong> — 突破最左前缀限制，通过枚举前缀列不同值来实现对非最左列的索引使用。适合前缀列基数不高的场景</li>
+</ul>
+<p>两个特性都是 MySQL 优化器的<strong>零成本优化</strong>——不需要改 SQL、不需要加索引，升级到 MySQL 5.6+ &#x2F; 8.0.13+ 就能自动受益。理解它们的原理，能让你在面对执行计划时更快定位问题，写出更高效的 SQL。</p>
+<p>建议开发者在日常工作中多关注 EXPLAIN 输出的 Extra 列，这两个特性在日常 OLTP 查询优化中非常实用。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/07/27/mysql-icp-skip-scan-deep-dive/">https://jiweidong.github.io/2026/07/27/mysql-icp-skip-scan-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95%E4%BC%98%E5%8C%96/">索引优化</a><a class="post-meta__tags" href="/tags/ICP/">ICP</a><a class="post-meta__tags" href="/tags/Skip-Scan/">Skip Scan</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/07/27/redis-memory-model-encoding-deep-dive/" title="【Redis原理】Redis 内存模型与对象编码系统深度解析：从 SDS 到 quicklist 的内部实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis原理】Redis 内存模型与对象编码系统深度解析：从 SDS 到 quicklist 的内部实现</div></div><div class="info-2"><div class="info-item-1">【Redis原理】Redis 内存模型与对象编码系统深度解析：从 SDS 到 quicklist 的内部实现前言“Redis 为什么快？”是面试中的经典问题。大多数人都能答出”基于内存、单线程、IO 多路复用”——但很少有人能深入到底层数据结构和编码方式。 Redis 的高性能不仅来自”在内存中运行”，更来自对内存的极致利用——它针对不同场景设计了多种编码方式，在性能和内存占用之间做精细的取舍。 本文将从源码角度，深入剖析 Redis 的对象系统与底层编码实现。  一、Redis 对象系统架构1.1 redisObject 结构体Redis 中的所有键值对，最终都封装在 redisObject 中： 12345678// Redis 源码：server.htypedef struct redisObject &#123;    unsigned type:4;       // 对象类型：STRING、LIST、HASH、SET、ZSET    unsigned encoding:4;   // 编码方式：RAW、INT、EMBSTR、HT、LINKEDLIST、ZIPLIST....</div></div></div></a><a class="pagination-related" href="/2026/07/27/kafka-producer-send-source-deep-dive/" title="【Kafka源码】Kafka Producer 发送流程源码深度解析：从 send() 到分区选择与批处理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Kafka源码】Kafka Producer 发送流程源码深度解析：从 send() 到分区选择与批处理</div></div><div class="info-2"><div class="info-item-1">【Kafka源码】Kafka Producer 发送流程源码深度解析：从 send() 到分区选择与批处理前言在 Kafka 客户端三剑客中，Producer 是最复杂也最体现设计智慧的一个。当你调用 producer.send() 时，消息并不是直接发到 Broker——而是要经过拦截器 → 序列化器 → 分区器 → 累加器 → 发送线程等一系列流程。 理解 Producer 的完整发送链路，是深入掌握 Kafka 性能调优和问题排查的关键。 本文基于 Kafka 3.x 源码，逐层解析 Producer 发送流程的每一个环节。  一、Producer 整体架构先上大图——Kafka Producer 的内部模块： 123456789101112131415161718┌─────────────────────────────────────────────────────────┐│                    KafkaProducer                         ││  ┌──────────┐  ┌──────────┐  ┌──────...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/16/mysql-sql-optimization-explain/" title="MySQL SQL 优化实战：Explain 详解与慢查询调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-16</div><div class="info-item-2">MySQL SQL 优化实战：Explain 详解与慢查询调优</div></div><div class="info-2"><div class="info-item-1">MySQL SQL 优化实战：Explain 详解与慢查询调优一、SQL 优化的整体思路当一个系统变慢时，DBA 或后端开发的第一反应通常是：查慢查询日志。优化一条 SQL 不是靠猜，而是靠一套系统化的方法： 1慢 SQL → 定位问题 → EXPLAIN 分析 → 制定优化方案 → 验证 → 上线  优化优先级金字塔1234567      ⬆ 收益高                   代码层面     / \    /   \                    SQL 改写   /     \                索引优化  /       \                   中间件（缓存、读写分离） /         \              架构层面（分库分表、多级缓存）/___________\              硬件（SSD、内存加大）  80% 的性能问题通过 索引优化 和 SQL 改写 就能解决。 二、慢查询日志配置123456789101112131415161718[mysqld]# 开启慢查询日志slow_query_log...</div></div></div></a><a class="pagination-related" href="/2026/06/16/mysql-innodb-storage-engine/" title="MySQL InnoDB 存储引擎与 B+ 树原理全解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-16</div><div class="info-item-2">MySQL InnoDB 存储引擎与 B+ 树原理全解</div></div><div class="info-2"><div class="info-item-1">MySQL InnoDB 存储引擎与 B+ 树原理全解一、为什么 InnoDB 成了 MySQL 的默认引擎？MySQL 5.5 起，InnoDB 取代 MyISAM 成为默认存储引擎。核心原因：    特性 InnoDB MyISAM    事务 ✅ ACID 支持 ❌ 不支持   行锁 ✅ 行级锁 ❌ 表级锁   外键 ✅ ❌   崩溃恢复 ✅ Redo Log 自动恢复 ❌ 需手动修复   MVCC ✅ ❌   全文索引 ✅ (5.6+) ✅   聚簇索引 ✅ ❌   选型结论：  OLTP（在线事务处理）场景一律选 InnoDB。MyISAM 仅在只读、表量小、不需要事务的场合还能一战。  二、InnoDB 的核心存储结构2.1 表空间（Tablespace）1234567891011InnoDB 表空间 ├── 系统表空间 (ibdata1) │    ├── Double Write Buffer │    ├── Insert Buffer (Change Buffer) │    ├── Undo Log │    └── 数据字典 ├── 独立表空间 (xxx....</div></div></div></a><a class="pagination-related" href="/2026/07/26/mysql-table-partitioning-deep-practice/" title="【数据库实战】MySQL 表分区（Partitioning）深度解析：原理、类型与实战避坑指南"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">【数据库实战】MySQL 表分区（Partitioning）深度解析：原理、类型与实战避坑指南</div></div><div class="info-2"><div class="info-item-1">MySQL 表分区（Partitioning）深度解析：原理、类型与实战避坑指南一、为什么需要表分区？当单表数据量达到千万级别甚至亿级别时，即使有合适的索引，查询性能也会出现明显下降。主要原因有三：  索引太大：B+Tree 索引深度增加，IO 次数增多 缓存压力：InnoDB Buffer Pool 无法容纳足够多的数据页 数据管理难：删除过期数据需要大量的 DELETE 操作，产生大量 binlog 和磁盘碎片  表分区（Partitioning） 将一张大表按规则拆分成多个物理分区，每个分区对应独立的 .ibd 文件，查询时通过分区裁剪只扫描相关分区，大幅提升性能。 1234-- 未分区：全表扫描SELECT * FROM orders WHERE created_at &gt;= &#x27;2026-01-01&#x27;;-- 分区后：只扫描相关分区，其余跳过  分区表的物理结构123456orders.ibd (未分区)       ↓orders#P#p2026Q1.ibdorders#P#p2026Q2.ibdorders#P#p2026Q3.ibdorders...</div></div></div></a><a class="pagination-related" href="/2026/07/05/mysql-pagination-optimization-guide/" title="【MySQL优化】MySQL 分页查询优化实战：从 LIMIT 深分页到游标分页与延迟关联"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-05</div><div class="info-item-2">【MySQL优化】MySQL 分页查询优化实战：从 LIMIT 深分页到游标分页与延迟关联</div></div><div class="info-2"><div class="info-item-1">【MySQL优化】MySQL 分页查询优化实战：从 LIMIT 深分页到游标分页与延迟关联一、深入解析 MySQL 分页查询性能1.1 问题背景：深分页的噩梦我们来看一个最常见的分页查询： 1234SELECT id, title, content, create_time FROM article ORDER BY create_time DESC LIMIT 100000, 20;  这个查询看起来简单，但你有没有注意到——随着页码增大，查询越来越慢？ 当面页（第1页）可能 1ms 就返回了，翻到第 5000 页可能直接飙到 5 秒以上。这不是偶然，而是 MySQL 在处理 LIMIT M, N 时的固有行为。 面试官经典追问：”说说 LIMIT 100000, 20 在 MySQL 内部是怎么执行的？为什么越往后越慢？” 1.2 为什么会慢？——查一下执行计划先1234EXPLAIN SELECT id, title, content, create_time FROM article ORDER BY create_time DESC LIMIT 100000, 20; ...</div></div></div></a><a class="pagination-related" href="/2026/07/19/jpa-hibernate-n-plus-one-deep-dive/" title="【JPA 性能】Hibernate N+1 查询问题深度解析与 6 种解决方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-19</div><div class="info-item-2">【JPA 性能】Hibernate N+1 查询问题深度解析与 6 种解决方案</div></div><div class="info-2"><div class="info-item-1">【JPA 性能】Hibernate N+1 查询问题深度解析与 6 种解决方案一、什么是 N+1 查询问题？经典场景假设有两个实体：Author（作者）和 Book（书籍），一对多关系： 1234567891011121314151617181920212223242526@Entity@Table(name = &quot;authors&quot;)public class Author &#123;    @Id    @GeneratedValue(strategy = GenerationType.IDENTITY)    private Long id;        private String name;        @OneToMany(mappedBy = &quot;author&quot;, fetch = FetchType.LAZY)    private List&lt;Book&gt; books = new ArrayList&lt;&gt;();&#125;@Entity@Table(name = &quot;books&quot;)publ...</div></div></div></a><a class="pagination-related" href="/2026/06/16/mysql-mvcc-lock-mechanism/" title="MySQL MVCC 与 InnoDB 锁机制深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-16</div><div class="info-item-2">MySQL MVCC 与 InnoDB 锁机制深度解析</div></div><div class="info-2"><div class="info-item-1">MySQL MVCC 与 InnoDB 锁机制深度解析一、并发控制的基本问题数据库并发操作时，会遇到三大问题：    问题 说明 影响    脏读 读到其他事务未提交的数据 读到最终可能不存在的”假数据”   不可重复读 同一事务内两次读同一行，结果不同 数据不一致   幻读 同一事务内两次查询，行数不同 数据量不一致   事务隔离级别1234567-- 查看当前隔离级别SELECT @@transaction_isolation;-- MySQL 8.0: REPEATABLE-READ（默认）-- 设置隔离级别SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ;     隔离级别 脏读 不可重复读 幻读    READ UNCOMMITTED ✅ 可能 ✅ 可能 ✅ 可能   READ COMMITTED ❌ ✅ 可能 ✅ 可能   REPEATABLE READ ❌ ❌ ✅ 可能（InnoDB 通过 Gap ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">352</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">580</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">120</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL%E4%BC%98%E5%8C%96%E3%80%91%E7%B4%A2%E5%BC%95%E4%B8%8B%E6%8E%A8%EF%BC%88ICP%EF%BC%89%E4%B8%8E%E7%B4%A2%E5%BC%95%E8%B7%B3%E8%B7%83%E6%89%AB%E6%8F%8F%EF%BC%88Skip-Scan%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E5%8E%9F%E7%90%86%E5%88%B0%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E7%B4%A2%E5%BC%95%E4%B8%8B%E6%8E%A8%EF%BC%88ICP%EF%BC%89"><span class="toc-number">1.2.</span> <span class="toc-text">一、索引下推（ICP）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E4%BB%80%E4%B9%88%E6%98%AF%E7%B4%A2%E5%BC%95%E4%B8%8B%E6%8E%A8%EF%BC%9F"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 什么是索引下推？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-ICP-%E7%9A%84%E9%80%82%E7%94%A8%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 ICP 的适用条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E6%B7%B1%E5%85%A5%E5%8E%9F%E7%90%86%EF%BC%9AICP-%E6%98%AF%E5%A6%82%E4%BD%95%E5%AE%9E%E7%8E%B0%E7%9A%84%EF%BC%9F"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 深入原理：ICP 是如何实现的？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-4-ICP-%E6%BA%90%E7%A0%81%E5%B1%82%E9%9D%A2%E7%9A%84%E5%AE%9E%E7%8E%B0%E6%9C%BA%E5%88%B6"><span class="toc-number">1.2.4.</span> <span class="toc-text">1.4 ICP 源码层面的实现机制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-5-ICP-%E5%AE%9E%E6%88%98%E6%A1%88%E4%BE%8B%E5%88%86%E6%9E%90"><span class="toc-number">1.2.5.</span> <span class="toc-text">1.5 ICP 实战案例分析</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-6-%E5%A6%82%E4%BD%95%E5%85%B3%E9%97%AD-ICP%EF%BC%9F"><span class="toc-number">1.2.6.</span> <span class="toc-text">1.6 如何关闭 ICP？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%B4%A2%E5%BC%95%E8%B7%B3%E8%B7%83%E6%89%AB%E6%8F%8F%EF%BC%88Index-Skip-Scan%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、索引跳跃扫描（Index Skip Scan）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%BB%80%E4%B9%88%E6%98%AF-Skip-Scan%EF%BC%9F"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 什么是 Skip Scan？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-Skip-Scan-%E7%9A%84%E5%BA%95%E5%B1%82%E5%8E%9F%E7%90%86"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 Skip Scan 的底层原理</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-Skip-Scan-%E7%9A%84%E5%B7%A5%E4%BD%9C%E6%B5%81%E7%A8%8B"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 Skip Scan 的工作流程</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-Skip-Scan-%E7%9A%84%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92%E5%88%86%E6%9E%90"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 Skip Scan 的执行计划分析</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-Skip-Scan-%E4%B8%8E%E5%85%A8%E8%A1%A8%E6%89%AB%E6%8F%8F%E7%9A%84%E6%80%A7%E8%83%BD%E5%AF%B9%E6%AF%94"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 Skip Scan 与全表扫描的性能对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-6-Skip-Scan-%E7%9A%84%E9%99%90%E5%88%B6%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.3.6.</span> <span class="toc-text">2.6 Skip Scan 的限制条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-7-Skip-Scan-%E5%AE%9E%E6%88%98%EF%BC%9A%E4%BD%95%E6%97%B6%E8%AF%A5%E7%94%A8%E4%BD%95%E6%97%B6%E4%B8%8D%E8%AF%A5%E7%94%A8"><span class="toc-number">1.3.7.</span> <span class="toc-text">2.7 Skip Scan 实战：何时该用何时不该用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-8-%E5%A6%82%E4%BD%95%E6%8E%A7%E5%88%B6-Skip-Scan%EF%BC%9F"><span class="toc-number">1.3.8.</span> <span class="toc-text">2.8 如何控制 Skip Scan？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81ICP-%E4%B8%8E-Skip-Scan-%E5%AF%B9%E6%AF%94%E6%80%BB%E7%BB%93"><span class="toc-number">1.4.</span> <span class="toc-text">三、ICP 与 Skip Scan 对比总结</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E9%97%AE%E9%A2%98"><span class="toc-number">1.5.</span> <span class="toc-text">四、面试高频问题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#Q1%EF%BC%9A%E5%A6%82%E4%BD%95%E5%88%A4%E6%96%AD%E4%B8%80%E6%9D%A1-SQL-%E6%98%AF%E5%90%A6%E4%BD%BF%E7%94%A8%E4%BA%86-ICP%EF%BC%9F"><span class="toc-number">1.5.1.</span> <span class="toc-text">Q1：如何判断一条 SQL 是否使用了 ICP？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q2%EF%BC%9AICP-%E5%AF%B9%E8%A6%86%E7%9B%96%E7%B4%A2%E5%BC%95%E6%9C%89%E6%95%88%E5%90%97%EF%BC%9F"><span class="toc-number">1.5.2.</span> <span class="toc-text">Q2：ICP 对覆盖索引有效吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q3%EF%BC%9ASkip-Scan-%E4%B8%80%E5%AE%9A%E8%83%BD%E6%8F%90%E5%8D%87%E6%80%A7%E8%83%BD%E5%90%97%EF%BC%9F"><span class="toc-number">1.5.3.</span> <span class="toc-text">Q3：Skip Scan 一定能提升性能吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Q4%EF%BC%9A%E5%A6%82%E4%BD%95%E6%9F%A5%E7%9C%8B-ICP-%E5%92%8C-Skip-Scan-%E7%9A%84%E5%AE%9E%E9%99%85%E6%89%A7%E8%A1%8C%E6%AC%A1%E6%95%B0%EF%BC%9F"><span class="toc-number">1.5.4.</span> <span class="toc-text">Q4：如何查看 ICP 和 Skip Scan 的实际执行次数？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.6.</span> <span class="toc-text">五、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/27/spring-boot-autoconfig-interview/" title="Spring Boot 自动装配原理 — 面试向深度解析">Spring Boot 自动装配原理 — 面试向深度解析</a><time datetime="2026-07-27T06:00:00.000Z" title="发表于 2026-07-27 14:00:00">2026-07-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/27/java-thread-class-source-deep-dive/" title="【并发编程】Java Thread 源码深度解析：线程状态机、生命周期与操作系统线程映射">【并发编程】Java Thread 源码深度解析：线程状态机、生命周期与操作系统线程映射</a><time datetime="2026-07-27T00:00:00.000Z" title="发表于 2026-07-27 08:00:00">2026-07-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/27/kafka-producer-send-source-deep-dive/" title="【Kafka源码】Kafka Producer 发送流程源码深度解析：从 send() 到分区选择与批处理">【Kafka源码】Kafka Producer 发送流程源码深度解析：从 send() 到分区选择与批处理</a><time datetime="2026-07-27T00:00:00.000Z" title="发表于 2026-07-27 08:00:00">2026-07-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/27/mysql-icp-skip-scan-deep-dive/" title="【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战">【MySQL优化】索引下推（ICP）与索引跳跃扫描（Skip Scan）深度解析：从原理到实战</a><time datetime="2026-07-27T00:00:00.000Z" title="发表于 2026-07-27 08:00:00">2026-07-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/07/27/redis-memory-model-encoding-deep-dive/" title="【Redis原理】Redis 内存模型与对象编码系统深度解析：从 SDS 到 quicklist 的内部实现">【Redis原理】Redis 内存模型与对象编码系统深度解析：从 SDS 到 quicklist 的内部实现</a><time datetime="2026-07-27T00:00:00.000Z" title="发表于 2026-07-27 08:00:00">2026-07-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
