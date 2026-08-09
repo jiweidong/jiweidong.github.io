@@ -1,0 +1,526 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理面试官：Java 怎么调用 C&#x2F;C++ 代码？JNI 和 JNA 有什么区别？场景很常见：性能瓶颈在加密算法、图像处理、音视频编解码，或者要调用操作系统底层 API、复用公司老旧的 C&#x2F;C++ 库——这时候 Java 就得「下凡」跟 Native 代码打交道。JNI（Java Native Inter">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/09/java-jni-jna-cross-language-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理面试官：Java 怎么调用 C&#x2F;C++ 代码？JNI 和 JNA 有什么区别？场景很常见：性能瓶颈在加密算法、图像处理、音视频编解码，或者要调用操作系统底层 API、复用公司老旧的 C&#x2F;C++ 库——这时候 Java 就得「下凡」跟 Native 代码打交道。JNI（Java Native Inter">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-09T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-09T00:20:10.383Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JNA">
+<meta property="article:tag" content="JNI">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="底层原理">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理",
+  "url": "https://jiweidong.github.io/2026/08/09/java-jni-jna-cross-language-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-09T00:00:00.000Z",
+  "dateModified": "2026-08-09T00:20:10.383Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/09/java-jni-jna-cross-language-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">422</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">636</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">141</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-09T00:00:00.000Z" title="发表于 2026-08-09 08:00:00">2026-08-09</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-09T00:20:10.383Z" title="更新于 2026-08-09 08:20:10">2026-08-09</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%90%8E%E7%AB%AF%E9%9D%A2%E8%AF%95/">后端面试</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java进阶】JNI-与-JNA-深度解析：从本地方法到跨语言调用的底层原理"><a href="#【Java进阶】JNI-与-JNA-深度解析：从本地方法到跨语言调用的底层原理" class="headerlink" title="【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理"></a>【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理</h1><h2 id="面试官：Java-怎么调用-C-C-代码？JNI-和-JNA-有什么区别？"><a href="#面试官：Java-怎么调用-C-C-代码？JNI-和-JNA-有什么区别？" class="headerlink" title="面试官：Java 怎么调用 C&#x2F;C++ 代码？JNI 和 JNA 有什么区别？"></a>面试官：Java 怎么调用 C&#x2F;C++ 代码？JNI 和 JNA 有什么区别？</h2><p>场景很常见：性能瓶颈在加密算法、图像处理、音视频编解码，或者要调用操作系统底层 API、复用公司老旧的 C&#x2F;C++ 库——这时候 Java 就得「下凡」跟 Native 代码打交道。JNI（Java Native Interface）是官方标准方案，JNA（Java Native Access）是社区封装的便捷方案。</p>
+<p>今天我们从 <code>native</code> 关键字开始，讲透 JNI 的完整调用链、JNA 的自动化机制、两者的性能差异，以及现代 Java 的替代方案 FFM API。</p>
+<h2 id="一、native-方法到底是怎么执行的？"><a href="#一、native-方法到底是怎么执行的？" class="headerlink" title="一、native 方法到底是怎么执行的？"></a>一、native 方法到底是怎么执行的？</h2><h3 id="1-1-一个最简单的-JNI-例子"><a href="#1-1-一个最简单的-JNI-例子" class="headerlink" title="1.1 一个最简单的 JNI 例子"></a>1.1 一个最简单的 JNI 例子</h3><p>Java 侧：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">HelloNative</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// native 方法：没有方法体，由本地库实现</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">native</span> String <span class="title function_">sayHello</span><span class="params">(String name)</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> &#123;</span><br><span class="line">        <span class="comment">// 加载本地库（Linux: libhello.so，Windows: hello.dll）</span></span><br><span class="line">        System.loadLibrary(<span class="string">&quot;hello&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> &#123;</span><br><span class="line">        System.out.println(sayHello(<span class="string">&quot;东哥&quot;</span>));</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>C 侧（hello.c）：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;jni.h&gt;</span></span></span><br><span class="line"><span class="meta">#<span class="keyword">include</span> <span class="string">&lt;stdio.h&gt;</span></span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 注意命名规则：Java_包名_类名_方法名（包名中的点换成下划线）</span></span><br><span class="line">JNIEXPORT jstring JNICALL</span><br><span class="line"><span class="title function_">Java_HelloNative_sayHello</span><span class="params">(JNIEnv *env, jclass clazz, jstring name)</span> &#123;</span><br><span class="line">    <span class="comment">// 把 Java 的 jstring 转成 C 字符串</span></span><br><span class="line">    <span class="type">const</span> <span class="type">char</span> *cName = (*env)-&gt;GetStringUTFChars(env, name, <span class="literal">NULL</span>);</span><br><span class="line">    <span class="type">char</span> result[<span class="number">128</span>];</span><br><span class="line">    <span class="built_in">sprintf</span>(result, <span class="string">&quot;Hello, %s! (from C)&quot;</span>, cName);</span><br><span class="line">    (*env)-&gt;ReleaseStringUTFChars(env, name, cName);</span><br><span class="line">    <span class="keyword">return</span> (*env)-&gt;NewStringUTF(env, result);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>编译并运行：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 生成头文件</span></span><br><span class="line">javac -h . HelloNative.java</span><br><span class="line"><span class="comment"># 编译动态库</span></span><br><span class="line">gcc -shared -fPIC -I<span class="string">&quot;<span class="variable">$JAVA_HOME</span>/include&quot;</span> -I<span class="string">&quot;<span class="variable">$JAVA_HOME</span>/include/linux&quot;</span> \</span><br><span class="line">    hello.c -o libhello.so</span><br><span class="line"><span class="comment"># 运行</span></span><br><span class="line">java -Djava.library.path=. HelloNative</span><br><span class="line"><span class="comment"># 输出: Hello, 东哥! (from C)</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="1-2-native-方法的完整调用链"><a href="#1-2-native-方法的完整调用链" class="headerlink" title="1.2 native 方法的完整调用链"></a>1.2 native 方法的完整调用链</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">Java 代码调用 native 方法</span><br><span class="line">    ↓</span><br><span class="line">JVM 根据方法名查找已加载本地库中的导出符号（名字修饰规则：Java_包名_类名_方法名）</span><br><span class="line">    ↓</span><br><span class="line">JNIEnv *env 指针（每个线程一个，指向 JNI 函数表）传入 C 函数</span><br><span class="line">    ↓</span><br><span class="line">C 函数通过 JNI 函数表操作 Java 对象（访问字段、调用方法、创建对象）</span><br><span class="line">    ↓</span><br><span class="line">返回值通过 JNI 类型转换（jstring ↔ char*、jint ↔ int 等）传回 Java</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键点</strong>：JNI 函数表里有 200+ 个函数，<code>GetStringUTFChars</code>、<code>NewStringUTF</code>、<code>CallObjectMethod</code>、<code>SetIntField</code> 这些都是通过 <code>env</code> 指针间接调用的，这就是「JNI 接口」的本质——<strong>一张函数指针表</strong>。</p>
+<h2 id="二、JNI-的核心机制深挖"><a href="#二、JNI-的核心机制深挖" class="headerlink" title="二、JNI 的核心机制深挖"></a>二、JNI 的核心机制深挖</h2><h3 id="2-1-JNI-数据类型映射"><a href="#2-1-JNI-数据类型映射" class="headerlink" title="2.1 JNI 数据类型映射"></a>2.1 JNI 数据类型映射</h3><table>
+<thead>
+<tr>
+<th>Java 类型</th>
+<th>JNI 类型</th>
+<th>C 类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>boolean</td>
+<td>jboolean</td>
+<td>unsigned char</td>
+<td>0 或 1</td>
+</tr>
+<tr>
+<td>byte</td>
+<td>jbyte</td>
+<td>signed char</td>
+<td></td>
+</tr>
+<tr>
+<td>char</td>
+<td>jchar</td>
+<td>unsigned short</td>
+<td>UTF-16</td>
+</tr>
+<tr>
+<td>short</td>
+<td>jshort</td>
+<td>short</td>
+<td></td>
+</tr>
+<tr>
+<td>int</td>
+<td>jint</td>
+<td>int</td>
+<td></td>
+</tr>
+<tr>
+<td>long</td>
+<td>jlong</td>
+<td>long long</td>
+<td></td>
+</tr>
+<tr>
+<td>float</td>
+<td>jfloat</td>
+<td>float</td>
+<td></td>
+</tr>
+<tr>
+<td>double</td>
+<td>jdouble</td>
+<td>double</td>
+<td></td>
+</tr>
+<tr>
+<td>Object</td>
+<td>jobject</td>
+<td>void*</td>
+<td>引用类型统称</td>
+</tr>
+<tr>
+<td>String</td>
+<td>jstring</td>
+<td>jobject 特化</td>
+<td>需要转换</td>
+</tr>
+<tr>
+<td>int[]</td>
+<td>jintArray</td>
+<td>jobject 特化</td>
+<td>需要转换</td>
+</tr>
+</tbody></table>
+<p><strong>引用类型不能直接当 C 指针用</strong>，必须通过 JNI 函数转换，比如字符串要用 <code>GetStringUTFChars</code>、数组要用 <code>GetIntArrayElements</code>。</p>
+<h3 id="2-2-局部引用与全局引用（内存泄漏高发区）"><a href="#2-2-局部引用与全局引用（内存泄漏高发区）" class="headerlink" title="2.2 局部引用与全局引用（内存泄漏高发区）"></a>2.2 局部引用与全局引用（内存泄漏高发区）</h3><p>JNI 有三种引用：</p>
+<table>
+<thead>
+<tr>
+<th>引用类型</th>
+<th>创建方式</th>
+<th>生命周期</th>
+<th>注意事项</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>局部引用</td>
+<td>默认创建</td>
+<td>方法返回时自动释放</td>
+<td>循环里创建大量局部引用会撑爆本地引用表（默认 512 个）</td>
+</tr>
+<tr>
+<td>全局引用</td>
+<td>NewGlobalRef</td>
+<td>手动 DeleteGlobalRef</td>
+<td>忘记释放 &#x3D; Java 对象永远无法被 GC</td>
+</tr>
+<tr>
+<td>弱全局引用</td>
+<td>NewWeakGlobalRef</td>
+<td>允许 GC 回收</td>
+<td>类似 WeakReference</td>
+</tr>
+</tbody></table>
+<p><strong>经典坑</strong>：在 C 代码里保存了 Java 对象的引用，长期不释放，导致 Java 侧内存泄漏。排查时发现 GC 日志里对象无法回收，多半是全局引用泄漏。</p>
+<h3 id="2-3-异常处理：JNI-异常不会中断-C-代码！"><a href="#2-3-异常处理：JNI-异常不会中断-C-代码！" class="headerlink" title="2.3 异常处理：JNI 异常不会中断 C 代码！"></a>2.3 异常处理：JNI 异常不会中断 C 代码！</h3><p><strong>JNI 的大坑</strong>：C 代码里调用 Java 方法抛出的异常，<strong>不会像 Java 一样抛出</strong>，而是「挂起」在 JNIEnv 上。C 代码必须显式检查：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">jmethodID mid = (*env)-&gt;GetMethodID(env, cls, <span class="string">&quot;dangerousMethod&quot;</span>, <span class="string">&quot;()V&quot;</span>);</span><br><span class="line">(*env)-&gt;CallVoidMethod(env, obj, mid);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 必须手动检查异常！</span></span><br><span class="line"><span class="keyword">if</span> ((*env)-&gt;ExceptionCheck(env)) &#123;</span><br><span class="line">    (*env)-&gt;ExceptionDescribe(env);   <span class="comment">// 打印异常</span></span><br><span class="line">    (*env)-&gt;ExceptionClear(env);      <span class="comment">// 清除异常，否则后续 JNI 调用会失败</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>如果不检查、不清除，后续所有 JNI 调用都会返回失败，非常隐蔽。</p>
+<h3 id="2-4-JNI-的性能开销"><a href="#2-4-JNI-的性能开销" class="headerlink" title="2.4 JNI 的性能开销"></a>2.4 JNI 的性能开销</h3><ul>
+<li><strong>方法调用开销</strong>：每次 native 调用约几十纳秒（比普通 Java 方法调用慢 10 倍左右）</li>
+<li><strong>数据转换开销</strong>：字符串、数组的拷贝（GetStringUTFChars 默认会拷贝）</li>
+<li><strong>临界区开销</strong>：跨 JNI 边界时，JVM 的 JIT 优化可能失效（无法内联、逃逸分析失效）</li>
+</ul>
+<p><strong>优化手段</strong>：用 <code>GetPrimitiveArrayCritical</code>&#x2F;<code>ReleasePrimitiveArrayCritical</code> 减少拷贝（但临界区内禁止调用任何 JNI 函数）；批量处理数据减少调用次数；对热点 native 方法保持简单签名。</p>
+<h2 id="三、JNA：让你忘掉-JNI-的繁琐"><a href="#三、JNA：让你忘掉-JNI-的繁琐" class="headerlink" title="三、JNA：让你忘掉 JNI 的繁琐"></a>三、JNA：让你忘掉 JNI 的繁琐</h2><h3 id="3-1-为什么需要-JNA？"><a href="#3-1-为什么需要-JNA？" class="headerlink" title="3.1 为什么需要 JNA？"></a>3.1 为什么需要 JNA？</h3><p>JNI 太痛苦了：要写 C 头文件、要遵循命名规则、要管理 JNIEnv、要处理引用和异常。JNA 的目标是<strong>零 C 代码</strong>——纯 Java 声明接口，自动完成类型映射和符号绑定。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 定义接口，继承 Library</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">CLibrary</span> <span class="keyword">extends</span> <span class="title class_">Library</span> &#123;</span><br><span class="line">    <span class="comment">// 2. 指定本地库</span></span><br><span class="line">    <span class="type">CLibrary</span> <span class="variable">INSTANCE</span> <span class="operator">=</span> Native.load(<span class="string">&quot;c&quot;</span>, CLibrary.class);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 3. 直接声明 C 函数（JNA 自动映射类型）</span></span><br><span class="line">    <span class="type">int</span> <span class="title function_">printf</span><span class="params">(String format, Object... args)</span>;</span><br><span class="line">    <span class="type">double</span> <span class="title function_">atof</span><span class="params">(String str)</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">JnaDemo</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> &#123;</span><br><span class="line">        CLibrary.INSTANCE.printf(<span class="string">&quot;Hello from C! %d\n&quot;</span>, <span class="number">42</span>);</span><br><span class="line">        System.out.println(CLibrary.INSTANCE.atof(<span class="string">&quot;3.14159&quot;</span>));</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-JNA-的原理：动态生成-JNI-桥接代码"><a href="#3-2-JNA-的原理：动态生成-JNI-桥接代码" class="headerlink" title="3.2 JNA 的原理：动态生成 JNI 桥接代码"></a>3.2 JNA 的原理：动态生成 JNI 桥接代码</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">Java 接口方法调用</span><br><span class="line">    ↓</span><br><span class="line">JNA 的 Proxy 动态代理拦截调用</span><br><span class="line">    ↓</span><br><span class="line">分析方法签名 → 生成对应的 JNI 调用（用反射 + 手写 JNI 函数指针操作）</span><br><span class="line">    ↓</span><br><span class="line">通过 libffi（Foreign Function Interface 库）完成 C 函数调用与参数转换</span><br></pre></td></tr></table></figure>
+
+<p>JNA 底层依赖 <strong>libffi</strong>，它能在运行时动态构造 C 函数调用（不需要编译期生成代码），从而把「接口声明 → C 调用」完全自动化。</p>
+<h3 id="3-3-JNA-类型映射速查"><a href="#3-3-JNA-类型映射速查" class="headerlink" title="3.3 JNA 类型映射速查"></a>3.3 JNA 类型映射速查</h3><table>
+<thead>
+<tr>
+<th>Java 类型</th>
+<th>C 类型</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>String</td>
+<td>char*</td>
+</tr>
+<tr>
+<td>byte[] &#x2F; ByteBuffer</td>
+<td>char*&#x2F;void*</td>
+</tr>
+<tr>
+<td>int &#x2F; long &#x2F; float &#x2F; double</td>
+<td>int &#x2F; long &#x2F; float &#x2F; double</td>
+</tr>
+<tr>
+<td>Pointer</td>
+<td>void*</td>
+</tr>
+<tr>
+<td>Structure</td>
+<td>struct*</td>
+</tr>
+<tr>
+<td>Callback</td>
+<td>函数指针</td>
+</tr>
+<tr>
+<td>ByReference 后缀类</td>
+<td>指针类型（IntByReference 等）</td>
+</tr>
+</tbody></table>
+<p><strong>指针参数</strong>用 ByReference 系列：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">MathLib</span> <span class="keyword">extends</span> <span class="title class_">Library</span> &#123;</span><br><span class="line">    <span class="type">MathLib</span> <span class="variable">INSTANCE</span> <span class="operator">=</span> Native.load(<span class="string">&quot;m&quot;</span>, MathLib.class);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// C: void divide(int a, int b, int *quotient, int *remainder);</span></span><br><span class="line">    <span class="keyword">void</span> <span class="title function_">divide</span><span class="params">(<span class="type">int</span> a, <span class="type">int</span> b, IntByReference quotient, IntByReference remainder)</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 调用</span></span><br><span class="line"><span class="type">IntByReference</span> <span class="variable">q</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">IntByReference</span>();</span><br><span class="line"><span class="type">IntByReference</span> <span class="variable">r</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">IntByReference</span>();</span><br><span class="line">MathLib.INSTANCE.divide(<span class="number">10</span>, <span class="number">3</span>, q, r);</span><br><span class="line">System.out.println(<span class="string">&quot;商=&quot;</span> + q.getValue() + <span class="string">&quot; 余=&quot;</span> + r.getValue()); <span class="comment">// 商=3 余=1</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-4-JNA-的适用场景"><a href="#3-4-JNA-的适用场景" class="headerlink" title="3.4 JNA 的适用场景"></a>3.4 JNA 的适用场景</h3><ul>
+<li><strong>快速调用系统库</strong>：Windows API（kernel32、user32）、Linux libc、macOS 系统框架</li>
+<li><strong>调用第三方原生库</strong>：快速集成、原型验证</li>
+<li><strong>不想写任何 C 代码</strong>的场景</li>
+</ul>
+<h2 id="四、JNI-vs-JNA-深度对比"><a href="#四、JNI-vs-JNA-深度对比" class="headerlink" title="四、JNI vs JNA 深度对比"></a>四、JNI vs JNA 深度对比</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>JNI</th>
+<th>JNA</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>代码量</td>
+<td>需要写 C&#x2F;C++ 胶水代码</td>
+<td>纯 Java，零 C 代码</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>高（直接调用，仅类型转换开销）</td>
+<td>中（动态代理 + libffi 反射式调用，约慢 2-5 倍）</td>
+</tr>
+<tr>
+<td>类型映射</td>
+<td>手动，精细控制</td>
+<td>自动，简单场景爽，复杂结构体麻烦</td>
+</tr>
+<tr>
+<td>错误排查</td>
+<td>崩溃难排查（JVM 可能直接挂）</td>
+<td>相对安全（有错误检查）</td>
+</tr>
+<tr>
+<td>依赖</td>
+<td>JDK 自带</td>
+<td>需要 jna.jar（+ jna-platform.jar）</td>
+</tr>
+<tr>
+<td>学习成本</td>
+<td>高</td>
+<td>低</td>
+</tr>
+<tr>
+<td>适合场景</td>
+<td>性能敏感、生产级、复杂交互</td>
+<td>快速集成、工具脚本、非性能瓶颈</td>
+</tr>
+</tbody></table>
+<p><strong>选型建议</strong>：</p>
+<ul>
+<li>性能敏感（如高频加解密、编解码）→ <strong>JNI</strong>（甚至用 Critical 区域优化）</li>
+<li>快速调用系统 API 或简单库 → <strong>JNA</strong></li>
+<li>大规模复杂库集成 → 考虑 JNI 或直接找现成封装</li>
+</ul>
+<h2 id="五、现代-Java-的答案：FFM-API（Project-Panama）"><a href="#五、现代-Java-的答案：FFM-API（Project-Panama）" class="headerlink" title="五、现代 Java 的答案：FFM API（Project Panama）"></a>五、现代 Java 的答案：FFM API（Project Panama）</h2><p>JDK 22 正式落地的 <strong>FFM API（Foreign Function &amp; Memory API）</strong> 是 JNI 的现代替代品：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 用 FFM API 调用 C 库函数（JDK 22+）</span></span><br><span class="line"><span class="keyword">import</span> java.lang.foreign.*;</span><br><span class="line"><span class="keyword">import</span> <span class="keyword">static</span> java.lang.foreign.ValueLayout.*;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FfmDemo</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> <span class="keyword">throws</span> Throwable &#123;</span><br><span class="line">        <span class="type">Linker</span> <span class="variable">linker</span> <span class="operator">=</span> Linker.nativeLinker();</span><br><span class="line">        <span class="type">SymbolLookup</span> <span class="variable">lookup</span> <span class="operator">=</span> SymbolLookup.libraryLookup(<span class="string">&quot;c&quot;</span>, Arena.global());</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 找到 printf 符号并绑定成 Java 方法句柄</span></span><br><span class="line">        <span class="type">MethodHandle</span> <span class="variable">printf</span> <span class="operator">=</span> linker.downcallHandle(</span><br><span class="line">                lookup.find(<span class="string">&quot;printf&quot;</span>).orElseThrow(),</span><br><span class="line">                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 在 Arena 中分配内存写字符串</span></span><br><span class="line">        <span class="keyword">try</span> (<span class="type">Arena</span> <span class="variable">arena</span> <span class="operator">=</span> Arena.ofConfined()) &#123;</span><br><span class="line">            <span class="type">MemorySegment</span> <span class="variable">str</span> <span class="operator">=</span> arena.allocateFrom(<span class="string">&quot;hello from FFM %d\n&quot;</span>);</span><br><span class="line">            printf.invoke(str, <span class="number">42</span>);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>FFM 的优势</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>JNI</th>
+<th>FFM API</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>安全性</td>
+<td>无安全检查，崩溃直接带崩 JVM</td>
+<td>Arena 管理内存，安全、可自动释放</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>好</td>
+<td>更好（无需 JNI 边界开销）</td>
+</tr>
+<tr>
+<td>类型安全</td>
+<td>弱</td>
+<td>强（MethodHandle + FunctionDescriptor）</td>
+</tr>
+<tr>
+<td>易用性</td>
+<td>差（大量样板代码）</td>
+<td>好（声明式绑定）</td>
+</tr>
+</tbody></table>
+<p><strong>建议</strong>：新项目、JDK 22+ 直接学 FFM；存量系统继续用 JNI&#x2F;JNA 也完全没问题，迁移不急于一时。</p>
+<h2 id="六、生产环境的坑与最佳实践"><a href="#六、生产环境的坑与最佳实践" class="headerlink" title="六、生产环境的坑与最佳实践"></a>六、生产环境的坑与最佳实践</h2><h3 id="6-1-崩溃排查：JVM-直接挂掉怎么办？"><a href="#6-1-崩溃排查：JVM-直接挂掉怎么办？" class="headerlink" title="6.1 崩溃排查：JVM 直接挂掉怎么办？"></a>6.1 崩溃排查：JVM 直接挂掉怎么办？</h3><p>Native 代码崩溃（段错误）时 JVM 会生成 <code>hs_err_pid*.log</code> 和 <code>core dump</code>，排查步骤：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 看 hs_err 日志顶部的崩溃原因</span></span><br><span class="line"><span class="built_in">head</span> -50 hs_err_pid12345.log</span><br><span class="line"><span class="comment"># 2. 看崩溃线程的堆栈，找到 native 帧</span></span><br><span class="line"><span class="comment"># 3. 用 gdb 分析 core 文件</span></span><br><span class="line">gdb <span class="variable">$JAVA_HOME</span>/bin/java core -ex <span class="string">&quot;bt&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>常见崩溃原因：C 代码数组越界、释放了已释放的内存（double free）、JNI 全局引用被提前删除、在临界区调用了 JNI 函数。</p>
+<h3 id="6-2-最佳实践清单"><a href="#6-2-最佳实践清单" class="headerlink" title="6.2 最佳实践清单"></a>6.2 最佳实践清单</h3><ul>
+<li>✅ 显式指定 <code>AsynchronousChannelGroup</code> 类似的资源管理——<strong>JNI 全局引用统一登记、统一释放</strong></li>
+<li>✅ 本地库版本管理：<code>System.loadLibrary</code> 失败要打日志，避免生产环境「本地库加载失败静默」</li>
+<li>✅ 在 <code>finally</code> 或 try-with-resources 中释放 <code>GetStringUTFChars</code> 得到的指针</li>
+<li>✅ 高并发场景为本地库调用加锁或做线程池隔离（部分 C 库非线程安全）</li>
+<li>✅ 用 <code>-Xcheck:jni</code> 启动参数在开发环境开启 JNI 安全检查</li>
+<li>❌ 不要在 JNI 临界区（Critical 区域）里做任何 JNI 调用</li>
+<li>❌ 不要把局部引用存到全局变量里跨方法使用</li>
+</ul>
+<h3 id="6-3-实战场景：Java-调用-OpenSSL"><a href="#6-3-实战场景：Java-调用-OpenSSL" class="headerlink" title="6.3 实战场景：Java 调用 OpenSSL"></a>6.3 实战场景：Java 调用 OpenSSL</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 用 JNA 调用 OpenSSL 的 MD5（示意）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">OpenSSL</span> <span class="keyword">extends</span> <span class="title class_">Library</span> &#123;</span><br><span class="line">    <span class="type">OpenSSL</span> <span class="variable">INSTANCE</span> <span class="operator">=</span> Native.load(<span class="string">&quot;crypto&quot;</span>, OpenSSL.class);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// C: unsigned char *MD5(const unsigned char *d, size_t n, unsigned char *md);</span></span><br><span class="line">    Pointer <span class="title function_">MD5</span><span class="params">(Pointer data, <span class="type">long</span> n, Pointer md)</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="type">byte</span>[] data = <span class="string">&quot;hello&quot;</span>.getBytes(StandardCharsets.UTF_8);</span><br><span class="line"><span class="keyword">try</span> (<span class="type">Memory</span> <span class="variable">dataMem</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Memory</span>(data.length);</span><br><span class="line">     <span class="type">Memory</span> <span class="variable">mdMem</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Memory</span>(<span class="number">16</span>)) &#123;</span><br><span class="line">    dataMem.write(<span class="number">0</span>, data, <span class="number">0</span>, data.length);</span><br><span class="line">    OpenSSL.INSTANCE.MD5(dataMem, data.length, mdMem);</span><br><span class="line">    <span class="type">byte</span>[] digest = mdMem.getByteArray(<span class="number">0</span>, <span class="number">16</span>);</span><br><span class="line">    System.out.println(HexFormat.of().formatHex(digest));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h2 id="七、总结"><a href="#七、总结" class="headerlink" title="七、总结"></a>七、总结</h2><table>
+<thead>
+<tr>
+<th>要点</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>JNI 本质</td>
+<td>Java 与 C&#x2F;C++ 的官方桥梁，通过 JNIEnv 函数表操作 Java 对象</td>
+</tr>
+<tr>
+<td>JNI 痛点</td>
+<td>样板代码多、引用管理难、异常要手动处理、崩溃难排查</td>
+</tr>
+<tr>
+<td>JNA 本质</td>
+<td>基于 libffi 的动态桥接，零 C 代码，牺牲部分性能换开发效率</td>
+</tr>
+<tr>
+<td>性能排序</td>
+<td>JNI ≈ FFM &gt; JNA</td>
+</tr>
+<tr>
+<td>现代方案</td>
+<td>JDK 22+ 用 FFM API（Project Panama），安全、高效、类型安全</td>
+</tr>
+<tr>
+<td>生产注意</td>
+<td>全局引用泄漏、异常未清除、临界区误用是三大高频坑</td>
+</tr>
+</tbody></table>
+<p><strong>面试万能回答</strong>：先从 <code>native</code> 关键字和 JNI 调用链讲起（名字修饰规则 + JNIEnv 函数表），再对比 JNA 的 libffi 动态代理原理，最后抛出 FFM API 作为现代替代方案，并强调「JNI 的引用管理和异常检查是生产环境最容易出问题的地方」。从原理到对比到趋势，一整套下来就是高分答案。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/09/java-jni-jna-cross-language-practice/">https://jiweidong.github.io/2026/08/09/java-jni-jna-cross-language-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/JNI/">JNI</a><a class="post-meta__tags" href="/tags/JNA/">JNA</a><a class="post-meta__tags" href="/tags/%E5%BA%95%E5%B1%82%E5%8E%9F%E7%90%86/">底层原理</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/09/kafka-replication-isr-deep-dive/" title="【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性</div></div><div class="info-2"><div class="info-item-1">【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性面试官：Kafka 的副本是怎么同步的？ISR 是什么？为什么 Kafka 用 ISR 而不用 Raft？Kafka 高可靠性的基石是副本机制（Replication），而理解副本机制的核心钥匙是 ISR（In-Sync Replicas，同步副本集合）。面试中关于「Kafka 为什么不会丢消息」「Leader 挂了怎么办」「acks 参数到底影响什么」的问题，答案全藏在 ISR 里。 今天我们从分区副本的架构讲起，深入 ISR 的判定与收缩扩张机制、HW 与 LEO 的推进逻辑、Leader 选举的细节，最后对比 Raft 选举，把 Kafka 副本机制一网打尽。 一、副本机制基础架构1.1 分区与副本的关系1234567891011Topic: orders（3 个分区 × 3 个副本 = 9 个副本，分布在 3 个 Broker 上）Broker 1           Broker 2           Broker 3┌────────────┐    ┌────...</div></div></div></a><a class="pagination-related" href="/2026/08/09/java-aio-async-io-deep-dive/" title="【Java进阶】Java AIO 异步 IO 深度解析：从 AsynchronousSocketChannel 到 Proactor 模式"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java进阶】Java AIO 异步 IO 深度解析：从 AsynchronousSocketChannel 到 Proactor 模式</div></div><div class="info-2"><div class="info-item-1">【Java进阶】Java AIO 异步 IO 深度解析：从 AsynchronousSocketChannel 到 Proactor 模式面试官：BIO、NIO、AIO 有什么区别？你用过 AIO 吗？这是 Java 网络编程面试的经典三连问。BIO 是阻塞 IO，NIO 是非阻塞 IO + 多路复用，而 AIO（Asynchronous IO，也叫 NIO.2）是真正的异步 IO——不需要你主动轮询，操作系统完成 IO 后主动回调你注册的 CompletionHandler。 很多同学背了概念却说不清楚 AIO 的原理，今天我们从底层讲透：AIO 的 Proactor 模型、JDK 的 AIO 实现（Windows 上是 IOCP，Linux 上是 epoll 模拟）、AsynchronousSocketChannel 的完整用法，以及为什么 Netty 作者说「AIO 在 Linux 上是个坑」。 一、先搞清楚：BIO &#x2F; NIO &#x2F; AIO 的本质区别1.1 一句话总结三种模型   模型 中文名 线程模型 谁负责等待数据 通知方式 典型代表    BIO...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/20/java-unsafe-core-principles-guide/" title="Java Unsafe 类核心原理与正确使用指南：从内存操作到安全替代"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-20</div><div class="info-item-2">Java Unsafe 类核心原理与正确使用指南：从内存操作到安全替代</div></div><div class="info-2"><div class="info-item-1">Java Unsafe 类核心原理与正确使用指南：从内存操作到安全替代一、Unsafe 是什么？sun.misc.Unsafe 是 JDK 中一个”非常特殊”的类。它提供了一系列 底层、不安全的操作，包括：  直接读写内存（堆外内存） 直接操作对象字段（绕过构造方法） CAS 原子操作 线程挂起和恢复（park&#x2F;unpark） 加载和存储屏障   之所以叫 “Unsafe”，是因为这些操作跳过了 Java 语言的安全检查（如数组边界检查、final 字段不可变性等），使用不当会导致 JVM 崩溃。  1.1 如何获取 Unsafe 实例Unsafe 类的构造方法是 private 的，且 getUnsafe() 方法做了类加载器检查： 123456789101112public final class Unsafe &#123;    private Unsafe() &#123;&#125;        public static Unsafe getUnsafe() &#123;        Class&lt;?&gt; caller = Reflection....</div></div></div></a><a class="pagination-related" href="/2026/06/13/java-reflection-proxy/" title="Java 反射与动态代理详解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">Java 反射与动态代理详解</div></div><div class="info-2"><div class="info-item-1">Java 反射与动态代理详解一、引言Java 反射（Reflection）和动态代理（Dynamic Proxy）是 Java 语言中两大重量级特性，它们是框架设计的基石，贯穿于 Spring、MyBatis、Hibernate、Dubbo 等主流框架的底层实现。深入理解这两者，不仅有助于我们看懂框架源码，更能帮助我们在日常开发中写出更灵活、更通用的代码。 本文将带你从零开始，系统性地掌握 Java 反射与动态代理的核心原理、API 用法、性能陷阱以及实际应用场景。   二、Java 反射机制2.1 什么是反射反射（Reflection）是指程序在运行期间能够获取自身的任何信息，并且能够直接操作任意对象的内部属性及方法的能力。简单来说，反射让 Java 代码在运行时拥有了”自省”的能力。 正常情况下，我们通过 new 关键字创建对象、通过 . 运算符调用方法——这些都是在编译期就确定好的。而反射允许我们在运行时动态加载类、创建对象、调用方法、访问字段，甚至在运行时修改私有成员的值。 2.2 获取 Class 对象的四种方式Java 中一切反射操作的起点都是 java.lang.C...</div></div></div></a><a class="pagination-related" href="/2026/07/03/java-inner-class-deep-dive/" title="【Java核心】内部类深度解析：静态内部类、匿名内部类、Lambda 与闭包实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-03</div><div class="info-item-2">【Java核心】内部类深度解析：静态内部类、匿名内部类、Lambda 与闭包实战</div></div><div class="info-2"><div class="info-item-1">【Java核心】内部类深度解析：静态内部类、匿名内部类、Lambda 与闭包实战内部类家族谱Java 内部类（Inner Class）是指定义在另一个类内部的类。它能访问外部类的所有成员（包括私有成员），是实现隐藏、回调、事件驱动的重要机制。 1234567内部类├── 成员内部类（Member Inner Class）│   ├── 普通成员内部类（非静态）│   └── 静态内部类（Static Nested Class）├── 局部内部类（Local Inner Class）— 定义在方法中├── 匿名内部类（Anonymous Inner Class）— 无类名，即时实现└── Lambda 表达式（Java 8+）— 函数式接口的匿名实现  一、成员内部类（非静态）定义与特性1234567891011121314public class Outer &#123;    private String outerField = &quot;外部类字段&quot;;    private static String staticField = &quot;静态字段&quot;...</div></div></div></a><a class="pagination-related" href="/2026/07/30/java-stackwalker-api-deep-dive/" title="【Java进阶】StackWalker API 深度解析：现代 Java 栈帧遍历的正确打开方式"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-30</div><div class="info-item-2">【Java进阶】StackWalker API 深度解析：现代 Java 栈帧遍历的正确打开方式</div></div><div class="info-2"><div class="info-item-1">【Java进阶】StackWalker API 深度解析：现代 Java 栈帧遍历的正确打开方式从面试题说起 面试官：如何获取当前方法的调用链？Thread.currentThread().getStackTrace() 和 Throwable().getStackTrace() 有什么区别？有什么性能问题？  这是一个很经典的 Java 面试题。在 Java 9 之前，我们只有两种方式获取调用栈：  Thread.currentThread().getStackTrace() new Throwable().getStackTrace() 或 Thread.dumpStack()  但这两种方式都有严重的性能问题和设计缺陷。Java 9 引入了 StackWalker API，彻底改变了栈帧遍历的方式。 一、传统方式的痛点1.1 传统方式示例1234567891011121314151617181920212223public class OldWay &#123;        public static void main(String[] args) &#123;    ...</div></div></div></a><a class="pagination-related" href="/2026/07/13/spring-boot-admin-practice/" title="【Spring Boot 实战】Spring Boot Admin 服务监控与管理平台深度实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-13</div><div class="info-item-2">【Spring Boot 实战】Spring Boot Admin 服务监控与管理平台深度实战</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Boot Admin 服务监控与管理平台深度实战一、为什么需要 Spring Boot Admin？Spring Boot Actuator 为我们暴露了大量端点（&#x2F;health、&#x2F;metrics、&#x2F;info、&#x2F;env 等），但有一个现实问题：当你有十几个甚至几十个微服务时，难道一个个手动访问它们的 Actuator 端点吗？ 这就是 Spring Boot Admin（以下简称 SBA）的用武之地——它把散落在各个微服务实例中的 Actuator 端点统一聚合到一个管理控制台，并提供可视化界面、告警通知、日志查看等功能。 管理数十个微服务的痛点   痛点 传统方案 SBA 方案    查看服务在线状态 SSH 到服务器 curl 每个实例 一目了然的状态面板   检查健康情况 逐个访问 &#x2F;actuator&#x2F;health 汇总展示，异常标红   查看 JVM 指标 构建监控大屏（Prometheus+Grafana） 开箱即用的 JVM 图表   动态调整日志级别 修改配置后...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-reflection-dynamic-proxy-deep-dive/" title="「Java 反射与动态代理」从字节码操作到 Spring AOP 的底层实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「Java 反射与动态代理」从字节码操作到 Spring AOP 的底层实现</div></div><div class="info-2"><div class="info-item-1">「Java 反射与动态代理」从字节码操作到 Spring AOP 的底层实现反射和动态代理是 Java 框架的基石——Spring 的 IoC&#x2F;AOP、MyBatis 的 Mapper 映射、Hibernate 的懒加载代理、RPC 框架的远程调用，底层都用到了它们。本文从字节码层面剖析反射和动态代理的原理，最后串联到 Spring AOP 的实现。  一、反射机制——运行时的”自省”1.1 什么是反射？Java 反射（Reflection）是指在运行状态中，对于任意一个类，都能够知道这个类的所有属性和方法；对于任意一个对象，都能够调用它的任意方法和属性。 简单来说：反射让 Java 具备了动态性。 1.2 反射的核心 API   类 用途 获取方式    Class&lt;?&gt; 类的元数据 对象.getClass() &#x2F; Class.forName() &#x2F; 类名.class   Constructor 构造方法 clazz.getConstructor() &#x2F; clazz.getDeclaredConstructors()   Me...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">422</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">636</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">141</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java%E8%BF%9B%E9%98%B6%E3%80%91JNI-%E4%B8%8E-JNA-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E6%9C%AC%E5%9C%B0%E6%96%B9%E6%B3%95%E5%88%B0%E8%B7%A8%E8%AF%AD%E8%A8%80%E8%B0%83%E7%94%A8%E7%9A%84%E5%BA%95%E5%B1%82%E5%8E%9F%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9AJava-%E6%80%8E%E4%B9%88%E8%B0%83%E7%94%A8-C-C-%E4%BB%A3%E7%A0%81%EF%BC%9FJNI-%E5%92%8C-JNA-%E6%9C%89%E4%BB%80%E4%B9%88%E5%8C%BA%E5%88%AB%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：Java 怎么调用 C&#x2F;C++ 代码？JNI 和 JNA 有什么区别？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81native-%E6%96%B9%E6%B3%95%E5%88%B0%E5%BA%95%E6%98%AF%E6%80%8E%E4%B9%88%E6%89%A7%E8%A1%8C%E7%9A%84%EF%BC%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、native 方法到底是怎么执行的？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E4%B8%80%E4%B8%AA%E6%9C%80%E7%AE%80%E5%8D%95%E7%9A%84-JNI-%E4%BE%8B%E5%AD%90"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 一个最简单的 JNI 例子</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-native-%E6%96%B9%E6%B3%95%E7%9A%84%E5%AE%8C%E6%95%B4%E8%B0%83%E7%94%A8%E9%93%BE"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 native 方法的完整调用链</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81JNI-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%9C%BA%E5%88%B6%E6%B7%B1%E6%8C%96"><span class="toc-number">1.3.</span> <span class="toc-text">二、JNI 的核心机制深挖</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-JNI-%E6%95%B0%E6%8D%AE%E7%B1%BB%E5%9E%8B%E6%98%A0%E5%B0%84"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 JNI 数据类型映射</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%B1%80%E9%83%A8%E5%BC%95%E7%94%A8%E4%B8%8E%E5%85%A8%E5%B1%80%E5%BC%95%E7%94%A8%EF%BC%88%E5%86%85%E5%AD%98%E6%B3%84%E6%BC%8F%E9%AB%98%E5%8F%91%E5%8C%BA%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 局部引用与全局引用（内存泄漏高发区）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%BC%82%E5%B8%B8%E5%A4%84%E7%90%86%EF%BC%9AJNI-%E5%BC%82%E5%B8%B8%E4%B8%8D%E4%BC%9A%E4%B8%AD%E6%96%AD-C-%E4%BB%A3%E7%A0%81%EF%BC%81"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 异常处理：JNI 异常不会中断 C 代码！</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-JNI-%E7%9A%84%E6%80%A7%E8%83%BD%E5%BC%80%E9%94%80"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 JNI 的性能开销</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81JNA%EF%BC%9A%E8%AE%A9%E4%BD%A0%E5%BF%98%E6%8E%89-JNI-%E7%9A%84%E7%B9%81%E7%90%90"><span class="toc-number">1.4.</span> <span class="toc-text">三、JNA：让你忘掉 JNI 的繁琐</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81-JNA%EF%BC%9F"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 为什么需要 JNA？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-JNA-%E7%9A%84%E5%8E%9F%E7%90%86%EF%BC%9A%E5%8A%A8%E6%80%81%E7%94%9F%E6%88%90-JNI-%E6%A1%A5%E6%8E%A5%E4%BB%A3%E7%A0%81"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 JNA 的原理：动态生成 JNI 桥接代码</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-JNA-%E7%B1%BB%E5%9E%8B%E6%98%A0%E5%B0%84%E9%80%9F%E6%9F%A5"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 JNA 类型映射速查</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-JNA-%E7%9A%84%E9%80%82%E7%94%A8%E5%9C%BA%E6%99%AF"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 JNA 的适用场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81JNI-vs-JNA-%E6%B7%B1%E5%BA%A6%E5%AF%B9%E6%AF%94"><span class="toc-number">1.5.</span> <span class="toc-text">四、JNI vs JNA 深度对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%8E%B0%E4%BB%A3-Java-%E7%9A%84%E7%AD%94%E6%A1%88%EF%BC%9AFFM-API%EF%BC%88Project-Panama%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、现代 Java 的答案：FFM API（Project Panama）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E7%94%9F%E4%BA%A7%E7%8E%AF%E5%A2%83%E7%9A%84%E5%9D%91%E4%B8%8E%E6%9C%80%E4%BD%B3%E5%AE%9E%E8%B7%B5"><span class="toc-number">1.7.</span> <span class="toc-text">六、生产环境的坑与最佳实践</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%B4%A9%E6%BA%83%E6%8E%92%E6%9F%A5%EF%BC%9AJVM-%E7%9B%B4%E6%8E%A5%E6%8C%82%E6%8E%89%E6%80%8E%E4%B9%88%E5%8A%9E%EF%BC%9F"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 崩溃排查：JVM 直接挂掉怎么办？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E6%9C%80%E4%BD%B3%E5%AE%9E%E8%B7%B5%E6%B8%85%E5%8D%95"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 最佳实践清单</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%AE%9E%E6%88%98%E5%9C%BA%E6%99%AF%EF%BC%9AJava-%E8%B0%83%E7%94%A8-OpenSSL"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 实战场景：Java 调用 OpenSSL</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/09/adapter-pattern-deep-dive/" title="【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter">【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter</a><time datetime="2026-08-09T00:00:00.000Z" title="发表于 2026-08-09 08:00:00">2026-08-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/09/decorator-pattern-deep-dive/" title="【设计模式】装饰器模式深度解析：从 Java IO 流到 Spring 框架的层层包装艺术">【设计模式】装饰器模式深度解析：从 Java IO 流到 Spring 框架的层层包装艺术</a><time datetime="2026-08-09T00:00:00.000Z" title="发表于 2026-08-09 08:00:00">2026-08-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/09/java-aio-async-io-deep-dive/" title="【Java进阶】Java AIO 异步 IO 深度解析：从 AsynchronousSocketChannel 到 Proactor 模式">【Java进阶】Java AIO 异步 IO 深度解析：从 AsynchronousSocketChannel 到 Proactor 模式</a><time datetime="2026-08-09T00:00:00.000Z" title="发表于 2026-08-09 08:00:00">2026-08-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/09/java-jni-jna-cross-language-practice/" title="【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理">【Java进阶】JNI 与 JNA 深度解析：从本地方法到跨语言调用的底层原理</a><time datetime="2026-08-09T00:00:00.000Z" title="发表于 2026-08-09 08:00:00">2026-08-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/09/kafka-replication-isr-deep-dive/" title="【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性">【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性</a><time datetime="2026-08-09T00:00:00.000Z" title="发表于 2026-08-09 08:00:00">2026-08-09</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
