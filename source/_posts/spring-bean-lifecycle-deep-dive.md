@@ -1,499 +1,242 @@
 ---
-title: 彻底搞懂 Spring Bean 的生命周期：从加载到销毁全流程解析
-date: 2026-06-21 08:00:00
+title: 【Spring 源码】Spring Bean 生命周期深度解析：从实例化到销毁的完整链路
+date: 2026-08-10 08:00:00
 tags:
-  - Java
   - Spring
-  - 源码分析
+  - 源码
+  - 面试
 categories:
-  - Java
-  - Spring 原理
+  - Spring
+  - 后端面试
 author: 东哥
 ---
 
-# 彻底搞懂 Spring Bean 的生命周期：从加载到销毁全流程解析
+# 【Spring 源码】Spring Bean 生命周期深度解析：从实例化到销毁的完整链路
 
-## 引言
+## 面试官：一个 Spring Bean 从创建到销毁，经历了哪些阶段？
 
-Spring Bean 的生命周期是 Spring 框架最核心的知识点之一，也是面试中高频出现的题目。很多同学背了一大堆扩展接口名称，但一到真实的源码层面就懵了。
+「Bean 生命周期」是 Spring 面试的必考题，也是很多人背了又忘的八股。原因是大家只背结论列表，不理解背后的**执行时机**和**设计意图**。其实 Bean 的生命周期就是一套**模板方法模式**的完美演绎：Spring 定义骨架流程，把扩展点留给开发者。
 
-这篇文章带你**一行一行过源码**，彻底搞懂 Bean 从"出生"到"死亡"的全过程。
+今天我们从 `BeanFactory` 到 `ApplicationContext` 两条链路，把 Bean 的完整生命周期拆解成 11 个阶段，配合源码定位，让你不仅知道「有哪些阶段」，还知道「为什么有这些阶段」。
 
-## 一、宏观概览——Bean 生命周期全流程图
+## 一、整体流程图
 
 ```
-BeanDefinition 加载 → 实例化 → 属性填充 → 初始化 → 使用中 → 销毁
-  │                    │          │          │          │        │
-  ▼                    ▼          ▼          ▼          ▼        ▼
-  配置解析         构造函数     设置属性    Aware回调    业务调用   DisposableBean
-  @Bean/XML      或工厂方法    populate()  各种Aware    AOP代理     @PreDestroy
-  @Component                                        BeanPostProcessor
+Bean 定义加载（BeanDefinition）
+        ↓
+① 实例化（构造器/new 对象）
+② 属性填充（依赖注入 @Autowired/@Resource）
+③ Aware 回调（BeanNameAware / BeanFactoryAware / ApplicationContextAware）
+④ BeanPostProcessor#postProcessBeforeInitialization（前置处理）
+⑤ @PostConstruct（JSR-250 注解初始化）
+⑥ InitializingBean#afterPropertiesSet（接口初始化）
+⑦ 自定义 init-method（XML/@Bean(initMethod=...)）
+⑧ BeanPostProcessor#postProcessAfterInitialization（后置处理 → 生成代理的时机）
+        ↓  —— 到这里 Bean 就可以使用了 ——
+⑨ 容器关闭：@PreDestroy
+⑩ DisposableBean#destroy
+⑪ 自定义 destroy-method
 ```
 
-核心流程分为 5 大阶段：
-1. **元数据加载阶段**：加载和解析 BeanDefinition
-2. **实例化阶段**：通过反射或工厂方法创建实例
-3. **属性填充阶段**：完成依赖注入（DI）
-4. **初始化阶段**：Aware 回调、BeanPostProcessor 前置处理、init 方法、BeanPostProcessor 后置处理
-5. **销毁阶段**：容器关闭时执行销毁逻辑
+## 二、三个前置概念
 
-## 二、从源码角度逐阶段剖析
+### 2.1 BeanDefinition：Bean 的「出生证明」
 
-### 阶段 1：BeanDefinition 加载
+Spring 不是直接用 `new` 创建对象，而是先把配置解析成 `BeanDefinition`（bean 的类、作用域、属性、初始化方法等元信息），存进 `BeanDefinitionRegistry`。实例化时根据这份元信息来创建。
 
-Spring 启动时，会通过 `BeanDefinitionReader` 读取配置（XML、注解、Java Config），封装成 `BeanDefinition` 对象。
+### 2.2 两大 IOC 容器差异
+
+- **BeanFactory**：基础容器，Bean 默认**懒加载**（getBean 时才创建）。
+- **ApplicationContext**：BeanFactory 的子接口，默认**预实例化**（启动时创建单例 Bean），并额外提供国际化、事件发布、AOP 集成等能力。
+
+### 2.3 扩展点分类
+
+| 类别 | 接口/注解 | 生效时机 |
+|------|-----------|----------|
+| 感知类 | Aware 系列 | 属性填充后 |
+| 初始化类 | @PostConstruct / InitializingBean / init-method | 前置处理之后 |
+| 后处理类 | BeanPostProcessor | 初始化前后各一次 |
+| 销毁类 | @PreDestroy / DisposableBean / destroy-method | 容器关闭时 |
+
+## 三、逐阶段源码解析
+
+### 阶段 ① 实例化
+
+`AbstractAutowireCapableBeanFactory#createBeanInstance`：根据 BeanDefinition 选择实例化策略——构造器注入、静态工厂、实例工厂。默认用无参构造器反射创建（`instantiateBean`）。**注意：此时对象已存在，但属性还是 null**。
+
+### 阶段 ② 属性填充
+
+`populateBean`：执行依赖注入。Spring 会遍历 `PropertyValues`，处理 `@Autowired`、`@Resource`、`@Value` 等注解（通过 `AutowiredAnnotationBeanPostProcessor` 等后处理器完成），把依赖的 Bean 注入进来。
+
+**此时循环依赖的「提前暴露」也发生在这个阶段**：单例 Bean 通过三级缓存提前暴露半成品，供依赖方引用（这正是三级缓存存在的意义）。
+
+### 阶段 ③ Aware 回调
+
+`invokeAwareMethods`（BeanFactory 容器）或 `ApplicationContextAwareProcessor`（ApplicationContext 容器）回调各种 Aware 接口，让 Bean 感知容器：
 
 ```java
-// BeanDefinition 的核心信息
-public interface BeanDefinition {
-    String SCOPE_SINGLETON = "singleton";
-    String SCOPE_PROTOTYPE = "prototype";
-    
-    // Bean 的类名
-    void setBeanClassName(String beanClassName);
-    // 作用域
-    void setScope(String scope);
-    // 懒加载
-    void setLazyInit(boolean lazyInit);
-    // 初始化方法名
-    void setInitMethodName(String initMethodName);
-    // 销毁方法名
-    void setDestroyMethodName(String destroyMethodName);
-    // 构造参数
-    ConstructorArgumentValues getConstructorArgumentValues();
-    // 属性值
-    MutablePropertyValues getPropertyValues();
+// AbstractAutowireCapableBeanFactory#invokeAwareMethods
+if (bean instanceof BeanNameAware) {
+    ((BeanNameAware) bean).setBeanName(beanName);
+}
+if (bean instanceof BeanClassLoaderAware) {
+    ((BeanClassLoaderAware) bean).setBeanClassLoader(bcl);
+}
+if (bean instanceof BeanFactoryAware) {
+    ((BeanFactoryAware) bean).setBeanFactory(this);
 }
 ```
 
-```java
-// 以注解配置为例：加载流程
-public class AnnotationConfigApplicationContext extends GenericApplicationContext {
-    
-    public AnnotationConfigApplicationContext(Class<?>... componentClasses) {
-        // 1. 创建 BeanDefinition 读取器
-        this.reader = new AnnotatedBeanDefinitionReader(this);
-        // 2. 创建 ClassPath 扫描器
-        this.scanner = new ClassPathBeanDefinitionScanner(this);
-        // 3. 注册配置类
-        register(componentClasses);
-        // 4. 刷新容器（核心入口）
-        refresh();
-    }
-}
-```
+ApplicationContext 容器额外支持 `ApplicationContextAware`、`EnvironmentAware`、`ApplicationEventPublisherAware` 等（由 `ApplicationContextAwareProcessor` 回调）。
 
-**关键源码**（AbstractApplicationContext.refresh）：
+### 阶段 ④ ~ ⑧ 初始化链路
+
+`initializeBean` 方法串联了核心逻辑：
 
 ```java
-@Override
-public void refresh() throws BeansException, IllegalStateException {
-    synchronized (this.startupShutdownMonitor) {
-        // 1. 准备刷新上下文
-        prepareRefresh();
-        
-        // 2. 获取 BeanFactory（关键步骤）
-        ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
-        
-        // 3. 准备 BeanFactory（设置类加载器、后置处理器等）
-        prepareBeanFactory(beanFactory);
-        
-        // 4. 执行 BeanFactoryPostProcessor（修改 BeanDefinition）
-        postProcessBeanFactory(beanFactory);
-        invokeBeanFactoryPostProcessors(beanFactory);
-        
-        // 5. 注册 BeanPostProcessor
-        registerBeanPostProcessors(beanFactory);
-        
-        // 6. 初始化消息源
-        initMessageSource();
-        
-        // 7. 初始化事件广播器
-        initApplicationEventMulticaster();
-        
-        // 8. 特殊 Bean 初始化（onRefresh）
-        onRefresh();
-        
-        // 9. 注册监听器
-        registerListeners();
-        
-        // 10. ◆ 实例化所有非懒加载的单例 Bean（核心入口）
-        finishBeanFactoryInitialization(beanFactory);
-        
-        // 11. 完成刷新
-        finishRefresh();
-    }
-}
-```
-
-### 阶段 2：实例化（Instantiation）
-
-`finishBeanFactoryInitialization` 中调用 `getBean()` → `doGetBean()` → `createBean()` → `doCreateBean()`：
-
-```java
-// AbstractAutowireCapableBeanFactory
-protected Object doCreateBean(String beanName, RootBeanDefinition mbd, @Nullable Object[] args) {
-    BeanWrapper instanceWrapper = null;
-    if (mbd.isSingleton()) {
-        // 从 FactoryBean 缓存中移除
-        instanceWrapper = this.factoryBeanInstanceCache.remove(beanName);
-    }
-    if (instanceWrapper == null) {
-        // ◆ 关键：创建 Bean 实例
-        instanceWrapper = createBeanInstance(beanName, mbd, args);
-    }
-    // ...
-}
-```
-
-**实例化策略**（`createBeanInstance`）：
-
-```java
-protected BeanWrapper createBeanInstance(String beanName, RootBeanDefinition mbd, @Nullable Object[] args) {
-    // 1. 检查是否有 Supplier
-    // 2. 检查是否有工厂方法
-    // 3. 解析构造参数（有参数时根据参数自动匹配）
-    // 4. 无参构造：通过反射实例化
-    return instantiateBean(beanName, mbd);
-}
-
-protected BeanWrapper instantiateBean(String beanName, RootBeanDefinition mbd) {
-    // 使用构造函数创建实例
-    return BeanUtils.instantiateClass(constructorToUse);
-}
-```
-
-这个阶段 bean 刚创建出来，**还是一个"毛胚房"**——属性都是 null，没有依赖注入。
-
-### 阶段 3：属性填充（Populate Bean）
-
-实例化完成后，Spring 进行属性填充（依赖注入）：
-
-```java
-// AbstractAutowireCapableBeanFactory
-protected void populateBean(String beanName, RootBeanDefinition mbd, @Nullable BeanWrapper bw) {
-    // 1. 执行 InstantiationAwareBeanPostProcessor 的前置处理
-    //    如果返回 false，跳过后续属性填充
-    if (!mbd.isSynthetic() && hasInstantiationAwareBeanPostProcessors()) {
-        for (BeanPostProcessor bp : getBeanPostProcessors()) {
-            if (bp instanceof InstantiationAwareBeanPostProcessor) {
-                InstantiationAwareBeanPostProcessor ibp = (InstantiationAwareBeanPostProcessor) bp;
-                if (!ibp.postProcessAfterInstantiation(bw.getWrappedInstance(), beanName)) {
-                    return;
-                }
-            }
-        }
-    }
-    
-    // 2. 获取属性值（从 BeanDefinition 中）
-    PropertyValues pvs = (mbd.hasPropertyValues() ? mbd.getPropertyValues() : null);
-    
-    // 3. 按注入类型处理
-    if (mbd.getResolvedAutowireMode() == AUTOWIRE_BY_NAME
-            || mbd.getResolvedAutowireMode() == AUTOWIRE_BY_TYPE) {
-        // 自动装配
-        autowireByName(beanName, mbd, bw, newPvs);
-        autowireByType(beanName, mbd, bw, newPvs);
-    }
-    
-    // 4. 检查是否有依赖检查
-    // 5. ◆ 应用属性值（注入实际值）
-    applyPropertyValues(beanName, mbd, bw, pvs);
-}
-```
-
-**依赖注入方式对比：**
-
-| 注入方式 | 实现方式 | 优缺点 |
-|----------|----------|--------|
-| field 注入 | `@Autowired` 直接加字段上 | 简洁，但无法被 final 修饰，不利于测试 |
-| setter 注入 | `@Autowired` 加 setter | 可选依赖，支持重新注入 |
-| 构造器注入 | 构造函数参数 + `@Autowired`（Spring 4.3+可省略） | **推荐**：不可变、不为 null、利于测试 |
-
-```java
-@Component
-public class UserService {
-    
-    // 方式一：字段注入（不推荐）
-    @Autowired
-    private UserRepository userRepository;
-    
-    // 方式二：构造器注入（推荐）
-    private final UserRepository userRepository;
-    
-    // Spring 4.3+ 单个构造器时 @Autowired 可省略
-    public UserService(UserRepository userRepository) {
-        this.userRepository = userRepository;
-    }
-}
-```
-
-### 阶段 4：初始化（Initialization）
-
-属性填充完成后，Bean 进入初始化阶段。这是**扩展点最多**的阶段：
-
-```java
-// AbstractAutowireCapableBeanFactory
-protected Object initializeBean(String beanName, Object bean, @Nullable RootBeanDefinition mbd) {
-    // ◆ 第一步：Aware 接口回调
+protected Object initializeBean(String beanName, Object bean, RootBeanDefinition mbd) {
+    // 阶段③：Aware 回调
     invokeAwareMethods(beanName, bean);
-    
-    // ◆ 第二步：BeanPostProcessor 前置处理（初始化前）
-    Object wrappedBean = applyBeanPostProcessorsBeforeInitialization(bean, beanName);
-    
-    // ◆ 第三步：执行初始化方法
+
+    // 阶段④：前置处理 —— 所有 BeanPostProcessor 的 before 方法
+    Object wrappedBean = applyBeanPostProcessorsBeforeInitialization(wrappedBean, beanName);
+
+    // 阶段⑤⑥⑦：执行初始化
     invokeInitMethods(beanName, wrappedBean, mbd);
-    
-    // ◆ 第四步：BeanPostProcessor 后置处理（初始化后，AOP 就在这里）
+
+    // 阶段⑧：后置处理 —— 所有 BeanPostProcessor 的 after 方法
     wrappedBean = applyBeanPostProcessorsAfterInitialization(wrappedBean, beanName);
-    
     return wrappedBean;
 }
-```
 
-#### 第一步：Aware 接口回调
-
-```java
-private void invokeAwareMethods(String beanName, Object bean) {
-    if (bean instanceof Aware) {
-        if (bean instanceof BeanNameAware) {
-            ((BeanNameAware) bean).setBeanName(beanName);
-        }
-        if (bean instanceof BeanClassLoaderAware) {
-            ((BeanClassLoaderAware) bean).setBeanClassLoader(getBeanClassLoader());
-        }
-        if (bean instanceof BeanFactoryAware) {
-            ((BeanFactoryAware) bean).setBeanFactory(AbstractAutowireCapableBeanFactory.this);
-        }
-    }
-}
-```
-
-注意：`ApplicationContextAware`、`EnvironmentAware` 等是通过 `ApplicationContextAwareProcessor`（一个 BeanPostProcessor）来注入的，在下一步执行。
-
-**常见 Aware 接口及用途：**
-
-| Aware 接口 | 注入对象 |
-|------------|----------|
-| BeanNameAware | 当前 Bean 的名称 |
-| BeanFactoryAware | 当前的 BeanFactory 容器 |
-| ApplicationContextAware | 当前的 ApplicationContext（ApplicationContextAwareProcessor 注入） |
-| EnvironmentAware | 当前的环境配置信息 |
-| ResourceLoaderAware | 资源加载器 |
-| MessageSourceAware | 国际化消息源 |
-
-#### 第二步：BeanPostProcessor 前置处理
-
-```java
-@Override
-public Object applyBeanPostProcessorsBeforeInitialization(Object existingBean, String beanName) {
-    Object result = existingBean;
-    for (BeanPostProcessor processor : getBeanPostProcessors()) {
-        Object current = processor.postProcessBeforeInitialization(result, beanName);
-        if (current == null) {
-            return result;
-        }
-        result = current;
-    }
-    return result;
-}
-```
-
-常见的前置处理器：
-- `ApplicationContextAwareProcessor`：注入 ApplicationContextAware 等
-- `InitDestroyAnnotationBeanPostProcessor`：处理 @PostConstruct（扫描标记方法，为后续执行做准备）
-
-#### 第三步：执行初始化方法
-
-```java
-protected void invokeInitMethods(String beanName, Object bean, @Nullable RootBeanDefinition mbd) {
-    // 如果 bean 实现了 InitializingBean，调用 afterPropertiesSet()
-    if (bean instanceof InitializingBean) {
+protected void invokeInitMethods(String beanName, Object bean, RootBeanDefinition mbd) {
+    // 阶段⑥：InitializingBean 接口
+    boolean isInitializingBean = (bean instanceof InitializingBean);
+    if (isInitializingBean) {
         ((InitializingBean) bean).afterPropertiesSet();
     }
-    
-    // 如果指定了自定义 init-method，通过反射调用
-    if (mbd != null && mbd.getInitMethodName() != null) {
-        invokeCustomInitMethod(beanName, bean, mbd);
-    }
-}
-```
-
-**初始化方法执行顺序：**
-1. `@PostConstruct` 标注的方法（在 InitDestroyAnnotationBeanPostProcessor 中执行）
-2. `InitializingBean.afterPropertiesSet()`
-3. 自定义 `@Bean(initMethod = "init")` 或 XML `init-method`
-
-#### 第四步：BeanPostProcessor 后置处理
-
-```java
-@Override
-public Object applyBeanPostProcessorsAfterInitialization(Object existingBean, String beanName) {
-    Object result = existingBean;
-    for (BeanPostProcessor processor : getBeanPostProcessors()) {
-        Object current = processor.postProcessAfterInitialization(result, beanName);
-        if (current == null) {
-            return result;
-        }
-        result = current;
-    }
-    return result;
-}
-```
-
-**最关键的后置处理器**：`AbstractAutoProxyCreator`（AOP 的入口）
-
-```java
-// AbstractAutoProxyCreator.postProcessAfterInitialization()
-@Override
-public Object postProcessAfterInitialization(@Nullable Object bean, String beanName) {
-    if (bean != null) {
-        // 检查是否需要被代理（是否有 @Transactional、@Aspect 等）
-        Object cacheKey = getCacheKey(bean.getClass(), beanName);
-        if (this.earlyProxyReferences.remove(cacheKey) != bean) {
-            // ◆ 核心：创建 AOP 代理
-            return wrapIfNecessary(bean, beanName, cacheKey);
-        }
-    }
-    return bean;
-}
-```
-
-**AOP 代理在这里创建**：如果当前 Bean 需要被增强（事务、缓存、切面等），这里会返回一个 JDK 动态代理或 CGLIB 代理对象。
-
-### 阶段 5：销毁（Destruction）
-
-容器关闭时，调用 `doClose()` → `destroyBeans()`：
-
-```java
-// DefaultSingletonBeanRegistry
-public void destroySingletons() {
-    // 处理 DisposableBean
-    for (String beanName : disposableBeanNames) {
-        DisposableBean disposableBean = this.disposableBeans.remove(beanName);
-        if (disposableBean != null) {
-            disposableBean.destroy();
+    // 阶段⑦：自定义 init-method
+    if (mbd != null && bean.getClass() != NullBean.class) {
+        String initMethodName = mbd.getInitMethodName();
+        if (initMethodName != null && !(isInitializingBean && "afterPropertiesSet".equals(initMethodName))) {
+            invokeCustomInitMethod(beanName, bean, mbd);
         }
     }
 }
 ```
 
-**销毁方法执行顺序：**
-1. `@PreDestroy` 标注的方法
-2. `DisposableBean.destroy()`
-3. 自定义 `@Bean(destroyMethod = "close")` 或 XML `destroy-method`
+那 `@PostConstruct` 在哪执行？它由 `CommonAnnotationBeanPostProcessor` 处理，这个处理器就是注册在 BeanPostProcessor 链上的——**在 `postProcessBeforeInitialization` 阶段调用 `@PostConstruct` 方法**。所以顺序是：④`@PostConstruct`（before 处理器内）→ ⑥`afterPropertiesSet` → ⑦`init-method`。
 
-## 三、Spring 关键扩展点总结
+**执行顺序记忆口诀：注解（@PostConstruct）→ 接口（InitializingBean）→ 配置（init-method）**。
 
-整个生命周期中的**扩展接口**按执行顺序：
+### 阶段 ⑧ 为什么是 AOP 代理的时机？
 
-```
-                  BeanFactoryPostProcessor
-                  ────────────────────────
-                  在 Bean 实例化之前修改 BeanDefinition
-                         │
-                         ▼
-                  BeanPostProcessor#postProcessBeforeInitialization
-                  ────────────────────────────────────────────────
-                  Aware 回调、@PostConstruct（在对应的 processor 中）
-                         │
-                         ▼
-                ┌────────┴────────┐
-                │  InitializingBean│── @PostConstruct → afterPropertiesSet → init-method
-                │  @PostConstruct  │
-                │  @Bean(init)     │
-                └────────┬────────┘
-                         │
-                         ▼
-                  BeanPostProcessor#postProcessAfterInitialization
-                  ────────────────────────────────────────────────
-                  AOP 代理创建入口
-                         │
-                         ▼
-                    DisposableBean
-                    @PreDestroy
-                    @Bean(destroyMethod)
-```
+`AbstractAutoProxyCreator`（AOP 自动代理的后处理器）在 `postProcessAfterInitialization` 中判断 Bean 是否需要代理，需要就返回代理对象。**所以 AOP 代理在初始化之后才生成**，这也是为什么 Spring 代理对象调用内部方法（this 调用）不生效——因为目标方法调用发生在代理内部，绕过了代理逻辑。
 
-## 四、经典面试题
+### 阶段 ⑨ ~ ⑪ 销毁链路
 
-### Q1：Spring 如何解决循环依赖？
-
-利用**三级缓存** + **提前暴露对象的 ObjectFactory**：
+容器关闭（`close()` / `ContextClosedEvent`）时，`doClose` → `destroyBeans`：
 
 ```java
-public class DefaultSingletonBeanRegistry {
-    // 一级缓存：完整的单例 Bean
-    private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);
-    // 二级缓存：提前暴露的早期对象（还没完成属性填充）
-    private final Map<String, Object> earlySingletonObjects = new ConcurrentHashMap<>(16);
-    // 三级缓存：ObjectFactory 工厂
-    private final Map<String, ObjectFactory<?>> singletonFactories = new HashMap<>(16);
-}
+// DisposableBeanAdapter 顺序：先 @PreDestroy，再 DisposableBean.destroy，再 destroy-method
+// 与初始化顺序相反：配置（destroy-method）在最外，注解在最先执行
 ```
 
-```java
-// 从三级缓存获取早期引用
-protected Object getSingleton(String beanName, boolean allowEarlyReference) {
-    Object singletonObject = this.singletonObjects.get(beanName);
-    if (singletonObject == null && isSingletonCurrentlyInCreation(beanName)) {
-        singletonObject = this.earlySingletonObjects.get(beanName);
-        if (singletonObject == null && allowEarlyReference) {
-            // 从三级缓存中获取 ObjectFactory 并创建早期引用
-            ObjectFactory<?> singletonFactory = this.singletonFactories.get(beanName);
-            if (singletonFactory != null) {
-                singletonObject = singletonFactory.getObject();
-                this.earlySingletonObjects.put(beanName, singletonObject);
-                this.singletonFactories.remove(beanName);
-            }
-        }
-    }
-    return singletonObject;
-}
-```
+**销毁顺序与初始化相反**：`@PreDestroy` → `destroy()` → `destroy-method`。为什么相反？依赖关系：被依赖者后销毁（先销毁依赖者，再销毁被依赖者，保证不引用已销毁的 Bean）。
 
-三级缓存解决的问题：A 依赖 B，B 依赖 A。A 创建时提前暴露给 B，B 通过三级缓存拿到 A 的早期引用完成自身创建，然后 A 再完成属性填充。
-
-**注意**：三级缓存只能解决 **setter 注入** 的循环依赖，**构造器注入**不行（构造时对象还没创建出来，没有早期引用可暴露）。
-
-### Q2：BeanPostProcessor 和 BeanFactoryPostProcessor 的区别？
-
-| 区别 | BeanFactoryPostProcessor | BeanPostProcessor |
-|------|------------------------|-------------------|
-| 执行时机 | Bean **实例化之前** | Bean 初始化前后 |
-| 操作对象 | BeanDefinition（元数据） | Bean 实例本身 |
-| 典型场景 | 修改属性值、注册特殊 Bean | 代理、包装、监控 |
-| 执行顺序 | 更早 | 更晚 |
+## 四、完整代码演示
 
 ```java
-// 自定义 BeanFactoryPostProcessor
 @Component
-public class MyBeanFactoryPostProcessor implements BeanFactoryPostProcessor {
+public class LifecycleDemo implements InitializingBean, DisposableBean, BeanNameAware {
+
+    private String beanName;
+
     @Override
-    public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
-        // 获取 BeanDefinition 并修改属性
-        BeanDefinition bd = beanFactory.getBeanDefinition("userService");
-        bd.getPropertyValues().add("timeout", 5000);
+    public void setBeanName(String name) {   // 阶段③
+        this.beanName = name;
+        System.out.println("3. setBeanName: " + name);
+    }
+
+    @PostConstruct                              // 阶段⑤
+    public void postConstruct() {
+        System.out.println("5. @PostConstruct");
+    }
+
+    @Override
+    public void afterPropertiesSet() {          // 阶段⑥
+        System.out.println("6. afterPropertiesSet");
+    }
+
+    @Bean(initMethod = "customInit", destroyMethod = "customDestroy")  // 或 XML 配置
+    // 阶段⑦ customInit / 阶段⑪ customDestroy
+    public void customInit() {
+        System.out.println("7. customInit");
+    }
+
+    @PreDestroy                                 // 阶段⑨
+    public void preDestroy() {
+        System.out.println("9. @PreDestroy");
+    }
+
+    @Override
+    public void destroy() {                     // 阶段⑩
+        System.out.println("10. destroy");
+    }
+
+    public void customDestroy() {               // 阶段⑪
+        System.out.println("11. customDestroy");
     }
 }
 ```
 
-### Q3：@PostConstruct、afterPropertiesSet、init-method 的执行顺序？
+再注册一个 BeanPostProcessor 观察④⑧：
 
+```java
+@Component
+public class LogBeanPostProcessor implements BeanPostProcessor {
+    @Override
+    public Object postProcessBeforeInitialization(Object bean, String beanName) {
+        System.out.println("4. beforeInit: " + beanName);
+        return bean;
+    }
+    @Override
+    public Object postProcessAfterInitialization(Object bean, String beanName) {
+        System.out.println("8. afterInit: " + beanName);
+        return bean;
+    }
+}
 ```
-1. @PostConstruct（注解方式，在 InitDestroyAnnotationBeanPostProcessor 中执行）
-2. InitializingBean#afterPropertiesSet（接口方式）
-3. @Bean(initMethod = "xxx") 或 XML init-method（反射方式）
-```
 
-**官方推荐**：用 `@PostConstruct` 最方便；用 `InitializingBean` 可以和 Spring 解耦（但不是完全解耦）；自定义 `init-method` 适用于 XML 配置的第三方 Bean。
+启动容器，输出顺序完全对应 ①~⑪ 的流程图。
 
-## 总结
+## 五、几个高频追问
 
-Spring Bean 生命周期看似复杂，但本质上就一句话：
+**Q1：BeanPostProcessor 和 BeanFactoryPostProcessor 的区别？**
+前者作用于 **Bean 实例**（对象创建后，可修改/包装 Bean）；后者作用于 **BeanDefinition**（容器启动早期，Bean 还没实例化时，可修改 Bean 的元信息）。典型如 `PropertySourcesPlaceholderConfigurer` 解析 `${...}` 占位符——它必须在 Bean 实例化前把占位符替换掉。
 
-> **先找到定义（BeanDefinition）→ 建房子（实例化）→ 装修（属性填充）→ 通水电（初始化回调）→ 住进去（使用）→ 拆房子（销毁）**
+**Q2：为什么 @PostConstruct 一定在 afterPropertiesSet 之前？**
+`@PostConstruct` 由 `CommonAnnotationBeanPostProcessor` 的 before 方法调用，而 `afterPropertiesSet` 在 `invokeInitMethods` 中调用，前者天然排在链路前面。面试可以答「一个是后处理器 before 阶段，一个是初始化阶段，顺序由模板方法固定」。
 
-每个阶段都预留了扩展点，让开发者可以"插一脚"干点私活——这就是 Spring 框架"开闭原则"的体现。
+**Q3：原型（Prototype）Bean 的生命周期有什么不同？**
+**初始化阶段完全一样**，但 Spring **不管理原型 Bean 的销毁**——没有回调 destroy 方法的机会（`DisposableBean` 不生效，除非手动调用 `beanFactory.destroyBean()`）。因为容器不知道原型 Bean 创建了多少个、该销毁哪个。
 
-掌握了 Bean 生命周期，你就掌握了 Spring 的"骨架"。无论是面试还是日常开发排查问题，都会游刃有余。
+**Q4：循环依赖时 Bean 的生命周期会被打断吗？**
+会。A 依赖 B、B 依赖 A 时，A 在**属性填充阶段**发现依赖 B，转而创建 B；B 填充时发现依赖 A，从**三级缓存**拿到 A 的提前暴露引用（此时 A 还没执行初始化）。所以循环依赖下，A 的初始化被延后到 B 创建完成之后。
+
+**Q5：init-method 和 InitializingBean 同时配了会执行几次？**
+两次，但 Spring 做了去重：若 init-method 名恰好是 `afterPropertiesSet`，则只执行一次（源码里 `!(isInitializingBean && "afterPropertiesSet".equals(initMethodName))` 的判断）。
+
+## 六、总结
+
+| 阶段 | 扩展点 | 一句话记忆 |
+|------|--------|-----------|
+| 实例化 | 构造器 | 对象诞生，属性为空 |
+| 属性填充 | DI | 依赖注入完成 |
+| Aware | Aware 接口 | 感知容器 |
+| before | BeanPostProcessor | 前置处理（含 @PostConstruct） |
+| init | InitializingBean / init-method | 初始化回调 |
+| after | BeanPostProcessor | 后置处理（AOP 代理在此） |
+| destroy | @PreDestroy / destroy / destroy-method | 容器关闭，反向销毁 |
+
+Bean 生命周期本质是**模板方法模式 + 观察者模式（后处理器链）**的结合：Spring 定好骨架，扩展点全开，开发者按需插入逻辑。理解了这个设计，你就从「背八股」进阶到「懂设计」了。
