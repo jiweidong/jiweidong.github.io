@@ -1,0 +1,285 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java 安全】内存马原理与攻防实战：从动态注册到检测防御 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java 安全】内存马原理与攻防实战：从动态注册到检测防御引言：为什么”文件马”正在被”内存马”取代？传统 WebShell 是往服务器写一个 .jsp 文件，落地即留痕：文件扫描、杀软查杀、文件完整性校验都能发现。而内存马（Memory Shell）不落地任何文件——恶意代码直接注入到运行中的 JVM 内存里，以 Tomcat&#x2F;Spring 容器内部的组件形态存活。 文件系统里什么都">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java 安全】内存马原理与攻防实战：从动态注册到检测防御">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/20/java-memory-shell-attack-defense-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java 安全】内存马原理与攻防实战：从动态注册到检测防御引言：为什么”文件马”正在被”内存马”取代？传统 WebShell 是往服务器写一个 .jsp 文件，落地即留痕：文件扫描、杀软查杀、文件完整性校验都能发现。而内存马（Memory Shell）不落地任何文件——恶意代码直接注入到运行中的 JVM 内存里，以 Tomcat&#x2F;Spring 容器内部的组件形态存活。 文件系统里什么都">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-20T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-20T00:18:23.655Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Spring">
+<meta property="article:tag" content="Tomcat">
+<meta property="article:tag" content="安全">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java 安全】内存马原理与攻防实战：从动态注册到检测防御",
+  "url": "https://jiweidong.github.io/2026/08/20/java-memory-shell-attack-defense-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-20T00:00:00.000Z",
+  "dateModified": "2026-08-20T00:18:23.655Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/20/java-memory-shell-attack-defense-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java 安全】内存马原理与攻防实战：从动态注册到检测防御',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">482</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">660</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">164</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java 安全】内存马原理与攻防实战：从动态注册到检测防御</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java 安全】内存马原理与攻防实战：从动态注册到检测防御</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-20T00:18:23.655Z" title="更新于 2026-08-20 08:18:23">2026-08-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%AE%89%E5%85%A8/">安全</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-安全】内存马原理与攻防实战：从动态注册到检测防御"><a href="#【Java-安全】内存马原理与攻防实战：从动态注册到检测防御" class="headerlink" title="【Java 安全】内存马原理与攻防实战：从动态注册到检测防御"></a>【Java 安全】内存马原理与攻防实战：从动态注册到检测防御</h1><h2 id="引言：为什么”文件马”正在被”内存马”取代？"><a href="#引言：为什么”文件马”正在被”内存马”取代？" class="headerlink" title="引言：为什么”文件马”正在被”内存马”取代？"></a>引言：为什么”文件马”正在被”内存马”取代？</h2><p>传统 WebShell 是往服务器写一个 <code>.jsp</code> 文件，落地即留痕：文件扫描、杀软查杀、文件完整性校验都能发现。而<strong>内存马（Memory Shell）不落地任何文件</strong>——恶意代码直接注入到运行中的 JVM 内存里，以 Tomcat&#x2F;Spring 容器内部的组件形态存活。</p>
+<p>文件系统里什么都没有，常规文件查杀完全失效；进程重启后内存马消失，也增加了取证难度。这就是为什么近年来攻防演练（红蓝对抗）中内存马成为主流武器。本文从原理讲透三类主流内存马，再给出检测与防御的完整方案。</p>
+<h2 id="一、内存马的原理基础"><a href="#一、内存马的原理基础" class="headerlink" title="一、内存马的原理基础"></a>一、内存马的原理基础</h2><p>内存马的本质是：<strong>向运行中的 Web 容器动态注册一个”请求处理器”</strong>，让特定 URL（或 Header）的请求被它接管执行任意命令。</p>
+<p>要实现这一点，需要三个前提：</p>
+<ol>
+<li><strong>能拿到容器组件的注册入口</strong>（Tomcat 的 Mapper&#x2F;Context、Spring 的 HandlerMapping）</li>
+<li><strong>能执行任意代码</strong>（通常先通过反序列化、JNDI 注入、表达式注入等漏洞拿到代码执行权限）</li>
+<li><strong>代码注入后能常驻</strong>（利用 ClassLoader 加载恶意类，且不被 GC）</li>
+</ol>
+<p>下面以最常见的 Tomcat 为例，看注册入口在哪。</p>
+<h2 id="二、三类主流内存马原理"><a href="#二、三类主流内存马原理" class="headerlink" title="二、三类主流内存马原理"></a>二、三类主流内存马原理</h2><h3 id="2-1-Filter-型内存马（最常见）"><a href="#2-1-Filter-型内存马（最常见）" class="headerlink" title="2.1 Filter 型内存马（最常见）"></a>2.1 Filter 型内存马（最常见）</h3><p>Tomcat 处理请求的管道是：<code>Connector → Engine → Host → Context → FilterChain → Servlet</code>。其中 <strong>Filter 在 Servlet 之前执行</strong>，且 Filter 列表存在 <code>Context</code> 的 <code>filterMaps</code> 和 <code>filterDefs</code> 中——这两个 Map 是可以在运行时<strong>动态添加</strong>的。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 核心思路：拿到 StandardContext，动态 addFilter + 添加 FilterMap</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FilterShellInjector</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">inject</span><span class="params">()</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="comment">// 1. 从当前线程拿到 StandardContext（Tomcat 上下文）</span></span><br><span class="line">        <span class="type">StandardContext</span> <span class="variable">context</span> <span class="operator">=</span> getStandardContext();</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 2. 创建恶意 Filter</span></span><br><span class="line">        <span class="type">FilterDef</span> <span class="variable">filterDef</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">FilterDef</span>();</span><br><span class="line">        filterDef.setFilterName(<span class="string">&quot;shellFilter&quot;</span>);</span><br><span class="line">        filterDef.setFilterClass(EvilFilter.class.getName());</span><br><span class="line">        filterDef.setFilter(<span class="keyword">new</span> <span class="title class_">EvilFilter</span>());</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 3. 注册 FilterDef 和 FilterMap（拦截 /*）</span></span><br><span class="line">        context.addFilterDef(filterDef);</span><br><span class="line">        <span class="type">FilterMap</span> <span class="variable">filterMap</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">FilterMap</span>();</span><br><span class="line">        filterMap.setFilterName(<span class="string">&quot;shellFilter&quot;</span>);</span><br><span class="line">        filterMap.addURLPattern(<span class="string">&quot;/*&quot;</span>);</span><br><span class="line">        context.addFilterMap(filterMap);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">EvilFilter</span> <span class="keyword">implements</span> <span class="title class_">Filter</span> &#123;</span><br><span class="line">        <span class="meta">@Override</span></span><br><span class="line">        <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">doFilter</span><span class="params">(ServletRequest req, ServletResponse res, FilterChain chain)</span> &#123;</span><br><span class="line">            <span class="comment">// 特定参数触发命令执行，否则放行</span></span><br><span class="line">            <span class="type">String</span> <span class="variable">cmd</span> <span class="operator">=</span> req.getParameter(<span class="string">&quot;cmd&quot;</span>);</span><br><span class="line">            <span class="keyword">if</span> (cmd != <span class="literal">null</span>) &#123;</span><br><span class="line">                <span class="comment">// 执行命令并写回响应（此处省略命令执行细节）</span></span><br><span class="line">                chain.doFilter(req, res);</span><br><span class="line">            &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">                chain.doFilter(req, res);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么 Filter 型最流行</strong>：<code>/*</code> 拦截一切请求，隐蔽性好（正常请求照常放行），且 addFilter 的 API 是 Tomcat 公开的，不需要反射 Hack 内部私有字段。</p>
+<h3 id="2-2-Servlet-型内存马"><a href="#2-2-Servlet-型内存马" class="headerlink" title="2.2 Servlet 型内存马"></a>2.2 Servlet 型内存马</h3><p>原理与 Filter 类似：往 <code>StandardContext</code> 的 <code>children</code> 里 addChild 一个 Wrapper（Servlet 包装），并映射 URL。Servlet 型的问题是要占用一个 URL 路径，隐蔽性略差，且部分版本需要手动设置 Servlet 的 class 加载。</p>
+<h3 id="2-3-Spring-型内存马（Controller-Interceptor）"><a href="#2-3-Spring-型内存马（Controller-Interceptor）" class="headerlink" title="2.3 Spring 型内存马（Controller&#x2F;Interceptor）"></a>2.3 Spring 型内存马（Controller&#x2F;Interceptor）</h3><p>Spring MVC 应用不走 Tomcat 的 Servlet 管道注册也可以——直接往 Spring 容器注册组件：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 核心思路：往 RequestMappingHandlerMapping 里注册一个动态 Controller</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SpringShellInjector</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">inject</span><span class="params">(ApplicationContext ctx)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">RequestMappingHandlerMapping</span> <span class="variable">mapping</span> <span class="operator">=</span> ctx.getBean(RequestMappingHandlerMapping.class);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 通过 RequestMappingHandlerMapping 的 registerMapping 注册动态方法</span></span><br><span class="line">        <span class="type">Method</span> <span class="variable">method</span> <span class="operator">=</span> SpringShellInjector.class.getMethod(<span class="string">&quot;shell&quot;</span>, HttpServletRequest.class, HttpServletResponse.class);</span><br><span class="line">        <span class="type">RequestMappingInfo</span> <span class="variable">info</span> <span class="operator">=</span> RequestMappingInfo.paths(<span class="string">&quot;/api/shell&quot;</span>).build();</span><br><span class="line"></span><br><span class="line">        mapping.registerMapping(info, <span class="keyword">new</span> <span class="title class_">SpringShellInjector</span>(), method);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">shell</span><span class="params">(HttpServletRequest request, HttpServletResponse response)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">cmd</span> <span class="operator">=</span> request.getParameter(<span class="string">&quot;cmd&quot;</span>);</span><br><span class="line">        <span class="keyword">if</span> (cmd != <span class="literal">null</span>) &#123;</span><br><span class="line">            <span class="comment">// 命令执行...</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>Spring 型内存马的好处：注册后就是一个”正常”的 Spring MVC Controller，<code>@RequestMapping</code> 映射表里多了一条，从 Filter 层看完全无异常，隐蔽性更强。</p>
+<h3 id="2-4-其他变种"><a href="#2-4-其他变种" class="headerlink" title="2.4 其他变种"></a>2.4 其他变种</h3><ul>
+<li><strong>Listener 型</strong>：注册 <code>ServletRequestListener</code>，每次请求触发</li>
+<li><strong>Agent 型</strong>：通过 Java Agent 的 retransform 篡改现有类字节码（如改 <code>org.apache.catalina.core.ApplicationFilterChain</code>），最隐蔽也最难写</li>
+<li><strong>WebSocket 型</strong>：注册 WebSocket 端点作为指令通道</li>
+</ul>
+<h2 id="三、实战攻防：攻击链路与检测方法"><a href="#三、实战攻防：攻击链路与检测方法" class="headerlink" title="三、实战攻防：攻击链路与检测方法"></a>三、实战攻防：攻击链路与检测方法</h2><h3 id="3-1-完整攻击链"><a href="#3-1-完整攻击链" class="headerlink" title="3.1 完整攻击链"></a>3.1 完整攻击链</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">1. 漏洞入口（反序列化 / JNDI / 表达式注入 / 任意文件上传）</span><br><span class="line">        ↓</span><br><span class="line">2. 获取代码执行（通常借助字节码加载：defineClass / BCEL / 恶意 ClassLoader）</span><br><span class="line">        ↓</span><br><span class="line">3. 注入内存马（Filter/Servlet/Spring Controller 注册）</span><br><span class="line">        ↓</span><br><span class="line">4. 访问 shell URL 持续控制（可加密混淆流量）</span><br></pre></td></tr></table></figure>
+
+<p>关键点：第 2 步的”类加载”环节，攻击者一般通过 <code>Thread.currentThread().getContextClassLoader()</code> 拿到 Web 应用的 ClassLoader，保证恶意类能被容器正常加载且不被回收。</p>
+<h3 id="3-2-检测思路（红队视角反推）"><a href="#3-2-检测思路（红队视角反推）" class="headerlink" title="3.2 检测思路（红队视角反推）"></a>3.2 检测思路（红队视角反推）</h3><p><strong>① 基于行为的检测（流量侧）</strong></p>
+<p>内存马总要通信：特定 URL、特定 Header（如 <code>cmd</code> 参数、<code>X-Options</code> 头、加密 payload）。WAF&#x2F;网关侧重点监控：</p>
+<ul>
+<li>异常参数名（cmd、exec、shell 等高频词）</li>
+<li>请求与响应内容特征（命令执行回显特征、whoami 等命令指纹）</li>
+<li>高频访问单一 URL 且参数加密的异常行为</li>
+</ul>
+<p><strong>② 基于容器的检测（内存侧）</strong></p>
+<p>这是最有效的检测方式——直接查容器内部注册表：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 检测脚本：遍历 Tomcat 的 Filter 列表，比对是否为&quot;已知/预期&quot;的 Filter</span></span><br><span class="line"><span class="type">StandardContext</span> <span class="variable">context</span> <span class="operator">=</span> getStandardContext();</span><br><span class="line">ApplicationFilterConfig[] filterConfigs = context.findFilterConfigs();</span><br><span class="line"><span class="keyword">for</span> (ApplicationFilterConfig fc : filterConfigs) &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">filterClass</span> <span class="operator">=</span> fc.getFilterClass();</span><br><span class="line">    <span class="type">String</span> <span class="variable">name</span> <span class="operator">=</span> fc.getFilterName();</span><br><span class="line">    <span class="comment">// 1. 不在白名单（web.xml/注解配置）里的 Filter = 可疑</span></span><br><span class="line">    <span class="comment">// 2. FilterClass 不在 classpath 任何 jar/classes 中 = 高危</span></span><br><span class="line">    <span class="comment">// 3. 类名混淆、加载器异常 = 高危</span></span><br><span class="line">    System.out.println(name + <span class="string">&quot; -&gt; &quot;</span> + filterClass);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>同理可以遍历 <code>RequestMappingHandlerMapping</code> 的 handlerMethods，检查是否有 handler 对应的类不在代码库中。</p>
+<p><strong>③ 基于 JVM 的检测</strong></p>
+<ul>
+<li><strong>ClassLoader 溯源</strong>：正常业务类由 WebAppClassLoader 从应用目录加载；恶意类可能来自自定义 ClassLoader 或反射 defineClass，类文件无对应磁盘路径</li>
+<li><strong>JSP 预编译残留</strong>：访问过被删 JSP 的编译产物 class 文件会留在 work 目录</li>
+<li><strong>线程排查</strong>：CPU 高、可疑守护线程（连接外部 C2 的线程）</li>
+<li><strong>JDK 自带工具</strong>：<code>jmap -histo</code> 看可疑类、<code>jstack</code> 看线程栈、Arthas <code>sc</code>&#x2F;<code>jad</code> 命令排查</li>
+</ul>
+<h3 id="3-3-防御体系（蓝队视角）"><a href="#3-3-防御体系（蓝队视角）" class="headerlink" title="3.3 防御体系（蓝队视角）"></a>3.3 防御体系（蓝队视角）</h3><p><strong>① 源头治理（最重要）</strong></p>
+<ul>
+<li>漏洞修复：反序列化、JNDI、表达式注入是内存马入口，优先封堵</li>
+<li>依赖安全：升级 Fastjson、Log4j2、Spring 等高风险组件版本</li>
+<li>RASP（Runtime Application Self-Protection）：在 JVM 层拦截 <code>Filter.addFilterDef</code>、<code>defineClass</code>、<code>ProcessBuilder</code> 等敏感 API——<strong>RASP 是目前对抗内存马最有效的技术</strong>，因为它直接阻断”动态注册”这个动作本身</li>
+</ul>
+<p><strong>② 运行时检测</strong></p>
+<ul>
+<li>部署内存马检测 Agent（如阿里云、长亭的检测方案），定时比对容器注册表与基线</li>
+<li>关键业务容器开启 <strong>只读文件系统 + 最小化 JDK</strong>，压缩攻击面</li>
+<li>禁止应用使用反射调用容器内部 API（可通过 SecurityManager&#x2F;模块化限制，Java 17+ 可考虑 strong encapsulation 收益）</li>
+</ul>
+<p><strong>③ 响应处置</strong></p>
+<ul>
+<li>确认内存马后：<code>kill -9</code> 重启进程是唯一彻底的清除手段（内存马不落地，重启即消失）</li>
+<li>重启前先抓内存快照（<code>jmap -dump</code>）、线程栈、进程内存，保留取证</li>
+<li>排查同类服务器是否也被打（内存马通常批量投放）</li>
+</ul>
+<h2 id="四、自己动手写个检测-Demo"><a href="#四、自己动手写个检测-Demo" class="headerlink" title="四、自己动手写个检测 Demo"></a>四、自己动手写个检测 Demo</h2><p>一个最小可用的 Filter 基线检测（基于 JDK 内置工具思路）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 用 jmap 导出类直方图，找可疑类</span></span><br><span class="line">jmap -histo &lt;pid&gt; | grep -i <span class="string">&quot;evil\|shell\|filter&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. 用 jstack 找可疑线程（连接外网 IP 的线程）</span></span><br><span class="line">jstack &lt;pid&gt; &gt; stack.txt</span><br><span class="line">grep -B5 -A20 <span class="string">&quot;RUNNABLE&quot;</span> stack.txt</span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. 用 Arthas 列出所有 Filter</span></span><br><span class="line"><span class="comment">#    需要先拿到 SpringContext/TomcatContext，再遍历 filterConfigs</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="五、面试追问环节"><a href="#五、面试追问环节" class="headerlink" title="五、面试追问环节"></a>五、面试追问环节</h2><p><strong>Q1：内存马为什么不落地文件还能生效？</strong><br>答：Java 类加载机制决定了”类不一定来自文件”。<code>ClassLoader.defineClass()</code> 可以传入字节数组直接定义类，字节码可以来自网络、反序列化数据甚至恶意类加载器。类被加载进 JVM 后，是否在磁盘上有对应文件并不影响其执行。</p>
+<p><strong>Q2：为什么重启能清除内存马？</strong><br>答：内存马的”马”只存在于 JVM 内存（类 + 容器注册表项）。JVM 进程结束，所有类定义和注册的组件随之消失；因为没有落地文件，也没有持久化机制，重启后不会自动复活。</p>
+<p><strong>Q3：Filter 内存马为什么难以被常规安全设备发现？</strong><br>答：因为它在”应用容器内部”，请求先经过它再进业务代码，流量层的 WAF 看到的是正常请求形态（恶意触发参数可加密&#x2F;伪造成正常参数）；文件层完全没有痕迹；只有”容器注册表比对”和”JVM 内存分析”这类检测能看到它。</p>
+<p><strong>Q4：RASP 为什么能防住内存马？</strong><br>答：RASP 以 Java Agent 方式注入 JVM，在 <code>addFilterDef</code>、<code>defineClass</code>、<code>invoke</code>、<code>ProcessBuilder</code> 等关键方法上做 Hook，动态注册动作一旦发生立即阻断并告警。它和内存马在同一个”内存战场”，所以能看到传统边界设备看不到的东西。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>内存马是 Java Web 安全攻防的”高阶战场”：攻击者把恶意代码藏进容器内存，绕过文件层防护；防御方则需要”流量行为 + 容器注册表 + JVM 内存”三层联动检测，用 RASP 从源头阻断注入动作。<strong>对于 Java 开发者，理解 Tomcat 的 Filter&#x2F;Servlet 注册机制、Spring 的 HandlerMapping 结构，不仅是写业务的基础，也是看懂攻防攻防的关键</strong>——防御永远建立在对底层机制的理解之上。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/20/java-memory-shell-attack-defense-deep-dive/">https://jiweidong.github.io/2026/08/20/java-memory-shell-attack-defense-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E5%AE%89%E5%85%A8/">安全</a><a class="post-meta__tags" href="/tags/Spring/">Spring</a><a class="post-meta__tags" href="/tags/Tomcat/">Tomcat</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/20/jedis-vs-lettuce-redis-client-comparison/" title="【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战</div></div><div class="info-2"><div class="info-item-1">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战面试官：你们项目里用的是 Jedis 还是 Lettuce？为什么？这是 Spring Boot 项目里最常被问到的问题之一。Spring Boot 2.x 默认集成 Lettuce，Spring Boot 1.x 默认 Jedis；Spring Data Redis 把两者都做了封装，很多人只是跟着默认走，却说不清两者的本质区别。 本文从线程模型、连接管理、源码实现、性能表现四个维度，把 Jedis 和 Lettuce 彻底讲透，最后给出生产环境选型建议。 一、先看本质：一个线程安全，一个线程不安全这是两者最核心、最根本的区别，其余所有差异几乎都由它衍生出来。 1.1 Jedis：非线程安全，必须配连接池Jedis 实例内部持有 Socket 连接，直接复用同一个 Jedis 实例执行并发命令，会出现响应错乱、数据交叉污染的问题。看源码： 1234567// Jedis 底层本质是对 redis.clients.jedis.Connection 的封装public class Co...</div></div></div></a><a class="pagination-related" href="/2026/08/20/contract-testing-pact-spring-cloud-contract-deep-practice/" title="【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地</div></div><div class="info-2"><div class="info-item-1">【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地问题：微服务联调为什么这么痛？微服务化之后，服务间通过 HTTP&#x2F;RPC 通信。最经典的痛点场景：  订单服务（消费方）调用用户服务（提供方）的 GET /api/users/{id}，联调时发现返回结构变了——字段 nickname 被改成了 nickName。用户服务自己测试全绿，订单服务却直接崩了。  传统解法是”集成测试 + 联调环境”，但问题很多：  联调环境不稳定，依赖方一多就互相阻塞 测试要在真实网络里跑，慢且脆弱 问题发现太晚——通常在开发后期  契约测试（Contract Testing） 就是来解决这个问题的：消费方和提供方不联调，只对着同一份”契约”各自测试。契约描述”请求长什么样、响应长什么样”，双方只要都满足契约，就能保证集成不出问题。 一、契约测试的核心思想契约测试的出发点是：消费方真正关心的，是提供方 API 的”形状”（Schema），而不是它的实现。 12传统方式： 消费方 ──真实调用──► 提供方（联调环境，不稳定）契约方式： 消费...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/05/strategy-pattern-deep-dive/" title="【设计模式】策略模式深度解析：干掉 if-else 的优雅之道与 Spring 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-05</div><div class="info-item-2">【设计模式】策略模式深度解析：干掉 if-else 的优雅之道与 Spring 实践</div></div><div class="info-2"><div class="info-item-1">【设计模式】策略模式深度解析：干掉 if-else 的优雅之道与 Spring 实践面试官：支付系统支持支付宝、微信、银行卡，代码怎么设计？初级答案：一个 pay() 方法里写 if-else 判断渠道类型。高级答案：策略模式 + 工厂 + Spring 注入。本文从最原始的 if-else 出发，一步步重构出生产级策略模式实现，并剖析 JDK 和 Spring 源码中的策略模式应用。   一、什么是策略模式定义：定义一系列算法，把它们一个个封装起来，并且使它们可以相互替换。策略模式让算法的变化独立于使用算法的客户。 核心角色：  Strategy（抽象策略）：定义算法的公共接口 ConcreteStrategy（具体策略）：实现具体算法 Context（上下文）：持有 Strategy 引用，负责调用策略  适用场景：  同一行为有多种实现方式且可替换（支付、排序、压缩、限流算法） 大量 if-else &#x2F; switch-case 分支，每个分支是一个算法 需要在运行时动态选择算法  二、从 if-else 到策略模式的重构之路第一步：原始的 if-else12345...</div></div></div></a><a class="pagination-related" href="/2026/06/17/design-patterns-in-practice/" title="设计模式在企业级Java开发中的最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">设计模式在企业级Java开发中的最佳实践</div></div><div class="info-2"><div class="info-item-1">设计模式在企业级Java开发中的最佳实践一、为什么需要设计模式？设计模式是经过验证的、可复用的解决方案模板。它们不是代码片段，而是解决特定问题的设计思路。在复杂的业务系统中，合理运用设计模式可以显著提升代码的可维护性、可扩展性和可读性。 1.1 设计模式分类   类型 模式名称 核心意图 Spring中的应用    创建型 工厂方法 延迟对象创建到子类 BeanFactory   创建型 抽象工厂 创建相关对象族 无   创建型 单例模式 确保类只有一个实例 ApplicationContext   创建型 建造者模式 分步创建复杂对象 Builder模式无处不在   创建型 原型模式 通过克隆创建对象 Bean scope&#x3D;prototype   结构型 适配器模式 接口转换 MVC中的HandlerAdapter   结构型 代理模式 控制对象访问 AOP动态代理   结构型 装饰器模式 动态添加职责 BufferedReader包装   结构型 组合模式 树形结构的统一处理 Spring Security过滤器链   结构型 外观模式 简化接口 JdbcTempl...</div></div></div></a><a class="pagination-related" href="/2026/08/05/template-method-pattern-deep-dive/" title="【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-05</div><div class="info-item-2">【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用</div></div><div class="info-2"><div class="info-item-1">【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用面试官：AQS 的源码你看过吗？为什么子类只需要重写 tryAcquire 几个方法就能实现各种锁？能回答上来的同学，基本都理解了模板方法模式（Template Method Pattern）。AQS 是模板方法模式在并发领域最经典的运用：父类把 acquire()、release() 的骨架流程写死，把 tryAcquire()、tryRelease() 这些”变化点”留给子类实现。本文从手写模板方法开始，拆解 AQS、Spring、MyBatis 中的框架级应用。   一、什么是模板方法模式定义：定义一个操作中的算法骨架，将一些步骤延迟到子类中实现。模板方法使得子类可以不改变算法结构的情况下，重新定义算法中的某些步骤。 核心角色：  AbstractClass（抽象类）：定义模板方法（骨架）和抽象步骤方法（钩子） ConcreteClass（具体子类）：实现步骤方法，不改变骨架  两个关键概念：  模板方法（Template Method）：定义流程骨架，通常用 final 修饰，...</div></div></div></a><a class="pagination-related" href="/2026/08/06/observer-pattern-deep-dive/" title="【设计模式】观察者模式深度解析：从手写实现到 Spring Event 与 MQ 发布订阅"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【设计模式】观察者模式深度解析：从手写实现到 Spring Event 与 MQ 发布订阅</div></div><div class="info-2"><div class="info-item-1">【设计模式】观察者模式深度解析：从手写实现到 Spring Event 与 MQ 发布订阅面试官：说说观察者模式？它和发布订阅模式有什么区别？观察者模式（Observer Pattern）是行为型设计模式中最常用的一种，核心思想是：定义对象间一对多的依赖关系，当一个对象（主题 Subject）的状态发生变化时，所有依赖它的对象（观察者 Observer）都会收到通知并自动更新。 用一句话概括：「发布」与「订阅」解耦，「事件」驱动「联动」。 观察者模式解决的核心问题是耦合：如果不使用观察者模式，被观察者需要显式依赖所有关注它的对象，新增一个关注者就要修改被观察者的代码，违反开闭原则。观察者模式把「通知」这个动作抽象出来，让主题只依赖观察者接口，实现反向解耦。 观察者模式 vs 发布订阅模式这是面试高频追问点，务必分清：    维度 观察者模式 发布订阅模式    耦合关系 主题与观察者互相知道（观察者注册到主题上） 发布者与订阅者互不知道，通过 Broker&#x2F;事件总线中转   通信方式 同步调用为主，主题直接调用观察者方法 异步解耦，消息通过中间件（MQ、事件总线）分发 ...</div></div></div></a><a class="pagination-related" href="/2026/07/06/java-security-jca-jce-crypto-guide/" title="【Java核心】Java 加密与安全编程实战：JCA&#x2F;JCE 体系、消息摘要与数字签名全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-06</div><div class="info-item-2">【Java核心】Java 加密与安全编程实战：JCA&#x2F;JCE 体系、消息摘要与数字签名全解析</div></div><div class="info-2"><div class="info-item-1">Java 加密与安全编程实战：从 JCA&#x2F;JCE 到数字签名一、引言安全是软件开发的基石。无论是用户密码的存储、API 接口的签名验证，还是 HTTPS 通信的证书校验，都离不开加密技术。 Java 通过 JCA（Java Cryptography Architecture） 和 JCE（Java Cryptography Extension） 提供了完善的加密安全编程框架。本文将从实战出发，系统梳理 Java 安全编程的各个组件，并提供完整的代码示例。  二、JCA&#x2F;JCE 整体架构2.1 架构设计JCA&#x2F;JCE 采用 Provider（提供者）架构——定义服务接口（SPI），由不同的 Provider 提供具体实现。 12345678910┌─────────────────────────────────────┐│         应用程序代码                 │├─────────────────────────────────────┤│     JCA/JCE API（标准接口层）        │├──────────...</div></div></div></a><a class="pagination-related" href="/2026/08/06/factory-pattern-deep-dive/" title="【设计模式】工厂模式深度解析：从简单工厂到抽象工厂，再到 Spring BeanFactory 源码"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【设计模式】工厂模式深度解析：从简单工厂到抽象工厂，再到 Spring BeanFactory 源码</div></div><div class="info-2"><div class="info-item-1">【设计模式】工厂模式深度解析：从简单工厂到抽象工厂，再到 Spring BeanFactory 源码面试官：说说工厂模式有哪几种？它们之间有什么区别？工厂模式（Factory Pattern）是 Java 开发中使用频率最高的创建型设计模式，核心思想是：将对象的创建和使用分离，由「工厂」负责创建对象，调用方只关心「要什么」，不关心「怎么造」。 工厂模式家族一共三个成员，面试时最容易混淆，先用一张表分清：    类型 核心思想 创建方式 扩展点 典型场景    简单工厂（非 GoF 23 种） 一个工厂类，根据参数 switch 创建不同产品 静态方法 + if&#x2F;switch 新增产品要改工厂类，违反开闭 工具类、类型简单时   工厂方法 每个产品对应一个工厂类，工厂接口 + 具体工厂 子类工厂覆盖工厂方法 新增产品只需新增工厂类，符合开闭 框架扩展点，如 JDBC DriverManager、MyBatis SqlSessionFactory   抽象工厂 工厂接口定义一组产品族，一个工厂创建一族产品 工厂接口 + 多产品接口 新增产品族方便，新增产品难 跨平台 UI ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">482</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">660</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">164</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-%E5%AE%89%E5%85%A8%E3%80%91%E5%86%85%E5%AD%98%E9%A9%AC%E5%8E%9F%E7%90%86%E4%B8%8E%E6%94%BB%E9%98%B2%E5%AE%9E%E6%88%98%EF%BC%9A%E4%BB%8E%E5%8A%A8%E6%80%81%E6%B3%A8%E5%86%8C%E5%88%B0%E6%A3%80%E6%B5%8B%E9%98%B2%E5%BE%A1"><span class="toc-number">1.</span> <span class="toc-text">【Java 安全】内存马原理与攻防实战：从动态注册到检测防御</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%BC%95%E8%A8%80%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E2%80%9D%E6%96%87%E4%BB%B6%E9%A9%AC%E2%80%9D%E6%AD%A3%E5%9C%A8%E8%A2%AB%E2%80%9D%E5%86%85%E5%AD%98%E9%A9%AC%E2%80%9D%E5%8F%96%E4%BB%A3%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">引言：为什么”文件马”正在被”内存马”取代？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%86%85%E5%AD%98%E9%A9%AC%E7%9A%84%E5%8E%9F%E7%90%86%E5%9F%BA%E7%A1%80"><span class="toc-number">1.2.</span> <span class="toc-text">一、内存马的原理基础</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%89%E7%B1%BB%E4%B8%BB%E6%B5%81%E5%86%85%E5%AD%98%E9%A9%AC%E5%8E%9F%E7%90%86"><span class="toc-number">1.3.</span> <span class="toc-text">二、三类主流内存马原理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-Filter-%E5%9E%8B%E5%86%85%E5%AD%98%E9%A9%AC%EF%BC%88%E6%9C%80%E5%B8%B8%E8%A7%81%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 Filter 型内存马（最常见）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-Servlet-%E5%9E%8B%E5%86%85%E5%AD%98%E9%A9%AC"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 Servlet 型内存马</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-Spring-%E5%9E%8B%E5%86%85%E5%AD%98%E9%A9%AC%EF%BC%88Controller-Interceptor%EF%BC%89"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 Spring 型内存马（Controller&#x2F;Interceptor）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E5%85%B6%E4%BB%96%E5%8F%98%E7%A7%8D"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 其他变种</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%AE%9E%E6%88%98%E6%94%BB%E9%98%B2%EF%BC%9A%E6%94%BB%E5%87%BB%E9%93%BE%E8%B7%AF%E4%B8%8E%E6%A3%80%E6%B5%8B%E6%96%B9%E6%B3%95"><span class="toc-number">1.4.</span> <span class="toc-text">三、实战攻防：攻击链路与检测方法</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%AE%8C%E6%95%B4%E6%94%BB%E5%87%BB%E9%93%BE"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 完整攻击链</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E6%A3%80%E6%B5%8B%E6%80%9D%E8%B7%AF%EF%BC%88%E7%BA%A2%E9%98%9F%E8%A7%86%E8%A7%92%E5%8F%8D%E6%8E%A8%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 检测思路（红队视角反推）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E9%98%B2%E5%BE%A1%E4%BD%93%E7%B3%BB%EF%BC%88%E8%93%9D%E9%98%9F%E8%A7%86%E8%A7%92%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 防御体系（蓝队视角）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%87%AA%E5%B7%B1%E5%8A%A8%E6%89%8B%E5%86%99%E4%B8%AA%E6%A3%80%E6%B5%8B-Demo"><span class="toc-number">1.5.</span> <span class="toc-text">四、自己动手写个检测 Demo</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E7%8E%AF%E8%8A%82"><span class="toc-number">1.6.</span> <span class="toc-text">五、面试追问环节</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.7.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/contract-testing-pact-spring-cloud-contract-deep-practice/" title="【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地">【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/java-memory-shell-attack-defense-deep-dive/" title="【Java 安全】内存马原理与攻防实战：从动态注册到检测防御">【Java 安全】内存马原理与攻防实战：从动态注册到检测防御</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/jedis-vs-lettuce-redis-client-comparison/" title="【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/multi-site-active-active-architecture-deep-dive/" title="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

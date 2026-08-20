@@ -1,0 +1,362 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化面试官：机房挂了怎么办？说说异地多活“高可用”做到 99.99% 以上，单机房已经不够了——机房级故障（断电、光缆被挖断、自然灾害）无法靠机内冗余解决。异地多活（Multi-Site Active-Active）就是为了解决机房级容灾而生的架构设计。 但很多人对多活的理解停留在”多部署几套”的层面。真正的难点在于：数据怎么同步？流量怎么">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/20/multi-site-active-active-architecture-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化面试官：机房挂了怎么办？说说异地多活“高可用”做到 99.99% 以上，单机房已经不够了——机房级故障（断电、光缆被挖断、自然灾害）无法靠机内冗余解决。异地多活（Multi-Site Active-Active）就是为了解决机房级容灾而生的架构设计。 但很多人对多活的理解停留在”多部署几套”的层面。真正的难点在于：数据怎么同步？流量怎么">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-20T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-20T00:15:50.953Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="架构">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="高可用">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化",
+  "url": "https://jiweidong.github.io/2026/08/20/multi-site-active-active-architecture-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-20T00:00:00.000Z",
+  "dateModified": "2026-08-20T00:15:50.953Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/20/multi-site-active-active-architecture-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">482</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">660</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">164</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-20T00:15:50.953Z" title="更新于 2026-08-20 08:15:50">2026-08-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化"><a href="#【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化" class="headerlink" title="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化"></a>【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</h1><h2 id="面试官：机房挂了怎么办？说说异地多活"><a href="#面试官：机房挂了怎么办？说说异地多活" class="headerlink" title="面试官：机房挂了怎么办？说说异地多活"></a>面试官：机房挂了怎么办？说说异地多活</h2><p>“高可用”做到 99.99% 以上，单机房已经不够了——机房级故障（断电、光缆被挖断、自然灾害）无法靠机内冗余解决。异地多活（Multi-Site Active-Active）就是为了解决<strong>机房级容灾</strong>而生的架构设计。</p>
+<p>但很多人对多活的理解停留在”多部署几套”的层面。真正的难点在于：<strong>数据怎么同步？流量怎么切？冲突怎么处理？</strong> 本文从容灾等级讲起，逐步深入到单元化架构与冲突处理，最后给出落地路线图。</p>
+<h2 id="一、先搞清楚容灾等级"><a href="#一、先搞清楚容灾等级" class="headerlink" title="一、先搞清楚容灾等级"></a>一、先搞清楚容灾等级</h2><table>
+<thead>
+<tr>
+<th>级别</th>
+<th>名称</th>
+<th>RTO</th>
+<th>RPO</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>RTO</td>
+<td>恢复时间目标</td>
+<td>—</td>
+<td>—</td>
+<td>故障后多久恢复服务</td>
+</tr>
+<tr>
+<td>RPO</td>
+<td>恢复点目标</td>
+<td>—</td>
+<td>—</td>
+<td>最多丢失多少数据</td>
+</tr>
+<tr>
+<td>冷备</td>
+<td>数据备份 + 手动恢复</td>
+<td>小时级</td>
+<td>天级</td>
+<td>定期备份，恢复靠人</td>
+</tr>
+<tr>
+<td>热备</td>
+<td>主备 + 自动切换</td>
+<td>分钟级</td>
+<td>秒级~分钟级</td>
+<td>备机实时同步，故障自动切换，但备机不承担流量</td>
+</tr>
+<tr>
+<td><strong>同城双活</strong></td>
+<td>两个机房同时承担流量</td>
+<td>秒级~分钟级</td>
+<td>秒级</td>
+<td>距离近（&lt;50km），专线互联，延迟低</td>
+</tr>
+<tr>
+<td><strong>两地三中心</strong></td>
+<td>同城双活 + 异地灾备</td>
+<td>分钟级</td>
+<td>分钟级</td>
+<td>同城两机房互备 + 异地第三机房兜底</td>
+</tr>
+<tr>
+<td><strong>异地多活</strong></td>
+<td>多地同时读写</td>
+<td>秒级</td>
+<td>秒级（或按单元）</td>
+<td>真正的 Active-Active，难度最高</td>
+</tr>
+</tbody></table>
+<p><strong>核心认知</strong>：双活 ≠ 多活。同城双活本质还是”一个逻辑集群跨两个机房”，依赖专线低延迟；异地多活是”多个逻辑集群同时读写”，要面对网络延迟、数据冲突、路由一致性三大难题。</p>
+<h2 id="二、异地多活的三种典型架构"><a href="#二、异地多活的三种典型架构" class="headerlink" title="二、异地多活的三种典型架构"></a>二、异地多活的三种典型架构</h2><h3 id="2-1-同城双活（两中心双活）"><a href="#2-1-同城双活（两中心双活）" class="headerlink" title="2.1 同城双活（两中心双活）"></a>2.1 同城双活（两中心双活）</h3><p>两个机房距离近、专线延迟 &lt;1ms，可以共享一套数据库集群（比如 MySQL 跨机房部署，或一个机房主写、另一个机房只读 + 半同步复制）。</p>
+<ul>
+<li>优点：实现简单，数据强一致成本低</li>
+<li>缺点：无法抵御<strong>城市级</strong>灾害；专线中断 &#x3D; 双活变双瘫</li>
+</ul>
+<h3 id="2-2-两地三中心"><a href="#2-2-两地三中心" class="headerlink" title="2.2 两地三中心"></a>2.2 两地三中心</h3><p>在同城双活基础上，加一个异地灾备中心（异步复制，平时不承担流量，只做数据备份和演练）。</p>
+<ul>
+<li>优点：城市级容灾能力，成本相对可控</li>
+<li>缺点：异地中心是”冷”的，故障切换有 RPO 窗口（可能丢数据）；异地中心平时不产生价值</li>
+</ul>
+<h3 id="2-3-单元化（Set-化）多活"><a href="#2-3-单元化（Set-化）多活" class="headerlink" title="2.3 单元化（Set 化）多活"></a>2.3 单元化（Set 化）多活</h3><p>这是大型互联网公司（阿里、美团、字节）的主流方案。把业务按<strong>用户维度</strong>切成多个单元（Set），每个单元拥有完整的业务栈 + 独立数据分片，流量按规则（如 userId hash）路由到对应单元：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">         ┌──────────── 全局路由层（GSLB/DNS + L4/L7）────────────┐</span><br><span class="line">         │            userId hash 决定进入哪个单元              │</span><br><span class="line">         └──────────────────────────────────────────────────────┘</span><br><span class="line">┌───────────────────┐                 ┌───────────────────┐</span><br><span class="line">│   单元 A（北京）    │                 │   单元 B（上海）    │</span><br><span class="line">│  app 全栈 + DB 分片 │   异步/同步复制   │  app 全栈 + DB 分片 │</span><br><span class="line">│  userId%2 == 0     │ ◄─────────────► │  userId%2 == 1     │</span><br><span class="line">└───────────────────┘                 └───────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>单元化的精髓</strong>：每个单元数据自包含（只处理自己分片的数据），单元间不需要强一致——跨单元的数据同步退化为”异步汇总 + 最终一致”。这样网络延迟、冲突问题都被”路由”挡在了单元边界之外。</p>
+<h2 id="三、异地多活的三大核心难题"><a href="#三、异地多活的三大核心难题" class="headerlink" title="三、异地多活的三大核心难题"></a>三、异地多活的三大核心难题</h2><h3 id="难题一：流量路由（怎么把请求送到对的单元）"><a href="#难题一：流量路由（怎么把请求送到对的单元）" class="headerlink" title="难题一：流量路由（怎么把请求送到对的单元）"></a>难题一：流量路由（怎么把请求送到对的单元）</h3><p>路由的核心是<strong>确定性</strong>：同一个用户的请求必须稳定落到同一个单元（否则他的数据在 A，请求却打到 B，就会读不到）。</p>
+<p>路由层级：</p>
+<ol>
+<li><strong>DNS&#x2F;GSLB 层</strong>：按地域解析到最近机房（粗粒度）</li>
+<li><strong>接入层路由</strong>：根据 <code>userId</code> 等路由键 hash，决定转发到哪个单元</li>
+<li><strong>单元内路由</strong>：单元内部再按业务分片路由到具体服务&#x2F;数据库</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 路由规则示例：按 userId 取模</span></span><br><span class="line"><span class="keyword">public</span> String <span class="title function_">routeToUnit</span><span class="params">(<span class="type">long</span> userId)</span> &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">slot</span> <span class="operator">=</span> (<span class="type">int</span>) (userId % <span class="number">1024</span>);   <span class="comment">// 先把用户分到 1024 个逻辑分片</span></span><br><span class="line">    <span class="keyword">if</span> (slot &lt; <span class="number">512</span>) <span class="keyword">return</span> <span class="string">&quot;unit-beijing&quot;</span>;</span><br><span class="line">    <span class="keyword">return</span> <span class="string">&quot;unit-shanghai&quot;</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意：<strong>路由键的选择</strong>决定一切。必须选业务上稳定、均匀的字段（userId、订单维度），并且全链路（网关、服务、DB 分片）使用同一套路由规则，否则会出现”入口在 A 单元、数据查询却在 B 单元”的串门问题。</p>
+<h3 id="难题二：数据同步（单元间的数据怎么流动）"><a href="#难题二：数据同步（单元间的数据怎么流动）" class="headerlink" title="难题二：数据同步（单元间的数据怎么流动）"></a>难题二：数据同步（单元间的数据怎么流动）</h3><p>单元化下数据分三类处理：</p>
+<table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>处理方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单元内数据</td>
+<td>本地读写，无需跨单元</td>
+</tr>
+<tr>
+<td>全局数据（配置、商品目录、用户主档）</td>
+<td>全局唯一副本 + 多单元缓存&#x2F;异步推送，或按”主单元写 + 广播读”</td>
+</tr>
+<tr>
+<td>跨单元业务数据（A 单元用户买了 B 单元商家的商品）</td>
+<td>异步消息&#x2F;异步复制，最终一致</td>
+</tr>
+</tbody></table>
+<p>同步技术选型：</p>
+<ul>
+<li><strong>数据库级</strong>：MySQL 主从复制、DTS&#x2F;DataX、Canal 监听 binlog</li>
+<li><strong>缓存级</strong>：跨机房缓存同步（阿里 Tair 的跨域同步、Redis 的 Cluster 跨机房方案）</li>
+<li><strong>消息级</strong>：Kafka 跨机房镜像（MirrorMaker 2）、RocketMQ 的容灾复制</li>
+<li><strong>文件级</strong>：对象存储跨区域复制（OSS&#x2F;S3 的 region 复制）</li>
+</ul>
+<h3 id="难题三：冲突处理（数据不一致怎么办）"><a href="#难题三：冲突处理（数据不一致怎么办）" class="headerlink" title="难题三：冲突处理（数据不一致怎么办）"></a>难题三：冲突处理（数据不一致怎么办）</h3><p>异地多活允许”最终一致”，就必须定义冲突时的裁决规则。常见策略：</p>
+<ol>
+<li><strong>避免冲突</strong>（首选）：靠路由把可能冲突的数据限制在单单元内——单元化的根本目的</li>
+<li><strong>版本裁决</strong>：每条数据带版本号&#x2F;时间戳，冲突时取版本高者（Last-Write-Wins，注意时钟漂移问题）</li>
+<li><strong>业务合并</strong>：如余额变动类数据用”流水 + 汇总”而非直接覆盖，冲突时重放流水</li>
+<li><strong>人工仲裁</strong>：设置冲突队列，无法自动裁决的数据进入人工处理流程</li>
+</ol>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- LWW 冲突裁决示例</span></span><br><span class="line"><span class="keyword">UPDATE</span> account <span class="keyword">SET</span> balance <span class="operator">=</span> ?, version <span class="operator">=</span> version <span class="operator">+</span> <span class="number">1</span></span><br><span class="line"><span class="keyword">WHERE</span> account_id <span class="operator">=</span> ? <span class="keyword">AND</span> version <span class="operator">&lt;</span> ?;   <span class="comment">-- 乐观锁，版本旧者失败</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="四、异地多活架构设计要点"><a href="#四、异地多活架构设计要点" class="headerlink" title="四、异地多活架构设计要点"></a>四、异地多活架构设计要点</h2><h3 id="4-1-全链路-ID-必须全局唯一"><a href="#4-1-全链路-ID-必须全局唯一" class="headerlink" title="4.1 全链路 ID 必须全局唯一"></a>4.1 全链路 ID 必须全局唯一</h3><p>分布式 ID（雪花算法等）是前提，否则两个单元各自生成的订单号冲突，数据合并时直接崩溃。</p>
+<h3 id="4-2-数据必须可路由"><a href="#4-2-数据必须可路由" class="headerlink" title="4.2 数据必须可路由"></a>4.2 数据必须可路由</h3><p>每张核心表都要有<strong>路由键字段</strong>（如 user_id、order_no 前缀），并建立”路由键 → 单元”的映射索引。反例：订单表只按自增主键查询，无法按单元拆分。</p>
+<h3 id="4-3-依赖要分级"><a href="#4-3-依赖要分级" class="headerlink" title="4.3 依赖要分级"></a>4.3 依赖要分级</h3><p>把依赖分为”强依赖”（实时同步、跨单元调用）和”弱依赖”（异步、可延迟）。跨单元调用尽量异步化——一次同步跨单元 RPC 的延迟（几十毫秒起）会拖垮整条链路。</p>
+<h3 id="4-4-容灾切换要可演练"><a href="#4-4-容灾切换要可演练" class="headerlink" title="4.4 容灾切换要可演练"></a>4.4 容灾切换要可演练</h3><p>多活架构必须配套<strong>流量切换系统 + 应急预案 + 定期演练</strong>。演练目标是验证：</p>
+<ul>
+<li>单元 A 整体故障，流量 100% 切到 B，数据是否可读可写</li>
+<li>切换后数据回补流程是否正常</li>
+<li>切回时双写窗口如何过渡</li>
+</ul>
+<h3 id="4-5-全局唯一组件要特殊处理"><a href="#4-5-全局唯一组件要特殊处理" class="headerlink" title="4.5 全局唯一组件要特殊处理"></a>4.5 全局唯一组件要特殊处理</h3><p>注册中心、配置中心、分布式锁、ID 生成器等”全局唯一”组件是异地多活的天然痛点。解法：</p>
+<ul>
+<li>注册中心&#x2F;配置中心：跨机房三节点部署（如 Nacos 的异地容灾）或单元内独立 + 配置同步</li>
+<li>分布式锁：避免跨单元抢同一把锁，锁 key 带上单元维度；必须全局的锁用”主单元 + 降级”</li>
+<li>ID 生成器：每个单元独立号段（雪花算法 workId 按单元分配）</li>
+</ul>
+<h2 id="五、落地路线图：从单机房到多活"><a href="#五、落地路线图：从单机房到多活" class="headerlink" title="五、落地路线图：从单机房到多活"></a>五、落地路线图：从单机房到多活</h2><p>不要一上来就上异地多活——它带来的复杂度（路由、数据、运维）会让中小团队崩溃。推荐循序渐进：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">第一步：同城双活（数据库跨机房半同步 + 流量主备/双活）</span><br><span class="line">   ↓</span><br><span class="line">第二步：两地三中心（+ 异地灾备，异步复制，保证&quot;可恢复&quot;）</span><br><span class="line">   ↓</span><br><span class="line">第三步：关键链路单元化（先切 1~2 个核心域做单元化试点）</span><br><span class="line">   ↓</span><br><span class="line">第四步：全量单元化（全业务多活 + 常态演练 + 自动化切换）</span><br></pre></td></tr></table></figure>
+
+<p><strong>何时必须上单元化</strong>：RTO 要求分钟级、业务规模大到单机房资源放不下、或城市级容灾是合规要求时。</p>
+<h2 id="六、面试追问环节"><a href="#六、面试追问环节" class="headerlink" title="六、面试追问环节"></a>六、面试追问环节</h2><p><strong>Q1：异地多活和两地三中心什么关系？</strong><br>答：两地三中心是”同城双活 + 异地灾备”的组合，异地中心通常只备份不承接流量，严格说是”两地三中心五副本”式的容灾方案；异地多活要求多个中心同时读写，是更高阶的目标。</p>
+<p><strong>Q2：单元化的”单元”到底怎么切？</strong><br>答：按用户维度（userId 哈希或按地域天然划分）切分，每个单元包含完整业务栈和对应数据分片。单元内自包含、自给自足，单元间只做异步同步。切分时要评估”单元间流量占比”——如果 30% 的请求需要跨单元访问数据，说明切分不合理。</p>
+<p><strong>Q3：跨单元的数据一致性怎么保证？</strong><br>答：核心原则是”能避免就避免”——通过路由设计让大多数数据不跨单元；必须跨的用异步消息 + 幂等消费实现最终一致；金额等敏感数据用流水重放 + 对账兜底。</p>
+<p><strong>Q4：多活的数据库主键怎么设计？</strong><br>答：不能用单库自增主键。用全局分布式 ID（雪花算法 + 单元 workId 隔离），保证全局唯一且带路由信息。</p>
+<p><strong>Q5：异地多活的成本高在哪？</strong><br>答：一是基础设施翻倍（机房、带宽、专线）；二是研发复杂度（路由框架、数据同步、冲突处理）；三是运维复杂度（切换系统、演练、监控）。这也是为什么业界普遍”先同城双活 + 异地灾备”，只有头部公司才做全量单元化。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>异地多活的本质不是”多部署几套系统”，而是<strong>用路由把全局问题切分成局部问题</strong>：单元化让大多数数据读写不跨机房，异步复制处理少数跨单元数据，冲突裁决规则兜底最终一致。记住三句话：流量能路由、数据能拆分、冲突有预案——这就是异地多活架构的全部精髓。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/20/multi-site-active-active-architecture-deep-dive/">https://jiweidong.github.io/2026/08/20/multi-site-active-active-architecture-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%8F%AF%E7%94%A8/">高可用</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84/">架构</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</div></div><div class="info-2"><div class="info-item-1">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践引言：为什么需要 Kafka Connect？很多团队接 Kafka 的方式是”写个消费者程序，把数据从 Topic 搬到数据库”。一个系统这么干没问题，当系统多起来：订单数据进 ES、埋点数据进 HDFS、MySQL 变更同步到 Redis……每个需求写一个消费程序，就要重复处理：  分区分配与 Rebalance 位移提交与 Exactly-Once 语义 断线重连、重试、死信 连接管理、线程池、资源释放  Kafka Connect 的价值就是把”搬数据”这件事框架化：你只需要写（或直接复用现成的）Source&#x2F;Sink Connector，框架帮你搞定分布式执行、容错、偏移量管理、负载均衡。本文从架构原理到生产落地，带你把 Kafka Connect 用明白。 一、核心架构：三个角色 + 两类组件1.1 三个运行时角色   角色 说明    Worker 运行 Connector 和 Task 的 JVM 进程。分 Standalone（单机）和 Distributed（集群）两种模式 ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/17/payment-system-architecture-design/" title="【系统设计】支付系统架构设计：对账、幂等、资金安全与高可用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-17</div><div class="info-item-2">【系统设计】支付系统架构设计：对账、幂等、资金安全与高可用</div></div><div class="info-2"><div class="info-item-1">【系统设计】支付系统架构设计：对账、幂等、资金安全与高可用一、支付系统为什么难做？支付系统是**”钱”的系统**，对一致性、安全性、可追溯性的要求远超普通业务系统。面试中”设计一个支付系统”是系统设计类的压轴题，考察点集中在：  资金安全：不能多扣、不能少扣、不能重复扣 一致性：支付状态、订单状态、账务记录三方必须最终一致 对账能力：和微信&#x2F;支付宝&#x2F;银行的对账单能对上 高可用：支付挂 1 分钟，业务可能损失惨重  本文从架构分层讲到核心链路，把支付系统的设计要点一次讲清。 二、整体架构分层1234567891011┌─────────────────────────────────────────────┐│              接入层（网关/风控/限流）          │├─────────────────────────────────────────────┤│              交易核心（收单/下单/支付确认）      │├─────────────────────────────────────────────┤│        ...</div></div></div></a><a class="pagination-related" href="/2026/06/24/api-idempotence-design-practice/" title="【高并发设计】接口幂等性方案全解析：从原理到代码实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-24</div><div class="info-item-2">【高并发设计】接口幂等性方案全解析：从原理到代码实战</div></div><div class="info-2"><div class="info-item-1">【高并发设计】接口幂等性方案全解析：从原理到代码实战一、什么是幂等性？ 幂等（Idempotent）：在编程中，一个幂等操作的特点是其任意多次执行所产生的影响均与一次执行的影响相同。  举个生活例子：电梯按钮——按一次电梯到1楼，按十次电梯还是到1楼，结果不会变。这就是幂等。 在分布式系统中，幂等性尤为重要，因为网络不可靠，重试是常态。 为什么需要幂等？   场景 问题 后果    支付接口重试 用户点了两次”支付” 重复扣款   订单创建重试 提交订单超时，自动重试 生成重复订单   MQ 消息重复消费 消费成功但 ACK 失败 重复处理   前端重复提交 用户狂点提交按钮 数据重复    幂等设计是分布式系统的第一道防线。  二、幂等实现方案全景图1234567891011方案对比总览┌─────────────────────────────────────────────────┐│                 幂等方案                          │├───────────────────────────────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/07/30/spring-modulith-monolith-modular-architecture/" title="【架构实战】Spring Modulith 单体模块化架构：一种被忽视的优雅架构方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-30</div><div class="info-item-2">【架构实战】Spring Modulith 单体模块化架构：一种被忽视的优雅架构方案</div></div><div class="info-2"><div class="info-item-1">【架构实战】Spring Modulith 单体模块化架构：一种被忽视的优雅架构方案前言：微服务不是银弹你可能听过这样的故事：某个团队把单体应用拆成 50 个微服务，结果运维复杂度爆炸，一个简单的联调要跨 5 个服务，分布式事务堆成山，最后不得不合并回来。  面试官：什么时候不应该用微服务？有没有比微服务更好的选择？  微服务的本质是将复杂度从代码层转移到运维层。如果你的团队规模小于 20 人，业务边界不清晰，或者对延迟敏感 —— 也许你需要一个折中方案：模块化单体（Modular Monolith）。 Spring Modulith 正是 Spring 官方为解决”拆还是不拆”这一世纪难题推出的答案。 一、什么是 Spring ModulithSpring Modulith 是 Spring 团队在 2022 年启动的项目，核心思想是：在单体应用内部实现模块化，当需要时再平滑拆分微服务。 1.1 核心特性   特性 说明    模块化验证 编译期&#x2F;测试期检测模块依赖违规   模块间事件驱动 使用 ApplicationEvent 实现松耦合   文档生成 自动生成 C...</div></div></div></a><a class="pagination-related" href="/2026/08/19/im-system-architecture-design/" title="【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-19</div><div class="info-item-2">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线</div></div><div class="info-2"><div class="info-item-1">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线面试官：让你设计一个支持百万在线的 IM 系统，你怎么设计？IM（Instant Messaging）是系统设计面试的”压轴题”之一：它集齐了长连接、消息可靠性、顺序性、在线状态、群聊扩散、历史消息存储几乎所有分布式难点。微信、钉钉、Slack 的架构都能在这套骨架里找到影子。 本文按”需求分析 → 单机原型 → 分布式演进 → 核心难点逐个击破”的顺序，给你一套可以直接背诵+扩展的完整方案。  一、需求分析：先搞清楚要做什么1.1 核心功能   功能 说明 难点    单聊 点对点消息 路由、可靠性   群聊 一对多广播 扩散模型选择   在线状态 上下线感知 一致性、实时性   消息可靠性 不丢不重 ACK + 重传 + 幂等   消息顺序 单会话内有序 seq 机制   历史消息 离线拉取、漫游 海量存储、分页   已读回执 已读未读 状态同步   1.2 非功能需求 规模：100 万在线，峰值 QPS 10 万+，单聊消息峰值 5 万&#x2F;秒 延迟：消息端到端 &lt; 200ms 可靠性：消息不丢（至少...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-spi-service-loader-deep-dive/" title="「Java SPI 机制深度解析」从 ServiceLoader 到 Spring Factories 的扩展之道"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「Java SPI 机制深度解析」从 ServiceLoader 到 Spring Factories 的扩展之道</div></div><div class="info-2"><div class="info-item-1">「Java SPI 机制深度解析」从 ServiceLoader 到 Spring Factories 的扩展之道在开发现代 Java 框架时，我们常常需要一种插件化的扩展机制：核心框架不直接依赖具体实现类，而是通过约定让第三方提供实现，框架在运行时动态加载。这就是 SPI（Service Provider Interface）。 JDBC 驱动、SLF4J 日志门面、Spring Boot 的自动配置，背后都是 SPI 的思想。本文从 JDK 原生 SPI 讲到 Spring 的扩展，帮你彻底理解这一核心机制。  一、什么是 SPI？SPI 全称 Service Provider Interface，是一种服务发现机制。它通过在 classpath 下 META-INF/services/ 目录中放置配置文件，让框架在运行时动态加载接口的实现类。 SPI vs API   概念 API（Application Programming Interface） SPI（Service Provider Interface）    视角 供给方提供接口和实现 供给方提供接口，调用方提供...</div></div></div></a><a class="pagination-related" href="/2026/08/03/seckill-system-architecture-design/" title="【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减面试官：做过秒杀系统吗？说说你是怎么设计的？秒杀是后端面试中出现频率最高的系统设计题，没有之一。它把高并发场景下的所有经典问题都浓缩在了一起：高流量冲击、超卖、热点数据、缓存一致性、限流降级。今天这篇，我们从零开始，把秒杀系统的完整设计思路、核心代码和面试追问一次讲透。 一、秒杀的业务特点与核心难点秒杀（Seckill）的业务模型很简单：在极短时间内（通常几秒到几分钟），以极低价格限量售卖少量商品。但它的技术特征却极其极端：    特点 描述 带来的问题    瞬时流量巨大 开售瞬间 QPS 可达平时百倍千倍 打垮应用层与数据库   读写比例极端 读多写少，热点集中在少数商品 缓存热点、单点压力   库存有限 如 100 件商品，10 万人抢 超卖风险   时间敏感 开售前蓄客，开售后瞬间释放 流量脉冲，无法水平扩容应对   核心难点可以归纳为三个词：削峰（把瞬时流量摊平）、限流（保护下游）、防超卖（保证数据正确）。 二、整体架构设计：分层削峰一个成熟的秒杀架构，从用户请求到数据库，需要经过 6 层防线： 123456789...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">482</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">660</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">164</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E5%BC%82%E5%9C%B0%E5%A4%9A%E6%B4%BB%E6%9E%B6%E6%9E%84%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%90%8C%E5%9F%8E%E5%8F%8C%E6%B4%BB%E3%80%81%E4%B8%A4%E5%9C%B0%E4%B8%89%E4%B8%AD%E5%BF%83%E4%B8%8E%E5%8D%95%E5%85%83%E5%8C%96"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%9C%BA%E6%88%BF%E6%8C%82%E4%BA%86%E6%80%8E%E4%B9%88%E5%8A%9E%EF%BC%9F%E8%AF%B4%E8%AF%B4%E5%BC%82%E5%9C%B0%E5%A4%9A%E6%B4%BB"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：机房挂了怎么办？说说异地多活</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%9E%E6%B8%85%E6%A5%9A%E5%AE%B9%E7%81%BE%E7%AD%89%E7%BA%A7"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搞清楚容灾等级</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%BC%82%E5%9C%B0%E5%A4%9A%E6%B4%BB%E7%9A%84%E4%B8%89%E7%A7%8D%E5%85%B8%E5%9E%8B%E6%9E%B6%E6%9E%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、异地多活的三种典型架构</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%90%8C%E5%9F%8E%E5%8F%8C%E6%B4%BB%EF%BC%88%E4%B8%A4%E4%B8%AD%E5%BF%83%E5%8F%8C%E6%B4%BB%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 同城双活（两中心双活）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%A4%E5%9C%B0%E4%B8%89%E4%B8%AD%E5%BF%83"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 两地三中心</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%8D%95%E5%85%83%E5%8C%96%EF%BC%88Set-%E5%8C%96%EF%BC%89%E5%A4%9A%E6%B4%BB"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 单元化（Set 化）多活</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%BC%82%E5%9C%B0%E5%A4%9A%E6%B4%BB%E7%9A%84%E4%B8%89%E5%A4%A7%E6%A0%B8%E5%BF%83%E9%9A%BE%E9%A2%98"><span class="toc-number">1.4.</span> <span class="toc-text">三、异地多活的三大核心难题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%9A%BE%E9%A2%98%E4%B8%80%EF%BC%9A%E6%B5%81%E9%87%8F%E8%B7%AF%E7%94%B1%EF%BC%88%E6%80%8E%E4%B9%88%E6%8A%8A%E8%AF%B7%E6%B1%82%E9%80%81%E5%88%B0%E5%AF%B9%E7%9A%84%E5%8D%95%E5%85%83%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">难题一：流量路由（怎么把请求送到对的单元）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%9A%BE%E9%A2%98%E4%BA%8C%EF%BC%9A%E6%95%B0%E6%8D%AE%E5%90%8C%E6%AD%A5%EF%BC%88%E5%8D%95%E5%85%83%E9%97%B4%E7%9A%84%E6%95%B0%E6%8D%AE%E6%80%8E%E4%B9%88%E6%B5%81%E5%8A%A8%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">难题二：数据同步（单元间的数据怎么流动）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%9A%BE%E9%A2%98%E4%B8%89%EF%BC%9A%E5%86%B2%E7%AA%81%E5%A4%84%E7%90%86%EF%BC%88%E6%95%B0%E6%8D%AE%E4%B8%8D%E4%B8%80%E8%87%B4%E6%80%8E%E4%B9%88%E5%8A%9E%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">难题三：冲突处理（数据不一致怎么办）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%BC%82%E5%9C%B0%E5%A4%9A%E6%B4%BB%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%E8%A6%81%E7%82%B9"><span class="toc-number">1.5.</span> <span class="toc-text">四、异地多活架构设计要点</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%85%A8%E9%93%BE%E8%B7%AF-ID-%E5%BF%85%E9%A1%BB%E5%85%A8%E5%B1%80%E5%94%AF%E4%B8%80"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 全链路 ID 必须全局唯一</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%95%B0%E6%8D%AE%E5%BF%85%E9%A1%BB%E5%8F%AF%E8%B7%AF%E7%94%B1"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 数据必须可路由</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E4%BE%9D%E8%B5%96%E8%A6%81%E5%88%86%E7%BA%A7"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 依赖要分级</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E5%AE%B9%E7%81%BE%E5%88%87%E6%8D%A2%E8%A6%81%E5%8F%AF%E6%BC%94%E7%BB%83"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 容灾切换要可演练</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-5-%E5%85%A8%E5%B1%80%E5%94%AF%E4%B8%80%E7%BB%84%E4%BB%B6%E8%A6%81%E7%89%B9%E6%AE%8A%E5%A4%84%E7%90%86"><span class="toc-number">1.5.5.</span> <span class="toc-text">4.5 全局唯一组件要特殊处理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E8%90%BD%E5%9C%B0%E8%B7%AF%E7%BA%BF%E5%9B%BE%EF%BC%9A%E4%BB%8E%E5%8D%95%E6%9C%BA%E6%88%BF%E5%88%B0%E5%A4%9A%E6%B4%BB"><span class="toc-number">1.6.</span> <span class="toc-text">五、落地路线图：从单机房到多活</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E7%8E%AF%E8%8A%82"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试追问环节</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/contract-testing-pact-spring-cloud-contract-deep-practice/" title="【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地">【微服务测试】契约测试深度实战：Pact 与 Spring Cloud Contract 从原理到落地</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/java-memory-shell-attack-defense-deep-dive/" title="【Java 安全】内存马原理与攻防实战：从动态注册到检测防御">【Java 安全】内存马原理与攻防实战：从动态注册到检测防御</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/jedis-vs-lettuce-redis-client-comparison/" title="【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/20/multi-site-active-active-architecture-deep-dive/" title="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</a><time datetime="2026-08-20T00:00:00.000Z" title="发表于 2026-08-20 08:00:00">2026-08-20</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
