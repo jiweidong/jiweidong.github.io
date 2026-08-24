@@ -1,0 +1,457 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>延迟队列深度解析：五种实现方案对比与订单超时关闭实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列">
+<meta property="og:type" content="article">
+<meta property="og:title" content="延迟队列深度解析：五种实现方案对比与订单超时关闭实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/16/delay-queue-solutions-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-16T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-16T00:18:31.304Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="延迟队列">
+<meta property="article:tag" content="消息队列">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "延迟队列深度解析：五种实现方案对比与订单超时关闭实战",
+  "url": "https://jiweidong.github.io/2026/08/16/delay-queue-solutions-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-16T00:00:00.000Z",
+  "dateModified": "2026-08-16T00:18:31.304Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/16/delay-queue-solutions-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '延迟队列深度解析：五种实现方案对比与订单超时关闭实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">502</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">674</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">171</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-16T00:00:00.000Z" title="发表于 2026-08-16 08:00:00">2026-08-16</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-16T00:18:31.304Z" title="更新于 2026-08-16 08:18:31">2026-08-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><a href="#延迟队列深度解析：五种实现方案对比与订单超时关闭实战" class="headerlink" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"></a>延迟队列深度解析：五种实现方案对比与订单超时关闭实战</h1><h2 id="面试官：说说你们是怎么实现订单超时自动关闭的？"><a href="#面试官：说说你们是怎么实现订单超时自动关闭的？" class="headerlink" title="面试官：说说你们是怎么实现订单超时自动关闭的？"></a>面试官：说说你们是怎么实现订单超时自动关闭的？</h2><p>这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你<strong>对方案选型的思考</strong>：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？</p>
+<p>本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。</p>
+<h2 id="一、什么是延迟队列？"><a href="#一、什么是延迟队列？" class="headerlink" title="一、什么是延迟队列？"></a>一、什么是延迟队列？</h2><p>普通队列：生产者放入消息，消费者<strong>立即</strong>消费。<br>延迟队列：消息进入队列后，<strong>等待指定时间</strong>才被消费者消费。</p>
+<p>核心能力：<strong>“到点了才执行”</strong>。</p>
+<p>典型业务场景：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>延迟时间</th>
+<th>到期动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>订单超时未支付</td>
+<td>30 分钟</td>
+<td>关闭订单、释放库存</td>
+</tr>
+<tr>
+<td>用户下单未评价</td>
+<td>7 天</td>
+<td>发送提醒</td>
+</tr>
+<tr>
+<td>定时发布文章</td>
+<td>自定义</td>
+<td>自动上架</td>
+</tr>
+<tr>
+<td>支付成功通知</td>
+<td>5 秒</td>
+<td>通知下游</td>
+</tr>
+<tr>
+<td>分布式锁续期</td>
+<td>30 秒</td>
+<td>续期&#x2F;释放</td>
+</tr>
+<tr>
+<td>失败重试</td>
+<td>递增</td>
+<td>重新投递</td>
+</tr>
+</tbody></table>
+<h2 id="二、方案一：数据库轮询（最朴素，先被否定）"><a href="#二、方案一：数据库轮询（最朴素，先被否定）" class="headerlink" title="二、方案一：数据库轮询（最朴素，先被否定）"></a>二、方案一：数据库轮询（最朴素，先被否定）</h2><p>用定时任务（XXL-Job &#x2F; Quartz）每 N 秒扫一次表，把 <code>expire_time &lt; now</code> 的记录捞出来处理。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 每 10 秒执行一次</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> t_order</span><br><span class="line"><span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="string">&#x27;UNPAID&#x27;</span> <span class="keyword">AND</span> expire_time <span class="operator">&lt;</span> NOW()</span><br><span class="line">LIMIT <span class="number">1000</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>致命问题：</strong></p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>延迟不可控</td>
+<td>轮询间隔 10s，最坏延迟 10s+</td>
+</tr>
+<tr>
+<td>数据库压力大</td>
+<td>全表扫描 + 频繁查询，量大扛不住</td>
+</tr>
+<tr>
+<td>时间不准</td>
+<td>到点不执行，永远慢一个间隔</td>
+</tr>
+<tr>
+<td>冷热不均</td>
+<td>高峰期扫到大量数据，低峰期空转</td>
+</tr>
+</tbody></table>
+<p>结论：<strong>只适合对延迟不敏感、量小的场景</strong>。面试时先抛出这个方案再否定它，展示思考过程。</p>
+<h2 id="三、方案二：Java-DelayQueue（JDK-自带）"><a href="#三、方案二：Java-DelayQueue（JDK-自带）" class="headerlink" title="三、方案二：Java DelayQueue（JDK 自带）"></a>三、方案二：Java DelayQueue（JDK 自带）</h2><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderTimeoutTask</span> <span class="keyword">implements</span> <span class="title class_">Delayed</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">long</span> orderId;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">long</span> expireTime; <span class="comment">// 到期时间戳</span></span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">OrderTimeoutTask</span><span class="params">(<span class="type">long</span> orderId, <span class="type">long</span> delayMillis)</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.orderId = orderId;</span><br><span class="line">        <span class="built_in">this</span>.expireTime = System.currentTimeMillis() + delayMillis;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">long</span> <span class="title function_">getDelay</span><span class="params">(TimeUnit unit)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> unit.convert(expireTime - System.currentTimeMillis(), TimeUnit.MILLISECONDS);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">int</span> <span class="title function_">compareTo</span><span class="params">(Delayed o)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> Long.compare(<span class="built_in">this</span>.expireTime, ((OrderTimeoutTask) o).expireTime);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 消费者线程</span></span><br><span class="line">DelayQueue&lt;OrderTimeoutTask&gt; queue = <span class="keyword">new</span> <span class="title class_">DelayQueue</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line"><span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">    <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="type">OrderTimeoutTask</span> <span class="variable">task</span> <span class="operator">=</span> queue.take(); <span class="comment">// 阻塞直到有任务到期</span></span><br><span class="line">            closeOrder(task.getOrderId());</span><br><span class="line">        &#125; <span class="keyword">catch</span> (InterruptedException e) &#123;</span><br><span class="line">            Thread.currentThread().interrupt();</span><br><span class="line">            <span class="keyword">break</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;, <span class="string">&quot;delay-consumer&quot;</span>).start();</span><br></pre></td></tr></table></figure>
+
+<p><strong>原理</strong>：DelayQueue 内部是 PriorityQueue（优先队列），按 <code>compareTo</code> 排序，<code>take()</code> 时用 <code>getDelay</code> 判断队头是否到期，未到期就 <code>await</code> 精确到纳秒。</p>
+<p><strong>致命缺陷：</strong></p>
+<ul>
+<li><strong>内存队列</strong>，重启即丢，订单超时任务丢失 &#x3D; 资金风险</li>
+<li><strong>单机</strong>，无法水平扩展，消费者线程挂了任务就卡死</li>
+<li>任务量大了内存扛不住</li>
+</ul>
+<p>结论：<strong>只适合单体应用、可容忍丢失、任务量小的场景</strong>（如本地缓存过期清理）。</p>
+<h2 id="四、方案三：Redis-ZSet（最经典的中间件方案）"><a href="#四、方案三：Redis-ZSet（最经典的中间件方案）" class="headerlink" title="四、方案三：Redis ZSet（最经典的中间件方案）"></a>四、方案三：Redis ZSet（最经典的中间件方案）</h2><p>利用 ZSet 的 score 特性：<strong>score 存到期时间戳，到期任务 score &lt;&#x3D; 当前时间</strong>。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RedisDelayQueue</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">KEY</span> <span class="operator">=</span> <span class="string">&quot;delay:order:close&quot;</span>;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Autowired</span></span><br><span class="line">    <span class="keyword">private</span> StringRedisTemplate redis;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 添加延迟任务 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">addOrder</span><span class="params">(<span class="type">long</span> orderId, <span class="type">long</span> delaySeconds)</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">expireScore</span> <span class="operator">=</span> System.currentTimeMillis() / <span class="number">1000</span> + delaySeconds;</span><br><span class="line">        redis.opsForZSet().add(KEY, String.valueOf(orderId), expireScore);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 拉取到期任务 */</span></span><br><span class="line">    <span class="keyword">public</span> List&lt;String&gt; <span class="title function_">pollExpired</span><span class="params">(<span class="type">int</span> batchSize)</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">now</span> <span class="operator">=</span> System.currentTimeMillis() / <span class="number">1000</span>;</span><br><span class="line">        Set&lt;String&gt; expired = redis.opsForZSet().rangeByScore(KEY, <span class="number">0</span>, now, <span class="number">0</span>, batchSize);</span><br><span class="line">        <span class="keyword">if</span> (expired == <span class="literal">null</span> || expired.isEmpty()) &#123;</span><br><span class="line">            <span class="keyword">return</span> Collections.emptyList();</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 批量移除，防止重复消费</span></span><br><span class="line">        redis.opsForZSet().remove(KEY, expired.toArray());</span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;(expired);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 消费者：定时拉取到期任务</span></span><br><span class="line"><span class="meta">@Scheduled(fixedDelay = 1000)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">consume</span><span class="params">()</span> &#123;</span><br><span class="line">    List&lt;String&gt; orderIds = delayQueue.pollExpired(<span class="number">500</span>);</span><br><span class="line">    <span class="keyword">for</span> (String orderId : orderIds) &#123;</span><br><span class="line">        <span class="comment">// 注意：先查订单状态再关闭，幂等处理</span></span><br><span class="line">        closeOrderIfUnpaid(Long.parseLong(orderId));</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>要点：</strong></p>
+<ol>
+<li><strong>先 range 再 remove</strong>，中间有并发窗口，所以消费者必须<strong>幂等</strong></li>
+<li>可以用 Lua 脚本把”取+删”原子化：</li>
+</ol>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- lua 脚本：原子取出并删除到期元素</span></span><br><span class="line"><span class="keyword">local</span> list = redis.call(<span class="string">&#x27;ZRANGEBYSCORE&#x27;</span>, KEYS[<span class="number">1</span>], <span class="number">0</span>, ARGV[<span class="number">1</span>], <span class="string">&#x27;LIMIT&#x27;</span>, <span class="number">0</span>, ARGV[<span class="number">2</span>])</span><br><span class="line"><span class="keyword">if</span> #list &gt; <span class="number">0</span> <span class="keyword">then</span></span><br><span class="line">    redis.call(<span class="string">&#x27;ZREM&#x27;</span>, KEYS[<span class="number">1</span>], <span class="built_in">unpack</span>(list))</span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"><span class="keyword">return</span> list</span><br></pre></td></tr></table></figure>
+
+<p><strong>优缺点：</strong></p>
+<table>
+<thead>
+<tr>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Redis 持久化（AOF&#x2F;RDB），比内存队列可靠</td>
+<td>需要自研轮询逻辑，没有 ACK 机制</td>
+</tr>
+<tr>
+<td>天然支持分布式，多消费者抢任务</td>
+<td>消费者挂了任务没人拉取（无自动重投）</td>
+</tr>
+<tr>
+<td>实现简单，依赖少</td>
+<td>大量任务积压时 ZSet 内存占用高</td>
+</tr>
+</tbody></table>
+<p>结论：<strong>中小团队最常用的方案，够用且可控</strong>。</p>
+<h2 id="五、方案四：RabbitMQ-TTL-死信队列"><a href="#五、方案四：RabbitMQ-TTL-死信队列" class="headerlink" title="五、方案四：RabbitMQ TTL + 死信队列"></a>五、方案四：RabbitMQ TTL + 死信队列</h2><p>RabbitMQ 官方没有延迟队列，但可以用两个特性组合出来：</p>
+<ol>
+<li><strong>TTL</strong>（消息过期时间）</li>
+<li><strong>死信队列</strong>（消息过期 → 转发到 DLX 绑定的队列）</li>
+</ol>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">生产者 → 延迟交换机 → 延迟队列(ttl=30min) --过期--&gt; 死信交换机 → 实际消费队列 → 消费者</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 声明死信队列（真正的消费队列）</span></span><br><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> Queue <span class="title function_">realQueue</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> QueueBuilder.durable(<span class="string">&quot;order.close.queue&quot;</span>).build();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> DirectExchange <span class="title function_">deadLetterExchange</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">DirectExchange</span>(<span class="string">&quot;dlx.order.exchange&quot;</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> Binding <span class="title function_">deadLetterBinding</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> BindingBuilder.bind(realQueue()).to(deadLetterExchange()).with(<span class="string">&quot;order.close&quot;</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 2. 声明延迟队列（消息过期后进死信）</span></span><br><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> Queue <span class="title function_">delayQueue</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> QueueBuilder.durable(<span class="string">&quot;order.delay.queue&quot;</span>)</span><br><span class="line">            .ttl(<span class="number">30</span> * <span class="number">60</span> * <span class="number">1000</span>) <span class="comment">// 消息 30 分钟过期</span></span><br><span class="line">            .deadLetterExchange(<span class="string">&quot;dlx.order.exchange&quot;</span>)   <span class="comment">// 死信去向</span></span><br><span class="line">            .deadLetterRoutingKey(<span class="string">&quot;order.close&quot;</span>)        <span class="comment">// 死信路由键</span></span><br><span class="line">            .build();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 3. 发送延迟消息</span></span><br><span class="line">rabbitTemplate.convertAndSend(<span class="string">&quot;order.exchange&quot;</span>, <span class="string">&quot;order.delay&quot;</span>, orderMessage);</span><br></pre></td></tr></table></figure>
+
+<p><strong>坑点（面试加分）：</strong></p>
+<ul>
+<li><strong>队列级 TTL</strong>：队列里所有消息统一过期时间，先到的消息会被后面更短 TTL 的消息”插队”（RabbitMQ 只检查队头），导致延迟不准</li>
+<li>解决方案：用<strong>消息级 TTL</strong>，或<strong>每个延迟级别建一个队列</strong>（如 30s、1min、30min 各一个）</li>
+<li>死信消息会重新入队消费，消费失败要处理好重试，防止死信死循环</li>
+</ul>
+<p>结论：<strong>适合已用 RabbitMQ 的团队</strong>，但 TTL 语义有坑，延迟级别多时不优雅。</p>
+<h2 id="六、方案五：RocketMQ-延迟消息（生产环境首选）"><a href="#六、方案五：RocketMQ-延迟消息（生产环境首选）" class="headerlink" title="六、方案五：RocketMQ 延迟消息（生产环境首选）"></a>六、方案五：RocketMQ 延迟消息（生产环境首选）</h2><p>RocketMQ 原生支持延迟消息：发送时指定延迟级别，Broker 到期后才投递给消费者。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Message</span> <span class="variable">msg</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Message</span>(<span class="string">&quot;ORDER_TOPIC&quot;</span>, <span class="string">&quot;close&quot;</span>, orderId.getBytes());</span><br><span class="line"><span class="comment">// 延迟级别：1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h</span></span><br><span class="line">msg.setDelayTimeLevel(<span class="number">16</span>); <span class="comment">// 16 = 30 分钟，正好对应订单超时</span></span><br><span class="line">producer.send(msg);</span><br></pre></td></tr></table></figure>
+
+<p>消费者无感知，到期自动收到消息：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@RocketMQMessageListener(topic = &quot;ORDER_TOPIC&quot;, consumerGroup = &quot;order-close-group&quot;)</span></span><br><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderCloseConsumer</span> <span class="keyword">implements</span> <span class="title class_">RocketMQListener</span>&lt;OrderCloseMessage&gt; &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onMessage</span><span class="params">(OrderCloseMessage message)</span> &#123;</span><br><span class="line">        <span class="comment">// 幂等：根据订单号查状态，只有 UNPAID 才关闭</span></span><br><span class="line">        <span class="type">Order</span> <span class="variable">order</span> <span class="operator">=</span> orderMapper.selectById(message.getOrderId());</span><br><span class="line">        <span class="keyword">if</span> (order != <span class="literal">null</span> &amp;&amp; order.getStatus() == OrderStatus.UNPAID) &#123;</span><br><span class="line">            orderService.closeOrder(order.getId());</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>原理</strong>：RocketMQ 把延迟消息先投递到 <code>SCHEDULE_TOPIC_XXXX</code>（按延迟级别分 18 个队列），由<strong>定时线程</strong>扫描到期的消息，再转发到真正的 Topic。</p>
+<p><strong>注意</strong>：默认只有 <strong>18 个固定延迟级别</strong>，不能自定义任意秒数。要任意延迟时间，需要改造（如按时间戳做消息存储 + 定时扫描），或升级 RocketMQ 5.x 使用<strong>定时消息</strong>（精确到秒&#x2F;毫秒）。</p>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>RocketMQ 延迟消息</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>延迟精度</td>
+<td>18 个固定级别（5.x 支持任意时间）</td>
+</tr>
+<tr>
+<td>可靠性</td>
+<td>消息持久化，重启不丢</td>
+</tr>
+<tr>
+<td>ACK 机制</td>
+<td>消费失败自动重试（16 次）</td>
+</tr>
+<tr>
+<td>积压能力</td>
+<td>亿级消息毫无压力</td>
+</tr>
+<tr>
+<td>运维成本</td>
+<td>需部署 RocketMQ 集群</td>
+</tr>
+</tbody></table>
+<h2 id="七、五种方案终极对比"><a href="#七、五种方案终极对比" class="headerlink" title="七、五种方案终极对比"></a>七、五种方案终极对比</h2><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>延迟精度</th>
+<th>可靠性</th>
+<th>分布式</th>
+<th>复杂度</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>数据库轮询</td>
+<td>秒~分钟级</td>
+<td>高</td>
+<td>支持</td>
+<td>低</td>
+<td>对延迟不敏感的小任务</td>
+</tr>
+<tr>
+<td>Java DelayQueue</td>
+<td>毫秒级</td>
+<td>低（重启即丢）</td>
+<td>不支持</td>
+<td>最低</td>
+<td>单机内存任务</td>
+</tr>
+<tr>
+<td>Redis ZSet</td>
+<td>秒级</td>
+<td>中（靠持久化）</td>
+<td>支持</td>
+<td>低</td>
+<td>中小团队订单超时</td>
+</tr>
+<tr>
+<td>RabbitMQ TTL+DLX</td>
+<td>秒级，有坑</td>
+<td>高</td>
+<td>支持</td>
+<td>中</td>
+<td>已用 RabbitMQ 的团队</td>
+</tr>
+<tr>
+<td>RocketMQ 延迟消息</td>
+<td>级别&#x2F;秒级</td>
+<td>高</td>
+<td>支持</td>
+<td>中</td>
+<td>大流量生产环境首选</td>
+</tr>
+</tbody></table>
+<p><strong>补充</strong>：Kafka 原生<strong>不支持</strong>延迟队列，需要自研（用时间轮 + 延迟主题），复杂度高，一般不建议。</p>
+<h2 id="八、生产实践清单（直接背）"><a href="#八、生产实践清单（直接背）" class="headerlink" title="八、生产实践清单（直接背）"></a>八、生产实践清单（直接背）</h2><ol>
+<li><strong>消费必须幂等</strong>：无论哪种方案，都可能重复消费，关闭订单前先查状态</li>
+<li><strong>状态机兜底</strong>：延迟队列只是”加速器”，数据库任务表 + 定时对账扫尾是最后防线</li>
+<li><strong>监控告警</strong>：监控延迟队列积压量、消费延迟时间，超过阈值告警</li>
+<li><strong>延迟级别设计</strong>：先梳理业务需要的延迟档位（10s&#x2F;30s&#x2F;1m&#x2F;30m&#x2F;1h…），再选方案</li>
+<li><strong>降级方案</strong>：MQ 挂了，降级到 Redis ZSet；Redis 也挂，降级到数据库轮询</li>
+</ol>
+<h2 id="九、面试高频追问"><a href="#九、面试高频追问" class="headerlink" title="九、面试高频追问"></a>九、面试高频追问</h2><p><strong>Q1：Redis ZSet 方案，消费者重启期间到期的任务会丢失吗？</strong><br>不会。任务在 Redis 里，消费者重启只是停止拉取，重启后会一次性拉到所有到期任务（可能瞬间积压，注意批量拉取的 limit）。</p>
+<p><strong>Q2：ZSet 方案怎么保证任务只被消费一次？</strong><br>取和删不是原子的（除非 Lua），两个消费者可能同时 range 到同一个任务。解决方案：Lua 原子化；或者消费者收到后先执行”标记任务为处理中”（如 Redis SETNX 锁），处理完再删。</p>
+<p><strong>Q3：RabbitMQ 队列级 TTL 的坑怎么解释？</strong><br>RabbitMQ 惰性检查队头消息：如果队头是 30 分钟过期的消息，后面来了一个 5 秒过期的，必须等队头到期才会检查后面的，导致 5 秒的任务实际延迟 30 分钟。所以延迟级别多时要按级别分队列或用消息级 TTL。</p>
+<p><strong>Q4：为什么不用 Kafka 做延迟队列？</strong><br>Kafka 设计目标是高吞吐日志流，没有延迟消息语义，也没有死信和延迟级别的内置支持，自研成本高。延迟队列是 RocketMQ&#x2F;RabbitMQ 的强项。</p>
+<p><strong>Q5：如果延迟时间要精确到秒且任意指定，选什么？</strong><br>RocketMQ 5.x 定时消息（任意时间戳），或者自研：Redis ZSet + 时间轮扫描（参考 Kafka 的时间轮思想），精度可以做到毫秒级。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>延迟队列的选型本质是<strong>在可靠性、精度、复杂度之间做权衡</strong>：</p>
+<ul>
+<li>面试先讲需求场景，再讲数据库轮询 → DelayQueue 的局限</li>
+<li>重点展开 Redis ZSet（最通用）和 RocketMQ（最可靠）两个方案</li>
+<li>最后补充幂等、对账、监控这三个生产级细节，就是满分回答</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/16/delay-queue-solutions-deep-dive/">https://jiweidong.github.io/2026/08/16/delay-queue-solutions-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E5%BB%B6%E8%BF%9F%E9%98%9F%E5%88%97/">延迟队列</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/16/distributed-transaction-final-consistency-deep-dive/" title="分布式事务最终一致性实战：本地消息表、事务消息与最大努力通知深度对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">分布式事务最终一致性实战：本地消息表、事务消息与最大努力通知深度对比</div></div><div class="info-2"><div class="info-item-1">分布式事务最终一致性实战：本地消息表、事务消息与最大努力通知深度对比面试官：跨服务调用怎么保证数据一致性？微服务架构下，一个业务往往横跨多个服务、多个数据库。比如”下单”要同时完成：订单库扣减库存、账户库扣减余额、积分库增加积分——任何一个失败，数据就乱了。 强一致方案（2PC&#x2F;XA）在互联网场景基本被抛弃（性能差、协调者单点、阻塞）。真正落地的是最终一致性：允许中间状态不一致，但通过消息、对账等手段保证最终一致。 本文深挖三个最核心的最终一致性方案：本地消息表、事务消息、最大努力通知，讲清原理、代码和选型。 一、先看问题本质1234567// 伪代码：下单同时扣库存@Transactionalpublic void createOrder(Order order) &#123;    orderMapper.insert(order);                    // ① 本地订单    inventoryService.deduct(order.getSkuId());    // ② 远程扣库存    // ② 失败了怎么办？① 已经提交了！&#125...</div></div></div></a><a class="pagination-related" href="/2026/08/15/state-pattern-deep-dive/" title="【设计模式】状态模式深度解析：从有限状态机到订单状态流转实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【设计模式】状态模式深度解析：从有限状态机到订单状态流转实战</div></div><div class="info-2"><div class="info-item-1">【设计模式】状态模式深度解析：从有限状态机到订单状态流转实战面试官：订单状态流转你怎么写？if-else 套 if-else ？听说过状态模式吗？“订单状态”是后端面试必考的代码设计题。最朴素的写法是： 12345if (status == 1) &#123;          // 待支付    if (action == &quot;pay&quot;) &#123; status = 2; ... &#125;&#125; else if (status == 2) &#123;   // 已支付    if (action == &quot;cancel&quot;) &#123; status = 3; ... &#125;&#125;  状态一多、动作一多，这个方法就变成几百行的”屎山”。**状态模式（State Pattern）**就是为了优雅解决”对象的行为随内部状态变化而变化”这类问题而生的。 一、状态模式的定义与核心思想 允许一个对象在其内部状态改变时改变它的行为，对象看起来好像修改了它的类。 —— GoF  1.1 核心角色   角色 说明 订单例子    ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/17/redis-stream-message-queue/" title="Redis Stream 消息队列实战：从原理到企业级应用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">Redis Stream 消息队列实战：从原理到企业级应用</div></div><div class="info-2"><div class="info-item-1">Redis Stream 消息队列实战：从原理到企业级应用 Redis Stream 是 Redis 5.0 引入的强大的消息队列数据结构，它兼具消息持久化、消费者组管理、ACK 确认机制等企业级特性，弥补了 List 和 Pub&#x2F;Sub 在生产环境中的诸多不足。本文将深入讲解 Stream 的原理、用法，并通过实战案例带你掌握企业级消息队列的搭建。  一、Redis Stream 概述1.1 什么是 StreamRedis Stream 是一个追加式日志（append-only log）数据结构。每条消息都有一个唯一的 ID，消息以键值对字典的形式存储。与传统的 List 和 Pub&#x2F;Sub 相比，Stream 提供了更加完善的消息队列功能：  消息持久化：基于 RDB&#x2F;AOF，重启不丢失 消费者组：支持组内负载均衡消费 ACK 确认机制：保证消息至少被消费一次 消息回溯：可以从头到尾重新消费 阻塞读取：支持阻塞等待新消息  1.2 核心概念   概念 说明    消息 ID 格式 &lt;毫秒时间戳&gt;-&lt;序列号&gt;，全局唯一、单调...</div></div></div></a><a class="pagination-related" href="/2026/08/06/redis-transaction-deep-dive/" title="【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比面试官：Redis 的事务和 MySQL 的事务有什么区别？Redis 事务能回滚吗？Redis 事务是面试中高频且容易答错的考点。很多人的第一反应是「Redis 事务就是一组命令的批量执行」，但面试官往往会在后面连续追问：「它能回滚吗？」「有隔离性吗？」「WATCH 是什么？」「为什么不建议用事务而用 Lua？」 这篇文章把 Redis 事务从命令到原理、从对比到实战彻底讲透。  一、Redis 事务的核心命令Redis 事务通过四个命令实现：MULTI、EXEC、DISCARD、WATCH。    命令 作用    MULTI 开启事务，标记事务开始   EXEC 执行事务队列中的所有命令   DISCARD 取消事务，清空命令队列   WATCH 监视一个或多个 key，事务执行前若被修改则事务被打断   基本用法123456789127.0.0.1:6379&gt; MULTIOK127.0.0.1:6379&gt; SET account:1001...</div></div></div></a><a class="pagination-related" href="/2026/08/20/jedis-vs-lettuce-redis-client-comparison/" title="【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战</div></div><div class="info-2"><div class="info-item-1">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战面试官：你们项目里用的是 Jedis 还是 Lettuce？为什么？这是 Spring Boot 项目里最常被问到的问题之一。Spring Boot 2.x 默认集成 Lettuce，Spring Boot 1.x 默认 Jedis；Spring Data Redis 把两者都做了封装，很多人只是跟着默认走，却说不清两者的本质区别。 本文从线程模型、连接管理、源码实现、性能表现四个维度，把 Jedis 和 Lettuce 彻底讲透，最后给出生产环境选型建议。 一、先看本质：一个线程安全，一个线程不安全这是两者最核心、最根本的区别，其余所有差异几乎都由它衍生出来。 1.1 Jedis：非线程安全，必须配连接池Jedis 实例内部持有 Socket 连接，直接复用同一个 Jedis 实例执行并发命令，会出现响应错乱、数据交叉污染的问题。看源码： 1234567// Jedis 底层本质是对 redis.clients.jedis.Connection 的封装public class Co...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-cache-breakdown-penetration-avalanche-guide/" title="【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析面试官：说说缓存穿透、缓存击穿、缓存雪崩，以及各自的解决方案？缓存三兄弟是 Redis 面试的开场必问题，但很多人只背了”布隆过滤器、互斥锁、随机过期时间”这几个词，被追问”为什么””怎么实现”就露馅。这篇从原理出发，把三个问题讲透，每个都带代码实现和面试追问。 一、三兄弟一句话区分先建立整体认知，它们都发生在”缓存 Miss 之后回源数据库”这个环节，但病因不同：    问题 本质 一句话描述 危害    缓存穿透 查询的 key 不存在 查一个缓存和 DB 都没有的数据，每次请求都打到 DB DB 被无效流量打爆   缓存击穿 热点 key 过期瞬间 一个热点 key 过期，大量并发同时回源 DB DB 单点压力瞬间飙升   缓存雪崩 大量 key 同时过期 或 Redis 宕机 缓存层大面积失效，流量全部涌向 DB DB 直接宕机，系统整体不可用   区别的关键：穿透是”没有数据”，击穿是”一个热点 key 过期”，雪崩是”一批 key 过期&#x2F;缓存层挂了”。 二、缓存穿透：查不存在的数据原理...</div></div></div></a><a class="pagination-related" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</div></div><div class="info-2"><div class="info-item-1">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践引言：为什么需要 Kafka Connect？很多团队接 Kafka 的方式是”写个消费者程序，把数据从 Topic 搬到数据库”。一个系统这么干没问题，当系统多起来：订单数据进 ES、埋点数据进 HDFS、MySQL 变更同步到 Redis……每个需求写一个消费程序，就要重复处理：  分区分配与 Rebalance 位移提交与 Exactly-Once 语义 断线重连、重试、死信 连接管理、线程池、资源释放  Kafka Connect 的价值就是把”搬数据”这件事框架化：你只需要写（或直接复用现成的）Source&#x2F;Sink Connector，框架帮你搞定分布式执行、容错、偏移量管理、负载均衡。本文从架构原理到生产落地，带你把 Kafka Connect 用明白。 一、核心架构：三个角色 + 两类组件1.1 三个运行时角色   角色 说明    Worker 运行 Connector 和 Task 的 JVM 进程。分 Standalone（单机）和 Distributed（集群）两种模式 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">502</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">674</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">171</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E5%BB%B6%E8%BF%9F%E9%98%9F%E5%88%97%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BA%94%E7%A7%8D%E5%AE%9E%E7%8E%B0%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94%E4%B8%8E%E8%AE%A2%E5%8D%95%E8%B6%85%E6%97%B6%E5%85%B3%E9%97%AD%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AF%B4%E8%AF%B4%E4%BD%A0%E4%BB%AC%E6%98%AF%E6%80%8E%E4%B9%88%E5%AE%9E%E7%8E%B0%E8%AE%A2%E5%8D%95%E8%B6%85%E6%97%B6%E8%87%AA%E5%8A%A8%E5%85%B3%E9%97%AD%E7%9A%84%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：说说你们是怎么实现订单超时自动关闭的？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%BB%80%E4%B9%88%E6%98%AF%E5%BB%B6%E8%BF%9F%E9%98%9F%E5%88%97%EF%BC%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、什么是延迟队列？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E6%95%B0%E6%8D%AE%E5%BA%93%E8%BD%AE%E8%AF%A2%EF%BC%88%E6%9C%80%E6%9C%B4%E7%B4%A0%EF%BC%8C%E5%85%88%E8%A2%AB%E5%90%A6%E5%AE%9A%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、方案一：数据库轮询（最朴素，先被否定）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9AJava-DelayQueue%EF%BC%88JDK-%E8%87%AA%E5%B8%A6%EF%BC%89"><span class="toc-number">1.4.</span> <span class="toc-text">三、方案二：Java DelayQueue（JDK 自带）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9ARedis-ZSet%EF%BC%88%E6%9C%80%E7%BB%8F%E5%85%B8%E7%9A%84%E4%B8%AD%E9%97%B4%E4%BB%B6%E6%96%B9%E6%A1%88%EF%BC%89"><span class="toc-number">1.5.</span> <span class="toc-text">四、方案三：Redis ZSet（最经典的中间件方案）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%96%B9%E6%A1%88%E5%9B%9B%EF%BC%9ARabbitMQ-TTL-%E6%AD%BB%E4%BF%A1%E9%98%9F%E5%88%97"><span class="toc-number">1.6.</span> <span class="toc-text">五、方案四：RabbitMQ TTL + 死信队列</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%96%B9%E6%A1%88%E4%BA%94%EF%BC%9ARocketMQ-%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%EF%BC%88%E7%94%9F%E4%BA%A7%E7%8E%AF%E5%A2%83%E9%A6%96%E9%80%89%EF%BC%89"><span class="toc-number">1.7.</span> <span class="toc-text">六、方案五：RocketMQ 延迟消息（生产环境首选）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E4%BA%94%E7%A7%8D%E6%96%B9%E6%A1%88%E7%BB%88%E6%9E%81%E5%AF%B9%E6%AF%94"><span class="toc-number">1.8.</span> <span class="toc-text">七、五种方案终极对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5%E6%B8%85%E5%8D%95%EF%BC%88%E7%9B%B4%E6%8E%A5%E8%83%8C%EF%BC%89"><span class="toc-number">1.9.</span> <span class="toc-text">八、生产实践清单（直接背）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/bitmap-bit-operation-deep-practice/" title="【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战">【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/java-method-reference-deep-dive/" title="【Java 基础】方法引用深度解析：四种形式、底层原理与实战避坑指南">【Java 基础】方法引用深度解析：四种形式、底层原理与实战避坑指南</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/jfr-java-flight-recorder-deep-dive/" title="【JVM 实战】JFR 深度解析：Java 飞行记录器从录制原理到线上诊断实战">【JVM 实战】JFR 深度解析：Java 飞行记录器从录制原理到线上诊断实战</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/mysql-b-plus-tree-index-deep-dive/" title="【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现">【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/mysql-gap-lock-next-key-lock-deep-dive/" title="【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战">【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

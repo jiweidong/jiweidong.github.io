@@ -1,0 +1,422 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码面试官：Redis 的 ZSet 底层为什么用跳表，不用红黑树？这是 Redis 面试中出现频率极高的追问。很多人能背出”ZSet &#x3D; 哈希表 + 跳表”，但当面试官继续问”跳表为什么不用红黑树””跳表的层数怎么确定””ZSet 什么时候退化成 ziplist&#x2F;listpack”时，就">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/08/redis-skiplist-zset-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码面试官：Redis 的 ZSet 底层为什么用跳表，不用红黑树？这是 Redis 面试中出现频率极高的追问。很多人能背出”ZSet &#x3D; 哈希表 + 跳表”，但当面试官继续问”跳表为什么不用红黑树””跳表的层数怎么确定””ZSet 什么时候退化成 ziplist&#x2F;listpack”时，就">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-08T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-08T00:23:41.695Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="ZSet">
+<meta property="article:tag" content="数据结构">
+<meta property="article:tag" content="跳表">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码",
+  "url": "https://jiweidong.github.io/2026/08/08/redis-skiplist-zset-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-08T00:00:00.000Z",
+  "dateModified": "2026-08-08T00:23:41.695Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/08/redis-skiplist-zset-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">502</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">674</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">171</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-08T00:00:00.000Z" title="发表于 2026-08-08 08:00:00">2026-08-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-08T00:23:41.695Z" title="更新于 2026-08-08 08:23:41">2026-08-08</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/Redis/">Redis</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-原理】跳表与-ZSet-深度解析：从-Skip-List-数据结构到有序集合源码"><a href="#【Redis-原理】跳表与-ZSet-深度解析：从-Skip-List-数据结构到有序集合源码" class="headerlink" title="【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码"></a>【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码</h1><h2 id="面试官：Redis-的-ZSet-底层为什么用跳表，不用红黑树？"><a href="#面试官：Redis-的-ZSet-底层为什么用跳表，不用红黑树？" class="headerlink" title="面试官：Redis 的 ZSet 底层为什么用跳表，不用红黑树？"></a>面试官：Redis 的 ZSet 底层为什么用跳表，不用红黑树？</h2><p>这是 Redis 面试中出现频率极高的追问。很多人能背出”ZSet &#x3D; 哈希表 + 跳表”，但当面试官继续问”跳表为什么不用红黑树””跳表的层数怎么确定””ZSet 什么时候退化成 ziplist&#x2F;listpack”时，就开始含糊其辞了。</p>
+<p>本文从数据结构本身讲起，再到 Redis 源码（t_zset.c &#x2F; server.h），彻底拆解跳表与 ZSet。</p>
+<span id="more"></span>
+
+<h2 id="一、为什么需要跳表：有序数据结构的进化史"><a href="#一、为什么需要跳表：有序数据结构的进化史" class="headerlink" title="一、为什么需要跳表：有序数据结构的进化史"></a>一、为什么需要跳表：有序数据结构的进化史</h2><h3 id="1-1-有序集合的基本需求"><a href="#1-1-有序集合的基本需求" class="headerlink" title="1.1 有序集合的基本需求"></a>1.1 有序集合的基本需求</h3><p>ZSet 需要支持的操作：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>复杂度要求</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>按分数插入 &#x2F; 删除 &#x2F; 更新</td>
+<td>O(logN)</td>
+</tr>
+<tr>
+<td>按分数区间查询（ZRANGEBYSCORE）</td>
+<td>O(logN + M)</td>
+</tr>
+<tr>
+<td>按排名查询（ZRANK）</td>
+<td>O(logN)</td>
+</tr>
+<tr>
+<td>取最大值 &#x2F; 最小值（ZPOPMAX&#x2F;ZPOPMIN）</td>
+<td>O(logN)</td>
+</tr>
+</tbody></table>
+<p>能满足这些需求的候选数据结构有：<strong>平衡二叉树（红黑树）、B+ 树、跳表</strong>。Redis 选择了跳表，主要因为：</p>
+<ol>
+<li><strong>实现简单</strong>：红黑树插入后的旋转、变色逻辑极其复杂，而跳表本质是”带索引的有序链表”，几十行就能实现；</li>
+<li><strong>区间查询友好</strong>：跳表按序访问时只需沿底层链表顺序遍历，红黑树需要中序遍历（含栈&#x2F;递归回溯）；</li>
+<li><strong>并发友好</strong>：跳表支持高效的局部更新，且更容易实现无锁版本（LevelDB、ConcurrentSkipListMap 都证明了这一点）；</li>
+<li><strong>层数随机化</strong>：不需要像红黑树那样做全局平衡调整。</li>
+</ol>
+<h3 id="1-2-跳表的结构"><a href="#1-2-跳表的结构" class="headerlink" title="1.2 跳表的结构"></a>1.2 跳表的结构</h3><p>跳表 &#x3D; 有序链表 + 多层索引：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">level 3:  head ────────────────→ 60 ──────────────→ NULL</span><br><span class="line">level 2:  head ───────→ 30 ────→ 60 ──────→ 90 ──→ NULL</span><br><span class="line">level 1:  head ──→ 10 ──→ 30 ──→ 60 ──→ 70 ──→ 90 ──→ NULL</span><br><span class="line">底层:     head → 10 → 20 → 30 → 40 → 60 → 70 → 80 → 90 → NULL</span><br></pre></td></tr></table></figure>
+
+<p>查找过程：从最高层开始，向右走直到”下一个节点大于目标”，然后降一层继续。每层跳过一半节点，所以查找复杂度 O(logN)。</p>
+<h2 id="二、跳表的数学原理：为什么层数是随机的"><a href="#二、跳表的数学原理：为什么层数是随机的" class="headerlink" title="二、跳表的数学原理：为什么层数是随机的"></a>二、跳表的数学原理：为什么层数是随机的</h2><h3 id="2-1-层数生成：抛硬币"><a href="#2-1-层数生成：抛硬币" class="headerlink" title="2.1 层数生成：抛硬币"></a>2.1 层数生成：抛硬币</h3><p>每个新节点插入时，层数通过”抛硬币”决定：初始 1 层，每次有 1&#x2F;2 概率加一层：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Redis 源码 t_zset.c 中的 zslRandomLevel</span></span><br><span class="line"><span class="type">int</span> <span class="title function_">zslRandomLevel</span><span class="params">(<span class="type">void</span>)</span> &#123;</span><br><span class="line">    <span class="type">int</span> level = <span class="number">1</span>;</span><br><span class="line">    <span class="comment">// ZSKIPLIST_P = 0.25，即 1/4 概率升层</span></span><br><span class="line">    <span class="keyword">while</span> ((random() &amp; <span class="number">0xFFFF</span>) &lt; (ZSKIPLIST_P * <span class="number">0xFFFF</span>))</span><br><span class="line">        level += <span class="number">1</span>;</span><br><span class="line">    <span class="keyword">return</span> (level &lt; ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>Redis 把概率 P 设为 <strong>0.25</strong>（而不是经典的 0.5），层数分布更”瘦高”，在内存和查找效率之间取得平衡：</p>
+<table>
+<thead>
+<tr>
+<th>层数</th>
+<th>概率（P&#x3D;0.25）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>75%</td>
+</tr>
+<tr>
+<td>2</td>
+<td>18.75%</td>
+</tr>
+<tr>
+<td>3</td>
+<td>4.69%</td>
+</tr>
+<tr>
+<td>≥ 4</td>
+<td>1.56%</td>
+</tr>
+</tbody></table>
+<h3 id="2-2-为什么随机层数依然能保证-O-logN-？"><a href="#2-2-为什么随机层数依然能保证-O-logN-？" class="headerlink" title="2.2 为什么随机层数依然能保证 O(logN)？"></a>2.2 为什么随机层数依然能保证 O(logN)？</h3><p>这是跳表最反直觉的地方：<strong>层数是随机的，但期望复杂度是有保证的</strong>。</p>
+<ul>
+<li>每个节点出现在第 k 层的概率是 p^(k-1)，所以第 k 层期望节点数为 n·p^(k-1)；</li>
+<li>从最高层逐层下降，每层期望只需走 O(1&#x2F;p) 步；</li>
+<li>总层数期望为 O(log(1&#x2F;p) N)，因此<strong>期望查找、插入、删除复杂度都是 O(logN)</strong>。</li>
+</ul>
+<p>概率保证代替了确定性平衡——这就是跳表”用随机换简单”的精髓。极端情况下（所有节点都只有 1 层）退化成链表 O(N)，但概率无限趋近于 0，实践中完全可接受。</p>
+<h2 id="三、Redis-ZSet-源码级拆解"><a href="#三、Redis-ZSet-源码级拆解" class="headerlink" title="三、Redis ZSet 源码级拆解"></a>三、Redis ZSet 源码级拆解</h2><h3 id="3-1-ZSet-的整体结构"><a href="#3-1-ZSet-的整体结构" class="headerlink" title="3.1 ZSet 的整体结构"></a>3.1 ZSet 的整体结构</h3><p>Redis 7.0 之前，ZSet 有两种底层编码：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// server.h</span></span><br><span class="line"><span class="keyword">typedef</span> <span class="class"><span class="keyword">struct</span> <span class="title">zset</span> &#123;</span></span><br><span class="line">    dict *dict;          <span class="comment">// 哈希表：member -&gt; score，用于 O(1) 按成员查分数</span></span><br><span class="line">    zskiplist *zsl;      <span class="comment">// 跳表：按 score 排序，用于区间查询和排名</span></span><br><span class="line">&#125; zset;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><strong>dict</strong>：解决”按 member 查 score”（ZSCORE）O(1) 的问题；</li>
+<li><strong>zskiplist</strong>：解决”按分数排序、区间、排名”的问题。</li>
+</ul>
+<p><strong>为什么必须两个结构一起用？</strong> 只有跳表的话，ZSCORE 需要 O(logN)；只有哈希表的话，无法按分数排序。两者组合，各取所长，代价是插入时双写（内存换性能）。</p>
+<h3 id="3-2-跳表节点结构"><a href="#3-2-跳表节点结构" class="headerlink" title="3.2 跳表节点结构"></a>3.2 跳表节点结构</h3><figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">typedef</span> <span class="class"><span class="keyword">struct</span> <span class="title">zskiplistNode</span> &#123;</span></span><br><span class="line">    sds ele;                    <span class="comment">// 成员（member），字符串</span></span><br><span class="line">    <span class="type">double</span> score;               <span class="comment">// 分数</span></span><br><span class="line">    <span class="class"><span class="keyword">struct</span> <span class="title">zskiplistNode</span> *<span class="title">backward</span>;</span>  <span class="comment">// 后退指针，指向底层前一个节点</span></span><br><span class="line">    <span class="class"><span class="keyword">struct</span> <span class="title">zskiplistLevel</span> &#123;</span></span><br><span class="line">        <span class="class"><span class="keyword">struct</span> <span class="title">zskiplistNode</span> *<span class="title">forward</span>;</span> <span class="comment">// 前进指针</span></span><br><span class="line">        <span class="type">unsigned</span> <span class="type">long</span> span;            <span class="comment">// 跨度：本层跨越多少个节点</span></span><br><span class="line">    &#125; level[];                  <span class="comment">// 柔性数组，每层一个指针+跨度</span></span><br><span class="line">&#125; zskiplistNode;</span><br><span class="line"></span><br><span class="line"><span class="keyword">typedef</span> <span class="class"><span class="keyword">struct</span> <span class="title">zskiplist</span> &#123;</span></span><br><span class="line">    <span class="class"><span class="keyword">struct</span> <span class="title">zskiplistNode</span> *<span class="title">header</span>, *<span class="title">tail</span>;</span> <span class="comment">// 头尾哨兵</span></span><br><span class="line">    <span class="type">unsigned</span> <span class="type">long</span> length;       <span class="comment">// 节点总数</span></span><br><span class="line">    <span class="type">int</span> level;                  <span class="comment">// 当前最大层数</span></span><br><span class="line">&#125; zskiplist;</span><br></pre></td></tr></table></figure>
+
+<p><strong>span（跨度）字段是关键设计</strong>：<code>ZRANK</code>（按成员查排名）和 <code>ZREVRANK</code> 之所以是 O(logN)，就是因为查找时沿途累加每层的 span，直接得到排名，而<strong>不需要从头遍历链表</strong>。</p>
+<h3 id="3-3-插入流程（zslInsert）"><a href="#3-3-插入流程（zslInsert）" class="headerlink" title="3.3 插入流程（zslInsert）"></a>3.3 插入流程（zslInsert）</h3><figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">zskiplistNode *<span class="title function_">zslInsert</span><span class="params">(zskiplist *zsl, <span class="type">double</span> score, sds ele)</span> &#123;</span><br><span class="line">    zskiplistNode *update[ZSKIPLIST_MAXLEVEL];  <span class="comment">// 每层待更新前驱</span></span><br><span class="line">    <span class="type">unsigned</span> <span class="type">long</span> rank[ZSKIPLIST_MAXLEVEL];     <span class="comment">// 每层前驱的排名</span></span><br><span class="line">    <span class="comment">// 1. 从最高层向下查找插入位置，记录每层前驱和排名</span></span><br><span class="line">    <span class="comment">// 2. 生成随机层数</span></span><br><span class="line">    <span class="type">int</span> level = zslRandomLevel();</span><br><span class="line">    <span class="comment">// 3. 如果新层数超过当前最大层，初始化新层</span></span><br><span class="line">    <span class="comment">// 4. 创建节点，逐层插入，更新 span 和 backward</span></span><br><span class="line">    <span class="comment">// 5. 更新头节点和长度</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>排序规则（重要细节）：</p>
+<ol>
+<li>先按 <strong>score 升序</strong>；</li>
+<li>score 相同时按 <strong>member 的字典序（memcmp）</strong> 排序。</li>
+</ol>
+<p>这就是为什么 ZRANGE 在分数相同时输出稳定有序。</p>
+<h3 id="3-4-编码切换：什么时候不用跳表？"><a href="#3-4-编码切换：什么时候不用跳表？" class="headerlink" title="3.4 编码切换：什么时候不用跳表？"></a>3.4 编码切换：什么时候不用跳表？</h3><table>
+<thead>
+<tr>
+<th>Redis 版本</th>
+<th>小数据量编码</th>
+<th>阈值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>≤ 7.0</td>
+<td>ziplist（压缩列表）</td>
+<td>元素 ≤ 128 且 每个元素长度 ≤ 64 字节</td>
+</tr>
+<tr>
+<td>≥ 7.0</td>
+<td>listpack（紧凑列表）</td>
+<td>元素 ≤ 128 且 每个元素长度 ≤ 64 字节</td>
+</tr>
+</tbody></table>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// t_zset.c</span></span><br><span class="line"><span class="type">static</span> <span class="type">char</span> *zsetTypeGetEncoding... <span class="comment">// 判断逻辑：</span></span><br><span class="line"><span class="comment">// zset_max_listpack_entries = 128</span></span><br><span class="line"><span class="comment">// zset_max_listpack_value = 64</span></span><br></pre></td></tr></table></figure>
+
+<p>当元素数或单元素大小超过阈值，自动转换为 <code>zset</code>（dict + 跳表），且<strong>不可逆</strong>（不会转回 listpack）。可以通过配置调整：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">zset-max-listpack-entries 128</span><br><span class="line">zset-max-listpack-value   64</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p><strong>面试追问：为什么小数据量不用跳表？</strong> listpack 是连续内存、按序紧凑排列，128 个元素以内线性扫描 O(N) 和跳表 O(logN) 差距可忽略，但内存占用跳表是 listpack 的几倍（每个节点要存多层指针 + span + backward）。空间换时间的工程取舍。</p>
+</blockquote>
+<h2 id="四、跳表-vs-红黑树-vs-B-树：终极对比"><a href="#四、跳表-vs-红黑树-vs-B-树：终极对比" class="headerlink" title="四、跳表 vs 红黑树 vs B+ 树：终极对比"></a>四、跳表 vs 红黑树 vs B+ 树：终极对比</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>跳表</th>
+<th>红黑树</th>
+<th>B+ 树</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>实现复杂度</td>
+<td>低（~百行）</td>
+<td>高（旋转+变色）</td>
+<td>中（分裂&#x2F;合并）</td>
+</tr>
+<tr>
+<td>查找</td>
+<td>O(logN) 期望</td>
+<td>O(logN) 最坏</td>
+<td>O(logN)，但层高更矮</td>
+</tr>
+<tr>
+<td>区间遍历</td>
+<td>极好（底层链表）</td>
+<td>差（中序遍历）</td>
+<td>极好（叶节点链表）</td>
+</tr>
+<tr>
+<td>范围删除</td>
+<td>简单（断链）</td>
+<td>复杂（逐个删除）</td>
+<td>简单</td>
+</tr>
+<tr>
+<td>磁盘友好</td>
+<td>否</td>
+<td>否</td>
+<td>是（页节点存储）</td>
+</tr>
+<tr>
+<td>Redis 用途</td>
+<td>ZSet 排序索引</td>
+<td>无（Redis 不用红黑树）</td>
+<td>无（MySQL InnoDB 用）</td>
+</tr>
+</tbody></table>
+<p><strong>一句话总结</strong>：内存场景选跳表（简单+区间友好），磁盘场景选 B+ 树（页大小 IO 友好），需要严格最坏复杂度保证的场景选红黑树。</p>
+<h2 id="五、实战：用-Java-手写一个迷你跳表"><a href="#五、实战：用-Java-手写一个迷你跳表" class="headerlink" title="五、实战：用 Java 手写一个迷你跳表"></a>五、实战：用 Java 手写一个迷你跳表</h2><p>理解源码最好的方式是手写。下面实现一个支持插入、查找、删除的简单跳表：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SkipList</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">MAX_LEVEL</span> <span class="operator">=</span> <span class="number">32</span>;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">double</span> <span class="variable">P</span> <span class="operator">=</span> <span class="number">0.25</span>;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">Node</span> <span class="variable">head</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Node</span>(Integer.MIN_VALUE, MAX_LEVEL);</span><br><span class="line">    <span class="keyword">private</span> <span class="type">int</span> <span class="variable">level</span> <span class="operator">=</span> <span class="number">1</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">Node</span> &#123;</span><br><span class="line">        <span class="type">int</span> val;</span><br><span class="line">        Node[] next;   <span class="comment">// 每层下一个节点</span></span><br><span class="line">        Node(<span class="type">int</span> val, <span class="type">int</span> level) &#123;</span><br><span class="line">            <span class="built_in">this</span>.val = val;</span><br><span class="line">            <span class="built_in">this</span>.next = <span class="keyword">new</span> <span class="title class_">Node</span>[level];</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="type">int</span> <span class="title function_">randomLevel</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">lv</span> <span class="operator">=</span> <span class="number">1</span>;</span><br><span class="line">        <span class="keyword">while</span> (Math.random() &lt; P &amp;&amp; lv &lt; MAX_LEVEL) lv++;</span><br><span class="line">        <span class="keyword">return</span> lv;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">insert</span><span class="params">(<span class="type">int</span> val)</span> &#123;</span><br><span class="line">        Node[] update = <span class="keyword">new</span> <span class="title class_">Node</span>[MAX_LEVEL];</span><br><span class="line">        <span class="type">Node</span> <span class="variable">cur</span> <span class="operator">=</span> head;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> level - <span class="number">1</span>; i &gt;= <span class="number">0</span>; i--) &#123;</span><br><span class="line">            <span class="keyword">while</span> (cur.next[i] != <span class="literal">null</span> &amp;&amp; cur.next[i].val &lt; val) &#123;</span><br><span class="line">                cur = cur.next[i];</span><br><span class="line">            &#125;</span><br><span class="line">            update[i] = cur;   <span class="comment">// 记录每层待插入位置</span></span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">int</span> <span class="variable">newLevel</span> <span class="operator">=</span> randomLevel();</span><br><span class="line">        <span class="keyword">if</span> (newLevel &gt; level) &#123;</span><br><span class="line">            <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> level; i &lt; newLevel; i++) update[i] = head;</span><br><span class="line">            level = newLevel;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">Node</span> <span class="variable">node</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Node</span>(val, newLevel);</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; newLevel; i++) &#123;</span><br><span class="line">            node.next[i] = update[i].next[i];</span><br><span class="line">            update[i].next[i] = node;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">search</span><span class="params">(<span class="type">int</span> val)</span> &#123;</span><br><span class="line">        <span class="type">Node</span> <span class="variable">cur</span> <span class="operator">=</span> head;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> level - <span class="number">1</span>; i &gt;= <span class="number">0</span>; i--) &#123;</span><br><span class="line">            <span class="keyword">while</span> (cur.next[i] != <span class="literal">null</span> &amp;&amp; cur.next[i].val &lt; val) &#123;</span><br><span class="line">                cur = cur.next[i];</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        cur = cur.next[<span class="number">0</span>];</span><br><span class="line">        <span class="keyword">return</span> cur != <span class="literal">null</span> &amp;&amp; cur.val == val;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">delete</span><span class="params">(<span class="type">int</span> val)</span> &#123;</span><br><span class="line">        Node[] update = <span class="keyword">new</span> <span class="title class_">Node</span>[MAX_LEVEL];</span><br><span class="line">        <span class="type">Node</span> <span class="variable">cur</span> <span class="operator">=</span> head;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> level - <span class="number">1</span>; i &gt;= <span class="number">0</span>; i--) &#123;</span><br><span class="line">            <span class="keyword">while</span> (cur.next[i] != <span class="literal">null</span> &amp;&amp; cur.next[i].val &lt; val) &#123;</span><br><span class="line">                cur = cur.next[i];</span><br><span class="line">            &#125;</span><br><span class="line">            update[i] = cur;</span><br><span class="line">        &#125;</span><br><span class="line">        cur = cur.next[<span class="number">0</span>];</span><br><span class="line">        <span class="keyword">if</span> (cur == <span class="literal">null</span> || cur.val != val) <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; level; i++) &#123;</span><br><span class="line">            <span class="keyword">if</span> (update[i].next[i] == cur) update[i].next[i] = cur.next[i];</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">while</span> (level &gt; <span class="number">1</span> &amp;&amp; head.next[level - <span class="number">1</span>] == <span class="literal">null</span>) level--;</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这段代码与 Redis 的 <code>zslInsert</code> &#x2F; <code>zslDelete</code> 逻辑同构：从高层向下找位置、记录每层前驱、更新指针。能独立写出来，说明你真的懂了。</p>
+<h2 id="六、ZSet-经典使用场景"><a href="#六、ZSet-经典使用场景" class="headerlink" title="六、ZSet 经典使用场景"></a>六、ZSet 经典使用场景</h2><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>命令设计</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>排行榜（日榜&#x2F;周榜&#x2F;总榜）</td>
+<td><code>ZADD rank:total 100 user:1</code>，<code>ZREVRANGE rank:total 0 9 WITHSCORES</code></td>
+</tr>
+<tr>
+<td>延迟队列</td>
+<td>score 存执行时间戳，<code>ZRANGEBYSCORE</code> 取到期任务</td>
+</tr>
+<tr>
+<td>滑动窗口限流</td>
+<td>score 存时间戳，配合 <code>ZREMRANGEBYSCORE</code> 清理过期窗口</td>
+</tr>
+<tr>
+<td>商品销量排序</td>
+<td>score 存销量，销量变化 <code>ZINCRBY</code></td>
+</tr>
+<tr>
+<td>在线用户心跳</td>
+<td>score 存最后活跃时间，定期 <code>ZREMRANGEBYSCORE</code> 清理超时用户</td>
+</tr>
+</tbody></table>
+<h2 id="七、总结"><a href="#七、总结" class="headerlink" title="七、总结"></a>七、总结</h2><ul>
+<li><strong>跳表 &#x3D; 有序链表 + 随机多层索引</strong>，用随机化换取 O(logN) 期望复杂度和极简实现；</li>
+<li><strong>ZSet &#x3D; dict + 跳表</strong>，dict 负责 O(1) 查分，跳表负责有序区间与排名；</li>
+<li><strong>span 跨度</strong>让 ZRANK 达到 O(logN)；</li>
+<li><strong>小数据用 listpack，大数据转跳表</strong>，阈值 128 元素 &#x2F; 64 字节；</li>
+<li>面试对比结论：<strong>内存选跳表、磁盘选 B+ 树、最坏复杂度敏感选红黑树</strong>。</li>
+</ul>
+<p>下次面试官再问”ZSet 为什么用跳表”，你可以从实现复杂度、区间查询、并发扩展、内存模型四个维度展开，最后补一句：”其实 MySQL 的 InnoDB 不用跳表而用 B+ 树，是因为磁盘顺序 IO 和页大小的原因”——这一句话，就能让面试官知道你不仅懂 Redis，还懂数据库。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/08/redis-skiplist-zset-deep-dive/">https://jiweidong.github.io/2026/08/08/redis-skiplist-zset-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84/">数据结构</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E8%B7%B3%E8%A1%A8/">跳表</a><a class="post-meta__tags" href="/tags/ZSet/">ZSet</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/08/spring-boot-graceful-shutdown-deep-dive/" title="【Spring Boot 实战】优雅停机深度解析：从 kill 命令到 Graceful Shutdown 平滑下线"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Spring Boot 实战】优雅停机深度解析：从 kill 命令到 Graceful Shutdown 平滑下线</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】优雅停机深度解析：从 kill 命令到 Graceful Shutdown 平滑下线面试官：线上发版直接 kill -9 进程，会有什么问题？很多人发版时的流程是：找到 PID → kill -9 → 启动新包。运气好没事，运气不好就会出现：  正在处理的请求被中断：用户下单到一半，接口 502； 数据不一致：写入数据库一半的事务回滚，或者消息队列里的消息处理一半就丢了； 注册中心感知延迟：服务还在被调用方请求，进程却已经没了。  本文从 Linux 信号机制讲起，完整梳理 Spring Boot 优雅停机的原理与配置，让”发版无感”成为标配。   一、先搞清楚：kill 到底在干什么？1.1 信号与默认行为kill &lt;pid&gt; 本质是向进程发送信号。常用信号：    信号 数值 默认行为 进程能否捕获    SIGTERM 15 终止进程 能（可优雅处理）   SIGKILL 9 立即杀死 不能（内核直接回收）   SIGHUP 1 挂断（终端断开） 能   SIGINT 2 Ctrl+C 能   关键结论：  kill -9（SIG...</div></div></div></a><a class="pagination-related" href="/2026/08/08/mysql-transaction-isolation-levels-deep-dive/" title="【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读面试官：MySQL 默认隔离级别是什么？为什么它能解决幻读？“MySQL 默认是 RR（可重复读）”——这句话几乎人人会背，但接下来的追问能刷掉 80% 的人：  脏读、不可重复读、幻读到底怎么演示？ READ COMMITTED 和 REPEATABLE READ 在 MVCC 下有什么区别？ MySQL 的 RR 为什么能解决幻读，而教科书说 RR 不能？ 什么时候应该把隔离级别改成 RC？  本文用 SQL 实验 + 原理分析，一次讲透。   一、三大并发问题：先建立直觉假设有一张表：user(id, name, balance)，初始数据 id=1, balance=100。 1.1 脏读（Dirty Read）：读到未提交的数据123事务 A：UPDATE user SET balance=200 WHERE id=1;   -- 未提交事务 B：SELECT balance FROM user WHERE id=1;      -- 读到 200 ❌事务 A：ROLLBACK;    ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/03/redis-db-cache-consistency-deep-dive/" title="【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案面试官：数据更新时，你是怎么保证 Redis 缓存和 MySQL 数据一致性的？这是 Redis 面试的”必考题”，也是生产环境最容易踩坑的地方。很多同学背了”先更新数据库，再删缓存”的口诀，但被追问一句”那并发情况下还有问题吗”就卡住了。今天我们把缓存一致性这个问题从方案到原理到代码彻底讲透。 一、先搞清楚：为什么会有缓存不一致？缓存不一致的根源只有一个：对同一份数据，MySQL 和 Redis 各存了一份，而更新操作不是原子的。  更新 MySQL 成功、更新 Redis 失败 → 不一致； 更新 Redis 成功、更新 MySQL 失败 → 不一致； 两个都成功，但执行顺序不同 → 中间态不一致； 并发读写交叉 → 旧数据覆盖新数据。  要理解各种方案，先看业界标准的四种缓存读写模式：    模式 读 写 特点    Cache Aside（旁路缓存） 读 Miss 后回源 DB 先更新 DB，再删缓存 最常用，简单可控   Read Through 缓存组件负责回源 同 Cache ...</div></div></div></a><a class="pagination-related" href="/2026/08/24/bitmap-bit-operation-deep-practice/" title="【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战</div></div><div class="info-2"><div class="info-item-1">【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战面试官：10 亿个整数里如何快速判断某个数是否存在？内存只有 1GB，怎么处理？常规思路（HashSet、HashMap）在这个数据量下直接内存爆掉：10 亿个 int 用 HashSet 存，光数据就 4GB，加上对象头和哈希表结构膨胀，实际占用 20GB+。而用位图（Bitmap），只需要 10 亿 bit &#x3D; 约 119MB。这就是位图的威力——用 1 个 bit 表示一个元素的状态，空间压缩 32 倍以上。 一、位运算基础（先夯实底层）Java 的位运算操作符：    运算符 名称 示例 结果    &amp; 按位与 5 &amp; 3 1（0101 &amp; 0011 &#x3D; 0001）   | 按位或 5 | 3 7（0101 | 0011 &#x3D; 0111）   ^ 按位异或 5 ^ 3 6（0101 ^ 0011 &#x3D; 0110）   ~ 按位取反 ~5 -6   &lt;&lt; 左移 1 &lt;&lt; 3 8   &gt;&gt; 右移（带...</div></div></div></a><a class="pagination-related" href="/2026/08/06/redis-transaction-deep-dive/" title="【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比面试官：Redis 的事务和 MySQL 的事务有什么区别？Redis 事务能回滚吗？Redis 事务是面试中高频且容易答错的考点。很多人的第一反应是「Redis 事务就是一组命令的批量执行」，但面试官往往会在后面连续追问：「它能回滚吗？」「有隔离性吗？」「WATCH 是什么？」「为什么不建议用事务而用 Lua？」 这篇文章把 Redis 事务从命令到原理、从对比到实战彻底讲透。  一、Redis 事务的核心命令Redis 事务通过四个命令实现：MULTI、EXEC、DISCARD、WATCH。    命令 作用    MULTI 开启事务，标记事务开始   EXEC 执行事务队列中的所有命令   DISCARD 取消事务，清空命令队列   WATCH 监视一个或多个 key，事务执行前若被修改则事务被打断   基本用法123456789127.0.0.1:6379&gt; MULTIOK127.0.0.1:6379&gt; SET account:1001...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-cache-breakdown-penetration-avalanche-guide/" title="【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析面试官：说说缓存穿透、缓存击穿、缓存雪崩，以及各自的解决方案？缓存三兄弟是 Redis 面试的开场必问题，但很多人只背了”布隆过滤器、互斥锁、随机过期时间”这几个词，被追问”为什么””怎么实现”就露馅。这篇从原理出发，把三个问题讲透，每个都带代码实现和面试追问。 一、三兄弟一句话区分先建立整体认知，它们都发生在”缓存 Miss 之后回源数据库”这个环节，但病因不同：    问题 本质 一句话描述 危害    缓存穿透 查询的 key 不存在 查一个缓存和 DB 都没有的数据，每次请求都打到 DB DB 被无效流量打爆   缓存击穿 热点 key 过期瞬间 一个热点 key 过期，大量并发同时回源 DB DB 单点压力瞬间飙升   缓存雪崩 大量 key 同时过期 或 Redis 宕机 缓存层大面积失效，流量全部涌向 DB DB 直接宕机，系统整体不可用   区别的关键：穿透是”没有数据”，击穿是”一个热点 key 过期”，雪崩是”一批 key 过期&#x2F;缓存层挂了”。 二、缓存穿透：查不存在的数据原理...</div></div></div></a><a class="pagination-related" href="/2026/08/13/redis-event-loop-deep-dive/" title="【Redis 原理】Redis 事件循环深度解析：文件事件、时间事件与 IO 多路复用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-13</div><div class="info-item-2">【Redis 原理】Redis 事件循环深度解析：文件事件、时间事件与 IO 多路复用</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 事件循环深度解析：文件事件、时间事件与 IO 多路复用面试官：Redis 为什么快？单线程模型到底是怎么运作的？「Redis 基于内存、单线程、IO 多路复用」——这几乎是背烂了的答案。但再往深问一层：「单线程是怎么同时处理那么多连接的？文件事件和时间事件是什么关系？为什么 6.0 又引入了多线程？」 这篇文章从 Redis 源码（ae.c &#x2F; ae_epoll.c）出发，把事件循环（Event Loop）的底层机制彻底讲透。 一、Redis 为什么选单线程 + IO 多路复用？1.1 核心原因 内存操作极快：Redis 命令基本都是内存读写，微秒级完成，CPU 不是瓶颈； 避免上下文切换和锁竞争：多线程要处理并发安全（加锁、原子操作），单线程天然无锁，杜绝了线程切换开销； IO 多路复用：单个线程可以同时监听成千上万个 socket 连接的就绪事件，只在有数据可读&#x2F;可写时才处理，非阻塞 IO 让线程不会被某个慢连接拖住； 模型简单：没有竞态条件，没有死锁问题，调试和维护成本极低。  1.2 单线程模型的瓶颈单线程意味着一条慢命...</div></div></div></a><a class="pagination-related" href="/2026/06/30/redis-advanced-data-structures-guide/" title="【Redis进阶】Redis 高级数据结构实战：Geo、HyperLogLog、BloomFilter 与 Bitmaps 原理与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">【Redis进阶】Redis 高级数据结构实战：Geo、HyperLogLog、BloomFilter 与 Bitmaps 原理与最佳实践</div></div><div class="info-2"><div class="info-item-1">【Redis进阶】Redis 高级数据结构实战：Geo、HyperLogLog、BloomFilter 与 Bitmaps 原理与最佳实践前言大多数 Java 开发者对 Redis 的认知停留在 String、Hash、List、Set、Sorted Set 这五种基础数据结构上。然而 Redis 还提供了 Geo（地理位置）、HyperLogLog（基数统计）、Bitmaps（位图） 等高级数据结构，以及通过 Module 加载的 BloomFilter（布隆过滤器），它们在特定场景下能发挥巨大威力。 本文将从原理、Redis 命令、Java 实战、性能对比四个维度深度剖析这些”隐藏神器”。  一、Redis Geo：地理空间索引1.1 应用场景 附近的人 &#x2F; 附近的商家 网约车距离匹配 外卖配送范围判断  1.2 原理：GeoHash 算法Redis Geo 底层使用 GeoHash 算法实现：  将经纬度二维坐标通过二分法编码为一维字符串 字符串前缀匹配越多，表示两个点距离越近 底层使用 Sorted Set（zset） 存储，GeoHash 值作为 score ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">502</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">674</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">171</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E5%8E%9F%E7%90%86%E3%80%91%E8%B7%B3%E8%A1%A8%E4%B8%8E-ZSet-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E-Skip-List-%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E5%88%B0%E6%9C%89%E5%BA%8F%E9%9B%86%E5%90%88%E6%BA%90%E7%A0%81"><span class="toc-number">1.</span> <span class="toc-text">【Redis 原理】跳表与 ZSet 深度解析：从 Skip List 数据结构到有序集合源码</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9ARedis-%E7%9A%84-ZSet-%E5%BA%95%E5%B1%82%E4%B8%BA%E4%BB%80%E4%B9%88%E7%94%A8%E8%B7%B3%E8%A1%A8%EF%BC%8C%E4%B8%8D%E7%94%A8%E7%BA%A2%E9%BB%91%E6%A0%91%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：Redis 的 ZSet 底层为什么用跳表，不用红黑树？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E8%B7%B3%E8%A1%A8%EF%BC%9A%E6%9C%89%E5%BA%8F%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E7%9A%84%E8%BF%9B%E5%8C%96%E5%8F%B2"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么需要跳表：有序数据结构的进化史</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E6%9C%89%E5%BA%8F%E9%9B%86%E5%90%88%E7%9A%84%E5%9F%BA%E6%9C%AC%E9%9C%80%E6%B1%82"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 有序集合的基本需求</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E8%B7%B3%E8%A1%A8%E7%9A%84%E7%BB%93%E6%9E%84"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 跳表的结构</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E8%B7%B3%E8%A1%A8%E7%9A%84%E6%95%B0%E5%AD%A6%E5%8E%9F%E7%90%86%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E5%B1%82%E6%95%B0%E6%98%AF%E9%9A%8F%E6%9C%BA%E7%9A%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、跳表的数学原理：为什么层数是随机的</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%B1%82%E6%95%B0%E7%94%9F%E6%88%90%EF%BC%9A%E6%8A%9B%E7%A1%AC%E5%B8%81"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 层数生成：抛硬币</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9A%8F%E6%9C%BA%E5%B1%82%E6%95%B0%E4%BE%9D%E7%84%B6%E8%83%BD%E4%BF%9D%E8%AF%81-O-logN-%EF%BC%9F"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 为什么随机层数依然能保证 O(logN)？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Redis-ZSet-%E6%BA%90%E7%A0%81%E7%BA%A7%E6%8B%86%E8%A7%A3"><span class="toc-number">1.4.</span> <span class="toc-text">三、Redis ZSet 源码级拆解</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-ZSet-%E7%9A%84%E6%95%B4%E4%BD%93%E7%BB%93%E6%9E%84"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 ZSet 的整体结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E8%B7%B3%E8%A1%A8%E8%8A%82%E7%82%B9%E7%BB%93%E6%9E%84"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 跳表节点结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E6%8F%92%E5%85%A5%E6%B5%81%E7%A8%8B%EF%BC%88zslInsert%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 插入流程（zslInsert）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E7%BC%96%E7%A0%81%E5%88%87%E6%8D%A2%EF%BC%9A%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E4%B8%8D%E7%94%A8%E8%B7%B3%E8%A1%A8%EF%BC%9F"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 编码切换：什么时候不用跳表？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%B7%B3%E8%A1%A8-vs-%E7%BA%A2%E9%BB%91%E6%A0%91-vs-B-%E6%A0%91%EF%BC%9A%E7%BB%88%E6%9E%81%E5%AF%B9%E6%AF%94"><span class="toc-number">1.5.</span> <span class="toc-text">四、跳表 vs 红黑树 vs B+ 树：终极对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%AE%9E%E6%88%98%EF%BC%9A%E7%94%A8-Java-%E6%89%8B%E5%86%99%E4%B8%80%E4%B8%AA%E8%BF%B7%E4%BD%A0%E8%B7%B3%E8%A1%A8"><span class="toc-number">1.6.</span> <span class="toc-text">五、实战：用 Java 手写一个迷你跳表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81ZSet-%E7%BB%8F%E5%85%B8%E4%BD%BF%E7%94%A8%E5%9C%BA%E6%99%AF"><span class="toc-number">1.7.</span> <span class="toc-text">六、ZSet 经典使用场景</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/bitmap-bit-operation-deep-practice/" title="【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战">【Java 实战】位图（Bitmap）深度解析：从位运算原理到海量数据去重与统计实战</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/java-method-reference-deep-dive/" title="【Java 基础】方法引用深度解析：四种形式、底层原理与实战避坑指南">【Java 基础】方法引用深度解析：四种形式、底层原理与实战避坑指南</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/jfr-java-flight-recorder-deep-dive/" title="【JVM 实战】JFR 深度解析：Java 飞行记录器从录制原理到线上诊断实战">【JVM 实战】JFR 深度解析：Java 飞行记录器从录制原理到线上诊断实战</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/mysql-b-plus-tree-index-deep-dive/" title="【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现">【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/24/mysql-gap-lock-next-key-lock-deep-dive/" title="【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战">【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战</a><time datetime="2026-08-24T00:00:00.000Z" title="发表于 2026-08-24 08:00:00">2026-08-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
