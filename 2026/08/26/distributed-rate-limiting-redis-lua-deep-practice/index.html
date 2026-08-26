@@ -1,0 +1,354 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案面试官：单机限流和分布式限流有什么区别？Redis 限流怎么保证原子性？上一篇文章讲了限流的四种算法（固定窗口、滑动窗口、漏桶、令牌桶），那都是单机视角。生产环境服务是集群部署的——你有 10 个实例，每个实例限 100 QPS，整体就能被冲到 1000 QPS，限流形同虚设。所以必须做分布式限流：把限流状态放到所有实例">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案面试官：单机限流和分布式限流有什么区别？Redis 限流怎么保证原子性？上一篇文章讲了限流的四种算法（固定窗口、滑动窗口、漏桶、令牌桶），那都是单机视角。生产环境服务是集群部署的——你有 10 个实例，每个实例限 100 QPS，整体就能被冲到 1000 QPS，限流形同虚设。所以必须做分布式限流：把限流状态放到所有实例">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-26T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-26T00:16:20.595Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="限流">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案",
+  "url": "https://jiweidong.github.io/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-26T00:00:00.000Z",
+  "dateModified": "2026-08-26T00:16:20.595Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">522</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">678</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">177</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-26T00:00:00.000Z" title="发表于 2026-08-26 08:00:00">2026-08-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-26T00:16:20.595Z" title="更新于 2026-08-26 08:16:20">2026-08-26</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【高并发实战】分布式限流深度实战：Redis-Lua-原子限流与网关级方案"><a href="#【高并发实战】分布式限流深度实战：Redis-Lua-原子限流与网关级方案" class="headerlink" title="【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案"></a>【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案</h1><h2 id="面试官：单机限流和分布式限流有什么区别？Redis-限流怎么保证原子性？"><a href="#面试官：单机限流和分布式限流有什么区别？Redis-限流怎么保证原子性？" class="headerlink" title="面试官：单机限流和分布式限流有什么区别？Redis 限流怎么保证原子性？"></a>面试官：单机限流和分布式限流有什么区别？Redis 限流怎么保证原子性？</h2><p>上一篇文章讲了限流的四种算法（固定窗口、滑动窗口、漏桶、令牌桶），那都是<strong>单机视角</strong>。生产环境服务是集群部署的——你有 10 个实例，每个实例限 100 QPS，整体就能被冲到 1000 QPS，限流形同虚设。所以必须做<strong>分布式限流</strong>：把限流状态放到所有实例共享的地方（Redis），让整个集群统一限流。</p>
+<p>本文实战讲解分布式限流的完整方案：Redis + Lua 的原子实现、滑动窗口与令牌桶的 Lua 脚本、网关层（Spring Cloud Gateway）限流落地，以及各种方案的对比与坑。</p>
+<h2 id="一、为什么必须用-Lua-脚本？"><a href="#一、为什么必须用-Lua-脚本？" class="headerlink" title="一、为什么必须用 Lua 脚本？"></a>一、为什么必须用 Lua 脚本？</h2><h3 id="1-1-分布式限流的本质矛盾"><a href="#1-1-分布式限流的本质矛盾" class="headerlink" title="1.1 分布式限流的本质矛盾"></a>1.1 分布式限流的本质矛盾</h3><p>分布式限流的核心操作是”读计数 → 判断 → 写计数”，例如固定窗口：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">INCR key          # 计数 +1</span><br><span class="line">if 计数 &gt; 限额: 拒绝</span><br></pre></td></tr></table></figure>
+
+<p>如果是”先 GET 再 INCR”，在高并发下会出现<strong>竞态条件</strong>：两个请求同时读到计数&#x3D;99，都 INCR 到 100，都放行，实际 101 个请求。这不是 Redis 单线程的问题，而是<strong>客户端多条命令之间不是原子的</strong>。</p>
+<h3 id="1-2-解决方案对比"><a href="#1-2-解决方案对比" class="headerlink" title="1.2 解决方案对比"></a>1.2 解决方案对比</h3><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>原子性</th>
+<th>网络开销</th>
+<th>复杂度</th>
+<th>评价</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>多条命令（GET+INCR）</td>
+<td>❌ 有竞态</td>
+<td>2 次 RTT</td>
+<td>低</td>
+<td>不可用</td>
+</tr>
+<tr>
+<td>事务 MULTI&#x2F;EXEC</td>
+<td>✅</td>
+<td>2 次 RTT</td>
+<td>中</td>
+<td>无法在事务中做判断（EXEC 才执行）</td>
+</tr>
+<tr>
+<td><strong>Lua 脚本</strong></td>
+<td>✅✅</td>
+<td>1 次 RTT</td>
+<td>中</td>
+<td><strong>标准答案</strong></td>
+</tr>
+<tr>
+<td>原生 Redis 命令组合</td>
+<td>部分</td>
+<td>1 次</td>
+<td>低</td>
+<td>如 INCR+EXPIRE 仍有窗口期问题</td>
+</tr>
+</tbody></table>
+<p>Redis 从 2.6 开始支持 Lua 脚本，<strong>整个脚本在 Redis 服务端原子执行</strong>（脚本执行期间其他命令排队），天然解决竞态。而且脚本在网络中只传一次，减少了 RTT。</p>
+<blockquote>
+<p>面试追问：为什么 Redis 的 Lua 脚本是原子的？<br>答：Redis 是单线程执行命令，Lua 脚本被当作一个整体在服务端执行，执行期间不会有其他命令插入（Redis 6 的异步线程只处理耗时的 IO 类命令，不影响脚本的原子性语义）。另外 Redis 内置了 Lua 解释器，无需额外安装。</p>
+</blockquote>
+<h2 id="二、方案一：固定窗口限流（Lua-版）"><a href="#二、方案一：固定窗口限流（Lua-版）" class="headerlink" title="二、方案一：固定窗口限流（Lua 版）"></a>二、方案一：固定窗口限流（Lua 版）</h2><p>固定窗口算法：每个时间窗口内计数，超过阈值拒绝，窗口结束清零。</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 固定窗口限流脚本</span></span><br><span class="line"><span class="comment">-- KEYS[1] = 限流 key，如 rate:limit:user:1001</span></span><br><span class="line"><span class="comment">-- ARGV[1] = 窗口大小（秒）</span></span><br><span class="line"><span class="comment">-- ARGV[2] = 窗口内最大请求数</span></span><br><span class="line"><span class="keyword">local</span> key = KEYS[<span class="number">1</span>]</span><br><span class="line"><span class="keyword">local</span> window = <span class="built_in">tonumber</span>(ARGV[<span class="number">1</span>])</span><br><span class="line"><span class="keyword">local</span> limit = <span class="built_in">tonumber</span>(ARGV[<span class="number">2</span>])</span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> current = redis.call(<span class="string">&#x27;INCR&#x27;</span>, key)</span><br><span class="line"><span class="keyword">if</span> current == <span class="number">1</span> <span class="keyword">then</span></span><br><span class="line">    <span class="comment">-- 第一次访问，设置过期时间（窗口大小），到期自动清空</span></span><br><span class="line">    redis.call(<span class="string">&#x27;EXPIRE&#x27;</span>, key, window)</span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"><span class="keyword">if</span> current &gt; limit <span class="keyword">then</span></span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>   <span class="comment">-- 拒绝</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"><span class="keyword">return</span> <span class="number">1</span>       <span class="comment">-- 放行</span></span><br></pre></td></tr></table></figure>
+
+<p>Java 端调用：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RedisRateLimiter</span> &#123;</span><br><span class="line">    <span class="meta">@Autowired</span></span><br><span class="line">    <span class="keyword">private</span> StringRedisTemplate redisTemplate;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 预加载脚本，返回 SHA 缓存，避免每次发送整个脚本</span></span><br><span class="line">    <span class="keyword">private</span> DefaultRedisScript&lt;Long&gt; fixedWindowScript = <span class="keyword">new</span> <span class="title class_">DefaultRedisScript</span>&lt;&gt;(</span><br><span class="line">            <span class="string">&quot;local key = KEYS[1]\n&quot;</span> +</span><br><span class="line">            <span class="string">&quot;local window = tonumber(ARGV[1])\n&quot;</span> +</span><br><span class="line">            <span class="string">&quot;local limit = tonumber(ARGV[2])\n&quot;</span> +</span><br><span class="line">            <span class="string">&quot;local current = redis.call(&#x27;INCR&#x27;, key)\n&quot;</span> +</span><br><span class="line">            <span class="string">&quot;if current == 1 then redis.call(&#x27;EXPIRE&#x27;, key, window) end\n&quot;</span> +</span><br><span class="line">            <span class="string">&quot;if current &gt; limit then return 0 end\n&quot;</span> +</span><br><span class="line">            <span class="string">&quot;return 1&quot;</span>, Long.class);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">tryAcquire</span><span class="params">(String key, <span class="type">int</span> windowSeconds, <span class="type">int</span> limit)</span> &#123;</span><br><span class="line">        <span class="type">Long</span> <span class="variable">result</span> <span class="operator">=</span> redisTemplate.execute(fixedWindowScript,</span><br><span class="line">                List.of(<span class="string">&quot;rate:limit:&quot;</span> + key), windowSeconds + <span class="string">&quot;&quot;</span>, limit + <span class="string">&quot;&quot;</span>);</span><br><span class="line">        <span class="keyword">return</span> result != <span class="literal">null</span> &amp;&amp; result == <span class="number">1L</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键点</strong>：<code>INCR</code> 返回 1 说明是新窗口，此时设置 <code>EXPIRE</code>，窗口自然过期。这个 Lua 脚本是<strong>原子</strong>的：INCR 和 EXPIRE 之间不会插入其他命令。</p>
+<p><strong>固定窗口的缺陷</strong>：窗口切换瞬间会有”双倍请求”问题——59 秒和 60 秒两个窗口的边界各能放行 limit 个请求，突发流量可能打穿。解决：滑动窗口。</p>
+<h2 id="三、方案二：滑动窗口限流（ZSet-版）"><a href="#三、方案二：滑动窗口限流（ZSet-版）" class="headerlink" title="三、方案二：滑动窗口限流（ZSet 版）"></a>三、方案二：滑动窗口限流（ZSet 版）</h2><p>滑动窗口用 ZSet 记录每个请求的时间戳，统计窗口内（当前时间 - 窗口大小）的请求数：</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 滑动窗口限流脚本（ZSet 实现）</span></span><br><span class="line"><span class="comment">-- KEYS[1] = 限流 key</span></span><br><span class="line"><span class="comment">-- ARGV[1] = 窗口大小（毫秒）</span></span><br><span class="line"><span class="comment">-- ARGV[2] = 窗口内最大请求数</span></span><br><span class="line"><span class="comment">-- ARGV[3] = 当前时间戳（毫秒）</span></span><br><span class="line"><span class="keyword">local</span> key = KEYS[<span class="number">1</span>]</span><br><span class="line"><span class="keyword">local</span> window = <span class="built_in">tonumber</span>(ARGV[<span class="number">1</span>])</span><br><span class="line"><span class="keyword">local</span> limit = <span class="built_in">tonumber</span>(ARGV[<span class="number">2</span>])</span><br><span class="line"><span class="keyword">local</span> now = <span class="built_in">tonumber</span>(ARGV[<span class="number">3</span>])</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 1. 清理窗口外的过期记录（score &lt; now - window）</span></span><br><span class="line">redis.call(<span class="string">&#x27;ZREMRANGEBYSCORE&#x27;</span>, key, <span class="number">0</span>, now - window)</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 2. 统计窗口内请求数</span></span><br><span class="line"><span class="keyword">local</span> count = redis.call(<span class="string">&#x27;ZCARD&#x27;</span>, key)</span><br><span class="line"></span><br><span class="line"><span class="keyword">if</span> count &gt;= limit <span class="keyword">then</span></span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>   <span class="comment">-- 拒绝</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 3. 记录本次请求（score 和时间戳都取 now）</span></span><br><span class="line">redis.call(<span class="string">&#x27;ZADD&#x27;</span>, key, now, now .. <span class="string">&#x27;-&#x27;</span> .. <span class="built_in">math</span>.<span class="built_in">random</span>(<span class="number">1000000</span>))</span><br><span class="line"><span class="comment">-- 4. 设置过期时间，防止 key 永久占内存</span></span><br><span class="line">redis.call(<span class="string">&#x27;PEXPIRE&#x27;</span>, key, window)</span><br><span class="line"><span class="keyword">return</span> <span class="number">1</span></span><br></pre></td></tr></table></figure>
+
+<p>Java 端：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">tryAcquire</span><span class="params">(String key, <span class="type">long</span> windowMillis, <span class="type">int</span> limit)</span> &#123;</span><br><span class="line">    <span class="type">Long</span> <span class="variable">result</span> <span class="operator">=</span> redisTemplate.execute(slidingWindowScript,</span><br><span class="line">            List.of(<span class="string">&quot;sliding:&quot;</span> + key),</span><br><span class="line">            windowMillis + <span class="string">&quot;&quot;</span>, limit + <span class="string">&quot;&quot;</span>, String.valueOf(System.currentTimeMillis()));</span><br><span class="line">    <span class="keyword">return</span> result != <span class="literal">null</span> &amp;&amp; result == <span class="number">1L</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>滑动窗口的代价</strong>：每个请求都要往 ZSet 写一条记录，内存开销大；高 QPS 下 ZSet 会很大。优化手段：<strong>采样滑动窗口</strong>（用多个固定窗口加权平均）或者直接用令牌桶。</p>
+<h2 id="四、方案三：令牌桶限流（Lua-版）——生产最常用"><a href="#四、方案三：令牌桶限流（Lua-版）——生产最常用" class="headerlink" title="四、方案三：令牌桶限流（Lua 版）——生产最常用"></a>四、方案三：令牌桶限流（Lua 版）——生产最常用</h2><p>令牌桶算法：以恒定速率往桶里放令牌，请求必须拿到令牌才能通过，桶满则丢弃令牌。它允许一定的<strong>突发流量</strong>（桶容量），又能限制<strong>平均速率</strong>，是生产环境最常用的算法（Guava RateLimiter、Sentinel 默认都是令牌桶思路）。</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 令牌桶限流脚本</span></span><br><span class="line"><span class="comment">-- KEYS[1] = 令牌桶 key（存放当前令牌数）</span></span><br><span class="line"><span class="comment">-- KEYS[2] = 上次补充时间 key</span></span><br><span class="line"><span class="comment">-- ARGV[1] = 桶容量 capacity</span></span><br><span class="line"><span class="comment">-- ARGV[2] = 每秒补充速率 rate（每秒新增令牌数）</span></span><br><span class="line"><span class="comment">-- ARGV[3] = 当前时间戳（秒）</span></span><br><span class="line"><span class="keyword">local</span> bucketKey = KEYS[<span class="number">1</span>]</span><br><span class="line"><span class="keyword">local</span> timeKey = KEYS[<span class="number">2</span>]</span><br><span class="line"><span class="keyword">local</span> capacity = <span class="built_in">tonumber</span>(ARGV[<span class="number">1</span>])</span><br><span class="line"><span class="keyword">local</span> rate = <span class="built_in">tonumber</span>(ARGV[<span class="number">2</span>])</span><br><span class="line"><span class="keyword">local</span> now = <span class="built_in">tonumber</span>(ARGV[<span class="number">3</span>])</span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> tokens = <span class="built_in">tonumber</span>(redis.call(<span class="string">&#x27;GET&#x27;</span>, bucketKey) <span class="keyword">or</span> capacity)</span><br><span class="line"><span class="keyword">local</span> lastTime = <span class="built_in">tonumber</span>(redis.call(<span class="string">&#x27;GET&#x27;</span>, timeKey) <span class="keyword">or</span> now)</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 1. 计算这段时间补充的令牌数</span></span><br><span class="line"><span class="keyword">local</span> elapsed = <span class="built_in">math</span>.<span class="built_in">max</span>(<span class="number">0</span>, now - lastTime)</span><br><span class="line">tokens = <span class="built_in">math</span>.<span class="built_in">min</span>(capacity, tokens + elapsed * rate)</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 2. 更新补充时间</span></span><br><span class="line">redis.call(<span class="string">&#x27;SET&#x27;</span>, timeKey, now, <span class="string">&#x27;EX&#x27;</span>, <span class="number">3600</span>)</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 3. 判断是否放行</span></span><br><span class="line"><span class="keyword">if</span> tokens &gt;= <span class="number">1</span> <span class="keyword">then</span></span><br><span class="line">    redis.call(<span class="string">&#x27;SET&#x27;</span>, bucketKey, tokens - <span class="number">1</span>, <span class="string">&#x27;EX&#x27;</span>, <span class="number">3600</span>)</span><br><span class="line">    <span class="keyword">return</span> <span class="number">1</span>   <span class="comment">-- 拿到令牌，放行</span></span><br><span class="line"><span class="keyword">else</span></span><br><span class="line">    redis.call(<span class="string">&#x27;SET&#x27;</span>, bucketKey, tokens, <span class="string">&#x27;EX&#x27;</span>, <span class="number">3600</span>)</span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span>   <span class="comment">-- 桶空了，拒绝</span></span><br><span class="line"><span class="keyword">end</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么这个脚本更优雅？</strong> 不需要后台任务定时放令牌——令牌按时间差<strong>惰性计算</strong>，每次请求时根据”上次补充时间”算出应补充的令牌数，省掉了定时器，这是生产实现的标准手法（Guava RateLimiter 内部也是惰性计算）。</p>
+<p><strong>注意</strong>：速率单位是”每秒”，如果对精度要求高，可以把时间单位换成毫秒，用 <code>PEXPIRE</code> 配合。</p>
+<h2 id="五、方案四：网关层分布式限流（Spring-Cloud-Gateway-Redis-RateLimiter）"><a href="#五、方案四：网关层分布式限流（Spring-Cloud-Gateway-Redis-RateLimiter）" class="headerlink" title="五、方案四：网关层分布式限流（Spring Cloud Gateway + Redis RateLimiter）"></a>五、方案四：网关层分布式限流（Spring Cloud Gateway + Redis RateLimiter）</h2><p>微服务架构下，最优雅的限流位置是<strong>网关</strong>——所有流量必经之地，在网关限流可以保护下游所有服务。</p>
+<p>Spring Cloud Gateway 内置了基于 <strong>Redis + Lua 令牌桶</strong>的 <code>RequestRateLimiter</code> 过滤器，用的是 Redis 官方 <code>token-bucket</code> 脚本（与上文的惰性令牌桶同思路），开箱即用：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">cloud:</span></span><br><span class="line">    <span class="attr">gateway:</span></span><br><span class="line">      <span class="attr">routes:</span></span><br><span class="line">        <span class="bullet">-</span> <span class="attr">id:</span> <span class="string">order-service</span></span><br><span class="line">          <span class="attr">uri:</span> <span class="string">lb://order-service</span></span><br><span class="line">          <span class="attr">predicates:</span></span><br><span class="line">            <span class="bullet">-</span> <span class="string">Path=/order/**</span></span><br><span class="line">          <span class="attr">filters:</span></span><br><span class="line">            <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">RequestRateLimiter</span></span><br><span class="line">              <span class="attr">args:</span></span><br><span class="line">                <span class="comment"># 限流 Key 解析器：按用户 ID 限流（每个用户独立配额）</span></span><br><span class="line">                <span class="attr">key-resolver:</span> <span class="string">&quot;#&#123;@userKeyResolver&#125;&quot;</span></span><br><span class="line">                <span class="comment"># 令牌桶容量：桶里最多放 20 个令牌</span></span><br><span class="line">                <span class="attr">redis-rate-limiter.replenishRate:</span> <span class="number">10</span></span><br><span class="line">                <span class="comment"># 每秒补充 10 个令牌</span></span><br><span class="line">                <span class="attr">redis-rate-limiter.burstCapacity:</span> <span class="number">20</span></span><br></pre></td></tr></table></figure>
+
+<p>Key 解析器（决定按什么维度限流——用户、IP、接口）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> KeyResolver <span class="title function_">userKeyResolver</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="comment">// 按用户 ID 限流；取不到用户时按 IP</span></span><br><span class="line">    <span class="keyword">return</span> exchange -&gt; &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">userId</span> <span class="operator">=</span> exchange.getRequest().getHeaders().getFirst(<span class="string">&quot;X-User-Id&quot;</span>);</span><br><span class="line">        <span class="keyword">if</span> (userId != <span class="literal">null</span>) &#123;</span><br><span class="line">            <span class="keyword">return</span> Mono.just(userId);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">String</span> <span class="variable">ip</span> <span class="operator">=</span> exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();</span><br><span class="line">        <span class="keyword">return</span> Mono.just(ip);</span><br><span class="line">    &#125;;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>网关限流返回 429 状态码，还可以自定义：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> RequestRateLimiterGatewayFilterFactory.RequestRateLimiterConfig ... </span><br><span class="line"><span class="comment">// 或直接全局处理 429：在 GlobalExceptionHandler 中捕获 TOO_MANY_REQUESTS</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="网关限流的优势与注意点"><a href="#网关限流的优势与注意点" class="headerlink" title="网关限流的优势与注意点"></a>网关限流的优势与注意点</h3><ul>
+<li>✅ 统一入口，一处配置保护所有下游</li>
+<li>✅ 天然分布式（Redis 共享状态）</li>
+<li>✅ 内置 Lua 脚本，原子且高效</li>
+<li>⚠️ 网关是单点瓶颈，网关本身要高可用、多实例部署</li>
+<li>⚠️ 每个请求多一次 Redis 往返（约 0.1-1ms），对极端性能敏感的场景可先在网关层粗限流，服务内再用本地限流兜底（两级限流）</li>
+</ul>
+<h2 id="六、多级限流架构：单机-分布式组合拳"><a href="#六、多级限流架构：单机-分布式组合拳" class="headerlink" title="六、多级限流架构：单机 + 分布式组合拳"></a>六、多级限流架构：单机 + 分布式组合拳</h2><p>生产环境的完整限流应该是<strong>分级</strong>的：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">客户端 → Nginx/LVS 层限流(连接数/IP) → API 网关层限流(Redis 分布式)</span><br><span class="line">       → 服务内本地限流(Sentinel/Guava，单机兜底) → 依赖层限流(DB/第三方)</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>技术</th>
+<th>粒度</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>接入层</td>
+<td>Nginx limit_req &#x2F; OpenResty</td>
+<td>IP&#x2F;连接</td>
+<td>防 DDoS、防刷</td>
+</tr>
+<tr>
+<td>网关层</td>
+<td>Gateway RequestRateLimiter（Redis+Lua）</td>
+<td>用户&#x2F;接口</td>
+<td>全局配额</td>
+</tr>
+<tr>
+<td>服务层</td>
+<td>Sentinel &#x2F; Resilience4j</td>
+<td>接口&#x2F;方法</td>
+<td>单机保护 + 熔断降级</td>
+</tr>
+<tr>
+<td>数据层</td>
+<td>连接池&#x2F;队列</td>
+<td>资源</td>
+<td>防止打垮存储</td>
+</tr>
+</tbody></table>
+<p>两层限流的典型组合：<strong>网关分布式限流（总量控制）+ 服务内本地限流（快速失败，避免每次请求都打 Redis）</strong>。本地限流可以先于分布式限流拒绝一部分请求，大幅降低 Redis 压力。</p>
+<h2 id="七、分布式限流的坑与最佳实践"><a href="#七、分布式限流的坑与最佳实践" class="headerlink" title="七、分布式限流的坑与最佳实践"></a>七、分布式限流的坑与最佳实践</h2><ol>
+<li><strong>Redis 挂了怎么办？</strong> 限流组件要支持<strong>降级</strong>：Redis 不可用时放行（牺牲限流保可用，防止限流组件拖垮业务）或本地限流兜底。Sentinel 的 <code>DegradeFlow</code> 思路值得借鉴。</li>
+<li><strong>Redis 超时</strong>：限流操作设置短超时（如 100ms），不能让一次 Redis 超时阻塞业务线程。</li>
+<li><strong>Key 爆炸</strong>：按用户维度限流时，key 数量 &#x3D; 用户数。给 key 设置 TTL（窗口大小或略长），配合定期清理。</li>
+<li><strong>时间戳依赖</strong>：多实例时钟漂移会导致滑动窗口统计偏差，用 Redis 的 <code>TIME</code> 命令取时间或接受毫秒级误差。</li>
+<li><strong>热 Key 问题</strong>：限流 Key 集中在少数热点（如大促的爆款商品），单 Redis 分片可能扛不住，考虑 Redis Cluster + 分片。</li>
+<li><strong>脚本预加载</strong>：用 <code>SCRIPT LOAD</code> 预加载脚本拿 SHA，<code>EVALSHA</code> 调用，省去每次传输脚本的开销。</li>
+<li><strong>限流响应</strong>：统一返回 429 + Retry-After 头，客户端可据此退避重试。</li>
+</ol>
+<h2 id="八、面试追问汇总"><a href="#八、面试追问汇总" class="headerlink" title="八、面试追问汇总"></a>八、面试追问汇总</h2><ol>
+<li><strong>为什么不用 MULTI&#x2F;EXEC 做限流？</strong> 事务是”批量执行”，执行期间无法根据中间结果做判断（EXEC 之前命令不执行），做不了”先判断后决定”的逻辑；Lua 可以。</li>
+<li><strong>Redis 单线程为什么还能扛高并发？</strong> IO 多路复用 + 内存操作微秒级，瓶颈在网络 IO 而非 CPU；6.0 引入多线程处理 IO 读写，命令执行仍是单线程。</li>
+<li><strong>固定窗口、滑动窗口、令牌桶怎么选？</strong> 简单场景固定窗口；要求平滑选滑动窗口或令牌桶；允许突发流量选令牌桶（桶容量控制突发量）；严格均匀速率选漏桶。</li>
+<li><strong>Sentinel 和 Redis 限流什么关系？</strong> Sentinel 默认是单机限流（本地内存），也支持集群限流（Token Server 模式，底层类似分布式令牌桶）；Redis 限流是自己造轮子，适合不想引入 Sentinel 的场景。</li>
+<li><strong>网关限流的 key-resolver 怎么设计？</strong> 按用户（登录态）、按 IP（匿名）、按接口+用户（精细控制）、按参数（如商品 ID 防刷）。</li>
+</ol>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>分布式限流的核心就三点：<strong>共享状态放 Redis、原子操作靠 Lua、落地位置在网关</strong>。本文的四个 Lua 脚本（固定窗口、滑动窗口、令牌桶）建议直接收藏，生产可直接改造使用；再配合网关 RequestRateLimiter 和 Sentinel 兜底，一套完整的分布式限流体系就搭起来了。面试时能画出”分级限流架构图”并说出 Lua 原子性的原理，这道题就是送分题。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/">https://jiweidong.github.io/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E9%99%90%E6%B5%81/">限流</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/26/handwrite-rpc-framework-deep-practice/" title="【Java 实战】手写一个 RPC 框架：从动态代理、序列化到 Netty 通信的完整实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 实战】手写一个 RPC 框架：从动态代理、序列化到 Netty 通信的完整实现</div></div><div class="info-2"><div class="info-item-1">【Java 实战】手写一个 RPC 框架：从动态代理、序列化到 Netty 通信的完整实现面试官：RPC 框架的原理是什么？如果让你从零实现一个，你会怎么设计？RPC（Remote Procedure Call，远程过程调用）就是让调用方像调用本地方法一样调用远程服务。Dubbo、gRPC、Thrift 这些框架本质都在解决同一件事：把”本地方法调用”翻译成”网络消息收发”。 很多同学面试被问到 RPC 原理时只会背概念，本文带大家手写一个迷你 RPC 框架，把 RPC 的五大核心模块全部落地：  动态代理：调用方无感知，像调本地方法一样调远程 协议设计：消息怎么封装，怎么区分请求&#x2F;响应 序列化：对象 ↔ 字节流互转 网络通信：基于 Netty 的 TCP 长连接 注册中心：服务发现与负载均衡  一、RPC 整体架构先画清脉络： 123456789101112131415┌─────────────┐   本地调用    ┌──────────────┐│   Service A  │ ───────────▶ │  Proxy 代理    ││  (消费者)     ...</div></div></div></a><a class="pagination-related" href="/2026/08/26/elasticsearch-deep-pagination-deep-dive/" title="【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型</div></div><div class="info-2"><div class="info-item-1">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型面试官：ES 里为什么「深分页」性能差？from+size、scroll、search_after 有什么区别？很多人在 ES 里翻到第 10000 条就报错，或者直接用 scroll 做普通分页导致内存爆炸。深分页是 ES 面试和实战的高频痛点，本文从分布式查询原理出发，把三种分页方案的机制、代价和选型讲清楚。 一、先理解 ES 查询的分布式本质ES 的一个索引分布在多个分片（shard）上。执行一次搜索，流程是：  协调节点（Coordinating Node） 接收查询请求； 把请求广播到所有分片（主分片或副本）； 每个分片本地排序后返回前 size 条（以及聚合信息）； 协调节点归并排序所有分片的结果，取全局前 size 条返回。  关键结论：ES 的排序是「先分片排序、再全局归并」，不是全局一次性排序。这直接决定了深分页的代价。 二、from + size：最直观但最贵123456GET /order/_search&#123; ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/16/delay-queue-solutions-deep-dive/" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</div></div><div class="info-2"><div class="info-item-1">延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。 一、什么是延迟队列？普通队列：生产者放入消息，消费者立即消费。延迟队列：消息进入队列后，等待指定时间才被消费者消费。 核心能力：“到点了才执行”。 典型业务场景：    场景 延迟时间 到期动作    订单超时未支付 30 分钟 关闭订单、释放库存   用户下单未评价 7 天 发送提醒   定时发布文章 自定义 自动上架   支付成功通知 5 秒 通知下游   分布式锁续期 30 秒 续期&#x2F;释放   失败重试 递增 重新投递   二、方案一：数据库轮询（最朴素，先被否定）用定时任务（XXL-Job &#x2F; Quart...</div></div></div></a><a class="pagination-related" href="/2026/07/05/spring-boot-redis-deep-practice/" title="Spring Boot 集成 Redis 深度实战：RedisTemplate、序列化、Pipeline 与 Lua 脚本"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-05</div><div class="info-item-2">Spring Boot 集成 Redis 深度实战：RedisTemplate、序列化、Pipeline 与 Lua 脚本</div></div><div class="info-2"><div class="info-item-1">Spring Boot 集成 Redis 深度实战：RedisTemplate、序列化、Pipeline 与 Lua 脚本一、引言Redis 在 Java 后端几乎是标配：缓存、分布式锁、计数器、排行榜、消息队列……但很多项目对 Redis 的用法停留在 opsForValue().set() &#x2F; opsForValue().get() 的层面，对底层序列化机制、Pipeline 批处理、Lua 脚本原子性等进阶用法缺乏了解。 本文从 Spring Boot 集成 Redis 开始，逐步深入 RedisTemplate 的核心原理和 Redis 在 Spring 生态中的高级用法。 面试官开场就问：”你们项目里 Redis 用的 Spring Data Redis 还是 Jedis？RedisTemplate 的序列化是怎么配的？遇到过什么问题吗？” 二、Spring Boot Redis 核心配置2.1 依赖与基础配置123456789&lt;dependency&gt;    &lt;groupId&gt;org.springframework.boot&lt;/g...</div></div></div></a><a class="pagination-related" href="/2026/08/22/feed-stream-system-design/" title="【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流</div></div><div class="info-2"><div class="info-item-1">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流面试官：微博的首页信息流是怎么做的？如果让你设计一个 Feed 流系统，你会怎么设计？Feed 流（信息流）是互联网最核心的业务形态之一：微博、朋友圈、抖音、小红书，全是 Feed 流。它和普通 CRUD 最大的区别在于——每个用户看到的首页内容都不一样，是”千人千面”的个性化时间线。设计 Feed 流，本质是解决三个问题：内容怎么分发、时间线怎么生成、读多写多怎么扛。 一、需求与指标先定义清楚规模，才有设计依据：  日活用户 1 亿，月活 3 亿； 平均每个用户关注 200 个账号； 每秒新增内容（发帖）1 万条，峰值 5 万条； 每秒读取时间线（刷首页）10 万次，峰值 50 万次； 要求：读延迟 &lt; 200ms，写后延迟 &lt; 1s 内可见。  读是写的 10 倍以上——这是所有 Feed 流设计的出发点：读多写少，必须为读优化。 二、三种核心模型：推、拉、推拉结合2.1 拉模式（Pull &#x2F; 读扩散）用户刷首页时，实时去拉取他关注的所有人的最新内容，再合并排序。 1用户刷首页 → 查关注列表...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-db-cache-consistency-deep-dive/" title="【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案面试官：数据更新时，你是怎么保证 Redis 缓存和 MySQL 数据一致性的？这是 Redis 面试的”必考题”，也是生产环境最容易踩坑的地方。很多同学背了”先更新数据库，再删缓存”的口诀，但被追问一句”那并发情况下还有问题吗”就卡住了。今天我们把缓存一致性这个问题从方案到原理到代码彻底讲透。 一、先搞清楚：为什么会有缓存不一致？缓存不一致的根源只有一个：对同一份数据，MySQL 和 Redis 各存了一份，而更新操作不是原子的。  更新 MySQL 成功、更新 Redis 失败 → 不一致； 更新 Redis 成功、更新 MySQL 失败 → 不一致； 两个都成功，但执行顺序不同 → 中间态不一致； 并发读写交叉 → 旧数据覆盖新数据。  要理解各种方案，先看业界标准的四种缓存读写模式：    模式 读 写 特点    Cache Aside（旁路缓存） 读 Miss 后回源 DB 先更新 DB，再删缓存 最常用，简单可控   Read Through 缓存组件负责回源 同 Cache ...</div></div></div></a><a class="pagination-related" href="/2026/08/06/redis-transaction-deep-dive/" title="【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比面试官：Redis 的事务和 MySQL 的事务有什么区别？Redis 事务能回滚吗？Redis 事务是面试中高频且容易答错的考点。很多人的第一反应是「Redis 事务就是一组命令的批量执行」，但面试官往往会在后面连续追问：「它能回滚吗？」「有隔离性吗？」「WATCH 是什么？」「为什么不建议用事务而用 Lua？」 这篇文章把 Redis 事务从命令到原理、从对比到实战彻底讲透。  一、Redis 事务的核心命令Redis 事务通过四个命令实现：MULTI、EXEC、DISCARD、WATCH。    命令 作用    MULTI 开启事务，标记事务开始   EXEC 执行事务队列中的所有命令   DISCARD 取消事务，清空命令队列   WATCH 监视一个或多个 key，事务执行前若被修改则事务被打断   基本用法123456789127.0.0.1:6379&gt; MULTIOK127.0.0.1:6379&gt; SET account:1001...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">522</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">678</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">177</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E9%AB%98%E5%B9%B6%E5%8F%91%E5%AE%9E%E6%88%98%E3%80%91%E5%88%86%E5%B8%83%E5%BC%8F%E9%99%90%E6%B5%81%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9ARedis-Lua-%E5%8E%9F%E5%AD%90%E9%99%90%E6%B5%81%E4%B8%8E%E7%BD%91%E5%85%B3%E7%BA%A7%E6%96%B9%E6%A1%88"><span class="toc-number">1.</span> <span class="toc-text">【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E5%8D%95%E6%9C%BA%E9%99%90%E6%B5%81%E5%92%8C%E5%88%86%E5%B8%83%E5%BC%8F%E9%99%90%E6%B5%81%E6%9C%89%E4%BB%80%E4%B9%88%E5%8C%BA%E5%88%AB%EF%BC%9FRedis-%E9%99%90%E6%B5%81%E6%80%8E%E4%B9%88%E4%BF%9D%E8%AF%81%E5%8E%9F%E5%AD%90%E6%80%A7%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：单机限流和分布式限流有什么区别？Redis 限流怎么保证原子性？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E5%BF%85%E9%A1%BB%E7%94%A8-Lua-%E8%84%9A%E6%9C%AC%EF%BC%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么必须用 Lua 脚本？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E5%88%86%E5%B8%83%E5%BC%8F%E9%99%90%E6%B5%81%E7%9A%84%E6%9C%AC%E8%B4%A8%E7%9F%9B%E7%9B%BE"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 分布式限流的本质矛盾</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 解决方案对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E5%9B%BA%E5%AE%9A%E7%AA%97%E5%8F%A3%E9%99%90%E6%B5%81%EF%BC%88Lua-%E7%89%88%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、方案一：固定窗口限流（Lua 版）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A3%E9%99%90%E6%B5%81%EF%BC%88ZSet-%E7%89%88%EF%BC%89"><span class="toc-number">1.4.</span> <span class="toc-text">三、方案二：滑动窗口限流（ZSet 版）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E4%BB%A4%E7%89%8C%E6%A1%B6%E9%99%90%E6%B5%81%EF%BC%88Lua-%E7%89%88%EF%BC%89%E2%80%94%E2%80%94%E7%94%9F%E4%BA%A7%E6%9C%80%E5%B8%B8%E7%94%A8"><span class="toc-number">1.5.</span> <span class="toc-text">四、方案三：令牌桶限流（Lua 版）——生产最常用</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%96%B9%E6%A1%88%E5%9B%9B%EF%BC%9A%E7%BD%91%E5%85%B3%E5%B1%82%E5%88%86%E5%B8%83%E5%BC%8F%E9%99%90%E6%B5%81%EF%BC%88Spring-Cloud-Gateway-Redis-RateLimiter%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、方案四：网关层分布式限流（Spring Cloud Gateway + Redis RateLimiter）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BD%91%E5%85%B3%E9%99%90%E6%B5%81%E7%9A%84%E4%BC%98%E5%8A%BF%E4%B8%8E%E6%B3%A8%E6%84%8F%E7%82%B9"><span class="toc-number">1.6.1.</span> <span class="toc-text">网关限流的优势与注意点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%A4%9A%E7%BA%A7%E9%99%90%E6%B5%81%E6%9E%B6%E6%9E%84%EF%BC%9A%E5%8D%95%E6%9C%BA-%E5%88%86%E5%B8%83%E5%BC%8F%E7%BB%84%E5%90%88%E6%8B%B3"><span class="toc-number">1.7.</span> <span class="toc-text">六、多级限流架构：单机 + 分布式组合拳</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%88%86%E5%B8%83%E5%BC%8F%E9%99%90%E6%B5%81%E7%9A%84%E5%9D%91%E4%B8%8E%E6%9C%80%E4%BD%B3%E5%AE%9E%E8%B7%B5"><span class="toc-number">1.8.</span> <span class="toc-text">七、分布式限流的坑与最佳实践</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E6%B1%87%E6%80%BB"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问汇总</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/26/elasticsearch-deep-pagination-deep-dive/" title="【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型</a><time datetime="2026-08-26T00:00:00.000Z" title="发表于 2026-08-26 08:00:00">2026-08-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/" title="【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案">【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案</a><time datetime="2026-08-26T00:00:00.000Z" title="发表于 2026-08-26 08:00:00">2026-08-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/26/handwrite-rpc-framework-deep-practice/" title="【Java 实战】手写一个 RPC 框架：从动态代理、序列化到 Netty 通信的完整实现">【Java 实战】手写一个 RPC 框架：从动态代理、序列化到 Netty 通信的完整实现</a><time datetime="2026-08-26T00:00:00.000Z" title="发表于 2026-08-26 08:00:00">2026-08-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/26/java-array-arrays-util-deep-dive/" title="【Java 基础】Java 数组深度解析：从内存布局到 Arrays 工具类的排序与二分源码">【Java 基础】Java 数组深度解析：从内存布局到 Arrays 工具类的排序与二分源码</a><time datetime="2026-08-26T00:00:00.000Z" title="发表于 2026-08-26 08:00:00">2026-08-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/26/java-iterator-fail-fast-fail-safe-deep-dive/" title="【Java 集合】Iterator 迭代器深度解析：从 for-each 语法糖到 fail-fast/fail-safe 机制源码级剖析">【Java 集合】Iterator 迭代器深度解析：从 for-each 语法糖到 fail-fast/fail-safe 机制源码级剖析</a><time datetime="2026-08-26T00:00:00.000Z" title="发表于 2026-08-26 08:00:00">2026-08-26</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
