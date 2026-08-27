@@ -1,0 +1,325 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制面试官：老年代对象引用新生代对象，Minor GC 是怎么找到它的？这几乎是 JVM 面试中最容易被问倒的问题之一。大多数人知道分代收集，知道 Minor GC 只扫新生代，但很少有人能说清楚：当老年代对象引用了新生代对象时，Minor GC 凭什么不漏掉这个”活”对象？ 答案就是今天的主角：记忆集（Remembered Set">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/27/jvm-remembered-set-card-table-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制面试官：老年代对象引用新生代对象，Minor GC 是怎么找到它的？这几乎是 JVM 面试中最容易被问倒的问题之一。大多数人知道分代收集，知道 Minor GC 只扫新生代，但很少有人能说清楚：当老年代对象引用了新生代对象时，Minor GC 凭什么不漏掉这个”活”对象？ 答案就是今天的主角：记忆集（Remembered Set">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-27T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-27T00:18:19.622Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="垃圾回收">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制",
+  "url": "https://jiweidong.github.io/2026/08/27/jvm-remembered-set-card-table-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-27T00:00:00.000Z",
+  "dateModified": "2026-08-27T00:18:19.622Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/27/jvm-remembered-set-card-table-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">527</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">678</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">177</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-27T00:00:00.000Z" title="发表于 2026-08-27 08:00:00">2026-08-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-27T00:18:19.622Z" title="更新于 2026-08-27 08:18:19">2026-08-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM/">JVM</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-底层】记忆集与卡表深度解析：跨代引用追踪与-GC-的底层机制"><a href="#【JVM-底层】记忆集与卡表深度解析：跨代引用追踪与-GC-的底层机制" class="headerlink" title="【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制"></a>【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制</h1><h2 id="面试官：老年代对象引用新生代对象，Minor-GC-是怎么找到它的？"><a href="#面试官：老年代对象引用新生代对象，Minor-GC-是怎么找到它的？" class="headerlink" title="面试官：老年代对象引用新生代对象，Minor GC 是怎么找到它的？"></a>面试官：老年代对象引用新生代对象，Minor GC 是怎么找到它的？</h2><p>这几乎是 JVM 面试中最容易被问倒的问题之一。大多数人知道分代收集，知道 Minor GC 只扫新生代，但很少有人能说清楚：<strong>当老年代对象引用了新生代对象时，Minor GC 凭什么不漏掉这个”活”对象？</strong></p>
+<p>答案就是今天的主角：<strong>记忆集（Remembered Set）与卡表（Card Table）</strong>。这是 G1、CMS 等几乎所有分代收集器的地基，也是理解写屏障、G1 RSet 的必经之路。</p>
+<h2 id="一、问题起源：分代收集的”跨代引用”难题"><a href="#一、问题起源：分代收集的”跨代引用”难题" class="headerlink" title="一、问题起源：分代收集的”跨代引用”难题"></a>一、问题起源：分代收集的”跨代引用”难题</h2><h3 id="1-1-分代收集的前提"><a href="#1-1-分代收集的前提" class="headerlink" title="1.1 分代收集的前提"></a>1.1 分代收集的前提</h3><p>JVM 堆被划分为新生代（Eden + Survivor）和老年代，新生代对象朝生夕灭，于是有了 <strong>Minor GC（只回收新生代）</strong>。但这里藏着一个致命问题：</p>
+<blockquote>
+<p>Minor GC 要判断新生代对象是否存活，就必须知道”有没有别的对象引用它”。如果只扫描新生代内部，那么<strong>被老年代对象引用的新生代对象</strong>会被误判为垃圾——这会导致活对象被错误回收，程序直接崩溃。</p>
+</blockquote>
+<h3 id="1-2-最笨的解法：全堆扫描"><a href="#1-2-最笨的解法：全堆扫描" class="headerlink" title="1.2 最笨的解法：全堆扫描"></a>1.2 最笨的解法：全堆扫描</h3><p>最直接的做法是 Minor GC 时把整个老年代也扫一遍，看看哪些对象引用了新生代。但老年代动辄几个 GB，每次 Minor GC 都全量扫描老年代，停顿时间会暴涨，分代收集的意义就没了。</p>
+<h3 id="1-3-精确的解法：记忆集"><a href="#1-3-精确的解法：记忆集" class="headerlink" title="1.3 精确的解法：记忆集"></a>1.3 精确的解法：记忆集</h3><p>更好的思路是：<strong>只记录”老年代中哪些区域存在指向新生代的引用”</strong>，GC 时只扫描这些区域即可。这个”记录跨代引用位置”的数据结构，就叫<strong>记忆集（Remembered Set，简称 RSet）</strong>。</p>
+<p>用一句话概括记忆集的本质：</p>
+<blockquote>
+<p>记忆集是一种抽象数据结构，用于记录”非收集区域”指向”收集区域”的指针信息，避免 GC 时全堆扫描。</p>
+</blockquote>
+<h2 id="二、卡表（Card-Table）：记忆集最常见的实现"><a href="#二、卡表（Card-Table）：记忆集最常见的实现" class="headerlink" title="二、卡表（Card Table）：记忆集最常见的实现"></a>二、卡表（Card Table）：记忆集最常见的实现</h2><p>记忆集是抽象概念，实现方式有字长精度、对象精度、卡精度等。HotSpot 虚拟机采用的是<strong>卡表（Card Table）</strong>，它是”卡精度”的实现，也是面试的核心考点。</p>
+<h3 id="2-1-卡表的结构"><a href="#2-1-卡表的结构" class="headerlink" title="2.1 卡表的结构"></a>2.1 卡表的结构</h3><p>卡表本身就是一个<strong>字节数组</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">CARD_TABLE [<span class="built_in">this</span> address &gt;&gt; <span class="number">9</span>] = <span class="number">0</span>;  <span class="comment">// 伪代码示意</span></span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>把堆内存划分为一个个 <strong>512 字节</strong>的卡（Card）</li>
+<li>每个卡对应卡表数组中的一个字节</li>
+<li>该字节为 0 表示”卡是干净的”（dirty&#x3D;0，无跨代引用）</li>
+<li>该字节为 1 表示”卡是脏的”（dirty&#x3D;1，可能含跨代引用）</li>
+</ul>
+<p>![卡表结构示意]</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">堆内存:  [卡0:0-511B] [卡1:512-1023B] [卡2:1024-1535B] ...</span><br><span class="line">                |            |              |</span><br><span class="line">卡表数组:  [0x00]         [0x01]         [0x00]</span><br><span class="line">           (干净)         (脏,含跨代引用)  (干净)</span><br></pre></td></tr></table></figure>
+
+<p>为什么是 512 字节？因为对象引用地址通常 8 字节对齐，512 &#x3D; 2^9，用 <code>地址 &gt;&gt; 9</code> 即可定位卡表下标，一次移位运算搞定，极快。</p>
+<h3 id="2-2-卡表如何被”弄脏”：写屏障（Write-Barrier）"><a href="#2-2-卡表如何被”弄脏”：写屏障（Write-Barrier）" class="headerlink" title="2.2 卡表如何被”弄脏”：写屏障（Write Barrier）"></a>2.2 卡表如何被”弄脏”：写屏障（Write Barrier）</h3><p>卡表本身不会自动更新。当发生<strong>老年代对象引用新生代对象</strong>的赋值操作时，必须把对应卡标记为脏。HotSpot 通过**写屏障（Write Barrier）**在赋值操作前后插入一段代码：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 伪代码：引用赋值 a.field = b;</span></span><br><span class="line"><span class="keyword">void</span> <span class="title function_">oop_field_store</span><span class="params">(oop* field, oop new_value)</span> &#123;</span><br><span class="line">    <span class="comment">// ① 执行真正的赋值</span></span><br><span class="line">    *field = new_value;</span><br><span class="line">    <span class="comment">// ② 写屏障：如果新值在新生代，标记老年代对象所在卡为脏</span></span><br><span class="line">    <span class="keyword">if</span> (is_in_young(new_value)) &#123;</span><br><span class="line">        dirty_card(field);  <span class="comment">// 卡表对应字节置 1</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p><strong>注意</strong>：这里的”写屏障”和并发编程里的”内存屏障”（Memory Barrier）是两个完全不同的概念，前者是 JVM 层面的引用赋值钩子，后者是 CPU 指令层面的顺序保证，面试时别搞混。</p>
+</blockquote>
+<h3 id="2-3-为什么只需要”老→新”方向的记录？"><a href="#2-3-为什么只需要”老→新”方向的记录？" class="headerlink" title="2.3 为什么只需要”老→新”方向的记录？"></a>2.3 为什么只需要”老→新”方向的记录？</h3><p>Minor GC 只回收新生代，需要防止”老年代引用新生代对象”导致误回收，所以只需要记录<strong>老年代指向新生代</strong>的引用。</p>
+<p>反过来，<strong>新生代指向老年代的引用</strong>不需要记录——因为 Minor GC 时新生代对象本身就是被扫描的对象，从新生代出发能自然找到老年代引用；而 Major GC &#x2F; Full GC 会扫描整个堆，也不需要跨代记录。</p>
+<h2 id="三、卡表的经典面试问题：伪共享与卡表变脏"><a href="#三、卡表的经典面试问题：伪共享与卡表变脏" class="headerlink" title="三、卡表的经典面试问题：伪共享与卡表变脏"></a>三、卡表的经典面试问题：伪共享与卡表变脏</h2><h3 id="3-1-伪共享（False-Sharing）"><a href="#3-1-伪共享（False-Sharing）" class="headerlink" title="3.1 伪共享（False Sharing）"></a>3.1 伪共享（False Sharing）</h3><p>卡表更新不是原子的。如果多个线程同时更新<strong>同一个卡表字节</strong>，就会产生竞争。HotSpot 的做法是：</p>
+<ul>
+<li>先判断卡是否已脏，<strong>已脏则直接跳过</strong>（减少重复写）</li>
+<li>未脏则用 CAS 或锁保护写入</li>
+</ul>
+<p>但更隐蔽的问题是<strong>伪共享</strong>：多个线程更新<strong>相邻</strong>的卡表字节时，虽然字节不同，但它们落在同一条 64 字节的 CPU 缓存行上，导致缓存行反复失效（缓存一致性协议要求缓存行是同步单位），性能骤降。</p>
+<h3 id="3-2-解决方案"><a href="#3-2-解决方案" class="headerlink" title="3.2 解决方案"></a>3.2 解决方案</h3><p>HotSpot 在卡表更新时做了优化：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 伪代码：卡表更新的经典优化</span></span><br><span class="line"><span class="keyword">if</span> (card_is_dirty(card)) &#123;</span><br><span class="line">    <span class="keyword">return</span>;  <span class="comment">// 已经脏了，无需重复标记</span></span><br><span class="line">&#125;</span><br><span class="line"><span class="comment">// 使用 CMOV（条件移动）等无锁技巧或加锁标记</span></span><br></pre></td></tr></table></figure>
+
+<p>同时引入 <strong>-XX:+UseCondCardMark</strong> 参数（默认开启），用条件判断避免不必要的卡表写操作，缓解伪共享。</p>
+<p><strong>面试追问：卡表变脏后，什么时候被清理？</strong><br>答：下一次 Minor GC 时，GC 扫描脏卡找到跨代引用后，会把对应卡重新标记为干净（0）。所以”脏”表示”上次 GC 之后可能产生了新跨代引用”，是一个”可能”而非”必然”，GC 需要扫描脏卡区域内的对象来确认。</p>
+<h2 id="四、G1-的记忆集：比卡表更进一步"><a href="#四、G1-的记忆集：比卡表更进一步" class="headerlink" title="四、G1 的记忆集：比卡表更进一步"></a>四、G1 的记忆集：比卡表更进一步</h2><h3 id="4-1-G1-为什么不用传统卡表"><a href="#4-1-G1-为什么不用传统卡表" class="headerlink" title="4.1 G1 为什么不用传统卡表"></a>4.1 G1 为什么不用传统卡表</h3><p>G1 把堆划分为一个个 <strong>Region</strong>（默认约 1MB~32MB），不再有物理上的代隔离，而是逻辑上的”新生代 Region 集合 &#x2F; 老年代 Region 集合”。G1 的收集（Mixed GC）是<strong>按 Region 集合</strong>进行的，所以它需要知道：<strong>哪些其他 Region 引用了我要回收的 Region 集合</strong>。</p>
+<p>这比传统卡表复杂得多——G1 的记忆集是一个 <strong>Per-Region 的 RSet</strong>，记录”谁引用了我”，是一个哈希结构：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">Region N 的 RSet:</span><br><span class="line">  Region A (地址区间) -&gt; 卡表（哪些卡脏）</span><br><span class="line">  Region B (地址区间) -&gt; 卡表</span><br><span class="line">  ...</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-G1-RSet-的写屏障"><a href="#4-2-G1-RSet-的写屏障" class="headerlink" title="4.2 G1 RSet 的写屏障"></a>4.2 G1 RSet 的写屏障</h3><p>G1 的写屏障做了重要优化，<strong>并不是所有跨 Region 引用都记录</strong>：</p>
+<ul>
+<li>如果引用的目标 Region 在本次收集集合（CSet）中，必须记录</li>
+<li>G1 通过 <code>-XX:+UseG1WriteBarrier</code> 控制，且引入了 <strong>SATB（Snapshot At The Beginning）</strong> 写屏障处理并发标记阶段的漏标问题</li>
+</ul>
+<p>G1 的 RSet 还使用了<strong>粗粒度&#x2F;细粒度</strong>分级存储（哈希表 → 位图 → 卡表数组），在空间与查询速度之间做平衡。</p>
+<h3 id="4-3-面试高频追问：为什么-G1-需要-RSet-而传统-CMS-只需要全局卡表？"><a href="#4-3-面试高频追问：为什么-G1-需要-RSet-而传统-CMS-只需要全局卡表？" class="headerlink" title="4.3 面试高频追问：为什么 G1 需要 RSet 而传统 CMS 只需要全局卡表？"></a>4.3 面试高频追问：为什么 G1 需要 RSet 而传统 CMS 只需要全局卡表？</h3><p>因为 CMS 的收集是”整代收集”，只需要一张全局卡表记录老→新引用；而 G1 是 <strong>Region 级局部收集</strong>，每次收集的 Region 集合不同，必须精确知道”哪些 Region 引用了当前 CSet”，所以需要 Per-Region 的 RSet。</p>
+<h2 id="五、从卡表到写屏障：三个概念的关系梳理"><a href="#五、从卡表到写屏障：三个概念的关系梳理" class="headerlink" title="五、从卡表到写屏障：三个概念的关系梳理"></a>五、从卡表到写屏障：三个概念的关系梳理</h2><table>
+<thead>
+<tr>
+<th>概念</th>
+<th>作用</th>
+<th>类比</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>跨代引用</td>
+<td>老年代对象引用新生代对象</td>
+<td>问题本身</td>
+</tr>
+<tr>
+<td>记忆集（RSet）</td>
+<td>记录跨代引用位置的抽象数据结构</td>
+<td>索引&#x2F;台账</td>
+</tr>
+<tr>
+<td>卡表（Card Table）</td>
+<td>记忆集的一种具体实现（卡精度）</td>
+<td>台账的具体格式</td>
+</tr>
+<tr>
+<td>写屏障（Write Barrier）</td>
+<td>在赋值时维护卡表&#x2F;RSet 的钩子</td>
+<td>记账员</td>
+</tr>
+<tr>
+<td>伪共享</td>
+<td>相邻卡表字节竞争同一缓存行</td>
+<td>台账页被多人抢着改</td>
+</tr>
+</tbody></table>
+<p><strong>一句话串联全流程：</strong></p>
+<blockquote>
+<p>JVM 把堆按 512 字节切成卡，赋值时通过写屏障把”可能含跨代引用”的卡标脏；Minor GC 时只扫描脏卡区域，从老年代对象出发顺着引用找到新生代对象，标记为存活，然后清理卡表。G1 把这张表升级成了 Per-Region 的 RSet，支持任意 Region 集合的局部收集。</p>
+</blockquote>
+<h2 id="六、源码级验证：HotSpot-中的卡表实现"><a href="#六、源码级验证：HotSpot-中的卡表实现" class="headerlink" title="六、源码级验证：HotSpot 中的卡表实现"></a>六、源码级验证：HotSpot 中的卡表实现</h2><p>在 HotSpot 源码（<code>share/gc/shared/cardTableBarrierSet.hpp</code>）中，卡表的核心定义：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">class</span> <span class="title class_">CardTableBarrierSet</span> : <span class="keyword">public</span> BarrierSet &#123;</span><br><span class="line">  <span class="comment">// 卡表数组，每个元素对应 512 字节堆空间</span></span><br><span class="line">  jbyte* _byte_map;</span><br><span class="line">  <span class="comment">// 卡表大小</span></span><br><span class="line">  <span class="type">size_t</span> _byte_map_size;</span><br><span class="line">  <span class="comment">// 脏卡标记值</span></span><br><span class="line">  <span class="type">static</span> <span class="type">const</span> <span class="type">int</span> dirty_card = <span class="number">0</span>;</span><br><span class="line">  <span class="type">static</span> <span class="type">const</span> <span class="type">int</span> clean_card = <span class="number">1</span>;</span><br><span class="line">  ...</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>写屏障入口（<code>cardTableBarrierSet.cpp</code>）：</p>
+<figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="type">void</span> <span class="title">CardTableBarrierSet::write_ref_field</span><span class="params">(oop* field, oop new_val)</span> </span>&#123;</span><br><span class="line">  <span class="keyword">if</span> (<span class="built_in">is_in_young</span>(new_val)) &#123;          <span class="comment">// 新值在新生代</span></span><br><span class="line">    jbyte* card = <span class="built_in">byte_for</span>(field);      <span class="comment">// 地址 &gt;&gt; 9 定位卡</span></span><br><span class="line">    *card = dirty_card;                 <span class="comment">// 标记脏</span></span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>可以看到实现和前面伪代码完全一致：<strong>判断新值是否在新生代 → 定位卡 → 标记脏</strong>。</p>
+<h2 id="七、常见面试追问与答案"><a href="#七、常见面试追问与答案" class="headerlink" title="七、常见面试追问与答案"></a>七、常见面试追问与答案</h2><p><strong>Q1：Minor GC 时如何确定老年代对象引用了新生代对象？</strong><br>A：不是每次现找，而是平时通过写屏障维护卡表。GC 时扫描脏卡区域内的对象，沿着引用找到新生代对象并标记。</p>
+<p><strong>Q2：卡表脏了之后一定会有跨代引用吗？</strong><br>A：不一定。卡表只标记”可能”，因为标记后引用可能被清除，GC 时扫描确认即可。脏卡只是缩小扫描范围。</p>
+<p><strong>Q3：为什么卡大小是 512 字节？</strong><br>A：引用 8 字节对齐，512 字节的卡包含 64 个引用槽位；卡表本身开销可控（4GB 堆 → 8MB 卡表），且用移位运算 <code>&gt;&gt;9</code> 定位下标，性能最优。</p>
+<p><strong>Q4：G1 的 RSet 与 CMS 的卡表有什么区别？</strong><br>A：CMS 是一张全局卡表（老→新）；G1 是每个 Region 一张 RSet（其他 Region → 本 Region），粒度更细、支持局部收集，但内存占用和写屏障开销更大。</p>
+<p><strong>Q5：什么是 SATB 写屏障？和卡表写屏障一样吗？</strong><br>A：不一样。卡表写屏障用于维护跨代引用记录；SATB（Snapshot At The Beginning）是 G1 并发标记阶段用的，记录”并发标记开始时”的快照，通过写屏障把”被覆盖的旧引用”加入队列，防止并发标记期间对象漏标。</p>
+<h2 id="八、实战启示：这些知识能帮你做什么"><a href="#八、实战启示：这些知识能帮你做什么" class="headerlink" title="八、实战启示：这些知识能帮你做什么"></a>八、实战启示：这些知识能帮你做什么</h2><ol>
+<li><strong>理解 GC 日志中的耗时</strong>：看到 Minor GC 时间较长时，可以推测是脏卡区域扫描过多，排查是否有大量老年代对象频繁引用新生代对象（比如缓存持有短生命周期对象）。</li>
+<li><strong>JVM 参数调优</strong>：<code>-XX:+UseCondCardMark</code>、G1 的 <code>-XX:G1HeapRegionSize</code>、<code>-XX:G1RSetRegionEntries</code> 等都和记忆集内存&#x2F;性能直接相关。</li>
+<li><strong>面试谈资</strong>：能讲清楚”写屏障 → 卡表 → 脏卡扫描”这条链路，再延伸到 G1 的 RSet 和 SATB，说明你对 GC 的理解不是背概念，而是懂机制。</li>
+</ol>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>记忆集与卡表是分代收集的”眼睛”：它用 512 字节的卡 + 写屏障维护一张跨代引用索引，让 Minor GC 不必全堆扫描。G1 将其升级为 Per-Region 的 RSet，支撑起 Region 级局部收集。理解这条链路，你就真正打通了”对象分配 → 跨代引用 → 写屏障 → GC 扫描”的完整闭环。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/27/jvm-remembered-set-card-table-deep-dive/">https://jiweidong.github.io/2026/08/27/jvm-remembered-set-card-table-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/">垃圾回收</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/27/mysql-group-replication-mgr-deep-dive/" title="【MySQL 高可用】MySQL 组复制 MGR 深度解析：从 Paxos 到多主写入与单主模式的完整实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 高可用】MySQL 组复制 MGR 深度解析：从 Paxos 到多主写入与单主模式的完整实践</div></div><div class="info-2"><div class="info-item-1">【MySQL 组复制 MGR 深度解析：从 Paxos 到多主写入与单主模式的完整实践面试官：主从复制挂了怎么办？MySQL 有原生高可用方案吗？传统的主从复制（异步复制）有一个天然的痛点：主库挂了，从库可能没收到最新 binlog，数据会丢，而且故障转移要依赖 MHA、Orchestrator 等外部工具，切换过程复杂、易出错。 MySQL 5.7.17 引入的**组复制（Group Replication，简称 MGR）**改变了这一切——它是 MySQL 官方的原生高可用方案，基于 Paxos 共识协议，支持多主写入、自动故障转移、强一致性（可配置）。今天我们就从 Paxos 原理讲到 MGR 的架构、部署与踩坑。 一、MGR 是什么：一句话总结 MGR 是一个基于 Paxos 协议的插件，它把一组 MySQL 实例组成一个复制组，组内所有节点通过组成员共识决定事务的提交，从而实现数据一致性、自动选主和故障转移。  它不是一个独立的产品，而是 MySQL Server 内置的插件（group_replication.so），和 InnoDB、binlog 深度集成。 二、为...</div></div></div></a><a class="pagination-related" href="/2026/08/27/java-sse-server-sent-events-deep-dive/" title="【Java 实战】SSE 服务端推送深度实战：从 EventSource 原理到 Spring 集成与 WebSocket 对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 实战】SSE 服务端推送深度实战：从 EventSource 原理到 Spring 集成与 WebSocket 对比</div></div><div class="info-2"><div class="info-item-1">【Java 实战】SSE 服务端推送深度实战：从 EventSource 原理到 Spring 集成与 WebSocket 对比面试官：实现一个”服务器主动推送”的功能，你选 WebSocket 还是 SSE？AI 对话流式输出、股票行情、订单状态通知、任务进度条……这些场景都需要服务端主动推送。很多人第一反应是 WebSocket，但 WebSocket 是全双工协议，复杂度高；如果只是”服务端单向推送”，SSE（Server-Sent Events，服务器发送事件） 往往更简单、更合适。 今天彻底讲透 SSE：HTTP 协议层面的原理、浏览器 EventSource API、Spring Boot 集成（含流式 AI 响应场景）、以及和 WebSocket 的选型对比。 一、SSE 是什么SSE 是 HTML5 标准的一部分，允许服务器通过普通的 HTTP 连接向浏览器持续推送数据。它的本质是：  一个长连接的 HTTP 响应，服务器不断往响应体里写文本数据，客户端通过 EventSource API 接收。  关键特性：  单向：服务器 → 客户端（客户端要发数据走普通请求...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/15/jvm-object-allocation-promotion-deep-dive/" title="【JVM 底层】对象分配与晋升机制深度解析：从 TLAB 到老年代的一生"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【JVM 底层】对象分配与晋升机制深度解析：从 TLAB 到老年代的一生</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】对象分配与晋升机制深度解析：从 TLAB 到老年代的一生面试官：new 出来的对象一定在堆上吗？它从出生到进入老年代经历了什么？很多同学背了”对象优先在 Eden 区分配，大对象直接进老年代”，但被追问到”什么是 TLAB？对象年龄多大晋升？动态年龄判定怎么算？空间分配担保是什么？”就卡壳了。 今天我们把一个 Java 对象的”一生”彻底讲透：栈上分配 → TLAB → Eden → Survivor → 老年代，每一站的原理、源码和调优参数全部覆盖。 一、对象分配的总览：一条完整的路径HotSpot 中对象分配的完整决策链如下： 12345678910111213new Object()    │    ├─ 1. 逃逸分析：能栈上分配？ ──→ 是 → 栈上分配（方法返回即销毁）    │       否    ├─ 2. 能 TLAB 分配？ ──→ 是 → TLAB 内 fast-path 分配（无锁）    │       否    ├─ 3. 大对象（&gt; -XX:PretenureSizeThreshold）？ ──→ 是 → 直接进老年代   ...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-synchronized-lock-upgrade-deep-dive/" title="「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析</div></div><div class="info-2"><div class="info-item-1">「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析面试开场面试官：你平时用 synchronized 做同步吗？知道它的锁升级机制吗？ 我：synchronized 在 JDK 6 之后引入了锁升级（锁膨胀）机制，不再是早期的纯重量级锁。锁的状态会从无锁 → 偏向锁 → 轻量级锁 → 重量级锁，且方向不可逆。 这是一道非常经典的并发面试题，几乎涵盖了 JVM、对象头、Mark Word、CAS、操作系统互斥量等多个知识点。今天就彻底把它讲透。  一、锁升级的背景：JDK 6 之前的 synchronized在 JDK 6 之前，synchronized 的实现依赖于操作系统的 Mutex Lock（互斥量），每次加锁&#x2F;解锁都需要从用户态切换到内核态，这个切换成本非常高。因此早期大家都说 synchronized 是”重量级锁”，性能不如 java.util.concurrent 包中的 Lock。 JDK 6 对 synchronized 做了大量优化，引入了一系列的锁优化技术：    优化技术 说明    偏向锁（Biased Lock...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-jmm-volatile-happens-before/" title="【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了</div></div><div class="info-2"><div class="info-item-1">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了面试官：说说什么是 JMM（Java 内存模型）？JMM（Java Memory Model） 是一个抽象的概念，它定义了一套规则和规范，用来屏蔽不同硬件和操作系统的内存访问差异，确保 Java 程序在各种平台上都能达到内存访问的一致性。  JMM 的核心围绕着三个特性展开：原子性（Atomicity）、可见性（Visibility）、有序性（Ordering）。  为什么需要 JMM？现代 CPU 采用多级缓存架构（L1&#x2F;L2&#x2F;L3 Cache）来加速数据访问，但这也带来了缓存一致性问题。每个 CPU 核心有自己私有的缓存，当多个线程在不同核心上运行时，它们看到的共享变量值可能不一致。 1234567891011121314151617┌─────────────────────────────────────────┐│               Java 线程                   ││   ┌──────────┐     ┌──────────┐...</div></div></div></a><a class="pagination-related" href="/2026/06/27/java-string-constant-pool-intern-deep-dive/" title="彻底搞懂 Java 字符串常量池与 intern 机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-27</div><div class="info-item-2">彻底搞懂 Java 字符串常量池与 intern 机制</div></div><div class="info-2"><div class="info-item-1">彻底搞懂 Java 字符串常量池与 intern 机制面试官：new String(“abc”) 创建了几个对象？这道面试经典题先开个头。在回答这个问题之前，我们需要先搞清楚 Java 字符串常量池（String Constant Pool）、字符串字面量、intern() 方法以及 JDK 版本演进带来的变化。 一、字符串常量池是什么？1.1 概念Java 字符串常量池（String Constant Pool）是 JVM 为优化字符串存储而开辟的一块特殊内存区域，用于存储字符串字面量和通过 intern() 方法进入的字符串对象。 核心思想：复用字符串对象，减少内存开销。 123String s1 = &quot;hello&quot;;String s2 = &quot;hello&quot;;System.out.println(s1 == s2); // true，指向常量池同一个对象  1.2 JDK 版本演进中的位置变化   JDK 版本 常量池位置 说明    JDK 6 及以前 方法区（永久代） 受 PermGen 大小限制，容易 OOM   JDK 7 堆内存...</div></div></div></a><a class="pagination-related" href="/2026/08/23/java-overload-override-jvm-dispatch-deep-dive/" title="【Java 基础】重载 vs 重写深度解析：从语法规则到 JVM 方法分派机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-23</div><div class="info-item-2">【Java 基础】重载 vs 重写深度解析：从语法规则到 JVM 方法分派机制</div></div><div class="info-2"><div class="info-item-1">【Java 基础】重载 vs 重写深度解析：从语法规则到 JVM 方法分派机制面试官：重载（Overload）和重写（Override）有什么区别？ 这道题几乎是 Java 面试的”开胃菜”，但大多数人的答案停留在”参数列表不同 vs 方法签名相同”的语法层面。真正拉开差距的是追问：JVM 如何决定调用哪个重载方法？多态调用在字节码层面怎么实现？ 本文带你从语法规则一路挖到 JVM 方法分派机制。  一、语法规则：先分清”是什么”1.1 重载（Overload）：同一个类中方法名相同，参数列表不同12345678910111213141516public class Calculator &#123;    public int add(int a, int b) &#123;        return a + b;    &#125;    public double add(double a, double b) &#123;   // ✅ 参数类型不同        return a + b;    &#125;    public int add(int a, int ...</div></div></div></a><a class="pagination-related" href="/2026/08/12/jvm-safepoint-deep-dive/" title="【JVM 底层】SafePoint 安全点深度解析：GC 停顿、STW 与线程状态的底层真相"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-12</div><div class="info-item-2">【JVM 底层】SafePoint 安全点深度解析：GC 停顿、STW 与线程状态的底层真相</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】SafePoint 安全点深度解析：GC 停顿、STW 与线程状态的底层真相面试官：GC 时为什么要 Stop The World？所有线程都要停吗？候选人：因为要保证引用关系不变，所以…… 面试官追问：“线程是怎么’停下来’的？GC 线程发个信号，业务线程就立刻停吗？” 这个问题触及 JVM 底层最容易被忽略的一环——SafePoint（安全点）。今天我们从 HotSpot 源码视角，彻底讲清楚：什么是安全点、线程如何到达安全点、安全点会带来哪些诡异的性能问题。  一、为什么需要安全点JVM 进行 GC 时，需要枚举 GC Roots（栈上的局部变量、静态变量、JNI 引用等），然后根据引用关系标记存活对象。问题在于：  如果业务线程正在修改引用（比如 obj.field = newObj），GC 线程看到的引用可能是中间状态，无法准确标记。 JVM 需要知道每个线程栈帧里哪些位置是引用（OopMap 记录了这些信息），但 OopMap 只在特定位置才生成。  所以 JVM 不能随时暂停线程，必须让线程运行到一个已知的、状态一致的位置再停。这个位置就是 Safe...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">527</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">678</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">177</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%BA%95%E5%B1%82%E3%80%91%E8%AE%B0%E5%BF%86%E9%9B%86%E4%B8%8E%E5%8D%A1%E8%A1%A8%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E8%B7%A8%E4%BB%A3%E5%BC%95%E7%94%A8%E8%BF%BD%E8%B8%AA%E4%B8%8E-GC-%E7%9A%84%E5%BA%95%E5%B1%82%E6%9C%BA%E5%88%B6"><span class="toc-number">1.</span> <span class="toc-text">【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%80%81%E5%B9%B4%E4%BB%A3%E5%AF%B9%E8%B1%A1%E5%BC%95%E7%94%A8%E6%96%B0%E7%94%9F%E4%BB%A3%E5%AF%B9%E8%B1%A1%EF%BC%8CMinor-GC-%E6%98%AF%E6%80%8E%E4%B9%88%E6%89%BE%E5%88%B0%E5%AE%83%E7%9A%84%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：老年代对象引用新生代对象，Minor GC 是怎么找到它的？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E9%97%AE%E9%A2%98%E8%B5%B7%E6%BA%90%EF%BC%9A%E5%88%86%E4%BB%A3%E6%94%B6%E9%9B%86%E7%9A%84%E2%80%9D%E8%B7%A8%E4%BB%A3%E5%BC%95%E7%94%A8%E2%80%9D%E9%9A%BE%E9%A2%98"><span class="toc-number">1.2.</span> <span class="toc-text">一、问题起源：分代收集的”跨代引用”难题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E5%88%86%E4%BB%A3%E6%94%B6%E9%9B%86%E7%9A%84%E5%89%8D%E6%8F%90"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 分代收集的前提</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E6%9C%80%E7%AC%A8%E7%9A%84%E8%A7%A3%E6%B3%95%EF%BC%9A%E5%85%A8%E5%A0%86%E6%89%AB%E6%8F%8F"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 最笨的解法：全堆扫描</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E7%B2%BE%E7%A1%AE%E7%9A%84%E8%A7%A3%E6%B3%95%EF%BC%9A%E8%AE%B0%E5%BF%86%E9%9B%86"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 精确的解法：记忆集</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%8D%A1%E8%A1%A8%EF%BC%88Card-Table%EF%BC%89%EF%BC%9A%E8%AE%B0%E5%BF%86%E9%9B%86%E6%9C%80%E5%B8%B8%E8%A7%81%E7%9A%84%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.3.</span> <span class="toc-text">二、卡表（Card Table）：记忆集最常见的实现</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%8D%A1%E8%A1%A8%E7%9A%84%E7%BB%93%E6%9E%84"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 卡表的结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%8D%A1%E8%A1%A8%E5%A6%82%E4%BD%95%E8%A2%AB%E2%80%9D%E5%BC%84%E8%84%8F%E2%80%9D%EF%BC%9A%E5%86%99%E5%B1%8F%E9%9A%9C%EF%BC%88Write-Barrier%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 卡表如何被”弄脏”：写屏障（Write Barrier）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%8F%AA%E9%9C%80%E8%A6%81%E2%80%9D%E8%80%81%E2%86%92%E6%96%B0%E2%80%9D%E6%96%B9%E5%90%91%E7%9A%84%E8%AE%B0%E5%BD%95%EF%BC%9F"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 为什么只需要”老→新”方向的记录？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%8D%A1%E8%A1%A8%E7%9A%84%E7%BB%8F%E5%85%B8%E9%9D%A2%E8%AF%95%E9%97%AE%E9%A2%98%EF%BC%9A%E4%BC%AA%E5%85%B1%E4%BA%AB%E4%B8%8E%E5%8D%A1%E8%A1%A8%E5%8F%98%E8%84%8F"><span class="toc-number">1.4.</span> <span class="toc-text">三、卡表的经典面试问题：伪共享与卡表变脏</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%BC%AA%E5%85%B1%E4%BA%AB%EF%BC%88False-Sharing%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 伪共享（False Sharing）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 解决方案</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81G1-%E7%9A%84%E8%AE%B0%E5%BF%86%E9%9B%86%EF%BC%9A%E6%AF%94%E5%8D%A1%E8%A1%A8%E6%9B%B4%E8%BF%9B%E4%B8%80%E6%AD%A5"><span class="toc-number">1.5.</span> <span class="toc-text">四、G1 的记忆集：比卡表更进一步</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-G1-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E7%94%A8%E4%BC%A0%E7%BB%9F%E5%8D%A1%E8%A1%A8"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 G1 为什么不用传统卡表</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-G1-RSet-%E7%9A%84%E5%86%99%E5%B1%8F%E9%9A%9C"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 G1 RSet 的写屏障</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88-G1-%E9%9C%80%E8%A6%81-RSet-%E8%80%8C%E4%BC%A0%E7%BB%9F-CMS-%E5%8F%AA%E9%9C%80%E8%A6%81%E5%85%A8%E5%B1%80%E5%8D%A1%E8%A1%A8%EF%BC%9F"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 面试高频追问：为什么 G1 需要 RSet 而传统 CMS 只需要全局卡表？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BB%8E%E5%8D%A1%E8%A1%A8%E5%88%B0%E5%86%99%E5%B1%8F%E9%9A%9C%EF%BC%9A%E4%B8%89%E4%B8%AA%E6%A6%82%E5%BF%B5%E7%9A%84%E5%85%B3%E7%B3%BB%E6%A2%B3%E7%90%86"><span class="toc-number">1.6.</span> <span class="toc-text">五、从卡表到写屏障：三个概念的关系梳理</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%BA%90%E7%A0%81%E7%BA%A7%E9%AA%8C%E8%AF%81%EF%BC%9AHotSpot-%E4%B8%AD%E7%9A%84%E5%8D%A1%E8%A1%A8%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.7.</span> <span class="toc-text">六、源码级验证：HotSpot 中的卡表实现</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%B8%B8%E8%A7%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E4%B8%8E%E7%AD%94%E6%A1%88"><span class="toc-number">1.8.</span> <span class="toc-text">七、常见面试追问与答案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E5%AE%9E%E6%88%98%E5%90%AF%E7%A4%BA%EF%BC%9A%E8%BF%99%E4%BA%9B%E7%9F%A5%E8%AF%86%E8%83%BD%E5%B8%AE%E4%BD%A0%E5%81%9A%E4%BB%80%E4%B9%88"><span class="toc-number">1.9.</span> <span class="toc-text">八、实战启示：这些知识能帮你做什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/27/handwrite-mini-rpc-framework-deep-dive/" title="【Java 实战】从零手写迷你 RPC 框架：动态代理、序列化、注册中心与负载均衡全实现">【Java 实战】从零手写迷你 RPC 框架：动态代理、序列化、注册中心与负载均衡全实现</a><time datetime="2026-08-27T00:00:00.000Z" title="发表于 2026-08-27 08:00:00">2026-08-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/27/java-sse-server-sent-events-deep-dive/" title="【Java 实战】SSE 服务端推送深度实战：从 EventSource 原理到 Spring 集成与 WebSocket 对比">【Java 实战】SSE 服务端推送深度实战：从 EventSource 原理到 Spring 集成与 WebSocket 对比</a><time datetime="2026-08-27T00:00:00.000Z" title="发表于 2026-08-27 08:00:00">2026-08-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/27/jvm-remembered-set-card-table-deep-dive/" title="【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制">【JVM 底层】记忆集与卡表深度解析：跨代引用追踪与 GC 的底层机制</a><time datetime="2026-08-27T00:00:00.000Z" title="发表于 2026-08-27 08:00:00">2026-08-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/27/mysql-group-replication-mgr-deep-dive/" title="【MySQL 高可用】MySQL 组复制 MGR 深度解析：从 Paxos 到多主写入与单主模式的完整实践">【MySQL 高可用】MySQL 组复制 MGR 深度解析：从 Paxos 到多主写入与单主模式的完整实践</a><time datetime="2026-08-27T00:00:00.000Z" title="发表于 2026-08-27 08:00:00">2026-08-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/27/spring-boot-jasypt-config-encryption-deep-dive/" title="【Spring Boot 实战】Jasypt 配置加密深度实战：配置文件敏感信息加密从入门到原理">【Spring Boot 实战】Jasypt 配置加密深度实战：配置文件敏感信息加密从入门到原理</a><time datetime="2026-08-27T00:00:00.000Z" title="发表于 2026-08-27 08:00:00">2026-08-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
