@@ -1,0 +1,366 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案面试官：说说扫码登录的完整流程？扫码登录已经是 PC 端登录的标配交互——微信、钉钉、淘宝、GitHub 全在用。面试官问这个题，考察的不是你会不会调接口，而是状态机设计、轮询 vs 长连接、二维码安全、过期与失效处理这些系统设计基本功。 先画一个整体流程： 123456789101112131415">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/28/qr-code-login-system-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案面试官：说说扫码登录的完整流程？扫码登录已经是 PC 端登录的标配交互——微信、钉钉、淘宝、GitHub 全在用。面试官问这个题，考察的不是你会不会调接口，而是状态机设计、轮询 vs 长连接、二维码安全、过期与失效处理这些系统设计基本功。 先画一个整体流程： 123456789101112131415">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-28T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-28T00:21:23.499Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案",
+  "url": "https://jiweidong.github.io/2026/08/28/qr-code-login-system-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-28T00:00:00.000Z",
+  "dateModified": "2026-08-28T00:21:23.499Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/28/qr-code-login-system-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">532</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">679</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-28T00:00:00.000Z" title="发表于 2026-08-28 08:00:00">2026-08-28</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-28T00:21:23.499Z" title="更新于 2026-08-28 08:21:23">2026-08-28</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】扫码登录系统设计：从二维码生成到轮询-WebSocket-实时通知的完整方案"><a href="#【系统设计】扫码登录系统设计：从二维码生成到轮询-WebSocket-实时通知的完整方案" class="headerlink" title="【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案"></a>【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案</h1><h2 id="面试官：说说扫码登录的完整流程？"><a href="#面试官：说说扫码登录的完整流程？" class="headerlink" title="面试官：说说扫码登录的完整流程？"></a>面试官：说说扫码登录的完整流程？</h2><p>扫码登录已经是 PC 端登录的标配交互——微信、钉钉、淘宝、GitHub 全在用。面试官问这个题，考察的不是你会不会调接口，而是<strong>状态机设计、轮询 vs 长连接、二维码安全、过期与失效处理</strong>这些系统设计基本功。</p>
+<p>先画一个整体流程：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">用户打开 PC 登录页         手机 App              后端服务</span><br><span class="line">    │                        │                      │</span><br><span class="line">    ├─ 1.请求生成二维码 ──────►                      │</span><br><span class="line">    │                        │  2.返回 qrId + 二维码图 │</span><br><span class="line">    │◄── 3.展示二维码 ────────┤                      │</span><br><span class="line">    │  4.启动轮询/建立长连接   │                      │</span><br><span class="line">    │                        │                      │</span><br><span class="line">    │                        │  5.手机扫码（解析 qrId）│</span><br><span class="line">    │                        ├──6.确认登录──────────►│</span><br><span class="line">    │                        │                      │  7.校验 qrId 状态</span><br><span class="line">    │                        │                      │  8.绑定用户，生成 ticket</span><br><span class="line">    │◄──── 9.轮询返回 ticket/ ──────────────────────┤</span><br><span class="line">    │         WebSocket 推送  │                      │</span><br><span class="line">    │ 10.用 ticket 换 token   │                      │</span><br><span class="line">    │◄────────────────────────┤                      │</span><br></pre></td></tr></table></figure>
+
+<p>核心链路就三步：<strong>生成二维码 → 手机确认 → PC 换取凭证</strong>。每一步都有设计细节。</p>
+<h2 id="一、二维码的生成：qrId-才是灵魂"><a href="#一、二维码的生成：qrId-才是灵魂" class="headerlink" title="一、二维码的生成：qrId 才是灵魂"></a>一、二维码的生成：qrId 才是灵魂</h2><p>二维码本身只是一个”字符串的图形化编码”，它承载的内容才是关键。设计上有两种方案：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>内容</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>方案 A</td>
+<td>直接编码登录页 URL + 参数</td>
+<td>无状态，扫码即跳转</td>
+<td>参数易被篡改，无法预绑定会话</td>
+</tr>
+<tr>
+<td>方案 B</td>
+<td>编码一个随机 qrId（UUID）</td>
+<td>无敏感信息，服务端可控</td>
+<td>需要维护 qrId 状态</td>
+</tr>
+</tbody></table>
+<p>生产中几乎都选方案 B。qrId 需要满足：</p>
+<ul>
+<li><strong>随机且不可预测</strong>：用 <code>UUID.randomUUID()</code> 或 <code>SecureRandom</code> 生成 32 位随机串，防止攻击者遍历猜测。</li>
+<li><strong>不包含用户信息</strong>：二维码里只有 qrId，任何用户信息都在服务端按 qrId 索引。</li>
+<li><strong>服务端维护状态</strong>：qrId → 状态机（待扫描&#x2F;已扫描待确认&#x2F;已确认&#x2F;已过期&#x2F;已取消）。</li>
+</ul>
+<p>qrId 与状态的存储，首选 Redis：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 生成二维码</span></span><br><span class="line"><span class="type">String</span> <span class="variable">qrId</span> <span class="operator">=</span> UUID.randomUUID().toString().replace(<span class="string">&quot;-&quot;</span>, <span class="string">&quot;&quot;</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">// Redis 存储扫码状态机，5 分钟过期（与二维码有效期一致）</span></span><br><span class="line">stringRedisTemplate.opsForValue().set(</span><br><span class="line">    <span class="string">&quot;login:qr:&quot;</span> + qrId,</span><br><span class="line">    QrState.WAITING_SCAN.name(),</span><br><span class="line">    Duration.ofMinutes(<span class="number">5</span>)</span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+
+<p>返回给前端的响应：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;qrId&quot;</span><span class="punctuation">:</span> <span class="string">&quot;a3f9c2e1...&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;qrContent&quot;</span><span class="punctuation">:</span> <span class="string">&quot;https://login.example.com/qr?a3f9c2e1...&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;expireIn&quot;</span><span class="punctuation">:</span> <span class="number">300</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>二维码图片本身可以由前端用 qrcode 库生成，也可以后端用 ZXing 生成 Base64 返回。<strong>推荐前端生成</strong>——后端少一次图片处理，二维码内容就是一个 URL。</p>
+<h2 id="二、状态机设计：四种状态一个流转"><a href="#二、状态机设计：四种状态一个流转" class="headerlink" title="二、状态机设计：四种状态一个流转"></a>二、状态机设计：四种状态一个流转</h2><p>扫码登录的状态机是整个系统的核心，务必画清楚：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">WAITING_SCAN(待扫描) ──手机扫码──► SCANNED(已扫描待确认)</span><br><span class="line">     │                                  │</span><br><span class="line">     │ 超时/刷新                         │ 用户点&quot;确认登录&quot;</span><br><span class="line">     ▼                                  ▼</span><br><span class="line">  EXPIRED(已过期)                    CONFIRMED(已确认)</span><br><span class="line">     ▲                                  │</span><br><span class="line">     │       用户点&quot;取消&quot;                │ PC 换取 token 成功</span><br><span class="line">     └──── CANCELLED(已取消) ◄───────────┘</span><br></pre></td></tr></table></figure>
+
+<p>用 Redis 实现时，推荐用 <strong>Hash + 原子操作</strong>而不是简单 String，因为状态流转需要”读-改-写”原子性：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 手机扫码后：WAITING_SCAN -&gt; SCANNED</span></span><br><span class="line"><span class="comment">// 必须原子操作，防止并发确认导致状态错乱</span></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">transition</span><span class="params">(String qrId, QrState from, QrState to)</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> <span class="string">&quot;login:qr:&quot;</span> + qrId;</span><br><span class="line">    <span class="type">String</span> <span class="variable">script</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">        local cur = redis.call(&#x27;HGET&#x27;, KEYS[1], &#x27;state&#x27;)</span></span><br><span class="line"><span class="string">        if cur == ARGV[1] then</span></span><br><span class="line"><span class="string">            redis.call(&#x27;HSET&#x27;, KEYS[1], &#x27;state&#x27;, ARGV[2])</span></span><br><span class="line"><span class="string">            return 1</span></span><br><span class="line"><span class="string">        end</span></span><br><span class="line"><span class="string">        return 0</span></span><br><span class="line"><span class="string">        &quot;&quot;&quot;</span>;</span><br><span class="line">    <span class="type">Long</span> <span class="variable">result</span> <span class="operator">=</span> stringRedisTemplate.execute(</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">DefaultRedisScript</span>&lt;&gt;(script, Long.class),</span><br><span class="line">        List.of(key), from.name(), to.name());</span><br><span class="line">    <span class="keyword">return</span> Long.valueOf(<span class="number">1</span>).equals(result);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>用 Lua 脚本保证 CAS（Compare-And-Swap）原子性，这是扫码登录正确性的关键——<strong>两个手机同时扫同一个码，只有第一个能成功</strong>。</p>
+<h2 id="三、PC-端如何知道”扫码成功”？轮询-vs-长连接"><a href="#三、PC-端如何知道”扫码成功”？轮询-vs-长连接" class="headerlink" title="三、PC 端如何知道”扫码成功”？轮询 vs 长连接"></a>三、PC 端如何知道”扫码成功”？轮询 vs 长连接</h2><p>这是面试官最爱追问的点。PC 端获取状态的方式有三种：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>原理</th>
+<th>实时性</th>
+<th>服务器压力</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>短轮询</td>
+<td>每 2-3s 拉一次状态接口</td>
+<td>秒级</td>
+<td>高（QPS &#x3D; 在线数&#x2F;间隔）</td>
+<td>简单、可靠、易实现</td>
+</tr>
+<tr>
+<td>长轮询</td>
+<td>请求挂起，有结果才返回</td>
+<td>准实时</td>
+<td>中（连接挂起占线程）</td>
+<td>兼容性好，无额外依赖</td>
+</tr>
+<tr>
+<td>WebSocket</td>
+<td>服务端主动推送</td>
+<td>实时</td>
+<td>中（长连接资源）</td>
+<td>交互丰富的现代应用</td>
+</tr>
+</tbody></table>
+<p><strong>面试回答要点：</strong></p>
+<ol>
+<li><p><strong>短轮询是默认方案</strong>。扫码确认的时效性要求是”秒级”，2 秒一次轮询完全够用。100 万在线用户，2s 间隔也就是 50 万 QPS 的状态查询——全部走 Redis GET，扛得住（Redis 单机轻松 10 万+ QPS，集群化更稳）。</p>
+</li>
+<li><p><strong>长轮询</strong>：请求到达后不立即返回，在服务端挂起（如 25s 超时），状态变化时由回调唤醒返回。相比短轮询减少了无效请求次数，但<strong>会占用连接和线程</strong>，配合 Servlet 3.1 异步或 WebFlux 才能高并发。</p>
+</li>
+<li><p><strong>WebSocket</strong>：PC 端与后端建立长连接，手机确认后后端主动推送。最实时，但要维护连接池、心跳、重连逻辑，复杂度最高。</p>
+</li>
+</ol>
+<p>实践中微信&#x2F;钉钉用的是”短轮询 + 状态缓存”的变体：轮询接口先查本地缓存，没变化直接返回”未变”标识，减少数据传输。<strong>记住一句话：能用轮询解决的就别上 WebSocket，这是架构师的基本克制。</strong></p>
+<h2 id="四、扫码后手机端做了什么"><a href="#四、扫码后手机端做了什么" class="headerlink" title="四、扫码后手机端做了什么"></a>四、扫码后手机端做了什么</h2><p>手机端扫码，本质是解析出 URL 中的 qrId，然后：</p>
+<ol>
+<li><strong>校验 qrId 合法性</strong>：查 Redis 是否存在、是否已过期。</li>
+<li><strong>展示确认页</strong>：显示 PC 端会话信息（如”确认登录 XX 网页版”）+ 登录账号头像昵称。</li>
+<li><strong>用户确认</strong>：调用 <code>POST /api/login/scan/confirm</code>，携带 qrId + 用户 token（手机端已登录）。</li>
+<li><strong>服务端处理</strong>：原子更新状态为 <code>SCANNED</code> → <code>CONFIRMED</code>，同时生成一个<strong>一次性 ticket</strong>（短期有效，如 30 秒），存入 Redis：</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 确认登录后，生成一次性 ticket 供 PC 换取 token</span></span><br><span class="line"><span class="type">String</span> <span class="variable">ticket</span> <span class="operator">=</span> UUID.randomUUID().toString().replace(<span class="string">&quot;-&quot;</span>, <span class="string">&quot;&quot;</span>);</span><br><span class="line">stringRedisTemplate.opsForValue().set(</span><br><span class="line">    <span class="string">&quot;login:ticket:&quot;</span> + ticket,</span><br><span class="line">    userId.toString(),</span><br><span class="line">    Duration.ofSeconds(<span class="number">30</span>)   <span class="comment">// 短时效，降低被劫持风险</span></span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+
+<h2 id="五、PC-端用-ticket-换-token：最后的闭环"><a href="#五、PC-端用-ticket-换-token：最后的闭环" class="headerlink" title="五、PC 端用 ticket 换 token：最后的闭环"></a>五、PC 端用 ticket 换 token：最后的闭环</h2><p>PC 端轮询到状态为 <code>CONFIRMED</code> 后，拿着 ticket 调登录接口：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@PostMapping(&quot;/api/login/confirm&quot;)</span></span><br><span class="line"><span class="keyword">public</span> Result&lt;String&gt; <span class="title function_">confirm</span><span class="params">(<span class="meta">@RequestBody</span> ConfirmReq req)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 校验 ticket 存在且未使用（一次性）</span></span><br><span class="line">    <span class="type">String</span> <span class="variable">userId</span> <span class="operator">=</span> stringRedisTemplate.opsForValue()</span><br><span class="line">        .getAndDelete(<span class="string">&quot;login:ticket:&quot;</span> + req.getTicket());</span><br><span class="line">    <span class="keyword">if</span> (userId == <span class="literal">null</span>) &#123;</span><br><span class="line">        <span class="keyword">return</span> Result.fail(<span class="string">&quot;凭证已失效，请重新扫码&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 2. 签发 token（JWT 或服务端 session）</span></span><br><span class="line">    <span class="type">String</span> <span class="variable">token</span> <span class="operator">=</span> jwtUtil.generateToken(Long.valueOf(userId));</span><br><span class="line">    <span class="keyword">return</span> Result.success(token);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意这里用的是 <strong><code>getAndDelete</code>（GETDEL）</strong>——ticket 一次性使用，取走即删除，防止重放攻击。</p>
+<h2 id="六、安全设计：扫码登录的五个坑"><a href="#六、安全设计：扫码登录的五个坑" class="headerlink" title="六、安全设计：扫码登录的五个坑"></a>六、安全设计：扫码登录的五个坑</h2><table>
+<thead>
+<tr>
+<th>风险</th>
+<th>攻击方式</th>
+<th>防御手段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>二维码伪造</td>
+<td>恶意站点生成假码诱导扫码</td>
+<td>qrId 服务端签发、URL 绑定域名、签名校验</td>
+</tr>
+<tr>
+<td>qrId 枚举</td>
+<td>遍历 qrId 抢注登录</td>
+<td>随机数 128bit+，Redis 限频</td>
+</tr>
+<tr>
+<td>扫码劫持</td>
+<td>用户扫了攻击者的码</td>
+<td>确认页展示”PC 端 IP&#x2F;浏览器”信息，用户确认</td>
+</tr>
+<tr>
+<td>ticket 重放</td>
+<td>截获 ticket 重复使用</td>
+<td>一次性使用（GETDEL）+ 30s 短时效</td>
+</tr>
+<tr>
+<td>中间人</td>
+<td>传输中被篡改</td>
+<td>全链路 HTTPS，二维码内容签名</td>
+</tr>
+</tbody></table>
+<p>另外两个容易被忽略的点：</p>
+<ul>
+<li><strong>异地提醒</strong>：扫码成功后若检测到 PC 端 IP 与常用地不符，可触发风控（短信验证或延迟登录）。</li>
+<li><strong>设备互踢</strong>：同一账号多地扫码登录，策略可以是”后者踢前者”或”全部保留”，微信是后者，但很多企业系统用前者。</li>
+</ul>
+<h2 id="七、高并发与性能优化"><a href="#七、高并发与性能优化" class="headerlink" title="七、高并发与性能优化"></a>七、高并发与性能优化</h2><p>扫码登录的并发压力点在<strong>状态查询接口</strong>（PC 端轮询）。优化三板斧：</p>
+<ol>
+<li><strong>Redis 扛读</strong>：状态全部在 Redis，天然抗压；热 qrId 可加本地缓存（Caffeine）二级兜底。</li>
+<li><strong>轮询加随机抖动</strong>：客户端在 1.5~3s 间随机取间隔，避免所有客户端同步请求造成”心跳洪峰”。</li>
+<li><strong>状态合并接口</strong>：轮询接口一次返回”登录态 + 未读消息数 + 版本号”，减少请求次数。</li>
+</ol>
+<h2 id="八、面试追问汇总"><a href="#八、面试追问汇总" class="headerlink" title="八、面试追问汇总"></a>八、面试追问汇总</h2><p><strong>Q1：为什么不用 WebSocket 而是轮询？</strong><br>答：扫码确认本身是低频事件（用户扫一次码），实时性要求只有秒级；轮询实现简单、无连接管理成本、天然兼容各种网络环境（公司防火墙可能封长连接）。只有需要持续双向通信（如 IM、协同编辑）才值得上 WebSocket。</p>
+<p><strong>Q2：二维码过期了怎么办？</strong><br>答：前端在 qrId 快过期时（如剩 30s）自动重新请求新二维码并切换轮询目标；用户已扫码但未确认时过期，需重新扫码。</p>
+<p><strong>Q3：一个码能被扫多次吗？</strong><br>答：不能。状态机 + Lua 原子流转保证只有第一次扫码能进入 SCANNED，后续扫码直接拒绝并提示”二维码已被使用”。</p>
+<p><strong>Q4：ticket 和 token 有什么区别？</strong><br>答：ticket 是短期（30s）、一次性、仅用于换取 token 的凭证，换取后即销毁；token 是长期会话凭证（JWT 或 session id），用于后续所有接口鉴权。这是”最小权限 + 短时效”的安全分层。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>扫码登录的完整答案就一句话：<strong>用随机 qrId 建立 PC 与手机的关联，用 Redis 维护状态机，用短轮询通知 PC，用一次性 ticket 完成凭证交换</strong>。把状态机画清楚、把原子流转和 ticket 一次性这两个细节讲出来，面试官就知道你是真做过而不是背概念。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/28/qr-code-login-system-design/">https://jiweidong.github.io/2026/08/28/qr-code-login-system-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/28/sso-single-sign-on-architecture-deep-dive/" title="【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2/OIDC 的演进"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2/OIDC 的演进</div></div><div class="info-2"><div class="info-item-1">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进面试官：公司有 20 个系统，怎么做到”一次登录，全网通行”？单点登录（Single Sign-On，SSO）是企业级应用绕不开的话题。面试官问这个问题，通常从最简单的场景开始，一路追问到 CAS 票据、OAuth2&#x2F;OIDC、跨域 Cookie 这些细节。本文从为什么要 SSO 讲起，梳理三条技术路线，最后给出生产级方案。 一、为什么需要 SSO：痛点分析没有 SSO 的世界是这样的：员工每天要登录 OA、ERP、GitLab、Jira、监控平台……每个系统一套账号密码，记不住、不安全、体验差。管理员的噩梦则是：离职员工的账号要在 20 个系统里逐个禁用。 SSO 的核心价值：  一次认证，多处访问：在认证中心登录一次，所有接入系统免登录。 集中账号管理：账号生命周期（入职&#x2F;离职&#x2F;改密）只在一处维护。 统一安全策略：密码策略、二次认证（MFA）、风控集中在认证中心。  架构上引入一个认证中心（Auth Center &#x...</div></div></div></a><a class="pagination-related" href="/2026/08/28/java-image-processing-deep-practice/" title="【Java 实战】Java 图片处理深度实战：ImageIO、Thumbnailator 与压缩、水印、缩略图全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 实战】Java 图片处理深度实战：ImageIO、Thumbnailator 与压缩、水印、缩略图全解析</div></div><div class="info-2"><div class="info-item-1">【Java 实战】Java 图片处理深度实战：ImageIO、Thumbnailator 与压缩、水印、缩略图全解析面试官：用户上传一张 10MB 的图片，你怎么处理？图片处理是后端基本功：头像上传要裁缩略图、商品图要加水印、日志图片要压缩省存储。Java 生态里图片处理有三板斧：JDK 自带的 ImageIO、开箱即用的 Thumbnailator、以及高性能的 GraphicsMagick&#x2F;OpenCV。本文从内存模型讲起，给出完整的实战方案。 一、Java 图片处理三板斧对比   方案 上手难度 性能 功能 依赖    ImageIO（JDK 内置） 中 中 基础读写&#x2F;缩放&#x2F;水印 无   Thumbnailator 极低 中 缩略图&#x2F;裁剪&#x2F;旋转&#x2F;水印 1 个 jar   GraphicsMagick + im4java 高 极高 全功能 系统级依赖   OpenCV 高 极高 识别+处理 原生库   TwelveMonkeys 低 中 补全 ImageIO 格式支持 插件 jar   选型建议：80% 的场景 Th...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/28/sso-single-sign-on-architecture-deep-dive/" title="【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-28</div><div class="info-item-2">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进</div></div><div class="info-2"><div class="info-item-1">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进面试官：公司有 20 个系统，怎么做到”一次登录，全网通行”？单点登录（Single Sign-On，SSO）是企业级应用绕不开的话题。面试官问这个问题，通常从最简单的场景开始，一路追问到 CAS 票据、OAuth2&#x2F;OIDC、跨域 Cookie 这些细节。本文从为什么要 SSO 讲起，梳理三条技术路线，最后给出生产级方案。 一、为什么需要 SSO：痛点分析没有 SSO 的世界是这样的：员工每天要登录 OA、ERP、GitLab、Jira、监控平台……每个系统一套账号密码，记不住、不安全、体验差。管理员的噩梦则是：离职员工的账号要在 20 个系统里逐个禁用。 SSO 的核心价值：  一次认证，多处访问：在认证中心登录一次，所有接入系统免登录。 集中账号管理：账号生命周期（入职&#x2F;离职&#x2F;改密）只在一处维护。 统一安全策略：密码策略、二次认证（MFA）、风控集中在认证中心。  架构上引入一个认证中心（Auth Center &#x...</div></div></div></a><a class="pagination-related" href="/2026/08/26/elasticsearch-deep-pagination-deep-dive/" title="【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-26</div><div class="info-item-2">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型</div></div><div class="info-2"><div class="info-item-1">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型面试官：ES 里为什么「深分页」性能差？from+size、scroll、search_after 有什么区别？很多人在 ES 里翻到第 10000 条就报错，或者直接用 scroll 做普通分页导致内存爆炸。深分页是 ES 面试和实战的高频痛点，本文从分布式查询原理出发，把三种分页方案的机制、代价和选型讲清楚。 一、先理解 ES 查询的分布式本质ES 的一个索引分布在多个分片（shard）上。执行一次搜索，流程是：  协调节点（Coordinating Node） 接收查询请求； 把请求广播到所有分片（主分片或副本）； 每个分片本地排序后返回前 size 条（以及聚合信息）； 协调节点归并排序所有分片的结果，取全局前 size 条返回。  关键结论：ES 的排序是「先分片排序、再全局归并」，不是全局一次性排序。这直接决定了深分页的代价。 二、from + size：最直观但最贵123456GET /order/_search&#123; ...</div></div></div></a><a class="pagination-related" href="/2026/08/06/scheduledthreadpoolexecutor-deep-dive/" title="【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理</div></div><div class="info-2"><div class="info-item-1">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理面试官：说说 JDK 里的定时任务调度是怎么实现的？一提到定时任务，很多人的第一反应是 Timer 或者 Spring 的 @Scheduled。但面试官真正想听到的，是 ScheduledThreadPoolExecutor（以下简称 STPE）——JDK 定时调度的正统实现。 被追问下去就是灵魂三连：  Timer 有什么缺陷？为什么现在都用 STPE？ scheduleAtFixedRate 和 scheduleWithFixedDelay 到底差在哪？ STPE 底层用什么数据结构存任务？延迟任务是怎么”到点触发”的？ 为什么 STPE 的 execute() 永远只创建一个线程？核心线程数会被”清零”吗？  本文结合 JDK 8 源码，把 STPE 和它的秘密武器 DelayedWorkQueue 彻底拆开。   一、Timer 的四大缺陷（面试必答）   缺陷 说明    单线程串行 一个任务执行时间过长，会阻塞后续所有任务   异常中断 ...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-threadpool-executor-deep-dive/" title="「彻底搞懂 ThreadPoolExecutor」核心源码、拒绝策略与实战调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「彻底搞懂 ThreadPoolExecutor」核心源码、拒绝策略与实战调优</div></div><div class="info-2"><div class="info-item-1">「彻底搞懂 ThreadPoolExecutor」核心源码、拒绝策略与实战调优线程池是 Java 并发编程中最常用的组件之一。无论是 Web 服务器的请求处理、异步任务的执行，还是消息队列的消费端，背后都离不开线程池。但你真的了解它吗？本文从源码到实战，帮你彻底搞懂 ThreadPoolExecutor。  一、为什么需要线程池？在没有线程池之前，我们创建一个线程来处理一个任务： 123new Thread(() -&gt; &#123;    // do something&#125;).start();  这种方式的三个致命问题：    问题 说明    频繁创建&#x2F;销毁 线程创建和销毁需要系统调用，开销大   资源无上限 大量并发时线程数爆炸，OOM 或系统崩溃   管理缺失 无法控制最大并发数，无法复用，无法监控   线程池解决了这些问题：复用线程、控制并发、统一管理。  二、ThreadPoolExecutor 核心构造参数1234567public ThreadPoolExecutor(int corePoolSize,                    ...</div></div></div></a><a class="pagination-related" href="/2026/08/05/strategy-pattern-deep-dive/" title="【设计模式】策略模式深度解析：干掉 if-else 的优雅之道与 Spring 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-05</div><div class="info-item-2">【设计模式】策略模式深度解析：干掉 if-else 的优雅之道与 Spring 实践</div></div><div class="info-2"><div class="info-item-1">【设计模式】策略模式深度解析：干掉 if-else 的优雅之道与 Spring 实践面试官：支付系统支持支付宝、微信、银行卡，代码怎么设计？初级答案：一个 pay() 方法里写 if-else 判断渠道类型。高级答案：策略模式 + 工厂 + Spring 注入。本文从最原始的 if-else 出发，一步步重构出生产级策略模式实现，并剖析 JDK 和 Spring 源码中的策略模式应用。   一、什么是策略模式定义：定义一系列算法，把它们一个个封装起来，并且使它们可以相互替换。策略模式让算法的变化独立于使用算法的客户。 核心角色：  Strategy（抽象策略）：定义算法的公共接口 ConcreteStrategy（具体策略）：实现具体算法 Context（上下文）：持有 Strategy 引用，负责调用策略  适用场景：  同一行为有多种实现方式且可替换（支付、排序、压缩、限流算法） 大量 if-else &#x2F; switch-case 分支，每个分支是一个算法 需要在运行时动态选择算法  二、从 if-else 到策略模式的重构之路第一步：原始的 if-else12345...</div></div></div></a><a class="pagination-related" href="/2026/08/05/template-method-pattern-deep-dive/" title="【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-05</div><div class="info-item-2">【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用</div></div><div class="info-2"><div class="info-item-1">【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用面试官：AQS 的源码你看过吗？为什么子类只需要重写 tryAcquire 几个方法就能实现各种锁？能回答上来的同学，基本都理解了模板方法模式（Template Method Pattern）。AQS 是模板方法模式在并发领域最经典的运用：父类把 acquire()、release() 的骨架流程写死，把 tryAcquire()、tryRelease() 这些”变化点”留给子类实现。本文从手写模板方法开始，拆解 AQS、Spring、MyBatis 中的框架级应用。   一、什么是模板方法模式定义：定义一个操作中的算法骨架，将一些步骤延迟到子类中实现。模板方法使得子类可以不改变算法结构的情况下，重新定义算法中的某些步骤。 核心角色：  AbstractClass（抽象类）：定义模板方法（骨架）和抽象步骤方法（钩子） ConcreteClass（具体子类）：实现步骤方法，不改变骨架  两个关键概念：  模板方法（Template Method）：定义流程骨架，通常用 final 修饰，...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">532</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">679</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E6%89%AB%E7%A0%81%E7%99%BB%E5%BD%95%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%EF%BC%9A%E4%BB%8E%E4%BA%8C%E7%BB%B4%E7%A0%81%E7%94%9F%E6%88%90%E5%88%B0%E8%BD%AE%E8%AF%A2-WebSocket-%E5%AE%9E%E6%97%B6%E9%80%9A%E7%9F%A5%E7%9A%84%E5%AE%8C%E6%95%B4%E6%96%B9%E6%A1%88"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AF%B4%E8%AF%B4%E6%89%AB%E7%A0%81%E7%99%BB%E5%BD%95%E7%9A%84%E5%AE%8C%E6%95%B4%E6%B5%81%E7%A8%8B%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：说说扫码登录的完整流程？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%BA%8C%E7%BB%B4%E7%A0%81%E7%9A%84%E7%94%9F%E6%88%90%EF%BC%9AqrId-%E6%89%8D%E6%98%AF%E7%81%B5%E9%AD%82"><span class="toc-number">1.2.</span> <span class="toc-text">一、二维码的生成：qrId 才是灵魂</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%8A%B6%E6%80%81%E6%9C%BA%E8%AE%BE%E8%AE%A1%EF%BC%9A%E5%9B%9B%E7%A7%8D%E7%8A%B6%E6%80%81%E4%B8%80%E4%B8%AA%E6%B5%81%E8%BD%AC"><span class="toc-number">1.3.</span> <span class="toc-text">二、状态机设计：四种状态一个流转</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81PC-%E7%AB%AF%E5%A6%82%E4%BD%95%E7%9F%A5%E9%81%93%E2%80%9D%E6%89%AB%E7%A0%81%E6%88%90%E5%8A%9F%E2%80%9D%EF%BC%9F%E8%BD%AE%E8%AF%A2-vs-%E9%95%BF%E8%BF%9E%E6%8E%A5"><span class="toc-number">1.4.</span> <span class="toc-text">三、PC 端如何知道”扫码成功”？轮询 vs 长连接</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%89%AB%E7%A0%81%E5%90%8E%E6%89%8B%E6%9C%BA%E7%AB%AF%E5%81%9A%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.5.</span> <span class="toc-text">四、扫码后手机端做了什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81PC-%E7%AB%AF%E7%94%A8-ticket-%E6%8D%A2-token%EF%BC%9A%E6%9C%80%E5%90%8E%E7%9A%84%E9%97%AD%E7%8E%AF"><span class="toc-number">1.6.</span> <span class="toc-text">五、PC 端用 ticket 换 token：最后的闭环</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%AE%89%E5%85%A8%E8%AE%BE%E8%AE%A1%EF%BC%9A%E6%89%AB%E7%A0%81%E7%99%BB%E5%BD%95%E7%9A%84%E4%BA%94%E4%B8%AA%E5%9D%91"><span class="toc-number">1.7.</span> <span class="toc-text">六、安全设计：扫码登录的五个坑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%AB%98%E5%B9%B6%E5%8F%91%E4%B8%8E%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96"><span class="toc-number">1.8.</span> <span class="toc-text">七、高并发与性能优化</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E6%B1%87%E6%80%BB"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问汇总</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/28/captcha-anti-brute-force-practice/" title="【Spring Boot 实战】验证码与接口防刷深度实战：图形验证码、短信验证码与 Redis 频控">【Spring Boot 实战】验证码与接口防刷深度实战：图形验证码、短信验证码与 Redis 频控</a><time datetime="2026-08-28T00:00:00.000Z" title="发表于 2026-08-28 08:00:00">2026-08-28</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/28/mongodb-index-query-optimization-deep-dive/" title="【MongoDB 实战】MongoDB 索引与查询性能优化深度实战：从 explain 到聚合管道调优">【MongoDB 实战】MongoDB 索引与查询性能优化深度实战：从 explain 到聚合管道调优</a><time datetime="2026-08-28T00:00:00.000Z" title="发表于 2026-08-28 08:00:00">2026-08-28</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/28/java-image-processing-deep-practice/" title="【Java 实战】Java 图片处理深度实战：ImageIO、Thumbnailator 与压缩、水印、缩略图全解析">【Java 实战】Java 图片处理深度实战：ImageIO、Thumbnailator 与压缩、水印、缩略图全解析</a><time datetime="2026-08-28T00:00:00.000Z" title="发表于 2026-08-28 08:00:00">2026-08-28</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/28/qr-code-login-system-design/" title="【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案">【系统设计】扫码登录系统设计：从二维码生成到轮询/WebSocket 实时通知的完整方案</a><time datetime="2026-08-28T00:00:00.000Z" title="发表于 2026-08-28 08:00:00">2026-08-28</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/28/sso-single-sign-on-architecture-deep-dive/" title="【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2/OIDC 的演进">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2/OIDC 的演进</a><time datetime="2026-08-28T00:00:00.000Z" title="发表于 2026-08-28 08:00:00">2026-08-28</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
