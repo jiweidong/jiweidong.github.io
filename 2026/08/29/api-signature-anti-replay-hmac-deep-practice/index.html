@@ -1,0 +1,436 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制面试官：开放平台给第三方提供 API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。HTTP 是明文协议，抓包工具（Charles&#x2F;Fiddler）能轻易看到请求内容。没有签名机制的接口，等于把「改金额、换参数、重放请求」的大门敞开。这一篇从签名要解决的三类问题出发，">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/29/api-signature-anti-replay-hmac-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制面试官：开放平台给第三方提供 API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。HTTP 是明文协议，抓包工具（Charles&#x2F;Fiddler）能轻易看到请求内容。没有签名机制的接口，等于把「改金额、换参数、重放请求」的大门敞开。这一篇从签名要解决的三类问题出发，">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-29T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-29T00:16:40.236Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Spring Boot">
+<meta property="article:tag" content="安全">
+<meta property="article:tag" content="实战">
+<meta property="article:tag" content="接口设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制",
+  "url": "https://jiweidong.github.io/2026/08/29/api-signature-anti-replay-hmac-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-29T00:00:00.000Z",
+  "dateModified": "2026-08-29T00:16:40.236Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/29/api-signature-anti-replay-hmac-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">537</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">682</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-29T00:00:00.000Z" title="发表于 2026-08-29 08:00:00">2026-08-29</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-29T00:16:40.236Z" title="更新于 2026-08-29 08:16:40">2026-08-29</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Spring-Boot-实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与-Nonce-机制"><a href="#【Spring-Boot-实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与-Nonce-机制" class="headerlink" title="【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制"></a>【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制</h1><h2 id="面试官：开放平台给第三方提供-API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。"><a href="#面试官：开放平台给第三方提供-API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。" class="headerlink" title="面试官：开放平台给第三方提供 API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。"></a>面试官：开放平台给第三方提供 API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。</h2><p>HTTP 是明文协议，抓包工具（Charles&#x2F;Fiddler）能轻易看到请求内容。没有签名机制的接口，等于把「改金额、换参数、重放请求」的大门敞开。这一篇从<strong>签名要解决的三类问题</strong>出发，讲透 HMAC 签名、时间戳、Nonce 防重放的设计，并给出一套可直接落地的 Spring Boot 拦截器实现。</p>
+<h2 id="一、签名机制到底在防什么"><a href="#一、签名机制到底在防什么" class="headerlink" title="一、签名机制到底在防什么"></a>一、签名机制到底在防什么</h2><table>
+<thead>
+<tr>
+<th>威胁</th>
+<th>攻击方式</th>
+<th>签名方案对应手段</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>篡改</strong></td>
+<td>中间人改参数（如把 <code>amount=100</code> 改成 <code>amount=1</code>）</td>
+<td>参数参与签名，验签失败即拒绝</td>
+</tr>
+<tr>
+<td><strong>伪造</strong></td>
+<td>攻击者伪造一个合法请求</td>
+<td>签名密钥（AppSecret）只有客户端和服务端知道</td>
+</tr>
+<tr>
+<td><strong>重放</strong></td>
+<td>截获合法请求，原样重复发送 N 次（如重复下单、重复转账）</td>
+<td>时间戳 + Nonce（一次性随机数）</td>
+</tr>
+<tr>
+<td><strong>伪装</strong></td>
+<td>冒充合法客户端</td>
+<td>AppId 标识身份 + Secret 签名</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>注意：签名解决的是<strong>身份认证 + 完整性 + 抗重放</strong>，但<strong>不解决机密性</strong>——敏感数据仍要走 HTTPS（见本站《HTTPS 与 TLS 握手深度解析》）。签名 + HTTPS 是标配组合，不是二选一。</p>
+</blockquote>
+<h2 id="二、签名算法选型：为什么是-HMAC"><a href="#二、签名算法选型：为什么是-HMAC" class="headerlink" title="二、签名算法选型：为什么是 HMAC"></a>二、签名算法选型：为什么是 HMAC</h2><h3 id="2-1-常见方案对比"><a href="#2-1-常见方案对比" class="headerlink" title="2.1 常见方案对比"></a>2.1 常见方案对比</h3><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>原理</th>
+<th>安全性</th>
+<th>性能</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>HMAC-SHA256</strong></td>
+<td>密钥参与哈希（<code>H(K XOR opad, H(K XOR ipad, msg))</code>）</td>
+<td>高：无密钥无法伪造</td>
+<td>快（~1μs 级）</td>
+</tr>
+<tr>
+<td>MD5(拼接+盐)</td>
+<td>简单拼接后 MD5</td>
+<td><strong>低</strong>：拼接顺序泄露易碰撞，已被弃用</td>
+<td>快</td>
+</tr>
+<tr>
+<td>RSA 签名</td>
+<td>私钥签名、公钥验签</td>
+<td>高：<strong>非对称</strong>，服务端不存客户端私钥</td>
+<td>慢（毫秒级）</td>
+</tr>
+<tr>
+<td>AES 加密参数</td>
+<td>参数加密传输</td>
+<td>中：防窥探，但不防重放</td>
+<td>中</td>
+</tr>
+</tbody></table>
+<p><strong>选型结论</strong>：</p>
+<ul>
+<li><strong>大部分场景用 HMAC-SHA256</strong>：对称密钥、计算快、实现简单。</li>
+<li><strong>高安全场景（开放平台对外）用 RSA&#x2F;国密 SM2</strong>：客户端持有私钥，即使服务端数据库泄露也伪造不了签名（见本站《国密算法深度实战》）。</li>
+<li><strong>签名和加密要分清</strong>：签名保证「没被改」，加密保证「看不见」。两者可以叠加（先签名后加密，或 HTTPS 只加密不签名则必须配合防篡改）。</li>
+</ul>
+<h3 id="2-2-HMAC-SHA256-的原理"><a href="#2-2-HMAC-SHA256-的原理" class="headerlink" title="2.2 HMAC-SHA256 的原理"></a>2.2 HMAC-SHA256 的原理</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">HMAC(K, m) = H( (K&#x27; ⊕ opad) || H( (K&#x27; ⊕ ipad) || m ) )</span><br><span class="line">K&#x27; = K（长度不足则补零，超过则先 H(K)）</span><br><span class="line">opad = 0x5c 重复块，ipad = 0x36 重复块</span><br></pre></td></tr></table></figure>
+
+<p>关键特性：<strong>即使消息 m 相同，没有密钥 K 也无法计算&#x2F;验证 HMAC</strong>；且 HMAC 对消息逐字节敏感，改一个字符签名完全不同。</p>
+<h2 id="三、防重放：时间戳-Nonce-双保险"><a href="#三、防重放：时间戳-Nonce-双保险" class="headerlink" title="三、防重放：时间戳 + Nonce 双保险"></a>三、防重放：时间戳 + Nonce 双保险</h2><h3 id="3-1-为什么单独的时间戳不够"><a href="#3-1-为什么单独的时间戳不够" class="headerlink" title="3.1 为什么单独的时间戳不够"></a>3.1 为什么单独的时间戳不够</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 请求头</span></span><br><span class="line">X-Timestamp: <span class="number">1724822400</span>   <span class="comment">// 当前秒级时间戳</span></span><br></pre></td></tr></table></figure>
+
+<p>服务端校验 <code>|now - timestamp| &lt;= 300s</code>，能挡住「很久以前的请求重放」，但<strong>拦不住 5 分钟内的重放</strong>——攻击者拿到请求后 1 秒内重放 100 次照样通过。</p>
+<h3 id="3-2-Nonce-一次性随机数"><a href="#3-2-Nonce-一次性随机数" class="headerlink" title="3.2 Nonce 一次性随机数"></a>3.2 Nonce 一次性随机数</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 请求头</span></span><br><span class="line">X-Nonce: 9f8a7b6c-5d4e-4a3b-8c2d-1e0f9a8b7c6d   <span class="comment">// UUID/随机串</span></span><br></pre></td></tr></table></figure>
+
+<p>服务端对每个 <code>(AppId, Nonce)</code> 在有效期内<strong>只接受一次</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">收到请求 → 校验时间戳(窗口内) → 查 Nonce 是否用过</span><br><span class="line">    ├─ 用过 → 拒绝（重复请求）</span><br><span class="line">    └─ 没用过 → 记录 Nonce（TTL=时间窗口）→ 放行</span><br></pre></td></tr></table></figure>
+
+<p><strong>Nonce 存储方案对比</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Redis SETNX + EXPIRE</td>
+<td>原子、天然过期、分布式共享</td>
+<td>需要 Redis</td>
+</tr>
+<tr>
+<td>本地 Caffeine 缓存</td>
+<td>零依赖、快</td>
+<td>多实例不共享（要粘性会话或每实例各自记）</td>
+</tr>
+<tr>
+<td>MySQL 唯一索引</td>
+<td>持久</td>
+<td>慢、要清理过期数据</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>生产推荐 Redis</strong>：<code>SET nonce:{appId}:{nonce} 1 EX 300 NX</code>，返回 OK 才是第一次。Redis 的分布式特性天然适配多实例部署（Redis 实战见本站系列文章）。</p>
+</blockquote>
+<h3 id="3-3-完整签名头设计（开放平台通用规范）"><a href="#3-3-完整签名头设计（开放平台通用规范）" class="headerlink" title="3.3 完整签名头设计（开放平台通用规范）"></a>3.3 完整签名头设计（开放平台通用规范）</h3><table>
+<thead>
+<tr>
+<th>请求头</th>
+<th>必选</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>X-App-Id</code></td>
+<td>✅</td>
+<td>客户端身份标识</td>
+</tr>
+<tr>
+<td><code>X-Timestamp</code></td>
+<td>✅</td>
+<td>秒级时间戳，服务端校验窗口（如 ±300s）</td>
+</tr>
+<tr>
+<td><code>X-Nonce</code></td>
+<td>✅</td>
+<td>一次性随机数，配合时间戳防重放</td>
+</tr>
+<tr>
+<td><code>X-Signature</code></td>
+<td>✅</td>
+<td><code>HMAC-SHA256(secret, 待签名串)</code> 的 hex</td>
+</tr>
+<tr>
+<td><code>X-Version</code></td>
+<td>❌</td>
+<td>签名版本，方便升级算法（v1&#x2F;v2 兼容期）</td>
+</tr>
+</tbody></table>
+<h2 id="四、待签名串的构造规范（最容易踩坑）"><a href="#四、待签名串的构造规范（最容易踩坑）" class="headerlink" title="四、待签名串的构造规范（最容易踩坑）"></a>四、待签名串的构造规范（最容易踩坑）</h2><h3 id="4-1-规范公式"><a href="#4-1-规范公式" class="headerlink" title="4.1 规范公式"></a>4.1 规范公式</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">待签名串 = HTTP方法 + &quot;\n&quot;</span><br><span class="line">         + 请求路径 + &quot;\n&quot;</span><br><span class="line">         + 规范化查询串 + &quot;\n&quot;     -- 参数名 ASCII 排序 &amp; key=value&amp; 拼接</span><br><span class="line">         + 规范化请求体 + &quot;\n&quot;     -- 原始 body（或 body 的 SHA256）</span><br><span class="line">         + AppId + &quot;\n&quot;</span><br><span class="line">         + Timestamp + &quot;\n&quot;</span><br><span class="line">         + Nonce</span><br><span class="line">signature = hex( HMAC-SHA256(secret, 待签名串) )</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么这么设计</strong>：</p>
+<ol>
+<li><strong>方法 + 路径</strong>：防止「把 GET 请求重放成 POST」「换路径复用签名」。</li>
+<li><strong>参数排序拼接</strong>：保证客户端服务端构造出<strong>完全一致的串</strong>（HashMap 遍历顺序不可控，必须排序）。</li>
+<li><strong>body 参与签名</strong>：防止请求体被篡改。<strong>大 body 的优化</strong>：只对 <code>SHA256(body)</code> 参与签名，避免把几 MB 的 body 直接拼进签名串。</li>
+<li><strong>时间戳 + Nonce 参与签名</strong>：让签名和「一次性」绑定，防重放更彻底。</li>
+</ol>
+<h3 id="4-2-客户端签名示例（Java）"><a href="#4-2-客户端签名示例（Java）" class="headerlink" title="4.2 客户端签名示例（Java）"></a>4.2 客户端签名示例（Java）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ApiSigner</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> String <span class="title function_">sign</span><span class="params">(String method, String path,</span></span><br><span class="line"><span class="params">                              Map&lt;String, String&gt; query,</span></span><br><span class="line"><span class="params">                              String body, String appId,</span></span><br><span class="line"><span class="params">                              String secret, <span class="type">long</span> timestamp, String nonce)</span></span><br><span class="line">            <span class="keyword">throws</span> Exception &#123;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 1. 查询参数规范化：按 key 字典序拼接</span></span><br><span class="line">        <span class="type">String</span> <span class="variable">queryStr</span> <span class="operator">=</span> query.entrySet().stream()</span><br><span class="line">                .sorted(Map.Entry.comparingByKey())</span><br><span class="line">                .map(e -&gt; e.getKey() + <span class="string">&quot;=&quot;</span> + e.getValue())</span><br><span class="line">                .collect(Collectors.joining(<span class="string">&quot;&amp;&quot;</span>));</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 2. body 摘要（大 body 只签名摘要）</span></span><br><span class="line">        <span class="type">String</span> <span class="variable">bodyDigest</span> <span class="operator">=</span> body == <span class="literal">null</span> || body.isEmpty() ? <span class="string">&quot;&quot;</span></span><br><span class="line">                : DigestUtils.sha256Hex(body);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 3. 组装待签名串</span></span><br><span class="line">        <span class="type">String</span> <span class="variable">raw</span> <span class="operator">=</span> String.join(<span class="string">&quot;\n&quot;</span>,</span><br><span class="line">                method.toUpperCase(), path, queryStr, bodyDigest,</span><br><span class="line">                appId, String.valueOf(timestamp), nonce);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 4. HMAC-SHA256 签名</span></span><br><span class="line">        <span class="type">Mac</span> <span class="variable">mac</span> <span class="operator">=</span> Mac.getInstance(<span class="string">&quot;HmacSHA256&quot;</span>);</span><br><span class="line">        mac.init(<span class="keyword">new</span> <span class="title class_">SecretKeySpec</span>(secret.getBytes(StandardCharsets.UTF_8),</span><br><span class="line">                <span class="string">&quot;HmacSHA256&quot;</span>));</span><br><span class="line">        <span class="type">byte</span>[] digest = mac.doFinal(raw.getBytes(StandardCharsets.UTF_8));</span><br><span class="line">        <span class="keyword">return</span> HexFormat.of().formatHex(digest);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h2 id="五、服务端拦截器落地（Spring-Boot）"><a href="#五、服务端拦截器落地（Spring-Boot）" class="headerlink" title="五、服务端拦截器落地（Spring Boot）"></a>五、服务端拦截器落地（Spring Boot）</h2><h3 id="5-1-自定义注解-HandlerInterceptor"><a href="#5-1-自定义注解-HandlerInterceptor" class="headerlink" title="5.1 自定义注解 + HandlerInterceptor"></a>5.1 自定义注解 + HandlerInterceptor</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Target(&#123;ElementType.METHOD, ElementType.TYPE&#125;)</span></span><br><span class="line"><span class="meta">@Retention(RetentionPolicy.RUNTIME)</span></span><br><span class="line"><span class="keyword">public</span> <span class="meta">@interface</span> ApiSign &#123;</span><br><span class="line">    <span class="comment">/** 时间戳允许的偏移窗口（秒） */</span></span><br><span class="line">    <span class="type">int</span> <span class="title function_">window</span><span class="params">()</span> <span class="keyword">default</span> <span class="number">300</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SignInterceptor</span> <span class="keyword">implements</span> <span class="title class_">HandlerInterceptor</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> StringRedisTemplate redis;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> AppSecretService appSecretService; <span class="comment">// AppId → Secret 查询</span></span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">preHandle</span><span class="params">(HttpServletRequest request,</span></span><br><span class="line"><span class="params">                             HttpServletResponse response, Object handler)</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (handler <span class="keyword">instanceof</span> HandlerMethod hm</span><br><span class="line">                &amp;&amp; hm.getMethodAnnotation(ApiSign.class) == <span class="literal">null</span></span><br><span class="line">                &amp;&amp; hm.getBeanType().getAnnotation(ApiSign.class) == <span class="literal">null</span>) &#123;</span><br><span class="line">            <span class="keyword">return</span> <span class="literal">true</span>; <span class="comment">// 未标注的不拦截</span></span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="type">String</span> <span class="variable">appId</span> <span class="operator">=</span> request.getHeader(<span class="string">&quot;X-App-Id&quot;</span>);</span><br><span class="line">        <span class="type">String</span> <span class="variable">timestamp</span> <span class="operator">=</span> request.getHeader(<span class="string">&quot;X-Timestamp&quot;</span>);</span><br><span class="line">        <span class="type">String</span> <span class="variable">nonce</span> <span class="operator">=</span> request.getHeader(<span class="string">&quot;X-Nonce&quot;</span>);</span><br><span class="line">        <span class="type">String</span> <span class="variable">signature</span> <span class="operator">=</span> request.getHeader(<span class="string">&quot;X-Signature&quot;</span>);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 1. 必填校验</span></span><br><span class="line">        <span class="keyword">if</span> (anyBlank(appId, timestamp, nonce, signature)) &#123;</span><br><span class="line">            <span class="keyword">return</span> reject(response, <span class="number">40001</span>, <span class="string">&quot;缺少签名参数&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 2. 时间戳窗口校验</span></span><br><span class="line">        <span class="type">long</span> <span class="variable">ts</span> <span class="operator">=</span> Long.parseLong(timestamp);</span><br><span class="line">        <span class="keyword">if</span> (Math.abs(System.currentTimeMillis() / <span class="number">1000</span> - ts) &gt; <span class="number">300</span>) &#123;</span><br><span class="line">            <span class="keyword">return</span> reject(response, <span class="number">40002</span>, <span class="string">&quot;请求已过期&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 3. Nonce 防重放（Redis 原子写入）</span></span><br><span class="line">        <span class="type">Boolean</span> <span class="variable">first</span> <span class="operator">=</span> redis.opsForValue()</span><br><span class="line">                .setIfAbsent(<span class="string">&quot;nonce:&quot;</span> + appId + <span class="string">&quot;:&quot;</span> + nonce, <span class="string">&quot;1&quot;</span>,</span><br><span class="line">                        Duration.ofSeconds(<span class="number">300</span>));</span><br><span class="line">        <span class="keyword">if</span> (Boolean.FALSE.equals(first)) &#123;</span><br><span class="line">            <span class="keyword">return</span> reject(response, <span class="number">40003</span>, <span class="string">&quot;重复请求&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 4. 验签</span></span><br><span class="line">        <span class="type">String</span> <span class="variable">secret</span> <span class="operator">=</span> appSecretService.getSecretByAppId(appId);</span><br><span class="line">        <span class="keyword">if</span> (secret == <span class="literal">null</span>) &#123;</span><br><span class="line">            <span class="keyword">return</span> reject(response, <span class="number">40004</span>, <span class="string">&quot;AppId 无效&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">String</span> <span class="variable">expect</span> <span class="operator">=</span> ApiSigner.sign(request.getMethod(), request.getRequestURI(),</span><br><span class="line">                request.getParameterMap(), readBody(request),</span><br><span class="line">                appId, secret, ts, nonce);</span><br><span class="line">        <span class="keyword">if</span> (!MessageDigest.isEqual(expect.getBytes(StandardCharsets.UTF_8),</span><br><span class="line">                signature.getBytes(StandardCharsets.UTF_8))) &#123;</span><br><span class="line">            <span class="keyword">return</span> reject(response, <span class="number">40005</span>, <span class="string">&quot;签名校验失败&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键细节</strong>：</p>
+<ul>
+<li>用 <code>MessageDigest.isEqual</code> 比较签名（<strong>常量时间比较</strong>，防时序攻击），别用 <code>String.equals</code>。</li>
+<li>Nonce 校验<strong>先于</strong>验签执行没问题，但要注意：验签失败的请求也消耗了 Nonce——这是可接受的（攻击者无法通过伪造请求消耗合法 Nonce，因为 Nonce 是客户端生成的）。</li>
+<li>读取 body 时用 <code>ContentCachingRequestWrapper</code> 包装，避免 <code>getInputStream()</code> 读一次后后续读取为空。</li>
+<li>验签失败写审计日志（appId、IP、路径、签名），用于风控。</li>
+</ul>
+<h3 id="5-2-注册拦截器"><a href="#5-2-注册拦截器" class="headerlink" title="5.2 注册拦截器"></a>5.2 注册拦截器</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Configuration</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">WebConfig</span> <span class="keyword">implements</span> <span class="title class_">WebMvcConfigurer</span> &#123;</span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">addInterceptors</span><span class="params">(InterceptorRegistry registry)</span> &#123;</span><br><span class="line">        registry.addInterceptor(signInterceptor)</span><br><span class="line">                .addPathPatterns(<span class="string">&quot;/openapi/**&quot;</span>)  <span class="comment">// 只拦开放平台接口</span></span><br><span class="line">                .excludePathPatterns(<span class="string">&quot;/openapi/callback/**&quot;</span>); <span class="comment">// 回调走 RSA 验签等</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-统一异常与返回"><a href="#5-3-统一异常与返回" class="headerlink" title="5.3 统一异常与返回"></a>5.3 统一异常与返回</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="type">boolean</span> <span class="title function_">reject</span><span class="params">(HttpServletResponse response,</span></span><br><span class="line"><span class="params">                             <span class="type">int</span> code, String msg)</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">    response.setStatus(HttpStatus.UNAUTHORIZED.value());</span><br><span class="line">    response.setContentType(<span class="string">&quot;application/json;charset=UTF-8&quot;</span>);</span><br><span class="line">    response.getWriter().write(<span class="string">&quot;&#123;\&quot;code\&quot;:&quot;</span> + code + <span class="string">&quot;,\&quot;msg\&quot;:\&quot;&quot;</span> + msg + <span class="string">&quot;\&quot;&#125;&quot;</span>);</span><br><span class="line">    <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>生产上配合本站《全局异常处理》把验签错误纳入统一错误码体系，前端才能友好提示。</p>
+</blockquote>
+<h2 id="六、进阶与实战经验"><a href="#六、进阶与实战经验" class="headerlink" title="六、进阶与实战经验"></a>六、进阶与实战经验</h2><h3 id="6-1-密钥管理"><a href="#6-1-密钥管理" class="headerlink" title="6.1 密钥管理"></a>6.1 密钥管理</h3><ol>
+<li><strong>密钥永不落库明文</strong>：Secret 用 AES 加密存储或 KMS 托管，查询时解密。</li>
+<li><strong>Secret 生成</strong>：<code>SecureRandom</code> 生成 32 字节随机数，Base64 编码（别用 UUID——熵不够且格式可预测）。</li>
+<li><strong>密钥轮换</strong>：支持 <code>X-Version</code> 头 + 双密钥，<code>v2</code> 上线后保留 <code>v1</code> 一段时间（兼容期），到期强制升级。</li>
+</ol>
+<h3 id="6-2-大文件上传怎么办"><a href="#6-2-大文件上传怎么办" class="headerlink" title="6.2 大文件上传怎么办"></a>6.2 大文件上传怎么办</h3><p>body 参与签名对大文件不现实。方案：<strong>先申请上传凭证（预签名 URL）</strong>——客户端先调用签名接口获取 OSS 预签名地址（含有效期），文件直传 OSS，业务参数（文件名、大小、SHA256）走正常签名接口。服务端回调校验文件 SHA256 一致性。详见本站《文件上传下载企业级实战》。</p>
+<h3 id="6-3-回调接口的签名（服务端-→-服务端）"><a href="#6-3-回调接口的签名（服务端-→-服务端）" class="headerlink" title="6.3 回调接口的签名（服务端 → 服务端）"></a>6.3 回调接口的签名（服务端 → 服务端）</h3><p>回调方向相反：<strong>我方是调用方</strong>，需要<strong>接收方</strong>能验证「这真的是我们发的」。做法：回调 URL 参数带 <code>signature + timestamp + nonce</code>，接收方用约定好的 Secret 验签 + 防重放。微信支付、支付宝回调都是这个模式（它们用的是 RSA + 平台证书）。</p>
+<h3 id="6-4-性能与安全平衡"><a href="#6-4-性能与安全平衡" class="headerlink" title="6.4 性能与安全平衡"></a>6.4 性能与安全平衡</h3><ul>
+<li>验签是 CPU 轻量操作（HMAC-SHA256 ~1μs），<strong>瓶颈不在验签</strong>，在 Nonce 的 Redis 访问——可以本地 Caffeine 做一层短 TTL 缓存（如 10s）批量去重，再回源 Redis 兜底。</li>
+<li>全链路建议：<strong>WAF&#x2F;网关层先限流</strong>（见本站《API 限流策略与算法》），签名拦截器放在业务层入口，双保险。</li>
+</ul>
+<h2 id="七、面试追问速答"><a href="#七、面试追问速答" class="headerlink" title="七、面试追问速答"></a>七、面试追问速答</h2><p><strong>追问 1：时间戳 + Nonce 就能完全防重放吗？</strong><br>在窗口期内能防「同请求重复提交」。但<strong>防不了「窗口内合法的多次调用」</strong>（比如用户真的连续下单 3 次）——那是业务幂等（见本站《接口幂等性方案全解析》）的职责。签名防「非授权重放」，幂等防「业务重复」，两者配合才是完整方案。</p>
+<p><strong>追问 2：为什么 Nonce 要参与签名计算？</strong><br>Nonce 不参与签名的话，攻击者可以<strong>替换 Nonce 重放</strong>：换一个新的 Nonce，绕过服务端「Nonce 已用」检查，而签名仍然有效（因为签名没绑定 Nonce）。Nonce 进签名后，换 Nonce 必然导致验签失败。</p>
+<p><strong>追问 3：为什么用 HMAC 而不是直接把 Secret 拼在参数里 MD5？</strong><br>MD5(参数+Secret) 的方案容易被<strong>长度扩展攻击</strong>（当拼接格式为 <code>secret+msg</code> 时）且算法公开碰撞风险高；HMAC 用密钥做两次哈希（ipad&#x2F;opad），不泄露密钥的任何信息，是密码学界公认的安全 MAC 构造。</p>
+<p><strong>追问 4：HTTPS 已经有了，还要签名吗？</strong><br>要。HTTPS 防的是<strong>传输途中被窃听&#x2F;篡改</strong>（中间人），但解决不了：①服务端日志&#x2F;抓包工具在可信环境下的内部泄露；②客户端被攻破后重放合法请求；③B 端系统之间的信任边界（双方用证书互信太重）。签名是应用层的信任机制，和传输层加密互补。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><table>
+<thead>
+<tr>
+<th>设计点</th>
+<th>推荐做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>签名算法</td>
+<td>HMAC-SHA256（高安全场景 RSA&#x2F;SM2）</td>
+</tr>
+<tr>
+<td>待签名串</td>
+<td>方法+路径+排序查询串+body摘要+AppId+时间戳+Nonce</td>
+</tr>
+<tr>
+<td>防重放</td>
+<td>时间戳窗口(300s) + Redis SETNX Nonce</td>
+</tr>
+<tr>
+<td>验签安全</td>
+<td>MessageDigest.isEqual 常量时间比较</td>
+</tr>
+<tr>
+<td>密钥管理</td>
+<td>KMS 托管 + 版本化轮换 + 兼容期</td>
+</tr>
+<tr>
+<td>边界</td>
+<td>防重放 ≠ 幂等，两者都要做</td>
+</tr>
+</tbody></table>
+<p>签名机制是开放平台的第一道门禁。把「篡改、伪造、重放、伪装」四个威胁对号入座，这一套设计就能讲得清清楚楚、落地得稳稳当当。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/29/api-signature-anti-replay-hmac-deep-practice/">https://jiweidong.github.io/2026/08/29/api-signature-anti-replay-hmac-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Spring-Boot/">Spring Boot</a><a class="post-meta__tags" href="/tags/%E5%AE%89%E5%85%A8/">安全</a><a class="post-meta__tags" href="/tags/%E6%8E%A5%E5%8F%A3%E8%AE%BE%E8%AE%A1/">接口设计</a><a class="post-meta__tags" href="/tags/%E5%AE%9E%E6%88%98/">实战</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/29/java-pdf-generation-itext-pdfbox-deep-practice/" title="【Java 实战】Java PDF 生成与处理深度实战：iText、PDFBox 与 OpenPDF 对比与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 实战】Java PDF 生成与处理深度实战：iText、PDFBox 与 OpenPDF 对比与最佳实践</div></div><div class="info-2"><div class="info-item-1">【Java 实战】Java PDF 生成与处理深度实战：iText、PDFBox 与 OpenPDF 对比与最佳实践面试官：要做一个电子合同&#x2F;发票&#x2F;报表下载功能，PDF 生成你选哪个库？中文乱码怎么处理？百万级 PDF 怎么扛？PDF 是 Java 后端最常见的「硬需求」之一：合同、发票、对账单、报表导出。但选错库、踩中文乱码、内存 OOM 的坑，几乎每个团队都趟过。这篇从三大主流库的底层架构对比讲起，给出中文处理、模板套打、批量生成的完整方案。 一、三大 PDF 库全景对比1.1 库的定位与血缘   库 开源协议 底层模型 强项 弱项    iText 5&#x2F;7 AGPL（商业需授权） 对象流 + 内容流直接操作 功能最全：表单、数字签名、水印、PDF&#x2F;A、PDF&#x2F;UA 授权费贵；5.x 已 EOL   Apache PDFBox Apache 2.0（宽松） 低层对象模型，贴近 PDF 规范 免费可商用；文本抽取、加密、合并拆分 高级排版弱；中文字体嵌入要手写较多代码   OpenPDF LGPL&#x2F;MPL 脱胎于 iT...</div></div></div></a><a class="pagination-related" href="/2026/08/28/sso-single-sign-on-architecture-deep-dive/" title="【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2/OIDC 的演进"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2/OIDC 的演进</div></div><div class="info-2"><div class="info-item-1">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进面试官：公司有 20 个系统，怎么做到”一次登录，全网通行”？单点登录（Single Sign-On，SSO）是企业级应用绕不开的话题。面试官问这个问题，通常从最简单的场景开始，一路追问到 CAS 票据、OAuth2&#x2F;OIDC、跨域 Cookie 这些细节。本文从为什么要 SSO 讲起，梳理三条技术路线，最后给出生产级方案。 一、为什么需要 SSO：痛点分析没有 SSO 的世界是这样的：员工每天要登录 OA、ERP、GitLab、Jira、监控平台……每个系统一套账号密码，记不住、不安全、体验差。管理员的噩梦则是：离职员工的账号要在 20 个系统里逐个禁用。 SSO 的核心价值：  一次认证，多处访问：在认证中心登录一次，所有接入系统免登录。 集中账号管理：账号生命周期（入职&#x2F;离职&#x2F;改密）只在一处维护。 统一安全策略：密码策略、二次认证（MFA）、风控集中在认证中心。  架构上引入一个认证中心（Auth Center &#x...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/29/spring-data-elasticsearch-deep-practice/" title="【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合面试官：项目里 ES 检索是怎么落地的？说说 Spring Data Elasticsearch 的 Repository 查询原理，以及 N+1、深度分页、高亮这些坑你怎么处理的？很多同学 ES 会用 Kibana 的 DevTools 写 DSL，但一上 Spring Boot 就露怯：Repository 怎么定义、@Query 怎么写、高亮怎么配、聚合怎么拿结果、和 MySQL 双写怎么保证一致。这篇从架构定位 → Repository 原理 → 高阶查询 → 生产实践完整走一遍。 一、Spring Data Elasticsearch 的架构定位1.1 它在全家桶里的位置12345Spring Boot  └── spring-boot-starter-data-elasticsearch        ├── ElasticsearchClient（官方 Java Client，走 HTTP/JSON）        ├── Elas...</div></div></div></a><a class="pagination-related" href="/2026/08/27/spring-boot-jasypt-config-encryption-deep-dive/" title="【Spring Boot 实战】Jasypt 配置加密深度实战：配置文件敏感信息加密从入门到原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-27</div><div class="info-item-2">【Spring Boot 实战】Jasypt 配置加密深度实战：配置文件敏感信息加密从入门到原理</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Jasypt 配置加密深度实战：配置文件敏感信息加密从入门到原理面试官：你们的数据库密码是明文写在配置文件里的吗？很多团队把 spring.datasource.password=123456 直接明文放在 application.yml 里，还提交到了 Git 仓库——这是生产环境最典型的安全隐患之一。任何一个能读到代码仓库的人，都拿到了你所有环境的数据库口令。 今天的主题就是解决这个问题：用 Jasypt（Java Simplified Encryption）对 Spring Boot 配置中的敏感信息进行加密。从引入依赖、加解密命令、配置方式，一路挖到它的底层原理和源码实现。 一、Jasypt 是什么Jasypt 是一个 Java 加密库，提供简单易用的 API 进行对称&#x2F;非对称加密。它和 Spring Boot 集成后，可以在配置加载阶段自动解密 ENC(...) 包裹的密文： 12345spring:  datasource:    username: root    # ENC() 包裹的即为密文，应用启动时自动解密    p...</div></div></div></a><a class="pagination-related" href="/2026/07/19/spring-boot-ssl-https-practice/" title="【运维实战】Spring Boot 生产级 HTTPS&#x2F;SSL 配置全指南：证书管理与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-19</div><div class="info-item-2">【运维实战】Spring Boot 生产级 HTTPS&#x2F;SSL 配置全指南：证书管理与最佳实践</div></div><div class="info-2"><div class="info-item-1">【运维实战】Spring Boot 生产级 HTTPS&#x2F;SSL 配置全指南：证书管理与最佳实践一、为什么要给 Spring Boot 配置 HTTPS？在当今的 Web 生态中，HTTPS 已经不再是”可选项”，而是”必选项”：  安全性：防止中间人攻击（MITM），确保数据传输加密 浏览器强制：Chrome 将 HTTP 标记为”不安全” 合规要求：等保 2.0、PCI-DSS、GDPR 均要求传输加密 接口要求：微信小程序、苹果 App Transport Security 均要求 HTTPS SEO 加分：Google 将 HTTPS 作为搜索排名因素  Spring Boot 内嵌了 Tomcat、Jetty 或 Undertow 容器，配置 HTTPS 完全可以在应用层完成，不需要额外的反向代理（当然，生产环境通常配合 Nginx 做 SSL 终结）。 二、SSL&#x2F;TLS 基础概念速览2.1 核心术语   术语 含义    SSL&#x2F;TLS 传输层安全协议，SSL 是前身（已弃用），TLS 是标准   X.509 证书 数字证书的标准格式，包...</div></div></div></a><a class="pagination-related" href="/2026/08/28/captcha-anti-brute-force-practice/" title="【Spring Boot 实战】验证码与接口防刷深度实战：图形验证码、短信验证码与 Redis 频控"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-28</div><div class="info-item-2">【Spring Boot 实战】验证码与接口防刷深度实战：图形验证码、短信验证码与 Redis 频控</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】验证码与接口防刷深度实战：图形验证码、短信验证码与 Redis 频控面试官：登录接口被脚本刷爆了怎么办？验证码和接口防刷是每个后端都要面对的基础安全课题。短信轰炸、撞库、薅羊毛、爬虫——攻击者永远比产品经理勤快。本文用 Spring Boot 3 + Redis 从零搭建一套图形验证码 + 短信验证码 + 频控体系，全部可落地的代码。 一、验证码的分类与选型   类型 原理 安全性 用户体验 成本    图形验证码 扭曲字符图片 低（OCR 可破） 差 极低   算术&#x2F;点选 简单交互 中 中 低   滑块验证 行为轨迹分析 较高 好 依赖第三方   短信验证码 手机号 + 一次性码 高（需防轰炸） 中 每条几分钱   行为验证（无感） 鼠标轨迹+环境指纹 高 最好 第三方   核心认知：验证码不是用来”完全挡住机器人”的，而是提高攻击成本。成本低于收益时，攻击者就转移目标了。所以线上通常组合使用：图形验证码挡第一层，短信验证码做高价值操作，频控兜底。 二、图形验证码：从生成到校验用开源的 EasyCaptcha（或 Hutool 的 ca...</div></div></div></a><a class="pagination-related" href="/2026/08/17/java-template-engine-comparison-deep-dive/" title="【Java实战】Java 模板引擎深度对比：Freemarker vs Thymeleaf vs Velocity 原理与选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-17</div><div class="info-item-2">【Java实战】Java 模板引擎深度对比：Freemarker vs Thymeleaf vs Velocity 原理与选型</div></div><div class="info-2"><div class="info-item-1">【Java实战】Java 模板引擎深度对比：Freemarker vs Thymeleaf vs Velocity 原理与选型一、为什么还要聊模板引擎？很多同学觉得”前后端分离时代，模板引擎已经过时了”。但实际上，模板引擎在以下场景依然大量存在：  服务端渲染页面（SSR）：CMS 系统、后台管理、电商详情页首屏 代码生成器：MyBatis-Plus Generator、自定义代码生成工具都靠模板引擎 邮件&#x2F;短信通知：订单通知、验证码邮件，模板化内容渲染 静态站点生成：文档站、配置生成  面试中”模板引擎的原理是什么””Thymeleaf 和 Freemarker 怎么选”也是常考题。这篇文章把三大主流模板引擎的原理、语法、性能一次性讲透。 二、三大引擎的前世今生   引擎 诞生 特点 现状    Velocity 2001 古老、简单、性能好 2010 年后停止活跃，已边缘化   Freemarker 2000 通用型，独立于 Web，性能强 活跃维护，后端渲染首选   Thymeleaf 2011 天然 HTML 友好，支持原型即页面 Spring Boot 官方推...</div></div></div></a><a class="pagination-related" href="/2026/08/11/spring-boot-auto-configuration-deep-dive/" title="【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-11</div><div class="info-item-2">【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter面试官：Spring Boot 为什么”开箱即用”？说说自动装配的原理这是 Spring Boot 面试中出场率最高的题目，没有之一。很多人能背出 @SpringBootApplication 由三个注解组成，但被追问到「AutoConfiguration.imports 文件是什么时候被加载的」「@ConditionalOnMissingBean 的判定时机」时就卡壳了。 本文从源码层面把自动装配这条链路完整走一遍，并手把手写一个自定义 Starter，彻底根治这个面试死角。   一、自动装配的入口：@SpringBootApplication123456789101112@Target(ElementType.TYPE)@Retention(RetentionPolicy.RUNTIME)@Documented@Inherited@SpringBootConfiguration   // 本质是 @Configuration@EnableAutoCo...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">537</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">682</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Spring-Boot-%E5%AE%9E%E6%88%98%E3%80%91%E6%8E%A5%E5%8F%A3%E5%AE%89%E5%85%A8%E7%AD%BE%E5%90%8D%E4%B8%8E%E9%98%B2%E9%87%8D%E6%94%BE%E6%94%BB%E5%87%BB%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9AHMAC%E3%80%81%E6%97%B6%E9%97%B4%E6%88%B3%E4%B8%8E-Nonce-%E6%9C%BA%E5%88%B6"><span class="toc-number">1.</span> <span class="toc-text">【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E5%BC%80%E6%94%BE%E5%B9%B3%E5%8F%B0%E7%BB%99%E7%AC%AC%E4%B8%89%E6%96%B9%E6%8F%90%E4%BE%9B-API%EF%BC%8C%E6%80%8E%E4%B9%88%E4%BF%9D%E8%AF%81%E8%AF%B7%E6%B1%82%E6%98%AF%E5%90%88%E6%B3%95%E7%9A%84%E3%80%81%E6%B2%A1%E8%A2%AB%E7%AF%A1%E6%94%B9%E7%9A%84%E3%80%81%E4%B8%8D%E6%98%AF%E9%87%8D%E6%94%BE%E7%9A%84%EF%BC%9F%E8%AE%B2%E8%AE%B2%E7%AD%BE%E5%90%8D%E6%9C%BA%E5%88%B6%E7%9A%84%E8%AE%BE%E8%AE%A1%E3%80%82"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：开放平台给第三方提供 API，怎么保证请求是合法的、没被篡改的、不是重放的？讲讲签名机制的设计。</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E7%AD%BE%E5%90%8D%E6%9C%BA%E5%88%B6%E5%88%B0%E5%BA%95%E5%9C%A8%E9%98%B2%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、签名机制到底在防什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%AD%BE%E5%90%8D%E7%AE%97%E6%B3%95%E9%80%89%E5%9E%8B%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E6%98%AF-HMAC"><span class="toc-number">1.3.</span> <span class="toc-text">二、签名算法选型：为什么是 HMAC</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%B8%B8%E8%A7%81%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 常见方案对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-HMAC-SHA256-%E7%9A%84%E5%8E%9F%E7%90%86"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 HMAC-SHA256 的原理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E9%98%B2%E9%87%8D%E6%94%BE%EF%BC%9A%E6%97%B6%E9%97%B4%E6%88%B3-Nonce-%E5%8F%8C%E4%BF%9D%E9%99%A9"><span class="toc-number">1.4.</span> <span class="toc-text">三、防重放：时间戳 + Nonce 双保险</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%8D%95%E7%8B%AC%E7%9A%84%E6%97%B6%E9%97%B4%E6%88%B3%E4%B8%8D%E5%A4%9F"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 为什么单独的时间戳不够</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-Nonce-%E4%B8%80%E6%AC%A1%E6%80%A7%E9%9A%8F%E6%9C%BA%E6%95%B0"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 Nonce 一次性随机数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%AE%8C%E6%95%B4%E7%AD%BE%E5%90%8D%E5%A4%B4%E8%AE%BE%E8%AE%A1%EF%BC%88%E5%BC%80%E6%94%BE%E5%B9%B3%E5%8F%B0%E9%80%9A%E7%94%A8%E8%A7%84%E8%8C%83%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 完整签名头设计（开放平台通用规范）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%BE%85%E7%AD%BE%E5%90%8D%E4%B8%B2%E7%9A%84%E6%9E%84%E9%80%A0%E8%A7%84%E8%8C%83%EF%BC%88%E6%9C%80%E5%AE%B9%E6%98%93%E8%B8%A9%E5%9D%91%EF%BC%89"><span class="toc-number">1.5.</span> <span class="toc-text">四、待签名串的构造规范（最容易踩坑）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E8%A7%84%E8%8C%83%E5%85%AC%E5%BC%8F"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 规范公式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%AE%A2%E6%88%B7%E7%AB%AF%E7%AD%BE%E5%90%8D%E7%A4%BA%E4%BE%8B%EF%BC%88Java%EF%BC%89"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 客户端签名示例（Java）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%9C%8D%E5%8A%A1%E7%AB%AF%E6%8B%A6%E6%88%AA%E5%99%A8%E8%90%BD%E5%9C%B0%EF%BC%88Spring-Boot%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、服务端拦截器落地（Spring Boot）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E8%87%AA%E5%AE%9A%E4%B9%89%E6%B3%A8%E8%A7%A3-HandlerInterceptor"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 自定义注解 + HandlerInterceptor</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E6%B3%A8%E5%86%8C%E6%8B%A6%E6%88%AA%E5%99%A8"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 注册拦截器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%BB%9F%E4%B8%80%E5%BC%82%E5%B8%B8%E4%B8%8E%E8%BF%94%E5%9B%9E"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 统一异常与返回</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E8%BF%9B%E9%98%B6%E4%B8%8E%E5%AE%9E%E6%88%98%E7%BB%8F%E9%AA%8C"><span class="toc-number">1.7.</span> <span class="toc-text">六、进阶与实战经验</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 密钥管理</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%A4%A7%E6%96%87%E4%BB%B6%E4%B8%8A%E4%BC%A0%E6%80%8E%E4%B9%88%E5%8A%9E"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 大文件上传怎么办</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%9B%9E%E8%B0%83%E6%8E%A5%E5%8F%A3%E7%9A%84%E7%AD%BE%E5%90%8D%EF%BC%88%E6%9C%8D%E5%8A%A1%E7%AB%AF-%E2%86%92-%E6%9C%8D%E5%8A%A1%E7%AB%AF%EF%BC%89"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 回调接口的签名（服务端 → 服务端）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E6%80%A7%E8%83%BD%E4%B8%8E%E5%AE%89%E5%85%A8%E5%B9%B3%E8%A1%A1"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 性能与安全平衡</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E9%80%9F%E7%AD%94"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问速答</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/29/api-signature-anti-replay-hmac-deep-practice/" title="【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制">【Spring Boot 实战】接口安全签名与防重放攻击深度实战：HMAC、时间戳与 Nonce 机制</a><time datetime="2026-08-29T00:00:00.000Z" title="发表于 2026-08-29 08:00:00">2026-08-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/29/java-pdf-generation-itext-pdfbox-deep-practice/" title="【Java 实战】Java PDF 生成与处理深度实战：iText、PDFBox 与 OpenPDF 对比与最佳实践">【Java 实战】Java PDF 生成与处理深度实战：iText、PDFBox 与 OpenPDF 对比与最佳实践</a><time datetime="2026-08-29T00:00:00.000Z" title="发表于 2026-08-29 08:00:00">2026-08-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/29/mysql-fulltext-index-ngram-deep-dive/" title="【MySQL 索引】MySQL 全文索引深度解析：FULLTEXT、ngram 分词与中文检索实战">【MySQL 索引】MySQL 全文索引深度解析：FULLTEXT、ngram 分词与中文检索实战</a><time datetime="2026-08-29T00:00:00.000Z" title="发表于 2026-08-29 08:00:00">2026-08-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/29/sensitive-word-filter-dfa-ac-automaton-deep-dive/" title="【Java 实战】敏感词过滤深度实战：DFA 状态机与 AC 自动机原理与实现">【Java 实战】敏感词过滤深度实战：DFA 状态机与 AC 自动机原理与实现</a><time datetime="2026-08-29T00:00:00.000Z" title="发表于 2026-08-29 08:00:00">2026-08-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/29/spring-data-elasticsearch-deep-practice/" title="【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合">【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合</a><time datetime="2026-08-29T00:00:00.000Z" title="发表于 2026-08-29 08:00:00">2026-08-29</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
