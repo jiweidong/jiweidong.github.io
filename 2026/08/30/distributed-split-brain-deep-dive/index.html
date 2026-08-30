@@ -1,0 +1,377 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制面试官：什么是脑裂？为什么分布式系统里最怕脑裂？脑裂（Split Brain） 是指一个集群因为网络分区（Network Partition），被切成了两个或多个「互相联系不上、但各自存活」的小团体，每个小团体都认为自己是集群的唯一">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/30/distributed-split-brain-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制面试官：什么是脑裂？为什么分布式系统里最怕脑裂？脑裂（Split Brain） 是指一个集群因为网络分区（Network Partition），被切成了两个或多个「互相联系不上、但各自存活」的小团体，每个小团体都认为自己是集群的唯一">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-30T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-30T00:13:56.667Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="ZooKeeper">
+<meta property="article:tag" content="分布式">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="高可用">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制",
+  "url": "https://jiweidong.github.io/2026/08/30/distributed-split-brain-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-30T00:00:00.000Z",
+  "dateModified": "2026-08-30T00:13:56.667Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/30/distributed-split-brain-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">542</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">690</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-30T00:00:00.000Z" title="发表于 2026-08-30 08:00:00">2026-08-30</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-30T00:13:56.667Z" title="更新于 2026-08-30 08:13:56">2026-08-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%88%86%E5%B8%83%E5%BC%8F/">分布式</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【分布式系统】脑裂（Split-Brain）问题深度解析：ZooKeeper、Redis-Sentinel、Elasticsearch-与-MySQL-主从的防脑裂机制"><a href="#【分布式系统】脑裂（Split-Brain）问题深度解析：ZooKeeper、Redis-Sentinel、Elasticsearch-与-MySQL-主从的防脑裂机制" class="headerlink" title="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制"></a>【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</h1><h2 id="面试官：什么是脑裂？为什么分布式系统里最怕脑裂？"><a href="#面试官：什么是脑裂？为什么分布式系统里最怕脑裂？" class="headerlink" title="面试官：什么是脑裂？为什么分布式系统里最怕脑裂？"></a>面试官：什么是脑裂？为什么分布式系统里最怕脑裂？</h2><p><strong>脑裂（Split Brain）</strong> 是指一个集群因为网络分区（Network Partition），被切成了两个或多个「互相联系不上、但各自存活」的小团体，每个小团体都认为自己是集群的唯一主人，各自继续对外提供服务、各自做出决策。</p>
+<blockquote>
+<p>用大白话说：一个大脑裂成了两个，两个「大脑」都觉得自己才是本体，于是开始各写各的账。</p>
+</blockquote>
+<p>脑裂的可怕之处不在于「集群分开了」，而在于<strong>分开之后双方都在写数据</strong>，等网络恢复、双方重新合并时，数据已经互相矛盾，无法无损合并。</p>
+<h3 id="脑裂的两个经典危害场景"><a href="#脑裂的两个经典危害场景" class="headerlink" title="脑裂的两个经典危害场景"></a>脑裂的两个经典危害场景</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>危害</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>数据库主主</td>
+<td>两个主库都接受写入，各自生成不同的 binlog，恢复后数据冲突，主键&#x2F;唯一键直接爆掉</td>
+</tr>
+<tr>
+<td>分布式锁</td>
+<td>两个节点都认为自己持有锁，同时进入临界区，秒杀超卖、重复扣款随之而来</td>
+</tr>
+<tr>
+<td>配置中心</td>
+<td>两个「主」各自修改配置，客户端读到互相矛盾的结果</td>
+</tr>
+<tr>
+<td>选主系统</td>
+<td>出现两个 Leader，日志复制与提交序号错乱，数据一致性被彻底破坏</td>
+</tr>
+</tbody></table>
+<p><strong>面试追问：网络分区为什么一定会发生？</strong></p>
+<p>因为分布式系统部署在不可靠的网络上：交换机故障、机架断电、光纤被挖断、GC 长暂停导致心跳超时……这些都会让节点之间的心跳长时间收不到。<strong>注意：心跳超时 ≠ 对方宕机</strong>，这可能只是网络问题，对方活得好好的——这正是脑裂的温床。</p>
+<h2 id="一、解决脑裂的通用思路：多数派（Quorum）与法定人数"><a href="#一、解决脑裂的通用思路：多数派（Quorum）与法定人数" class="headerlink" title="一、解决脑裂的通用思路：多数派（Quorum）与法定人数"></a>一、解决脑裂的通用思路：多数派（Quorum）与法定人数</h2><p>所有防脑裂方案的底层，几乎都离不开<strong>多数派原则（Majority&#x2F;Quorum）</strong>：</p>
+<blockquote>
+<p>一个决策要被采纳，必须获得<strong>超过半数</strong>节点的同意（N&#x2F;2 + 1）。</p>
+</blockquote>
+<p>为什么「超过半数」能防脑裂？因为网络分区最多只能把集群切成<strong>两个</strong>互不相通的团体（更极端的切法更不可能出现两个以上的多数派）。两个团体中，<strong>最多只有一个</strong>能凑齐超过半数的节点。凑不齐多数派的那一方，就无权选主、无权提交数据——它只能「降级为从」或者「拒绝服务」。</p>
+<p>这就是 CAP 理论里 CP 系统的核心动作：<strong>用可用性换一致性</strong>——小团体宁可不可用，也不能脑裂。</p>
+<h2 id="二、ZooKeeper：Quorum-ZAB-协议"><a href="#二、ZooKeeper：Quorum-ZAB-协议" class="headerlink" title="二、ZooKeeper：Quorum + ZAB 协议"></a>二、ZooKeeper：Quorum + ZAB 协议</h2><h3 id="2-1-半数机制"><a href="#2-1-半数机制" class="headerlink" title="2.1 半数机制"></a>2.1 半数机制</h3><p>ZooKeeper 集群由奇数个节点组成（3、5、7……），写请求要提交，必须经过 <strong>Leader 提出提案 → 超过半数 Follower 返回 ACK → Leader 提交</strong> 的过程（ZAB 协议的原子广播阶段）。</p>
+<p>网络分区发生时：</p>
+<ul>
+<li>假设 5 节点 ZK，分成 3+2 两个区。</li>
+<li>3 个节点的区能凑齐多数派（3 &gt; 2.5），可以正常选出 Leader 并对外服务。</li>
+<li>2 个节点的区凑不齐多数派，<strong>无法选举 Leader</strong>，对外表现为「连接被拒绝」或「只读」——它不会自己选一个 Leader 出来跟对面对着干。</li>
+</ul>
+<h3 id="2-2-新-Leader-的-epoch-机制"><a href="#2-2-新-Leader-的-epoch-机制" class="headerlink" title="2.2 新 Leader 的 epoch 机制"></a>2.2 新 Leader 的 epoch 机制</h3><p>ZK 用 <strong>epoch（任期&#x2F;纪元）</strong> 防止旧 Leader 复活后搞乱：</p>
+<ul>
+<li>每个 Leader 都有一个递增的 epoch 编号。</li>
+<li>分区恢复后，旧 Leader 如果还想提交提案，必须带上自己的 epoch；Follower 发现 epoch 小于当前 Leader 的 epoch，直接拒绝。</li>
+<li>旧 Leader 在丢掉了 Leader 身份后，<strong>即使网络恢复，也会主动降级为 Follower</strong>。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 伪代码：ZAB 提案提交的多数派判定</span></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">ZabProposal</span> &#123;</span><br><span class="line">    <span class="type">long</span> epoch;      <span class="comment">// 当前 Leader 任期</span></span><br><span class="line">    <span class="type">long</span> zxid;       <span class="comment">// 全局递增事务 ID，高 32 位是 epoch，低 32 位是序号</span></span><br><span class="line">    <span class="type">byte</span>[] data;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="type">boolean</span> <span class="title function_">canCommit</span><span class="params">(Proposal p, Set&lt;Node&gt; acks)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> acks.size() &gt; clusterSize / <span class="number">2</span>;   <span class="comment">// 多数派才允许提交</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>面试追问：ZK 节点数为什么必须是奇数？</strong></p>
+<ul>
+<li>防脑裂需要多数派，N 和 N+1（偶数）的多数派阈值可能相同：3 节点容错 1 台，4 节点同样只能容错 1 台（需要 3 票，3&#x2F;4 &gt; 2&#x2F;4）。</li>
+<li>4 节点分区成 2+2 时，<strong>两边都凑不齐 3 票，集群整体不可用</strong>——比 3 节点分区成 1+2（2 个节点的小团体还能服务）更差。</li>
+<li>所以偶数节点只增加成本，不增加可用性，奇数才是性价比最优。</li>
+</ul>
+<h2 id="三、Redis-Sentinel：quorum-majority"><a href="#三、Redis-Sentinel：quorum-majority" class="headerlink" title="三、Redis Sentinel：quorum + majority"></a>三、Redis Sentinel：quorum + majority</h2><h3 id="3-1-主观下线与客观下线"><a href="#3-1-主观下线与客观下线" class="headerlink" title="3.1 主观下线与客观下线"></a>3.1 主观下线与客观下线</h3><p>Sentinel 集群（通常 3 个 Sentinel）对 Redis 主节点做健康检查：</p>
+<ul>
+<li><strong>主观下线（sdown）</strong>：单个 Sentinel 在 <code>down-after-milliseconds</code> 内没收到主节点的有效回复，它自己认为主节点挂了。</li>
+<li><strong>客观下线（odown）</strong>：主观下线后，Sentinel 向其他 Sentinel 发起 <code>is-master-down-by-addr</code> 投票，<strong>收到 quorum 个（可配置，通常也是多数派）确认</strong>后，才判定客观下线，进入故障转移。</li>
+</ul>
+<p>关键设计：<strong>单台 Sentinel 说了不算，必须凑齐 quorum</strong>——就是为了防止「这台 Sentinel 恰好网络抖动」造成的误判误切换。</p>
+<h3 id="3-2-故障转移的-majority-选举"><a href="#3-2-故障转移的-majority-选举" class="headerlink" title="3.2 故障转移的 majority 选举"></a>3.2 故障转移的 majority 选举</h3><p>确定客观下线后，Sentinel 们要<strong>选出一个 Leader Sentinel</strong> 来执行故障转移（把某个从节点提升为新主）。这个选举同样需要<strong>超过半数 Sentinel 投票</strong>。</p>
+<p>网络分区时：3 个 Sentinel 分成 2+1，只有 2 个节点的区能选出 Leader Sentinel 并完成切换；1 个节点的区无法完成任何转移操作，老老实实等网络恢复。</p>
+<h3 id="3-3-Sentinel-的配置纪元"><a href="#3-3-Sentinel-的配置纪元" class="headerlink" title="3.3 Sentinel 的配置纪元"></a>3.3 Sentinel 的配置纪元</h3><p>Redis Sentinel 用 <code>config-epoch</code>（配置纪元）标记每次故障转移的版本：</p>
+<ul>
+<li>新主产生时，配置纪元 +1，并通过 <code>SENTINEL</code> 消息在 Sentinel 间传播。</li>
+<li>旧纪元的信息不会被采纳——<strong>配置纪元数字大的，永远覆盖数字小的</strong>，从机制上杜绝「两个主」同时存在并被双方 Sentinel 各自承认。</li>
+</ul>
+<p><strong>注意</strong>：Sentinel 模式严格说不是强一致方案，极端情况下（例如 <code>min-replicas-to-write 0</code> + 分区+异步复制）仍可能丢数据或短暂双主。生产建议：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"># redis.conf 关键防护参数</span><br><span class="line">min-replicas-to-write 1      # 主库至少要有 1 个从库 ACK 才接受写入</span><br><span class="line">min-replicas-max-lag 10      # 从库延迟超过 10 秒视为失联</span><br></pre></td></tr></table></figure>
+
+<p>这两行的作用：主库与从库失联（网络分区）后，主库会<strong>拒绝写入</strong>——宁可牺牲可用性，也不让分出去的小团体独自写数据，从源头掐灭脑裂。</p>
+<h2 id="四、Elasticsearch：discovery-minimum-master-nodes"><a href="#四、Elasticsearch：discovery-minimum-master-nodes" class="headerlink" title="四、Elasticsearch：discovery + minimum_master_nodes"></a>四、Elasticsearch：discovery + minimum_master_nodes</h2><h3 id="4-1-选主条件"><a href="#4-1-选主条件" class="headerlink" title="4.1 选主条件"></a>4.1 选主条件</h3><p>ES 集群选主需要满足：</p>
+<ul>
+<li>候选节点 <code>discovery.seed_hosts</code> 能互相发现；</li>
+<li>得票数达到 <strong><code>discovery.zen.minimum_master_nodes</code></strong>（ES 7 之后配置名改为 <code>cluster.initial_master_nodes</code> + <code>discovery.zen.minimum_master_nodes</code>，8.x 使用内置协调）。</li>
+</ul>
+<p>ES 官方推荐：<code>minimum_master_nodes = (master-eligible 节点数 / 2) + 1</code>。</p>
+<h3 id="4-2-脑裂的经典成因"><a href="#4-2-脑裂的经典成因" class="headerlink" title="4.2 脑裂的经典成因"></a>4.2 脑裂的经典成因</h3><p>历史上 ES 脑裂最常见的原因就是 <strong><code>minimum_master_nodes</code> 配成 1 或者没配</strong>：</p>
+<ul>
+<li>3 个 master-eligible 节点分区成 2+1，如果 minimum&#x3D;1，<strong>两边各能选出自己的 master</strong>，两个 master 同时接受写请求、各自维护集群状态，恢复后状态冲突。</li>
+<li>正确配置 minimum&#x3D;2：2 个节点的区能选主，1 个节点的区选不出来，只能报 <code>master_not_discovered_exception</code>。</li>
+</ul>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># elasticsearch.yml</span></span><br><span class="line"><span class="attr">discovery.zen.minimum_master_nodes:</span> <span class="number">2</span>   <span class="comment"># 3 个 master-eligible 节点时的推荐值</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>ES 7.x&#x2F;8.x 的更新</strong>：新版本引入集群引导（bootstrap）与投票配置（voting configuration），把「固定 minimum_master_nodes」演进为<strong>动态投票配置</strong>——集群自动维护一个「有资格投票的节点集合」，选主只需该集合的多数派。这解决了节点增减时静态配置来不及调整的问题，但<strong>多数派防脑裂的思想完全没变</strong>。</p>
+<h2 id="五、MySQL-主从：半同步复制-MHA-MGR-的防脑裂设计"><a href="#五、MySQL-主从：半同步复制-MHA-MGR-的防脑裂设计" class="headerlink" title="五、MySQL 主从：半同步复制 + MHA&#x2F;MGR 的防脑裂设计"></a>五、MySQL 主从：半同步复制 + MHA&#x2F;MGR 的防脑裂设计</h2><h3 id="5-1-主主复制是脑裂重灾区"><a href="#5-1-主主复制是脑裂重灾区" class="headerlink" title="5.1 主主复制是脑裂重灾区"></a>5.1 主主复制是脑裂重灾区</h3><p>MySQL 双主（互为主从）架构在两边都开启写入时，一旦分区：</p>
+<ul>
+<li>两边各自生成 binlog，同一行数据被两边各改一次；</li>
+<li><code>auto_increment</code> 冲突、唯一键冲突、数据行互相覆盖；</li>
+<li>网络恢复后，复制链路互相应用对方的 binlog，直接报错或产生脏数据。</li>
+</ul>
+<p><strong>经典教训</strong>：双主架构必须「一主一写」或者「双主只允许单边写」，否则就是埋雷。</p>
+<h3 id="5-2-半同步复制（Semisync）"><a href="#5-2-半同步复制（Semisync）" class="headerlink" title="5.2 半同步复制（Semisync）"></a>5.2 半同步复制（Semisync）</h3><p>异步复制下，主库提交事务不等待从库 ACK，分区时从库落后数据直接丢。<strong>半同步复制</strong>要求：</p>
+<ul>
+<li>主库提交事务时，至少等待 <strong>1 个从库</strong>（可配置 <code>rpl_semi_sync_master_wait_for_slave_count</code>）收到 binlog 并 ACK；</li>
+<li>ACK 超时（<code>rpl_semi_sync_master_timeout</code>）后降级为异步，并记录告警。</li>
+</ul>
+<p>配合 <code>min-replicas-to-write</code> 的思想，可以做到「从库失联 → 主库拒绝写」，保证任何时刻数据只存在于一个可写节点侧。</p>
+<h3 id="5-3-MHA-MGR-高可用方案"><a href="#5-3-MHA-MGR-高可用方案" class="headerlink" title="5.3 MHA &#x2F; MGR &#x2F; 高可用方案"></a>5.3 MHA &#x2F; MGR &#x2F; 高可用方案</h3><ul>
+<li><strong>MHA</strong>：主库宕机后由 Manager 选出数据最完整的新主，但 MHA 本身<strong>不防脑裂</strong>，需要依赖 SSH 互连 + 外部仲裁（如 ZK）来保证只有一个 Manager 执行切换。</li>
+<li><strong>MGR（MySQL Group Replication）</strong>：基于 Paxos 的组复制，写入必须经<strong>组内多数派</strong>同意，天然防脑裂——分区后少数派节点直接拒绝写入，多数派继续服务。</li>
+<li><strong>Orchestrator &#x2F; VIP 方案</strong>：靠仲裁节点（比如 3 台仲裁机）决定谁持有 VIP，仲裁同样要多数派。</li>
+</ul>
+<h2 id="六、业务层防脑裂：分布式锁的终极防护"><a href="#六、业务层防脑裂：分布式锁的终极防护" class="headerlink" title="六、业务层防脑裂：分布式锁的终极防护"></a>六、业务层防脑裂：分布式锁的终极防护</h2><p>就算中间件层面都防住了，业务代码里用分布式锁时也逃不开脑裂：</p>
+<h3 id="6-1-Redis-分布式锁的脑裂问题（Redlock-的争议）"><a href="#6-1-Redis-分布式锁的脑裂问题（Redlock-的争议）" class="headerlink" title="6.1 Redis 分布式锁的脑裂问题（Redlock 的争议）"></a>6.1 Redis 分布式锁的脑裂问题（Redlock 的争议）</h3><p>经典场景：A 拿到 Redis 锁，GC 停顿 10 秒，锁过期了；B 拿到锁开始干活；A 恢复后以为锁还是自己的，两个线程同时进临界区——<strong>这就是广义的「应用层脑裂」</strong>。</p>
+<p>防护手段：</p>
+<ol>
+<li><strong>锁续期（看门狗）</strong>：Redisson 的 <code>watchdog</code> 默认 30 秒续期，防止业务没干完锁先过期；</li>
+<li><strong>加锁时写入唯一标识（UUID&#x2F;线程ID）</strong>，释放时用 Lua 脚本比对后删除，防止误删别人的锁；</li>
+<li><strong>Fencing Token（ fencing token）</strong>：每次加锁拿到一个单调递增的 token，写数据时带上 token，服务端校验 token 是否最新——这是 Martin Kleppmann 提出的对抗「锁过期」的正解，比单纯续期更硬核。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Redisson 看门狗自动续期示例</span></span><br><span class="line"><span class="type">RLock</span> <span class="variable">lock</span> <span class="operator">=</span> redissonClient.getLock(<span class="string">&quot;order:&quot;</span> + orderId);</span><br><span class="line">lock.lock();   <span class="comment">// 默认 leaseTime=-1 时启动 watchdog，每 1/3 leaseTime 续期一次</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    <span class="comment">// 业务逻辑</span></span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    lock.unlock();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-ZooKeeper-锁为什么不怕脑裂"><a href="#6-2-ZooKeeper-锁为什么不怕脑裂" class="headerlink" title="6.2 ZooKeeper 锁为什么不怕脑裂"></a>6.2 ZooKeeper 锁为什么不怕脑裂</h3><p>ZK 锁基于临时顺序节点 + Watch：</p>
+<ul>
+<li>客户端持有锁 &#x3D; 持有一个<strong>临时节点</strong>，会话断开节点自动消失，锁自动释放，不会出现「持有者失联但锁还在」；</li>
+<li>所有竞争者按序号排队，<strong>锁的判定依赖 ZK 集群的多数派共识</strong>，ZK 自己防住了脑裂，业务锁自然安全。</li>
+</ul>
+<p>代价是性能不如 Redis，所以业界常见组合：<strong>并发高、容忍短暂不一致用 Redis 锁；强一致、绝不能双写用 ZK&#x2F;etcd 锁</strong>。</p>
+<h2 id="七、面试高频追问汇总"><a href="#七、面试高频追问汇总" class="headerlink" title="七、面试高频追问汇总"></a>七、面试高频追问汇总</h2><p><strong>Q1：为什么网络分区无法避免？</strong><br>A：硬件故障、链路抖动、GC 长暂停、虚拟机迁移都会造成节点间短暂失联，分布式系统必须把「分区」当作常态来设计（P 是 CAP 里唯一不可选的）。</p>
+<p><strong>Q2：多数派为什么能防脑裂？</strong><br>A：任意网络分区最多把集群分成两个不相通的团体，两个团体不可能同时凑齐超过半数节点，因此最多只有一个团体能完成「选主&#x2F;提交」，另一个只能降级等待。</p>
+<p><strong>Q3：3 节点和 4 节点，容错能力一样吗？</strong><br>A：一样，都是最多容忍 1 台故障；但 4 节点在 2+2 分区时整体不可用，3 节点在 1+2 分区时还能服务，所以奇数节点性价比更高。</p>
+<p><strong>Q4：脑裂恢复后数据怎么办？</strong><br>A：分情况。强一致系统（ZK&#x2F;MGR）靠 epoch&#x2F;zxid 和多数派丢弃少数派数据，直接恢复；弱一致系统（Redis 异步复制）要人工比对、补数据甚至回滚；所以生产上要尽量让「少数派不写数据」。</p>
+<p><strong>Q5：业务上怎么低成本防脑裂？</strong><br>A：写前自检（连不上对端就拒绝写）、锁带唯一标识 + 续期 + fencing token、数据库层加版本号乐观锁兜底、监控脑裂指标（主备心跳、双主告警）。</p>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><table>
+<thead>
+<tr>
+<th>系统</th>
+<th>防脑裂核心机制</th>
+<th>少数派的表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ZooKeeper</td>
+<td>Quorum 选主 + ZAB epoch&#x2F;zxid</td>
+<td>无法选主，拒绝服务</td>
+</tr>
+<tr>
+<td>Redis Sentinel</td>
+<td>sdown→odown 双重确认 + majority 选主 + config-epoch</td>
+<td>无法切换，等待恢复</td>
+</tr>
+<tr>
+<td>Elasticsearch</td>
+<td>minimum_master_nodes &#x2F; 动态投票配置</td>
+<td>报 master_not_discovered</td>
+</tr>
+<tr>
+<td>MySQL MGR</td>
+<td>Paxos 组内多数派提交</td>
+<td>拒绝写入</td>
+</tr>
+<tr>
+<td>业务分布式锁</td>
+<td>续期 + 唯一标识 + fencing token</td>
+<td>锁自动释放&#x2F;续期失败</td>
+</tr>
+</tbody></table>
+<p><strong>一句话总结</strong>：脑裂的本质是「网络分区下多个团体各自为政」，而所有成熟方案的核心都是<strong>多数派仲裁</strong>——让少数派学会「闭嘴」，宁可不可用，不可不一致。面试时把这条主线讲清楚，再展开各中间件的具体实现，就能拿捏住这道题。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/30/distributed-split-brain-deep-dive/">https://jiweidong.github.io/2026/08/30/distributed-split-brain-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%8F%AF%E7%94%A8/">高可用</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F/">分布式</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/ZooKeeper/">ZooKeeper</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/08/30/distributed-clock-logical-vector-clock-deep-dive/" title="【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟</div></div><div class="info-2"><div class="info-item-1">【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟面试官：两个服务器上的「8 点整」是同一个时刻吗？分布式系统里怎么给事件排序？这个问题是分布式系统面试里最容易被问懵的基础题。很多人第一反应是「同步一下时间不就行了」，但 NTP 同步有毫秒级误差，而时间戳误差在分布式系统里会导致订单乱序、缓存错乱、分布式锁误判。这一篇把物理时钟、逻辑时钟（Lamport）、向量时钟讲透，并给出 Java 实践与面试标准答案。 一、先看问题：为什么「墙上的钟」靠不住1.1 物理时钟的误差来源每台机器的本地时钟基于晶振（石英晶体振荡器）计数，而晶振频率受温度、电压、老化影响，会漂移：  普通服务器时钟漂移约 10~200 ppm（百万分之一），一天可能差 1~20 秒； 云主机更夸张，虚拟化层的时间补偿偶尔会让时钟往前跳或往后跳； 手动改时间、时区配置错误，直接造成分钟级错乱。  1.2 时间戳错误的真实事故   事故场景 后果    两台机器各自生成订单号（含时间戳） 后发的订单号比先发的小，主键&#x2F;排序全乱   缓存过期时间用本地时间 两台机器对同一 key...</div></div></div></a><a class="pagination-related" href="/2026/08/29/spring-data-elasticsearch-deep-practice/" title="【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Data Elasticsearch 深度实战：从 Repository 到高亮搜索与聚合面试官：项目里 ES 检索是怎么落地的？说说 Spring Data Elasticsearch 的 Repository 查询原理，以及 N+1、深度分页、高亮这些坑你怎么处理的？很多同学 ES 会用 Kibana 的 DevTools 写 DSL，但一上 Spring Boot 就露怯：Repository 怎么定义、@Query 怎么写、高亮怎么配、聚合怎么拿结果、和 MySQL 双写怎么保证一致。这篇从架构定位 → Repository 原理 → 高阶查询 → 生产实践完整走一遍。 一、Spring Data Elasticsearch 的架构定位1.1 它在全家桶里的位置12345Spring Boot  └── spring-boot-starter-data-elasticsearch        ├── ElasticsearchClient（官方 Java Client，走 HTTP/JSON）        ├── Elas...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/20/redis-7-new-features-guide/" title="Redis 7新特性深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Redis 7新特性深度解析</div></div><div class="info-2"><div class="info-item-1">Redis 7新特性深度解析Redis 7.0于2023年4月正式发布，是Redis历史上变化最大的版本之一。本文将从功能增强、性能优化、新数据结构、ACL改进、集群管理等多个维度深入解读Redis 7的重大变化，并附带生产级迁移和实践建议。 一、Redis 7核心特性总览   特性 Redis 6.2 Redis 7.0 变化    Redis Functions 不支持 原生支持 🆕 新功能   ACL v2 基础ACL 细粒度命令权限 ⬆️ 增强   多AOF文件 不支持 多文件+独立增量 🆕   SHUTDOWN改进 简单关闭 持久化策略控制 ⬆️   发布订阅增强 基础Pub&#x2F;Sub Sharded Pub&#x2F;Sub 🆕   内存效率 基础 更小的key元数据(8-&gt;4字节) ⬆️   复制改进 增加repl-diskless-sync 无盘复制默认启用 ⬆️   集群改进 基础 更好的failover和路由 ⬆️   Redis Stack 单独下载 合并到官方发布 🆕   RESP3协议 部分支持 全面支持 ⬆️   二、Redis ...</div></div></div></a><a class="pagination-related" href="/2026/06/23/api-idempotent-design-guide/" title="接口幂等性设计方案全面对比：Token、去重表、状态机与分布式锁"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-23</div><div class="info-item-2">接口幂等性设计方案全面对比：Token、去重表、状态机与分布式锁</div></div><div class="info-2"><div class="info-item-1">接口幂等性设计方案全面对比：Token、去重表、状态机与分布式锁面试官：支付系统怎么防止重复扣款？幂等性（Idempotence）—— 这是面试高频题，也是生产系统最容易踩坑的地方。 一、什么是幂等？幂等：同一个接口调用多次和调用一次产生的业务效果相同。 12345678// 非幂等UPDATE account SET balance = balance - 100 WHERE id = 1;// 执行一次 → 余额少100// 执行两次 → 余额少200 ❌// 幂等UPDATE account SET balance = 100 WHERE id = 1;// 无论执行多少次 → 余额都是100 ✅  二、哪些场景需要幂等？   场景 风险    支付扣款 用户多点了一次”确认支付”   下单接口 前端超时重试导致重复提交   MQ 消费 消费端宕机重启后重复消费   RPC 重试 服务超时导致客户端重试   定时任务 调度器重复触发   三、七种幂等方案详解方案一：唯一约束（数据库防重）利用数据库的唯一索引或联合唯一索引来防重。 1234567891011-- 支付流水表C...</div></div></div></a><a class="pagination-related" href="/2026/08/21/load-balancing-algorithms-deep-dive/" title="【系统设计】负载均衡算法深度解析：轮询、加权、最少连接与一致性哈希全对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-21</div><div class="info-item-2">【系统设计】负载均衡算法深度解析：轮询、加权、最少连接与一致性哈希全对比</div></div><div class="info-2"><div class="info-item-1">【系统设计】负载均衡算法深度解析：轮询、加权、最少连接与一致性哈希全对比面试官：Nginx 的 upstream 里有十几种负载均衡算法，你怎么选？负载均衡是分布式系统的地基：把请求分散到多台服务器，解决单点瓶颈。但”分散”的策略千差万别——是平均分配，还是按机器性能分配？是按连接数动态调整，还是保证同一用户永远打到同一台机器？这就是负载均衡算法的学问。 先给一张全景图，把主流算法按”是否感知服务器实时状态”分成两类：    分类 算法 是否感知后端负载 典型场景    静态算法 轮询（Round Robin） 否 后端性能均匀   静态算法 加权轮询（WRR） 否 后端性能不均   静态算法 IP Hash &#x2F; 一致性哈希 否 会话保持、缓存路由   动态算法 最少连接（Least Connections） 是（连接数） 长连接、耗时波动大   动态算法 加权最少连接 是 性能 + 负载双重考虑   动态算法 最快响应（EWMA） 是（响应时间） 延迟敏感服务   一、轮询（Round Robin）：最简单，也最”理想化”轮流把请求分给每台服务器：1→2→3→1→2→...</div></div></div></a><a class="pagination-related" href="/2026/06/13/redis-core/" title="Redis 核心技术与实战（面试跳槽篇）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">Redis 核心技术与实战（面试跳槽篇）</div></div><div class="info-2"><div class="info-item-1">Redis 核心技术与实战（面试跳槽篇） Redis 是后端面试的”必考点”，本文从底层原理到生产实战，全面覆盖 Redis 核心知识点。  一、Redis 基础1.1 为什么这么快Redis 单机 QPS 可达 10 万+，主要归功于以下几点： 纯内存操作：数据全在内存中，读写速度远快于磁盘 IO。内存寻址是纳秒级，而磁盘寻址是毫秒级，差了三个数量级。 单线程模型：Redis 6.0 之前，核心命令执行是单线程的。单线程避免了线程切换和锁竞争的开销。值得注意的是，”单线程”指的是网络 IO 和命令执行在同一个线程中串行处理，但持久化、异步删除等操作由后台线程完成。 IO 多路复用（epoll）：Redis 使用基于 epoll 的 IO 多路复用技术，单线程可以监听多个套接字。当有事件就绪时，才会处理该事件，避免了阻塞等待。epoll 相比 select&#x2F;poll 的优势在于：没有最大连接数限制，使用红黑树管理 fd，通过事件回调避免轮询。 高效的数据结构：Redis 为每种数据类型设计了高效的底层编码，如压缩列表、跳表等。 1.2 五大核心数据结构   结构 底层编...</div></div></div></a><a class="pagination-related" href="/2026/08/22/feed-stream-system-design/" title="【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流</div></div><div class="info-2"><div class="info-item-1">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流面试官：微博的首页信息流是怎么做的？如果让你设计一个 Feed 流系统，你会怎么设计？Feed 流（信息流）是互联网最核心的业务形态之一：微博、朋友圈、抖音、小红书，全是 Feed 流。它和普通 CRUD 最大的区别在于——每个用户看到的首页内容都不一样，是”千人千面”的个性化时间线。设计 Feed 流，本质是解决三个问题：内容怎么分发、时间线怎么生成、读多写多怎么扛。 一、需求与指标先定义清楚规模，才有设计依据：  日活用户 1 亿，月活 3 亿； 平均每个用户关注 200 个账号； 每秒新增内容（发帖）1 万条，峰值 5 万条； 每秒读取时间线（刷首页）10 万次，峰值 50 万次； 要求：读延迟 &lt; 200ms，写后延迟 &lt; 1s 内可见。  读是写的 10 倍以上——这是所有 Feed 流设计的出发点：读多写少，必须为读优化。 二、三种核心模型：推、拉、推拉结合2.1 拉模式（Pull &#x2F; 读扩散）用户刷首页时，实时去拉取他关注的所有人的最新内容，再合并排序。 1用户刷首页 → 查关注列表...</div></div></div></a><a class="pagination-related" href="/2026/08/17/payment-system-architecture-design/" title="【系统设计】支付系统架构设计：对账、幂等、资金安全与高可用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-17</div><div class="info-item-2">【系统设计】支付系统架构设计：对账、幂等、资金安全与高可用</div></div><div class="info-2"><div class="info-item-1">【系统设计】支付系统架构设计：对账、幂等、资金安全与高可用一、支付系统为什么难做？支付系统是**”钱”的系统**，对一致性、安全性、可追溯性的要求远超普通业务系统。面试中”设计一个支付系统”是系统设计类的压轴题，考察点集中在：  资金安全：不能多扣、不能少扣、不能重复扣 一致性：支付状态、订单状态、账务记录三方必须最终一致 对账能力：和微信&#x2F;支付宝&#x2F;银行的对账单能对上 高可用：支付挂 1 分钟，业务可能损失惨重  本文从架构分层讲到核心链路，把支付系统的设计要点一次讲清。 二、整体架构分层1234567891011┌─────────────────────────────────────────────┐│              接入层（网关/风控/限流）          │├─────────────────────────────────────────────┤│              交易核心（收单/下单/支付确认）      │├─────────────────────────────────────────────┤│        ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">542</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">690</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F%E3%80%91%E8%84%91%E8%A3%82%EF%BC%88Split-Brain%EF%BC%89%E9%97%AE%E9%A2%98%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AZooKeeper%E3%80%81Redis-Sentinel%E3%80%81Elasticsearch-%E4%B8%8E-MySQL-%E4%B8%BB%E4%BB%8E%E7%9A%84%E9%98%B2%E8%84%91%E8%A3%82%E6%9C%BA%E5%88%B6"><span class="toc-number">1.</span> <span class="toc-text">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E4%BB%80%E4%B9%88%E6%98%AF%E8%84%91%E8%A3%82%EF%BC%9F%E4%B8%BA%E4%BB%80%E4%B9%88%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F%E9%87%8C%E6%9C%80%E6%80%95%E8%84%91%E8%A3%82%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：什么是脑裂？为什么分布式系统里最怕脑裂？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%84%91%E8%A3%82%E7%9A%84%E4%B8%A4%E4%B8%AA%E7%BB%8F%E5%85%B8%E5%8D%B1%E5%AE%B3%E5%9C%BA%E6%99%AF"><span class="toc-number">1.1.1.</span> <span class="toc-text">脑裂的两个经典危害场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E8%A7%A3%E5%86%B3%E8%84%91%E8%A3%82%E7%9A%84%E9%80%9A%E7%94%A8%E6%80%9D%E8%B7%AF%EF%BC%9A%E5%A4%9A%E6%95%B0%E6%B4%BE%EF%BC%88Quorum%EF%BC%89%E4%B8%8E%E6%B3%95%E5%AE%9A%E4%BA%BA%E6%95%B0"><span class="toc-number">1.2.</span> <span class="toc-text">一、解决脑裂的通用思路：多数派（Quorum）与法定人数</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81ZooKeeper%EF%BC%9AQuorum-ZAB-%E5%8D%8F%E8%AE%AE"><span class="toc-number">1.3.</span> <span class="toc-text">二、ZooKeeper：Quorum + ZAB 协议</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%8D%8A%E6%95%B0%E6%9C%BA%E5%88%B6"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 半数机制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E6%96%B0-Leader-%E7%9A%84-epoch-%E6%9C%BA%E5%88%B6"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 新 Leader 的 epoch 机制</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Redis-Sentinel%EF%BC%9Aquorum-majority"><span class="toc-number">1.4.</span> <span class="toc-text">三、Redis Sentinel：quorum + majority</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%BB%E8%A7%82%E4%B8%8B%E7%BA%BF%E4%B8%8E%E5%AE%A2%E8%A7%82%E4%B8%8B%E7%BA%BF"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 主观下线与客观下线</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E6%95%85%E9%9A%9C%E8%BD%AC%E7%A7%BB%E7%9A%84-majority-%E9%80%89%E4%B8%BE"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 故障转移的 majority 选举</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-Sentinel-%E7%9A%84%E9%85%8D%E7%BD%AE%E7%BA%AA%E5%85%83"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 Sentinel 的配置纪元</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Elasticsearch%EF%BC%9Adiscovery-minimum-master-nodes"><span class="toc-number">1.5.</span> <span class="toc-text">四、Elasticsearch：discovery + minimum_master_nodes</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E9%80%89%E4%B8%BB%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 选主条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%84%91%E8%A3%82%E7%9A%84%E7%BB%8F%E5%85%B8%E6%88%90%E5%9B%A0"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 脑裂的经典成因</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81MySQL-%E4%B8%BB%E4%BB%8E%EF%BC%9A%E5%8D%8A%E5%90%8C%E6%AD%A5%E5%A4%8D%E5%88%B6-MHA-MGR-%E7%9A%84%E9%98%B2%E8%84%91%E8%A3%82%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.6.</span> <span class="toc-text">五、MySQL 主从：半同步复制 + MHA&#x2F;MGR 的防脑裂设计</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%B8%BB%E4%B8%BB%E5%A4%8D%E5%88%B6%E6%98%AF%E8%84%91%E8%A3%82%E9%87%8D%E7%81%BE%E5%8C%BA"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 主主复制是脑裂重灾区</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%8D%8A%E5%90%8C%E6%AD%A5%E5%A4%8D%E5%88%B6%EF%BC%88Semisync%EF%BC%89"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 半同步复制（Semisync）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-MHA-MGR-%E9%AB%98%E5%8F%AF%E7%94%A8%E6%96%B9%E6%A1%88"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 MHA &#x2F; MGR &#x2F; 高可用方案</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%9A%E5%8A%A1%E5%B1%82%E9%98%B2%E8%84%91%E8%A3%82%EF%BC%9A%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81%E7%9A%84%E7%BB%88%E6%9E%81%E9%98%B2%E6%8A%A4"><span class="toc-number">1.7.</span> <span class="toc-text">六、业务层防脑裂：分布式锁的终极防护</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-Redis-%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81%E7%9A%84%E8%84%91%E8%A3%82%E9%97%AE%E9%A2%98%EF%BC%88Redlock-%E7%9A%84%E4%BA%89%E8%AE%AE%EF%BC%89"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 Redis 分布式锁的脑裂问题（Redlock 的争议）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-ZooKeeper-%E9%94%81%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E6%80%95%E8%84%91%E8%A3%82"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 ZooKeeper 锁为什么不怕脑裂</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE%E6%B1%87%E6%80%BB"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试高频追问汇总</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/cas-aba-problem-deep-dive/" title="【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制">【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制</a><time datetime="2026-08-30T02:00:00.000Z" title="发表于 2026-08-30 10:00:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/database-smooth-migration-dual-write-deep-practice/" title="【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案">【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案</a><time datetime="2026-08-30T01:30:00.000Z" title="发表于 2026-08-30 09:30:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/gossip-protocol-deep-dive/" title="【分布式系统】Gossip 协议深度解析：从 Redis Cluster 节点通信到 Cassandra 故障检测与去中心化">【分布式系统】Gossip 协议深度解析：从 Redis Cluster 节点通信到 Cassandra 故障检测与去中心化</a><time datetime="2026-08-30T01:00:00.000Z" title="发表于 2026-08-30 09:00:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/distributed-clock-logical-vector-clock-deep-dive/" title="【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟">【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟</a><time datetime="2026-08-30T00:30:00.000Z" title="发表于 2026-08-30 08:30:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/distributed-split-brain-deep-dive/" title="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</a><time datetime="2026-08-30T00:00:00.000Z" title="发表于 2026-08-30 08:00:00">2026-08-30</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

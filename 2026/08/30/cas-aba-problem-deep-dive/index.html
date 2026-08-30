@@ -1,0 +1,367 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制面试官：CAS 有个著名的 ABA 问题，你讲讲它是什么？怎么解决？CAS（Compare And Swap，比较并交换）是无锁编程的基石，但它有一个经典陷阱：ABA 问题。很多人在面试时能背出「ABA 就是 A 变成 B 又变回 A」，但被追问「为什么这会有问题？">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制">
+<meta property="og:url" content="https://jiweidong.github.io/2026/08/30/cas-aba-problem-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制面试官：CAS 有个著名的 ABA 问题，你讲讲它是什么？怎么解决？CAS（Compare And Swap，比较并交换）是无锁编程的基石，但它有一个经典陷阱：ABA 问题。很多人在面试时能背出「ABA 就是 A 变成 B 又变回 A」，但被追问「为什么这会有问题？">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-08-30T02:00:00.000Z">
+<meta property="article:modified_time" content="2026-08-30T00:16:08.013Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="CAS">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制",
+  "url": "https://jiweidong.github.io/2026/08/30/cas-aba-problem-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-08-30T02:00:00.000Z",
+  "dateModified": "2026-08-30T00:16:08.013Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/08/30/cas-aba-problem-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">542</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">690</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-08-30T02:00:00.000Z" title="发表于 2026-08-30 10:00:00">2026-08-30</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-08-30T00:16:08.013Z" title="更新于 2026-08-30 08:16:08">2026-08-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/">并发编程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【面试必备】CAS-的-ABA-问题深度解析：从-ABA-复现到-AtomicStampedReference-与数据库版本号防重机制"><a href="#【面试必备】CAS-的-ABA-问题深度解析：从-ABA-复现到-AtomicStampedReference-与数据库版本号防重机制" class="headerlink" title="【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制"></a>【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制</h1><h2 id="面试官：CAS-有个著名的-ABA-问题，你讲讲它是什么？怎么解决？"><a href="#面试官：CAS-有个著名的-ABA-问题，你讲讲它是什么？怎么解决？" class="headerlink" title="面试官：CAS 有个著名的 ABA 问题，你讲讲它是什么？怎么解决？"></a>面试官：CAS 有个著名的 ABA 问题，你讲讲它是什么？怎么解决？</h2><p>CAS（Compare And Swap，比较并交换）是无锁编程的基石，但它有一个经典陷阱：<strong>ABA 问题</strong>。很多人在面试时能背出「ABA 就是 A 变成 B 又变回 A」，但被追问「为什么这会有问题？AtomicStampedReference 是怎么解决的？数据库里有没有 ABA？」就卡壳了。这一篇从复现到源码，把 ABA 彻底讲透。</p>
+<h2 id="一、先复习：CAS-是什么"><a href="#一、先复习：CAS-是什么" class="headerlink" title="一、先复习：CAS 是什么"></a>一、先复习：CAS 是什么</h2><p>CAS 是一条 CPU 原子指令（<code>cmpxchg</code>），语义是：</p>
+<blockquote>
+<p>如果内存当前值等于期望值 <code>expect</code>，就把它更新为 <code>update</code>，否则什么都不做；无论是否成功都返回当前值。</p>
+</blockquote>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Java 中 CAS 的经典用法：AtomicInteger</span></span><br><span class="line"><span class="type">AtomicInteger</span> <span class="variable">count</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">AtomicInteger</span>(<span class="number">0</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 期望值是 0 时才更新为 1</span></span><br><span class="line">count.compareAndSet(<span class="number">0</span>, <span class="number">1</span>);   <span class="comment">// 返回 true</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 期望值是 0 时更新失败（当前已是 1）</span></span><br><span class="line">count.compareAndSet(<span class="number">0</span>, <span class="number">2</span>);   <span class="comment">// 返回 false</span></span><br></pre></td></tr></table></figure>
+
+<p>CAS 的三大优点：无锁、无阻塞、无上下文切换开销。它的问题也很著名：<strong>只能保证「值没变」，不能保证「值没被改过」</strong>——这就是 ABA 的根源。</p>
+<h2 id="二、ABA-问题到底是什么"><a href="#二、ABA-问题到底是什么" class="headerlink" title="二、ABA 问题到底是什么"></a>二、ABA 问题到底是什么</h2><h3 id="2-1-问题定义"><a href="#2-1-问题定义" class="headerlink" title="2.1 问题定义"></a>2.1 问题定义</h3><p>线程 1 读取共享变量，值为 <strong>A</strong>；随后线程 2 把它改成 <strong>B</strong>，又改回 <strong>A</strong>；线程 1 执行 CAS 时发现「当前值还是 A」，于是 CAS 成功——<strong>但期间变量已经被改过两次了</strong>。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">时间线：</span><br><span class="line">T1 读取 → A</span><br><span class="line">T2 修改 → A → B</span><br><span class="line">T2 再改 → B → A</span><br><span class="line">T1 CAS(A, C) → 成功！但中间的 B 去哪了？</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-2-为什么「改过又改回来」会有问题"><a href="#2-2-为什么「改过又改回来」会有问题" class="headerlink" title="2.2 为什么「改过又改回来」会有问题"></a>2.2 为什么「改过又改回来」会有问题</h3><p>表面看「值没变，CAS 成功没毛病」，但问题在于：<strong>值相同 ≠ 状态没变</strong>。在很多场景里，变量的值只是「状态」的投影，两次 A 之间可能发生了<strong>对程序有影响的变化</strong>。</p>
+<h2 id="三、经典复现场景：无锁栈"><a href="#三、经典复现场景：无锁栈" class="headerlink" title="三、经典复现场景：无锁栈"></a>三、经典复现场景：无锁栈</h2><p>无锁栈（Treiber Stack）是 ABA 问题的教科书案例。栈顶操作 <code>pop</code> 时：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 无锁栈的 pop 操作</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">LockFreeStack</span>&lt;T&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> AtomicReference&lt;Node&lt;T&gt;&gt; top = <span class="keyword">new</span> <span class="title class_">AtomicReference</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">Node</span>&lt;T&gt; &#123;</span><br><span class="line">        <span class="keyword">final</span> T value;</span><br><span class="line">        <span class="keyword">volatile</span> Node&lt;T&gt; next;</span><br><span class="line">        Node(T value) &#123; <span class="built_in">this</span>.value = value; &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> T <span class="title function_">pop</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">            Node&lt;T&gt; oldTop = top.get();</span><br><span class="line">            <span class="keyword">if</span> (oldTop == <span class="literal">null</span>) <span class="keyword">return</span> <span class="literal">null</span>;</span><br><span class="line">            Node&lt;T&gt; newTop = oldTop.next;</span><br><span class="line">            <span class="keyword">if</span> (top.compareAndSet(oldTop, newTop)) &#123;</span><br><span class="line">                <span class="keyword">return</span> oldTop.value;</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="comment">// 失败则自旋重试</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-1-线程交错复现-ABA"><a href="#3-1-线程交错复现-ABA" class="headerlink" title="3.1 线程交错复现 ABA"></a>3.1 线程交错复现 ABA</h3><p>假设栈初始为 <code>A → B</code>（栈顶是 A，A 的 next 是 B）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">线程 1：oldTop = A, newTop = B    ← 准备把栈顶从 A 换成 B</span><br><span class="line">        然后线程 1 被挂起（时间片耗尽）</span><br><span class="line"></span><br><span class="line">线程 2：pop() 得到 A</span><br><span class="line">线程 2：pop() 得到 B（此时栈空了）</span><br><span class="line">线程 2：push(A)  —— A 被复用！此时 A.next 已经被改成 null（或指向别处）</span><br><span class="line">         栈变成 A → null</span><br><span class="line"></span><br><span class="line">线程 1 恢复：CAS(top, A, B) —— 当前 top 还是 A！CAS 成功！</span><br><span class="line">         但此时 B 早就被弹出去了，A.next 是 null</span><br><span class="line">         栈变成了 B → ??? ，B 被重复返回，链表结构被破坏！</span><br></pre></td></tr></table></figure>
+
+<p><strong>核心问题</strong>：线程 1 看到的「栈顶还是 A」是假象——这个 A 已经不是原来的 A 了（它被弹出过、被复用了）。CAS 用「值相等」骗过了自己。</p>
+<h3 id="3-2-不只是数据结构：ABA-的业务危害"><a href="#3-2-不只是数据结构：ABA-的业务危害" class="headerlink" title="3.2 不只是数据结构：ABA 的业务危害"></a>3.2 不只是数据结构：ABA 的业务危害</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>ABA 的危害</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>无锁栈&#x2F;队列</td>
+<td>链表节点被复用，结构损坏、元素重复返回</td>
+</tr>
+<tr>
+<td>账户余额 CAS</td>
+<td>余额 100 → 扣 100 → 充 100，中间那笔「扣款」的状态丢失</td>
+</tr>
+<tr>
+<td>资源分配</td>
+<td>资源被释放又分配给了别人，旧持有者 CAS 成功导致资源被双重占用</td>
+</tr>
+</tbody></table>
+<h2 id="四、解决方案一：AtomicStampedReference（版本号）"><a href="#四、解决方案一：AtomicStampedReference（版本号）" class="headerlink" title="四、解决方案一：AtomicStampedReference（版本号）"></a>四、解决方案一：AtomicStampedReference（版本号）</h2><h3 id="4-1-原理：值-版本号打包"><a href="#4-1-原理：值-版本号打包" class="headerlink" title="4.1 原理：值 + 版本号打包"></a>4.1 原理：值 + 版本号打包</h3><p><code>AtomicStampedReference</code> 把「引用值」和「整数版本号（stamp）」打包成一个 <code>Pair</code> 对象，CAS 时<strong>值和版本号必须同时匹配</strong>才成功：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">AtomicStampedReference&lt;String&gt; ref = <span class="keyword">new</span> <span class="title class_">AtomicStampedReference</span>&lt;&gt;(<span class="string">&quot;A&quot;</span>, <span class="number">0</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 修改时带上版本号</span></span><br><span class="line">ref.compareAndSet(<span class="string">&quot;A&quot;</span>, <span class="string">&quot;B&quot;</span>, <span class="number">0</span>, <span class="number">1</span>);   <span class="comment">// 期望值 A、期望版本 0 → 成功，版本变为 1</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 线程 1 的场景：</span></span><br><span class="line"><span class="type">int</span>[] stampHolder = <span class="keyword">new</span> <span class="title class_">int</span>[<span class="number">1</span>];</span><br><span class="line"><span class="type">String</span> <span class="variable">current</span> <span class="operator">=</span> ref.get(stampHolder);   <span class="comment">// 读取值和当前版本</span></span><br><span class="line"><span class="type">int</span> <span class="variable">stamp</span> <span class="operator">=</span> stampHolder[<span class="number">0</span>];</span><br><span class="line"><span class="comment">// 即使值还是 A，只要版本号变了，CAS 就会失败</span></span><br><span class="line"><span class="type">boolean</span> <span class="variable">ok</span> <span class="operator">=</span> ref.compareAndSet(current, <span class="string">&quot;C&quot;</span>, stamp, stamp + <span class="number">1</span>);</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-无锁栈的正确写法"><a href="#4-2-无锁栈的正确写法" class="headerlink" title="4.2 无锁栈的正确写法"></a>4.2 无锁栈的正确写法</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">LockFreeStack</span>&lt;T&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> AtomicStampedReference&lt;Node&lt;T&gt;&gt; top = <span class="keyword">new</span> <span class="title class_">AtomicStampedReference</span>&lt;&gt;(<span class="literal">null</span>, <span class="number">0</span>);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> T <span class="title function_">pop</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">int</span>[] stampHolder = <span class="keyword">new</span> <span class="title class_">int</span>[<span class="number">1</span>];</span><br><span class="line">        <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">            Node&lt;T&gt; oldTop = top.get(stampHolder);</span><br><span class="line">            <span class="type">int</span> <span class="variable">stamp</span> <span class="operator">=</span> stampHolder[<span class="number">0</span>];</span><br><span class="line">            <span class="keyword">if</span> (oldTop == <span class="literal">null</span>) <span class="keyword">return</span> <span class="literal">null</span>;</span><br><span class="line">            Node&lt;T&gt; newTop = oldTop.next;</span><br><span class="line">            <span class="keyword">if</span> (top.compareAndSet(oldTop, newTop, stamp, stamp + <span class="number">1</span>)) &#123;</span><br><span class="line">                <span class="keyword">return</span> oldTop.value;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键</strong>：每成功操作一次，版本号 +1。即使值从 A 变 B 又变回 A，版本号也回不去了——ABA 被版本号「盯死」。</p>
+<h3 id="4-3-源码剖析：为什么它能防-ABA"><a href="#4-3-源码剖析：为什么它能防-ABA" class="headerlink" title="4.3 源码剖析：为什么它能防 ABA"></a>4.3 源码剖析：为什么它能防 ABA</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// JDK 源码：AtomicStampedReference 内部结构</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">Pair</span>&lt;T&gt; &#123;</span><br><span class="line">    <span class="keyword">final</span> T reference;   <span class="comment">// 引用值</span></span><br><span class="line">    <span class="keyword">final</span> <span class="type">int</span> stamp;     <span class="comment">// 版本号</span></span><br><span class="line">    <span class="keyword">private</span> <span class="title function_">Pair</span><span class="params">(T reference, <span class="type">int</span> stamp)</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.reference = reference;</span><br><span class="line">        <span class="built_in">this</span>.stamp = stamp;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">static</span> &lt;T&gt; Pair&lt;T&gt; <span class="title function_">of</span><span class="params">(T reference, <span class="type">int</span> stamp)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">Pair</span>&lt;T&gt;(reference, stamp);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">volatile</span> Pair&lt;T&gt; pair;   <span class="comment">// 值 + 版本号原子地绑定在一起</span></span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">compareAndSet</span><span class="params">(T expectedReference, T newReference,</span></span><br><span class="line"><span class="params">                             <span class="type">int</span> expectedStamp, <span class="type">int</span> newStamp)</span> &#123;</span><br><span class="line">    Pair&lt;T&gt; current = pair;</span><br><span class="line">    <span class="keyword">return</span> expectedReference == current.reference &amp;&amp;   <span class="comment">// 引用相等</span></span><br><span class="line">           expectedStamp == current.stamp &amp;&amp;           <span class="comment">// 版本相等（关键！）</span></span><br><span class="line">           ((newReference == current.reference &amp;&amp; newStamp == current.stamp) ||</span><br><span class="line">            casPair(current, Pair.of(newReference, newStamp)));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：stamp 是 <code>int</code>，普通 <code>int</code> 读写本身就是原子的，所以 Pair 里的 reference 和 stamp 不存在「读到一半」的问题；而 pair 是 <code>volatile</code>，保证可见性。整个 CAS 变成「对 Pair 对象的 CAS」——版本号跟着值一起变，ABA 无机可乘。</p>
+<h3 id="4-4-AtomicMarkableReference：只关心「改没改过」"><a href="#4-4-AtomicMarkableReference：只关心「改没改过」" class="headerlink" title="4.4 AtomicMarkableReference：只关心「改没改过」"></a>4.4 AtomicMarkableReference：只关心「改没改过」</h3><p>有些场景我们只关心「这个值是否被动过」，不关心动过几次，这时可以用 <code>AtomicMarkableReference</code>——它只有 boolean 标记位：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">AtomicMarkableReference&lt;String&gt; ref = <span class="keyword">new</span> <span class="title class_">AtomicMarkableReference</span>&lt;&gt;(<span class="string">&quot;A&quot;</span>, <span class="literal">false</span>);</span><br><span class="line">ref.compareAndSet(<span class="string">&quot;A&quot;</span>, <span class="string">&quot;B&quot;</span>, <span class="literal">false</span>, <span class="literal">true</span>);   <span class="comment">// 标记从 false → true</span></span><br></pre></td></tr></table></figure>
+
+<p>典型用途：<strong>标记资源是否已被释放</strong>（如 <code>ReentrantReadWriteLock</code> 内部就用了类似思路处理「写锁是否被持有过」）。区别一句话：</p>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>附带信息</th>
+<th>能检测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>AtomicStampedReference</td>
+<td>int 版本号（可多次递增）</td>
+<td>改动次数&#x2F;版本演进</td>
+</tr>
+<tr>
+<td>AtomicMarkableReference</td>
+<td>boolean 标记</td>
+<td>是否被动过（只关心有无）</td>
+</tr>
+</tbody></table>
+<h2 id="五、解决方案二：数据库里的-ABA（版本号机制）"><a href="#五、解决方案二：数据库里的-ABA（版本号机制）" class="headerlink" title="五、解决方案二：数据库里的 ABA（版本号机制）"></a>五、解决方案二：数据库里的 ABA（版本号机制）</h2><h3 id="5-1-数据库-CAS：UPDATE-…-WHERE-条件"><a href="#5-1-数据库-CAS：UPDATE-…-WHERE-条件" class="headerlink" title="5.1 数据库 CAS：UPDATE … WHERE 条件"></a>5.1 数据库 CAS：UPDATE … WHERE 条件</h3><p>数据库里的 ABA 同样经典。比如「余额扣减」用 CAS 写法：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 线程 1：期望余额 100，扣成 90</span></span><br><span class="line"><span class="keyword">UPDATE</span> account <span class="keyword">SET</span> balance <span class="operator">=</span> <span class="number">90</span> <span class="keyword">WHERE</span> id <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> balance <span class="operator">=</span> <span class="number">100</span>;</span><br><span class="line"><span class="comment">-- 如果中间余额被改成 50 又改回 100，这条 SQL 依然会成功！—— 这就是数据库版 ABA</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-版本号方案（乐观锁）"><a href="#5-2-版本号方案（乐观锁）" class="headerlink" title="5.2 版本号方案（乐观锁）"></a>5.2 版本号方案（乐观锁）</h3><p>解决方式就是<strong>乐观锁版本号</strong>——和 AtomicStampedReference 的思路一模一样：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 1. 查询时带上版本号</span></span><br><span class="line"><span class="keyword">SELECT</span> id, balance, version <span class="keyword">FROM</span> account <span class="keyword">WHERE</span> id <span class="operator">=</span> <span class="number">1</span>;</span><br><span class="line"><span class="comment">-- 结果：balance=100, version=3</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 2. 更新时校验版本号，并让版本号 +1</span></span><br><span class="line"><span class="keyword">UPDATE</span> account</span><br><span class="line"><span class="keyword">SET</span> balance <span class="operator">=</span> <span class="number">90</span>, version <span class="operator">=</span> version <span class="operator">+</span> <span class="number">1</span></span><br><span class="line"><span class="keyword">WHERE</span> id <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> version <span class="operator">=</span> <span class="number">3</span>;</span><br><span class="line"><span class="comment">-- 影响行数 = 1 表示成功；= 0 表示版本已被别人改过，重试</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// MyBatis 乐观锁写法</span></span><br><span class="line"><span class="meta">@Update(&quot;UPDATE account SET balance = #&#123;balance&#125;, version = version + 1 &quot; +</span></span><br><span class="line"><span class="meta">        &quot;WHERE id = #&#123;id&#125; AND version = #&#123;version&#125;&quot;)</span></span><br><span class="line"><span class="type">int</span> <span class="title function_">updateWithVersion</span><span class="params">(Account account)</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 业务代码</span></span><br><span class="line"><span class="type">Account</span> <span class="variable">acc</span> <span class="operator">=</span> accountMapper.selectById(<span class="number">1</span>);</span><br><span class="line">acc.setBalance(acc.getBalance() - <span class="number">10</span>);</span><br><span class="line"><span class="type">int</span> <span class="variable">rows</span> <span class="operator">=</span> accountMapper.updateWithVersion(acc);</span><br><span class="line"><span class="keyword">if</span> (rows == <span class="number">0</span>) &#123;</span><br><span class="line">    <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">OptimisticLockException</span>(<span class="string">&quot;数据已被修改，请刷新重试&quot;</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>对比</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>对比项</th>
+<th>Java CAS + ABA</th>
+<th>数据库 CAS + ABA</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>问题根源</td>
+<td>值相同 ≠ 状态没变</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>解法</td>
+<td>AtomicStampedReference（stamp）</td>
+<td>version 字段（乐观锁）</td>
+</tr>
+<tr>
+<td>本质</td>
+<td>值 + 版本号一起比较</td>
+<td>WHERE 里加 version 条件 + 自增</td>
+</tr>
+<tr>
+<td>失败处理</td>
+<td>自旋重试</td>
+<td>返回影响行数 0，业务层重试&#x2F;报错</td>
+</tr>
+</tbody></table>
+<h3 id="5-3-其他数据库防-ABA-手段"><a href="#5-3-其他数据库防-ABA-手段" class="headerlink" title="5.3 其他数据库防 ABA 手段"></a>5.3 其他数据库防 ABA 手段</h3><ul>
+<li><strong>时间戳字段</strong>：<code>WHERE update_time = 旧值</code>，但时间戳精度不够时可能漏判（秒级时间戳并发下容易撞车）；</li>
+<li><strong>唯一约束&#x2F;唯一键</strong>：用业务唯一键约束直接堵死「重复状态」；</li>
+<li><strong>分布式锁 + 版本号双保险</strong>：分布式锁防并发，版本号防 ABA，两者互补。</li>
+</ul>
+<h2 id="六、面试高频追问汇总"><a href="#六、面试高频追问汇总" class="headerlink" title="六、面试高频追问汇总"></a>六、面试高频追问汇总</h2><p><strong>Q1：ABA 的本质是什么？</strong><br>A：CAS 只校验「当前值 &#x3D;&#x3D; 期望值」，但无法知道值是否「被改过又改回来」。当值只是状态投影时，两次相同的值可能代表完全不同的状态，导致 CAS 误判成功。</p>
+<p><strong>Q2：为什么 AtomicStampedReference 能解决？</strong><br>A：它把值和 int 版本号绑定成一个不可变 Pair，CAS 必须「值相等且版本号相等」才成功；每次修改版本号 +1，版本号单调递增，永远回不到旧值，ABA 的「A→B→A」在版本号维度上不成立。</p>
+<p><strong>Q3：stamp 用 int，会不会溢出？</strong><br>A：理论上会（约 21 亿次修改），但实际场景几乎不可能；如果真有这种极端场景，可以用 LongAdder 思路扩展或换方案。</p>
+<p><strong>Q4：数据库乐观锁和 AtomicStampedReference 是一回事吗？</strong><br>A：思想完全一致——都是「值 + 版本号」双重校验。区别在载体：一个是 Java 内存变量，一个是数据库行；失败处理也不同：Java 自旋重试，数据库靠影响行数判断后由业务层处理。</p>
+<p><strong>Q5：什么场景下 ABA 无伤大雅？</strong><br>A：只关心「最终值」的场景（如计数器累加、无状态标志位），ABA 不影响正确性；只有「中间过程有意义」的场景（链表结构、资源占用、金额流水）才必须防。</p>
+<h2 id="七、总结"><a href="#七、总结" class="headerlink" title="七、总结"></a>七、总结</h2><table>
+<thead>
+<tr>
+<th>层级</th>
+<th>防 ABA 手段</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Java 并发</td>
+<td>AtomicStampedReference（stamp）</td>
+<td>无锁数据结构、引用型共享变量</td>
+</tr>
+<tr>
+<td>Java 并发</td>
+<td>AtomicMarkableReference（mark）</td>
+<td>只关心「是否被动过」</td>
+</tr>
+<tr>
+<td>数据库</td>
+<td>version 乐观锁字段</td>
+<td>行数据更新、金额扣减</td>
+</tr>
+<tr>
+<td>数据库</td>
+<td>唯一约束&#x2F;时间戳</td>
+<td>从数据模型层面杜绝重复状态</td>
+</tr>
+<tr>
+<td>业务层</td>
+<td>分布式锁 + 版本号</td>
+<td>高并发写 + 强一致性要求</td>
+</tr>
+</tbody></table>
+<p><strong>一句话总结</strong>：ABA 问题的本质是「CAS 只认值不认过程」，解法万变不离其宗——<strong>给状态加一个单调递增的版本号，让「变回去」在版本维度上永远不可能</strong>。面试时先讲无锁栈复现（体现你真的懂），再对比 AtomicStampedReference 与数据库乐观锁（体现举一反三），这道题稳拿高分。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/08/30/cas-aba-problem-deep-dive/">https://jiweidong.github.io/2026/08/30/cas-aba-problem-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a><a class="post-meta__tags" href="/tags/CAS/">CAS</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/08/30/database-smooth-migration-dual-write-deep-practice/" title="【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案</div></div><div class="info-2"><div class="info-item-1">【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案面试官：公司要把订单库从 MySQL 5.7 迁到 MySQL 8.0，还要顺便分库分表，线上不能停服，你怎么设计这个迁移方案？数据库迁移是每个后端工程师迟早要面对的高危操作：表结构要改、数据量几个亿、业务不能停、出了问题要能回滚。直接停机迁移（Maintenance Window）在小公司还能接受，大流量业务根本停不起。这一篇讲透业界标准的平滑迁移四阶段方案：存量同步 → 增量同步 → 双写过渡 → 灰度切换，以及每一步的 Java 落地细节与回滚预案。 一、迁移的整体目标与原则1.1 三个核心目标   目标 说明    不停服 迁移全程业务可用，用户无感知   不丢数据 切换瞬间的数据也不能丢（0 丢失是理想，至少做到秒级可控）   可回滚 出问题能在分钟级回到旧库，而不是「回不去了」   1.2 什么时候必须走平滑迁移 数据量大（千万级以上），全量导出导入耗时长； 停机窗口不可用（7×24 业务、跨境电商、金融支付）； 迁移伴随架构变更（分库分表、换引擎、改字段类型）。  二、阶段一：全量同步（存...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/06/scheduledthreadpoolexecutor-deep-dive/" title="【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理</div></div><div class="info-2"><div class="info-item-1">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理面试官：说说 JDK 里的定时任务调度是怎么实现的？一提到定时任务，很多人的第一反应是 Timer 或者 Spring 的 @Scheduled。但面试官真正想听到的，是 ScheduledThreadPoolExecutor（以下简称 STPE）——JDK 定时调度的正统实现。 被追问下去就是灵魂三连：  Timer 有什么缺陷？为什么现在都用 STPE？ scheduleAtFixedRate 和 scheduleWithFixedDelay 到底差在哪？ STPE 底层用什么数据结构存任务？延迟任务是怎么”到点触发”的？ 为什么 STPE 的 execute() 永远只创建一个线程？核心线程数会被”清零”吗？  本文结合 JDK 8 源码，把 STPE 和它的秘密武器 DelayedWorkQueue 彻底拆开。   一、Timer 的四大缺陷（面试必答）   缺陷 说明    单线程串行 一个任务执行时间过长，会阻塞后续所有任务   异常中断 ...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-synchronized-lock-upgrade/" title="面试官：说说 Synchronized 的锁升级过程？"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">面试官：说说 Synchronized 的锁升级过程？</div></div><div class="info-2"><div class="info-item-1">面试官：说说 Synchronized 的锁升级过程？面试官：先说说 Synchronized 的基本用法吧Synchronized 是 Java 最基础的同步机制，从 JDK 1.0 就有了。用法分三种：    用法 锁对象 作用范围    修饰实例方法 当前实例对象 this 整个方法   修饰静态方法 当前 Class 对象 整个方法   同步代码块 指定的任意对象 代码块内   123456789101112131415161718public class SyncDemo &#123;    // 实例方法锁 - 锁的是 this    public synchronized void instanceMethod() &#123;        // ...    &#125;        // 静态方法锁 - 锁的是 Class 对象    public static synchronized void staticMethod() &#123;        // ...    &#125;        // 代码块锁 - 锁的是指定对象    public ...</div></div></div></a><a class="pagination-related" href="/2026/07/05/java-thread-communication-deep-dive/" title="【并发编程】Java 线程通信与协作机制详解：wait&#x2F;notify、Condition、LockSupport 与管程模型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-05</div><div class="info-item-2">【并发编程】Java 线程通信与协作机制详解：wait&#x2F;notify、Condition、LockSupport 与管程模型</div></div><div class="info-2"><div class="info-item-1">【并发编程】Java 线程通信与协作机制详解：wait&#x2F;notify、Condition、LockSupport 与管程模型一、为什么要学线程通信？多线程编程的核心问题有两个：互斥（Mutual Exclusion） 和 协作（Cooperation）。 互斥解决的是”同一时间谁能访问共享资源”——我们用 synchronized 或 Lock 来实现。 协作解决的是”线程之间如何协调执行节奏”——当一个线程需要等待某个条件满足时（如队列空了要等待生产），就需要线程通信机制。 面试官开场即问：”用 wait/notify 实现一个生产者-消费者模式，说说细节。” 二、Java 管程模型（Monitor）要理解线程通信，必须先理解管程（Monitor） 模型。Java 中每个对象都关联一个 Monitor，这是 synchronized 和 wait/notify 的底层基础。 2.1 Mesa 管程模型Java 采用 Mesa 管程模型（区别于 Hansen 管程和 Hoare 管程），核心特征： 1234Monitor（管程）├── 入口等待队列（Entry Set）...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-jmm-volatile-happens-before/" title="【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了</div></div><div class="info-2"><div class="info-item-1">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了面试官：说说什么是 JMM（Java 内存模型）？JMM（Java Memory Model） 是一个抽象的概念，它定义了一套规则和规范，用来屏蔽不同硬件和操作系统的内存访问差异，确保 Java 程序在各种平台上都能达到内存访问的一致性。  JMM 的核心围绕着三个特性展开：原子性（Atomicity）、可见性（Visibility）、有序性（Ordering）。  为什么需要 JMM？现代 CPU 采用多级缓存架构（L1&#x2F;L2&#x2F;L3 Cache）来加速数据访问，但这也带来了缓存一致性问题。每个 CPU 核心有自己私有的缓存，当多个线程在不同核心上运行时，它们看到的共享变量值可能不一致。 1234567891011121314151617┌─────────────────────────────────────────┐│               Java 线程                   ││   ┌──────────┐     ┌──────────┐...</div></div></div></a><a class="pagination-related" href="/2026/08/18/optimistic-pessimistic-lock-deep-dive/" title="【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现</div></div><div class="info-2"><div class="info-item-1">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现面试官：你项目里扣库存，用的乐观锁还是悲观锁？这是并发场景的”必考题”。很多人的答案是背出来的：”悲观锁就是锁住，乐观锁就是 CAS”。但一问到”什么场景选哪个、各自的坑在哪”，就露馅了。 本文把乐观锁和悲观锁从思想、实现、源码到实战场景一次讲透。  一、两种锁的哲学悲观锁（Pessimistic Lock）思想：冲突一定会发生，所以先锁再干。  操作数据前先加锁，其他事务&#x2F;线程必须等待； 数据库层面：SELECT ... FOR UPDATE、SELECT ... LOCK IN SHARE MODE； Java 层面：synchronized、ReentrantLock； 适用：写多读少、冲突概率高的场景。  乐观锁（Optimistic Lock）思想：冲突是少数，所以先干再验，冲突了重试。  不加锁，更新时校验数据是否被改过（版本号&#x2F;时间戳&#x2F;CAS）； 数据库层面：UPDATE ... SET version = version + 1 WHERE version = ?； J...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-synchronized-lock-upgrade-deep-dive/" title="「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析</div></div><div class="info-2"><div class="info-item-1">「面试官：谈谈 synchronized 的锁升级过程？」从偏向锁到重量级锁全解析面试开场面试官：你平时用 synchronized 做同步吗？知道它的锁升级机制吗？ 我：synchronized 在 JDK 6 之后引入了锁升级（锁膨胀）机制，不再是早期的纯重量级锁。锁的状态会从无锁 → 偏向锁 → 轻量级锁 → 重量级锁，且方向不可逆。 这是一道非常经典的并发面试题，几乎涵盖了 JVM、对象头、Mark Word、CAS、操作系统互斥量等多个知识点。今天就彻底把它讲透。  一、锁升级的背景：JDK 6 之前的 synchronized在 JDK 6 之前，synchronized 的实现依赖于操作系统的 Mutex Lock（互斥量），每次加锁&#x2F;解锁都需要从用户态切换到内核态，这个切换成本非常高。因此早期大家都说 synchronized 是”重量级锁”，性能不如 java.util.concurrent 包中的 Lock。 JDK 6 对 synchronized 做了大量优化，引入了一系列的锁优化技术：    优化技术 说明    偏向锁（Biased Lock...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">542</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">690</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E9%9D%A2%E8%AF%95%E5%BF%85%E5%A4%87%E3%80%91CAS-%E7%9A%84-ABA-%E9%97%AE%E9%A2%98%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E-ABA-%E5%A4%8D%E7%8E%B0%E5%88%B0-AtomicStampedReference-%E4%B8%8E%E6%95%B0%E6%8D%AE%E5%BA%93%E7%89%88%E6%9C%AC%E5%8F%B7%E9%98%B2%E9%87%8D%E6%9C%BA%E5%88%B6"><span class="toc-number">1.</span> <span class="toc-text">【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9ACAS-%E6%9C%89%E4%B8%AA%E8%91%97%E5%90%8D%E7%9A%84-ABA-%E9%97%AE%E9%A2%98%EF%BC%8C%E4%BD%A0%E8%AE%B2%E8%AE%B2%E5%AE%83%E6%98%AF%E4%BB%80%E4%B9%88%EF%BC%9F%E6%80%8E%E4%B9%88%E8%A7%A3%E5%86%B3%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：CAS 有个著名的 ABA 问题，你讲讲它是什么？怎么解决？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%A4%8D%E4%B9%A0%EF%BC%9ACAS-%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、先复习：CAS 是什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81ABA-%E9%97%AE%E9%A2%98%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.</span> <span class="toc-text">二、ABA 问题到底是什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E9%97%AE%E9%A2%98%E5%AE%9A%E4%B9%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 问题定义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%BA%E4%BB%80%E4%B9%88%E3%80%8C%E6%94%B9%E8%BF%87%E5%8F%88%E6%94%B9%E5%9B%9E%E6%9D%A5%E3%80%8D%E4%BC%9A%E6%9C%89%E9%97%AE%E9%A2%98"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 为什么「改过又改回来」会有问题</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E7%BB%8F%E5%85%B8%E5%A4%8D%E7%8E%B0%E5%9C%BA%E6%99%AF%EF%BC%9A%E6%97%A0%E9%94%81%E6%A0%88"><span class="toc-number">1.4.</span> <span class="toc-text">三、经典复现场景：无锁栈</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E7%BA%BF%E7%A8%8B%E4%BA%A4%E9%94%99%E5%A4%8D%E7%8E%B0-ABA"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 线程交错复现 ABA</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E4%B8%8D%E5%8F%AA%E6%98%AF%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%EF%BC%9AABA-%E7%9A%84%E4%B8%9A%E5%8A%A1%E5%8D%B1%E5%AE%B3"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 不只是数据结构：ABA 的业务危害</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9AAtomicStampedReference%EF%BC%88%E7%89%88%E6%9C%AC%E5%8F%B7%EF%BC%89"><span class="toc-number">1.5.</span> <span class="toc-text">四、解决方案一：AtomicStampedReference（版本号）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%8E%9F%E7%90%86%EF%BC%9A%E5%80%BC-%E7%89%88%E6%9C%AC%E5%8F%B7%E6%89%93%E5%8C%85"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 原理：值 + 版本号打包</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%97%A0%E9%94%81%E6%A0%88%E7%9A%84%E6%AD%A3%E7%A1%AE%E5%86%99%E6%B3%95"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 无锁栈的正确写法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E5%AE%83%E8%83%BD%E9%98%B2-ABA"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 源码剖析：为什么它能防 ABA</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-AtomicMarkableReference%EF%BC%9A%E5%8F%AA%E5%85%B3%E5%BF%83%E3%80%8C%E6%94%B9%E6%B2%A1%E6%94%B9%E8%BF%87%E3%80%8D"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 AtomicMarkableReference：只关心「改没改过」</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E6%95%B0%E6%8D%AE%E5%BA%93%E9%87%8C%E7%9A%84-ABA%EF%BC%88%E7%89%88%E6%9C%AC%E5%8F%B7%E6%9C%BA%E5%88%B6%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、解决方案二：数据库里的 ABA（版本号机制）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%95%B0%E6%8D%AE%E5%BA%93-CAS%EF%BC%9AUPDATE-%E2%80%A6-WHERE-%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 数据库 CAS：UPDATE … WHERE 条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%89%88%E6%9C%AC%E5%8F%B7%E6%96%B9%E6%A1%88%EF%BC%88%E4%B9%90%E8%A7%82%E9%94%81%EF%BC%89"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 版本号方案（乐观锁）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E5%85%B6%E4%BB%96%E6%95%B0%E6%8D%AE%E5%BA%93%E9%98%B2-ABA-%E6%89%8B%E6%AE%B5"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 其他数据库防 ABA 手段</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE%E6%B1%87%E6%80%BB"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试高频追问汇总</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/cas-aba-problem-deep-dive/" title="【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制">【面试必备】CAS 的 ABA 问题深度解析：从 ABA 复现到 AtomicStampedReference 与数据库版本号防重机制</a><time datetime="2026-08-30T02:00:00.000Z" title="发表于 2026-08-30 10:00:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/database-smooth-migration-dual-write-deep-practice/" title="【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案">【数据库实战】数据库平滑迁移深度实战：全量增量同步、双写过渡与灰度切换回滚方案</a><time datetime="2026-08-30T01:30:00.000Z" title="发表于 2026-08-30 09:30:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/gossip-protocol-deep-dive/" title="【分布式系统】Gossip 协议深度解析：从 Redis Cluster 节点通信到 Cassandra 故障检测与去中心化">【分布式系统】Gossip 协议深度解析：从 Redis Cluster 节点通信到 Cassandra 故障检测与去中心化</a><time datetime="2026-08-30T01:00:00.000Z" title="发表于 2026-08-30 09:00:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/distributed-clock-logical-vector-clock-deep-dive/" title="【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟">【分布式理论】分布式系统时钟深度解析：物理时钟、NTP 同步、逻辑时钟与向量时钟</a><time datetime="2026-08-30T00:30:00.000Z" title="发表于 2026-08-30 08:30:00">2026-08-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/08/30/distributed-split-brain-deep-dive/" title="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</a><time datetime="2026-08-30T00:00:00.000Z" title="发表于 2026-08-30 08:00:00">2026-08-30</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
