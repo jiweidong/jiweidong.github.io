@@ -1,0 +1,313 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战面试官：线上 MySQL 突然主从延迟 10 分钟，你怎么排查？很多人的第一反应是「从库机器不行」或「网络抖动」，但排查到最后，十有八九是主库跑了一个大事务——一次 UPDATE 扫了几百万行，或者一个业务事务里开了事务却迟迟不提交，把锁、undo log、binlog 全拖垮了。 本文把「大事务」和「长">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/01/mysql-long-transaction-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战面试官：线上 MySQL 突然主从延迟 10 分钟，你怎么排查？很多人的第一反应是「从库机器不行」或「网络抖动」，但排查到最后，十有八九是主库跑了一个大事务——一次 UPDATE 扫了几百万行，或者一个业务事务里开了事务却迟迟不提交，把锁、undo log、binlog 全拖垮了。 本文把「大事务」和「长">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-01T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-01T00:19:34.638Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="事务">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战",
+  "url": "https://jiweidong.github.io/2026/09/01/mysql-long-transaction-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-01T00:00:00.000Z",
+  "dateModified": "2026-09-01T00:19:34.638Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/01/mysql-long-transaction-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">552</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">692</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-01T00:00:00.000Z" title="发表于 2026-09-01 08:00:00">2026-09-01</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-01T00:19:34.638Z" title="更新于 2026-09-01 08:19:34">2026-09-01</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-进阶】大事务与长事务深度解析：从锁持有、undo-膨胀到主从延迟的危害与治理实战"><a href="#【MySQL-进阶】大事务与长事务深度解析：从锁持有、undo-膨胀到主从延迟的危害与治理实战" class="headerlink" title="【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战"></a>【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战</h1><h2 id="面试官：线上-MySQL-突然主从延迟-10-分钟，你怎么排查？"><a href="#面试官：线上-MySQL-突然主从延迟-10-分钟，你怎么排查？" class="headerlink" title="面试官：线上 MySQL 突然主从延迟 10 分钟，你怎么排查？"></a>面试官：线上 MySQL 突然主从延迟 10 分钟，你怎么排查？</h2><p>很多人的第一反应是「从库机器不行」或「网络抖动」，但排查到最后，<strong>十有八九是主库跑了一个大事务</strong>——一次 <code>UPDATE</code> 扫了几百万行，或者一个业务事务里开了事务却迟迟不提交，把锁、undo log、binlog 全拖垮了。</p>
+<p>本文把「大事务」和「长事务」这两个高频事故元凶拆开讲透：它们有什么危害、底层原理是什么、怎么发现、怎么治理。</p>
+<h2 id="一、先分清两个概念：大事务-vs-长事务"><a href="#一、先分清两个概念：大事务-vs-长事务" class="headerlink" title="一、先分清两个概念：大事务 vs 长事务"></a>一、先分清两个概念：大事务 vs 长事务</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>大事务（Large Transaction）</th>
+<th>长事务（Long Transaction）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>定义</td>
+<td>单次事务<strong>处理的数据量&#x2F;日志量</strong>巨大</td>
+<td>单次事务<strong>持续时间</strong>很长</td>
+</tr>
+<tr>
+<td>典型表现</td>
+<td>一次 DML 影响百万行、binlog 几十 GB</td>
+<td>事务开启后几小时不提交</td>
+</tr>
+<tr>
+<td>主要危害</td>
+<td>undo 膨胀、主从延迟、锁范围大</td>
+<td>锁长期占用、连接耗尽、死锁概率升高</td>
+</tr>
+<tr>
+<td>常见来源</td>
+<td>批量 UPDATE&#x2F;DELETE 不带条件、批量导入</td>
+<td>应用里事务内做 RPC 调用&#x2F;睡眠&#x2F;循环</td>
+</tr>
+</tbody></table>
+<p>两者经常同时出现：一个长事务往往也是大事务（跑了很久，写了很多行）。但治理思路略有区别。</p>
+<h2 id="二、大事务-长事务的五大危害（原理层面）"><a href="#二、大事务-长事务的五大危害（原理层面）" class="headerlink" title="二、大事务&#x2F;长事务的五大危害（原理层面）"></a>二、大事务&#x2F;长事务的五大危害（原理层面）</h2><h3 id="2-1-危害一：锁持有时间过长，阻塞其他事务"><a href="#2-1-危害一：锁持有时间过长，阻塞其他事务" class="headerlink" title="2.1 危害一：锁持有时间过长，阻塞其他事务"></a>2.1 危害一：锁持有时间过长，阻塞其他事务</h3><p>InnoDB 行锁是<strong>在事务提交&#x2F;回滚时才释放</strong>的（不是语句执行完就释放）。一个事务 <code>UPDATE</code> 了 10 万行且不提交，这 10 万行的排他锁就一直挂着：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 事务 A（不提交）</span></span><br><span class="line"><span class="keyword">BEGIN</span>;</span><br><span class="line"><span class="keyword">UPDATE</span> orders <span class="keyword">SET</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">0</span>;   <span class="comment">-- 扫了 200 万行，锁了 200 万行</span></span><br><span class="line"><span class="comment">-- 一直不 COMMIT，去调了个外部接口</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 事务 B（被阻塞）</span></span><br><span class="line"><span class="keyword">UPDATE</span> orders <span class="keyword">SET</span> status <span class="operator">=</span> <span class="number">2</span> <span class="keyword">WHERE</span> id <span class="operator">=</span> <span class="number">100</span>;     <span class="comment">-- 等锁，直到超时</span></span><br></pre></td></tr></table></figure>
+
+<p>表现：<code>SHOW PROCESSLIST</code> 里大量 <code>Waiting for lock</code>，应用侧报 <code>Lock wait timeout exceeded; try restarting transaction</code>（默认 50 秒超时）。</p>
+<h3 id="2-2-危害二：undo-log-膨胀，引发版本链过长"><a href="#2-2-危害二：undo-log-膨胀，引发版本链过长" class="headerlink" title="2.2 危害二：undo log 膨胀，引发版本链过长"></a>2.2 危害二：undo log 膨胀，引发版本链过长</h3><p>每次 <code>UPDATE</code>&#x2F;<code>DELETE</code> 都会把旧版本写入 undo log。大事务改得越多，undo 越大：</p>
+<ul>
+<li><strong>undo 空间撑爆</strong>：<code>ibdata1</code>（共享表空间）持续膨胀，除非开启了 <code>innodb_undo_tablespaces</code> 独立 undo 表空间且不回收，否则文件只增不减。</li>
+<li><strong>版本链过长 → 查询变慢</strong>：MVCC 的 <code>ReadView</code> 需要沿着 undo 版本链回溯，<strong>长事务存活期间</strong>，所有旧版本都不能被 purge 线程清理。一个跑了几小时的长事务，会让「读已提交&#x2F;可重复读」下的普通查询被迫遍历超长版本链，CPU 飙升。</li>
+<li>这是<strong>长事务最隐蔽的杀伤</strong>：它自己不写数据，却让整个库的查询变慢。</li>
+</ul>
+<h3 id="2-3-危害三：binlog-巨大，主从延迟雪崩"><a href="#2-3-危害三：binlog-巨大，主从延迟雪崩" class="headerlink" title="2.3 危害三：binlog 巨大，主从延迟雪崩"></a>2.3 危害三：binlog 巨大，主从延迟雪崩</h3><p>主从复制是<strong>单线程</strong>应用 binlog（8.0 的并行复制也只能按库&#x2F;按事务组并行）。大事务的 binlog 有几 GB 时：</p>
+<ul>
+<li>主库：一次事务的 binlog 要写盘 + 传从库，期间其他事务的 binlog 排队；</li>
+<li>从库：回放这个几 GB 的事务期间，<strong>从库几乎停摆</strong>，延迟从几秒拉到几十分钟；</li>
+<li>更糟的是<strong>从库延迟又会反过来放大问题</strong>：从库查询读到旧数据、半同步复制卡主库提交……</li>
+</ul>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 排查主从延迟</span></span><br><span class="line"><span class="keyword">SHOW</span> SLAVE STATUS\G</span><br><span class="line"><span class="comment">-- Seconds_Behind_Master: 654   ← 已经 11 分钟了</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="2-4-危害四：死锁概率飙升"><a href="#2-4-危害四：死锁概率飙升" class="headerlink" title="2.4 危害四：死锁概率飙升"></a>2.4 危害四：死锁概率飙升</h3><p>长事务持有大量锁不释放，其他事务排队等锁，一旦形成<strong>循环等待</strong>就死锁：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 事务 A 持锁 row1，等 row2；事务 B 持锁 row2，等 row1 → Deadlock</span></span><br></pre></td></tr></table></figure>
+
+<p>死锁本身 MySQL 会自动回滚一方（<code>Deadlock found when trying to get lock</code>），但被回滚的事务如果是个大事务，回滚也要重放 undo，又是一次性能灾难。</p>
+<h3 id="2-5-危害五：连接池被占满，服务雪崩"><a href="#2-5-危害五：连接池被占满，服务雪崩" class="headerlink" title="2.5 危害五：连接池被占满，服务雪崩"></a>2.5 危害五：连接池被占满，服务雪崩</h3><p>长事务占着连接不释放。连接池默认 20~50 个连接，<strong>20 个长事务就能把连接池打满</strong>，后续所有请求全部 <code>Connection is not available, request timed out</code>，服务直接雪崩。</p>
+<h2 id="三、怎么发现大事务和长事务？"><a href="#三、怎么发现大事务和长事务？" class="headerlink" title="三、怎么发现大事务和长事务？"></a>三、怎么发现大事务和长事务？</h2><h3 id="3-1-用-information-schema-查长事务"><a href="#3-1-用-information-schema-查长事务" class="headerlink" title="3.1 用 information_schema 查长事务"></a>3.1 用 information_schema 查长事务</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 找出所有运行超过 60 秒的事务</span></span><br><span class="line"><span class="keyword">SELECT</span></span><br><span class="line">    trx_id,</span><br><span class="line">    trx_state,</span><br><span class="line">    trx_started,</span><br><span class="line">    TIMESTAMPDIFF(<span class="keyword">SECOND</span>, trx_started, NOW()) <span class="keyword">AS</span> running_seconds,</span><br><span class="line">    trx_rows_locked,          <span class="comment">-- 锁定的行数（大事务信号）</span></span><br><span class="line">    trx_rows_modified,        <span class="comment">-- 修改的行数（大事务信号）</span></span><br><span class="line">    trx_mysql_thread_id</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_trx</span><br><span class="line"><span class="keyword">WHERE</span> TIMESTAMPDIFF(<span class="keyword">SECOND</span>, trx_started, NOW()) <span class="operator">&gt;</span> <span class="number">60</span></span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> running_seconds <span class="keyword">DESC</span>;</span><br></pre></td></tr></table></figure>
+
+<p>再结合 <code>performance_schema</code> 找到具体 SQL：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> performance_schema.events_statements_current</span><br><span class="line"><span class="keyword">WHERE</span> thread_id <span class="operator">=</span> (<span class="keyword">SELECT</span> trx_mysql_thread_id <span class="keyword">FROM</span> information_schema.innodb_trx <span class="keyword">ORDER</span> <span class="keyword">BY</span> trx_started LIMIT <span class="number">1</span>);</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-监控指标：undo-与-binlog-增速"><a href="#3-2-监控指标：undo-与-binlog-增速" class="headerlink" title="3.2 监控指标：undo 与 binlog 增速"></a>3.2 监控指标：undo 与 binlog 增速</h3><ul>
+<li><code>SHOW ENGINE INNODB STATUS\G</code> 看 <code>History list length</code>（history list 越长，说明可清理的旧版本越多，purge 跟不上，背后通常有长事务）。</li>
+<li>监控 <code>SHOW MASTER STATUS</code> 的 binlog 位点增长速度，判断单事务 binlog 大小。</li>
+<li>用 <code>pt-query-digest</code> 分析慢日志，找 <code>Rows_examined</code> 与 <code>Rows_affected</code> 巨大的语句。</li>
+</ul>
+<h3 id="3-3-大事务的典型-SQL-长相"><a href="#3-3-大事务的典型-SQL-长相" class="headerlink" title="3.3 大事务的典型 SQL 长相"></a>3.3 大事务的典型 SQL 长相</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- ① 全表/大范围更新</span></span><br><span class="line"><span class="keyword">UPDATE</span> orders <span class="keyword">SET</span> discount <span class="operator">=</span> <span class="number">0.9</span>;                     <span class="comment">-- 没 where，几百万行</span></span><br><span class="line"><span class="keyword">DELETE</span> <span class="keyword">FROM</span> logs <span class="keyword">WHERE</span> create_time <span class="operator">&lt;</span> NOW();          <span class="comment">-- 一次删一年数据</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- ② 循环里逐条写，但整个循环包在一个事务里</span></span><br><span class="line"><span class="keyword">BEGIN</span>;</span><br><span class="line"><span class="keyword">for</span> (<span class="type">int</span> i <span class="operator">=</span> <span class="number">0</span>; i <span class="operator">&lt;</span> <span class="number">100000</span>; i<span class="operator">+</span><span class="operator">+</span>) &#123;</span><br><span class="line">    jdbcTemplate.update(&quot;INSERT INTO t ...&quot;, ...);   <span class="comment">-- 10 万条 insert 一个事务</span></span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">COMMIT</span>;</span><br></pre></td></tr></table></figure>
+
+<h2 id="四、治理方案：从根上消灭大事务"><a href="#四、治理方案：从根上消灭大事务" class="headerlink" title="四、治理方案：从根上消灭大事务"></a>四、治理方案：从根上消灭大事务</h2><h3 id="4-1-应用层：控制事务边界（最重要）"><a href="#4-1-应用层：控制事务边界（最重要）" class="headerlink" title="4.1 应用层：控制事务边界（最重要）"></a>4.1 应用层：控制事务边界（最重要）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 错误：事务里做 RPC、睡大觉</span></span><br><span class="line"><span class="meta">@Transactional</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">process</span><span class="params">(Order order)</span> &#123;</span><br><span class="line">    orderService.update(order);          <span class="comment">// 数据库操作</span></span><br><span class="line">    Thread.sleep(<span class="number">2000</span>);                  <span class="comment">// 模拟外部调用</span></span><br><span class="line">    rpcClient.notifyWarehouse(order);    <span class="comment">// RPC 调用——锁被白白持有 2 秒+</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 正确：数据库操作最小化，外部调用移出事务</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">process</span><span class="params">(Order order)</span> &#123;</span><br><span class="line">    orderService.update(order);          <span class="comment">// 事务只覆盖这一步（方法内部单独开事务）</span></span><br><span class="line">    rpcClient.notifyWarehouse(order);    <span class="comment">// 在事务外</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>铁律</strong>：事务内只做数据库操作；RPC、HTTP、MQ、睡眠、文件 IO、循环计算全部挪到事务外。事务的「开」和「提交」之间要尽量短。</p>
+<h3 id="4-2-批量操作拆分：分页提交"><a href="#4-2-批量操作拆分：分页提交" class="headerlink" title="4.2 批量操作拆分：分页提交"></a>4.2 批量操作拆分：分页提交</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 一次性删除 1000 万行（大事务）→ 改成循环分批</span></span><br><span class="line"><span class="keyword">DELETE</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">4</span> LIMIT <span class="number">1000</span>;   <span class="comment">-- 每批 1000 行，循环执行</span></span><br></pre></td></tr></table></figure>
+
+<p>每批之间 sleep 一小段时间，既避免大事务，也避免主从延迟。注意：<code>LIMIT</code> 删除要配合索引，否则每批都是全表扫。</p>
+<h3 id="4-3-循环插入用批量-分批提交"><a href="#4-3-循环插入用批量-分批提交" class="headerlink" title="4.3 循环插入用批量 + 分批提交"></a>4.3 循环插入用批量 + 分批提交</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 10 万条数据：每 500 条一批，批内 batch insert，批间提交</span></span><br><span class="line"><span class="type">int</span> <span class="variable">batchSize</span> <span class="operator">=</span> <span class="number">500</span>;</span><br><span class="line"><span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; list.size(); i += batchSize) &#123;</span><br><span class="line">    List&lt;Order&gt; sub = list.subList(i, Math.min(i + batchSize, list.size()));</span><br><span class="line">    jdbcTemplate.batchUpdate(<span class="string">&quot;INSERT INTO orders ...&quot;</span>, sub);   <span class="comment">// 批内一个事务</span></span><br><span class="line">    <span class="comment">// 每批自动提交，单事务最大 500 行</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-4-数据库层：设置红线参数"><a href="#4-4-数据库层：设置红线参数" class="headerlink" title="4.4 数据库层：设置红线参数"></a>4.4 数据库层：设置红线参数</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- ① 事务锁等待超时：默认 50s 太久，生产通常调到 5~10s，快速失败</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> innodb_lock_wait_timeout <span class="operator">=</span> <span class="number">10</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- ② 单事务 binlog 上限（8.0 支持）：超过直接报错，拦下大事务</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_transaction_dependency_tracking <span class="operator">=</span> COMMIT_ORDER;  <span class="comment">-- 只是并行复制配置</span></span><br><span class="line"><span class="comment">-- 大事务保护可以用：max_binlog_cache_size + 监控告警</span></span><br></pre></td></tr></table></figure>
+
+<p>更实用的是<strong>监控告警</strong>：</p>
+<ul>
+<li>长事务 &gt; 30s → 告警；</li>
+<li><code>innodb_trx</code> 中 <code>trx_rows_modified &gt; 10000</code> → 告警；</li>
+<li><code>Seconds_Behind_Master &gt; 60s</code> → 告警。</li>
+</ul>
+<h3 id="4-5-历史数据清理：分片-归档工具"><a href="#4-5-历史数据清理：分片-归档工具" class="headerlink" title="4.5 历史数据清理：分片 + 归档工具"></a>4.5 历史数据清理：分片 + 归档工具</h3><p>清理历史数据不要裸写 DELETE：</p>
+<ul>
+<li>优先<strong>分区表 + DROP PARTITION</strong>（参考上一篇文章）；</li>
+<li>或用 <code>pt-archiver</code> 工具，它自带分批、限速、暂停功能，对主从最友好。</li>
+</ul>
+<h2 id="五、已经出现大事务-长事务了，怎么止血？"><a href="#五、已经出现大事务-长事务了，怎么止血？" class="headerlink" title="五、已经出现大事务&#x2F;长事务了，怎么止血？"></a>五、已经出现大事务&#x2F;长事务了，怎么止血？</h2><h3 id="5-1-找到线程并-kill"><a href="#5-1-找到线程并-kill" class="headerlink" title="5.1 找到线程并 kill"></a>5.1 找到线程并 kill</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 找到长事务对应的连接</span></span><br><span class="line"><span class="keyword">SELECT</span> trx_mysql_thread_id, trx_started <span class="keyword">FROM</span> information_schema.innodb_trx</span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> trx_started LIMIT <span class="number">5</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 从应用层 kill（不要直接 kill 数据库线程，先让应用感知）</span></span><br><span class="line">KILL <span class="number">12345</span>;   <span class="comment">-- 回滚该事务（大事务回滚也要时间，但比挂着强）</span></span><br></pre></td></tr></table></figure>
+
+<p>注意：<code>KILL</code> 大事务后，<strong>回滚过程同样耗时</strong>（要重放 undo），期间锁依然持有。所以止血要快，但不要以为 kill 了就立刻恢复。</p>
+<h3 id="5-2-从库延迟的临时缓解"><a href="#5-2-从库延迟的临时缓解" class="headerlink" title="5.2 从库延迟的临时缓解"></a>5.2 从库延迟的临时缓解</h3><ul>
+<li>如果延迟来自某个大事务，等它回放完自然会追平（期间可以临时把读流量切到其他从库或主库）；</li>
+<li>从库开启并行复制（<code>slave_parallel_workers</code>、<code>slave_parallel_type=LOGICAL_CLOCK</code>）——但<strong>并行复制救不了单个大事务</strong>，治本还是消灭大事务。</li>
+</ul>
+<h2 id="六、面试连环追问"><a href="#六、面试连环追问" class="headerlink" title="六、面试连环追问"></a>六、面试连环追问</h2><p><strong>Q1：为什么长事务会让「别人」的查询变慢？</strong><br>长事务的 ReadView 会一直保留，导致它开启之后的所有旧版本 undo 都不能被 purge；其他查询在 MVCC 回溯版本链时被迫遍历更长的历史，尤其二级索引回表场景，慢查询明显增多。这也是「一个不干活的长事务拖垮全库」的原理。</p>
+<p><strong>Q2：<code>UPDATE</code> 语句执行完但事务没提交，锁会释放吗？</strong><br>不会。InnoDB 的锁在事务结束时统一释放（提交或回滚）。语句执行完只是数据修改完成，锁要等 <code>COMMIT</code>&#x2F;<code>ROLLBACK</code>。</p>
+<p><strong>Q3：大事务导致主从延迟，为什么并行复制也救不了？</strong><br>并行复制的最小并行单元是「事务」，一个超大事务在从库必须<strong>串行</strong>回放（它内部的变更存在依赖），无法拆开并行。所以只要主库还在产生大事务，从库延迟就是必然的。</p>
+<p><strong>Q4：<code>@Transactional</code> 注解加在 public 方法上，方法内部调自己类的另一个方法，事务会生效吗？</strong><br>不会（经典 Spring 坑）。自调用不走代理，<code>this.method()</code> 直接调用原始对象，事务注解失效——方法内所有操作变成一个隐式大事务的一部分，更容易踩长事务的坑。要用 AOP 代理注入自己（<code>AopContext.currentProxy()</code>）或拆到别的 Bean。</p>
+<p><strong>Q5：如何从源头防止大事务上线？</strong><br>代码评审盯事务边界 + SQL 评审盯大范围 DML + 测试环境造数据跑 <code>EXPLAIN</code> 看影响行数 + 生产监控 <code>innodb_trx</code> 和主从延迟 + 慢日志告警。<strong>预防成本远低于止血成本</strong>。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>大事务和长事务是 MySQL 生产事故的「隐形炸弹」：一个不提交的长事务能拖慢全库查询，一个大事务能让主从延迟雪崩。治理的核心就一句话——<strong>事务要短、要小、边界要清晰</strong>：数据库操作最小化、外部调用移出事务、批量操作分批提交、监控红线兜底。面试时能把「锁持有、undo 版本链、binlog 单线程回放」这三条原理链路讲清楚，就已经赢过大部分人。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/01/mysql-long-transaction-deep-dive/">https://jiweidong.github.io/2026/09/01/mysql-long-transaction-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E4%BA%8B%E5%8A%A1/">事务</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/01/mysql-partition-table-deep-dive/" title="【MySQL 进阶】MySQL 分区表深度解析：从 Range/List/Hash/Key 分区原理到落地实践与避坑指南"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 进阶】MySQL 分区表深度解析：从 Range/List/Hash/Key 分区原理到落地实践与避坑指南</div></div><div class="info-2"><div class="info-item-1">【MySQL 进阶】MySQL 分区表深度解析：从 Range&#x2F;List&#x2F;Hash&#x2F;Key 分区原理到落地实践与避坑指南面试官：你们公司几千万行的表是怎么优化的？你会考虑分区表吗？很多同学一上来就说「分库分表」，但分库分表带来的分布式事务、跨库 JOIN、全局主键等问题，对于大部分业务来说其实是过度设计。在数据量还没到亿级、但单表已经明显变慢的阶段，MySQL 分区表（Partitioning） 是一个成本极低、效果直接的方案。 本文从分区表的底层原理讲起，对比四种分区类型，最后给出生产环境的落地实践与避坑指南。 一、分区表是什么？它到底解决了什么问题？1.1 逻辑上一张表，物理上是多个文件分区表在 SQL 层面和普通表完全一样，你照样 SELECT、INSERT、UPDATE、JOIN，但在存储层面，数据被拆散到多个物理文件中： 1234567# 未分区：一个表一个文件（假设 MyISAM/独立表空间）order.ibd# 按年份 Range 分区：一个分区一个文件order#P#p2023.ibdorder#P#p2024.ibdorder#P#...</div></div></div></a><a class="pagination-related" href="/2026/09/01/microservice-bulkhead-isolation-deep-dive/" title="【微服务】舱壁模式与服务隔离深度解析：线程池隔离、信号量隔离与故障传播治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【微服务】舱壁模式与服务隔离深度解析：线程池隔离、信号量隔离与故障传播治理</div></div><div class="info-2"><div class="info-item-1">【微服务】舱壁模式与服务隔离深度解析：线程池隔离、信号量隔离与故障传播治理面试官：一个第三方接口变慢，为什么能把你们整个系统拖垮？这就是微服务里最经典的**故障传播（Fault Propagation）**问题。船舱设计师早就给出了答案——舱壁模式（Bulkhead Pattern）：把船体分成多个独立水密舱，一个舱进水，其他舱不受影响，船不会沉。 本文从故障传播的底层机制讲起，深入对比线程池隔离、信号量隔离两种实现，最后给出 Hystrix&#x2F;Resilience4j&#x2F;Sentinel 的落地实战。 一、为什么一个慢接口能拖垮整个服务？1.1 故障传播的底层链路假设订单服务通过 HTTP 调用库存服务，库存服务挂了（变慢 30 秒才超时）： 1234567891011订单服务线程池（默认 200 线程）    ├── 线程 1：等库存服务响应，卡住 30s    ├── 线程 2：等库存服务响应，卡住 30s    ├── ...    ├── 线程 199：等库存服务响应，卡住 30s    └── 线程 200：等库存服务响应，卡住 30s    → 线程...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/08/mysql-transaction-isolation-levels-deep-dive/" title="【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读面试官：MySQL 默认隔离级别是什么？为什么它能解决幻读？“MySQL 默认是 RR（可重复读）”——这句话几乎人人会背，但接下来的追问能刷掉 80% 的人：  脏读、不可重复读、幻读到底怎么演示？ READ COMMITTED 和 REPEATABLE READ 在 MVCC 下有什么区别？ MySQL 的 RR 为什么能解决幻读，而教科书说 RR 不能？ 什么时候应该把隔离级别改成 RC？  本文用 SQL 实验 + 原理分析，一次讲透。   一、三大并发问题：先建立直觉假设有一张表：user(id, name, balance)，初始数据 id=1, balance=100。 1.1 脏读（Dirty Read）：读到未提交的数据123事务 A：UPDATE user SET balance=200 WHERE id=1;   -- 未提交事务 B：SELECT balance FROM user WHERE id=1;      -- 读到 200 ❌事务 A：ROLLBACK;    ...</div></div></div></a><a class="pagination-related" href="/2026/08/15/mysql-back-to-table-covering-index-deep-dive/" title="【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战面试官：什么是回表？什么是覆盖索引？为什么 select * 和 select 指定字段性能差这么多？“回表”和”覆盖索引”是 MySQL 索引面试中最核心的两个概念，也是 SQL 优化的基本功。很多同学知道”要建联合索引、不要 select *”，但说不清背后的原理——为什么覆盖索引能避免回表？为什么联合索引能覆盖更多查询？ 本文从 InnoDB 索引结构出发，把回表、覆盖索引、索引下推（ICP）的关系一次讲透，最后给出可直接落地的优化 checklist。 一、先从 InnoDB 索引结构说起1.1 聚簇索引（Clustered Index）InnoDB 的表本身就是一棵 B+ 树，主键索引就是聚簇索引：  叶子节点直接存放整行数据（包括所有字段）； 每张表只有一个聚簇索引（通常是主键，没有主键就用第一个非空唯一索引，再没有就隐藏的 rowid）； 数据行按照主键顺序物理排列（逻辑顺序）。  123456789聚簇索引 B+ 树（主键 id）┌─────────┐│  根节点   │  ...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mysql-composite-index-leftmost-prefix-deep-dive/" title="MySQL 联合索引与最左前缀原则深度解析：从 B+ 树结构到索引失效场景"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">MySQL 联合索引与最左前缀原则深度解析：从 B+ 树结构到索引失效场景</div></div><div class="info-2"><div class="info-item-1">MySQL 联合索引与最左前缀原则深度解析：从 B+ 树结构到索引失效场景面试官：联合索引 (a, b, c) 最左前缀原则，能命中哪些查询？这是 MySQL 索引方向出现频率最高的问题，也是线上 SQL 优化翻车率最高的知识点。很多人只会背”最左前缀”四个字，但不知道为什么、边界在哪、哪些场景会失效。本文从 B+ 树结构出发，把联合索引彻底讲透。 一、联合索引的 B+ 树到底长什么样？单列索引的 B+ 树，非叶子节点存索引值，叶子节点存主键（聚簇索引）或行指针。 联合索引 (a, b, c) 的 B+ 树： 123456                    [1, 100, &#x27;x&#x27;]                   /            \        [1, 200, &#x27;a&#x27;]          [2, 100, &#x27;b&#x27;]        /           \          /           \[1,100,&#x27;x&#x27;]  [1,200,&#x27;a&#x27;]  [2,...</div></div></div></a><a class="pagination-related" href="/2026/08/31/mysql-misoperation-flashback-practice/" title="【MySQL 运维】MySQL 误删数据急救实战：从 binlog 闪回到延时从库的完整恢复方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-31</div><div class="info-item-2">【MySQL 运维】MySQL 误删数据急救实战：从 binlog 闪回到延时从库的完整恢复方案</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】MySQL 误删数据急救实战：从 binlog 闪回到延时从库的完整恢复方案面试官：生产环境有人执行了 DELETE 忘带 WHERE，全表数据没了，你怎么恢复？这是运维和 DBA 面试的经典场景题，也是每个后端工程师迟早会遇到的真实事故。先别慌，更别急着重启 —— 只要 binlog 开着、日志还在，数据大概率能找回来。本文给出完整的误删应急手册。 一、事故发生后的第一分钟：止血与保护现场误删发生后，按顺序做这几件事（顺序很重要）：  停止写入：如果是 UPDATE&#x2F;DELETE 误操作，立刻 FLUSH TABLES WITH READ LOCK 或者直接停掉业务流量，防止新数据覆盖现场； 确认 binlog 状态：SHOW MASTER STATUS; 确认 binlog 是否开启、当前文件与位置； 立即备份现有 binlog：把 binlog 文件拷贝到安全位置（cp 到别的目录&#x2F;机器），防止后续操作或重启清掉日志； 记录当前时间点：误删发生的大致时间窗口，用于后面定位 binlog 位置； 评估损失范围：SHOW BINLOG E...</div></div></div></a><a class="pagination-related" href="/2026/08/18/optimistic-pessimistic-lock-deep-dive/" title="【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现</div></div><div class="info-2"><div class="info-item-1">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现面试官：你项目里扣库存，用的乐观锁还是悲观锁？这是并发场景的”必考题”。很多人的答案是背出来的：”悲观锁就是锁住，乐观锁就是 CAS”。但一问到”什么场景选哪个、各自的坑在哪”，就露馅了。 本文把乐观锁和悲观锁从思想、实现、源码到实战场景一次讲透。  一、两种锁的哲学悲观锁（Pessimistic Lock）思想：冲突一定会发生，所以先锁再干。  操作数据前先加锁，其他事务&#x2F;线程必须等待； 数据库层面：SELECT ... FOR UPDATE、SELECT ... LOCK IN SHARE MODE； Java 层面：synchronized、ReentrantLock； 适用：写多读少、冲突概率高的场景。  乐观锁（Optimistic Lock）思想：冲突是少数，所以先干再验，冲突了重试。  不加锁，更新时校验数据是否被改过（版本号&#x2F;时间戳&#x2F;CAS）； 数据库层面：UPDATE ... SET version = version + 1 WHERE version = ?； J...</div></div></div></a><a class="pagination-related" href="/2026/08/24/mysql-gap-lock-next-key-lock-deep-dive/" title="【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战面试官：说说 InnoDB 的间隙锁（Gap Lock）和临键锁（Next-Key Lock）？这道题是 MySQL 锁机制的”天花板”题目。先明确前提：间隙锁和临键锁只在 RR（可重复读）隔离级别下生效，RC 级别为了减少锁冲突，只保留记录锁。 一、为什么要引入间隙锁？——幻读问题先回顾三种读异常的级别：    隔离级别 脏读 不可重复读 幻读    READ UNCOMMITTED ❌可能 可能 可能   READ COMMITTED 不会 可能 可能   REPEATABLE READ 不会 不会 可能（InnoDB 已解决）   SERIALIZABLE 不会 不会 不会   幻读定义：在同一个事务里，两次相同条件的查询，第二次多出了第一次没有的行（插入型问题）。 注意区分：  不可重复读：同一行数据内容变了（UPDATE 造成）→ 用 MVCC 版本链 + 快照读解决 幻读：查询结果行数变多（INSERT 造成）→ 快照读靠 MVCC 解决，当前读要靠间隙锁解决  123456-- 事务 A...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">552</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">692</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E8%BF%9B%E9%98%B6%E3%80%91%E5%A4%A7%E4%BA%8B%E5%8A%A1%E4%B8%8E%E9%95%BF%E4%BA%8B%E5%8A%A1%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E9%94%81%E6%8C%81%E6%9C%89%E3%80%81undo-%E8%86%A8%E8%83%80%E5%88%B0%E4%B8%BB%E4%BB%8E%E5%BB%B6%E8%BF%9F%E7%9A%84%E5%8D%B1%E5%AE%B3%E4%B8%8E%E6%B2%BB%E7%90%86%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E7%BA%BF%E4%B8%8A-MySQL-%E7%AA%81%E7%84%B6%E4%B8%BB%E4%BB%8E%E5%BB%B6%E8%BF%9F-10-%E5%88%86%E9%92%9F%EF%BC%8C%E4%BD%A0%E6%80%8E%E4%B9%88%E6%8E%92%E6%9F%A5%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：线上 MySQL 突然主从延迟 10 分钟，你怎么排查？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%88%86%E6%B8%85%E4%B8%A4%E4%B8%AA%E6%A6%82%E5%BF%B5%EF%BC%9A%E5%A4%A7%E4%BA%8B%E5%8A%A1-vs-%E9%95%BF%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.2.</span> <span class="toc-text">一、先分清两个概念：大事务 vs 长事务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%A4%A7%E4%BA%8B%E5%8A%A1-%E9%95%BF%E4%BA%8B%E5%8A%A1%E7%9A%84%E4%BA%94%E5%A4%A7%E5%8D%B1%E5%AE%B3%EF%BC%88%E5%8E%9F%E7%90%86%E5%B1%82%E9%9D%A2%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、大事务&#x2F;长事务的五大危害（原理层面）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%8D%B1%E5%AE%B3%E4%B8%80%EF%BC%9A%E9%94%81%E6%8C%81%E6%9C%89%E6%97%B6%E9%97%B4%E8%BF%87%E9%95%BF%EF%BC%8C%E9%98%BB%E5%A1%9E%E5%85%B6%E4%BB%96%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 危害一：锁持有时间过长，阻塞其他事务</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%8D%B1%E5%AE%B3%E4%BA%8C%EF%BC%9Aundo-log-%E8%86%A8%E8%83%80%EF%BC%8C%E5%BC%95%E5%8F%91%E7%89%88%E6%9C%AC%E9%93%BE%E8%BF%87%E9%95%BF"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 危害二：undo log 膨胀，引发版本链过长</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%8D%B1%E5%AE%B3%E4%B8%89%EF%BC%9Abinlog-%E5%B7%A8%E5%A4%A7%EF%BC%8C%E4%B8%BB%E4%BB%8E%E5%BB%B6%E8%BF%9F%E9%9B%AA%E5%B4%A9"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 危害三：binlog 巨大，主从延迟雪崩</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E5%8D%B1%E5%AE%B3%E5%9B%9B%EF%BC%9A%E6%AD%BB%E9%94%81%E6%A6%82%E7%8E%87%E9%A3%99%E5%8D%87"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 危害四：死锁概率飙升</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-%E5%8D%B1%E5%AE%B3%E4%BA%94%EF%BC%9A%E8%BF%9E%E6%8E%A5%E6%B1%A0%E8%A2%AB%E5%8D%A0%E6%BB%A1%EF%BC%8C%E6%9C%8D%E5%8A%A1%E9%9B%AA%E5%B4%A9"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 危害五：连接池被占满，服务雪崩</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%80%8E%E4%B9%88%E5%8F%91%E7%8E%B0%E5%A4%A7%E4%BA%8B%E5%8A%A1%E5%92%8C%E9%95%BF%E4%BA%8B%E5%8A%A1%EF%BC%9F"><span class="toc-number">1.4.</span> <span class="toc-text">三、怎么发现大事务和长事务？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E7%94%A8-information-schema-%E6%9F%A5%E9%95%BF%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 用 information_schema 查长事务</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E7%9B%91%E6%8E%A7%E6%8C%87%E6%A0%87%EF%BC%9Aundo-%E4%B8%8E-binlog-%E5%A2%9E%E9%80%9F"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 监控指标：undo 与 binlog 增速</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%A4%A7%E4%BA%8B%E5%8A%A1%E7%9A%84%E5%85%B8%E5%9E%8B-SQL-%E9%95%BF%E7%9B%B8"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 大事务的典型 SQL 长相</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%B2%BB%E7%90%86%E6%96%B9%E6%A1%88%EF%BC%9A%E4%BB%8E%E6%A0%B9%E4%B8%8A%E6%B6%88%E7%81%AD%E5%A4%A7%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.5.</span> <span class="toc-text">四、治理方案：从根上消灭大事务</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%BA%94%E7%94%A8%E5%B1%82%EF%BC%9A%E6%8E%A7%E5%88%B6%E4%BA%8B%E5%8A%A1%E8%BE%B9%E7%95%8C%EF%BC%88%E6%9C%80%E9%87%8D%E8%A6%81%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 应用层：控制事务边界（最重要）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%89%B9%E9%87%8F%E6%93%8D%E4%BD%9C%E6%8B%86%E5%88%86%EF%BC%9A%E5%88%86%E9%A1%B5%E6%8F%90%E4%BA%A4"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 批量操作拆分：分页提交</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%BE%AA%E7%8E%AF%E6%8F%92%E5%85%A5%E7%94%A8%E6%89%B9%E9%87%8F-%E5%88%86%E6%89%B9%E6%8F%90%E4%BA%A4"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 循环插入用批量 + 分批提交</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E6%95%B0%E6%8D%AE%E5%BA%93%E5%B1%82%EF%BC%9A%E8%AE%BE%E7%BD%AE%E7%BA%A2%E7%BA%BF%E5%8F%82%E6%95%B0"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 数据库层：设置红线参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-5-%E5%8E%86%E5%8F%B2%E6%95%B0%E6%8D%AE%E6%B8%85%E7%90%86%EF%BC%9A%E5%88%86%E7%89%87-%E5%BD%92%E6%A1%A3%E5%B7%A5%E5%85%B7"><span class="toc-number">1.5.5.</span> <span class="toc-text">4.5 历史数据清理：分片 + 归档工具</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%B7%B2%E7%BB%8F%E5%87%BA%E7%8E%B0%E5%A4%A7%E4%BA%8B%E5%8A%A1-%E9%95%BF%E4%BA%8B%E5%8A%A1%E4%BA%86%EF%BC%8C%E6%80%8E%E4%B9%88%E6%AD%A2%E8%A1%80%EF%BC%9F"><span class="toc-number">1.6.</span> <span class="toc-text">五、已经出现大事务&#x2F;长事务了，怎么止血？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%89%BE%E5%88%B0%E7%BA%BF%E7%A8%8B%E5%B9%B6-kill"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 找到线程并 kill</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E4%BB%8E%E5%BA%93%E5%BB%B6%E8%BF%9F%E7%9A%84%E4%B8%B4%E6%97%B6%E7%BC%93%E8%A7%A3"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 从库延迟的临时缓解</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%9E%E7%8E%AF%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试连环追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/01/java-mysql-timezone-deep-dive/" title="【Java 实战】Java 与 MySQL 时区问题深度解析：从 TIMESTAMP 存储到跨时区应用的连环坑">【Java 实战】Java 与 MySQL 时区问题深度解析：从 TIMESTAMP 存储到跨时区应用的连环坑</a><time datetime="2026-09-01T00:00:00.000Z" title="发表于 2026-09-01 08:00:00">2026-09-01</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/01/microservice-bulkhead-isolation-deep-dive/" title="【微服务】舱壁模式与服务隔离深度解析：线程池隔离、信号量隔离与故障传播治理">【微服务】舱壁模式与服务隔离深度解析：线程池隔离、信号量隔离与故障传播治理</a><time datetime="2026-09-01T00:00:00.000Z" title="发表于 2026-09-01 08:00:00">2026-09-01</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/01/mysql-long-transaction-deep-dive/" title="【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战">【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战</a><time datetime="2026-09-01T00:00:00.000Z" title="发表于 2026-09-01 08:00:00">2026-09-01</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/01/mysql-partition-table-deep-dive/" title="【MySQL 进阶】MySQL 分区表深度解析：从 Range/List/Hash/Key 分区原理到落地实践与避坑指南">【MySQL 进阶】MySQL 分区表深度解析：从 Range/List/Hash/Key 分区原理到落地实践与避坑指南</a><time datetime="2026-09-01T00:00:00.000Z" title="发表于 2026-09-01 08:00:00">2026-09-01</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/01/rbac-data-permission-deep-dive/" title="【Spring Boot 实战】RBAC 权限模型与数据权限深度实战：从 RBAC0 到行级数据权限设计">【Spring Boot 实战】RBAC 权限模型与数据权限深度实战：从 RBAC0 到行级数据权限设计</a><time datetime="2026-09-01T00:00:00.000Z" title="发表于 2026-09-01 08:00:00">2026-09-01</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
