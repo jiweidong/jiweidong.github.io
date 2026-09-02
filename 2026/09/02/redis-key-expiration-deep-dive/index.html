@@ -1,0 +1,379 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜面试官：给 Key 设置了过期时间，Redis 是怎么把它删掉的？过期键会立刻消失吗？这是 Redis 面试的经典高频题，几乎必问。很多同学知道”惰性删除 + 定期删除”两个词，但说不清底层数据结构、删除时机、内存淘汰的关系，更答不上”主从复制下过期键怎么处理”这种进阶追问。今天一次讲透。  一、过期键">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/02/redis-key-expiration-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜面试官：给 Key 设置了过期时间，Redis 是怎么把它删掉的？过期键会立刻消失吗？这是 Redis 面试的经典高频题，几乎必问。很多同学知道”惰性删除 + 定期删除”两个词，但说不清底层数据结构、删除时机、内存淘汰的关系，更答不上”主从复制下过期键怎么处理”这种进阶追问。今天一次讲透。  一、过期键">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-02T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-02T00:04:41.261Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="缓存">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜",
+  "url": "https://jiweidong.github.io/2026/09/02/redis-key-expiration-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-02T00:00:00.000Z",
+  "dateModified": "2026-09-02T00:04:41.261Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/02/redis-key-expiration-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">557</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">692</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-02T00:00:00.000Z" title="发表于 2026-09-02 08:00:00">2026-09-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-02T00:04:41.261Z" title="更新于 2026-09-02 08:04:41">2026-09-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-原理】Redis-键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜"><a href="#【Redis-原理】Redis-键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜" class="headerlink" title="【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜"></a>【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜</h1><h2 id="面试官：给-Key-设置了过期时间，Redis-是怎么把它删掉的？过期键会立刻消失吗？"><a href="#面试官：给-Key-设置了过期时间，Redis-是怎么把它删掉的？过期键会立刻消失吗？" class="headerlink" title="面试官：给 Key 设置了过期时间，Redis 是怎么把它删掉的？过期键会立刻消失吗？"></a>面试官：给 Key 设置了过期时间，Redis 是怎么把它删掉的？过期键会立刻消失吗？</h2><p>这是 Redis 面试的经典高频题，几乎必问。很多同学知道”惰性删除 + 定期删除”两个词，但说不清底层数据结构、删除时机、内存淘汰的关系，更答不上”主从复制下过期键怎么处理”这种进阶追问。今天一次讲透。</p>
+<hr>
+<h2 id="一、过期键是怎么存的？"><a href="#一、过期键是怎么存的？" class="headerlink" title="一、过期键是怎么存的？"></a>一、过期键是怎么存的？</h2><h3 id="1-1-过期字典（expires-dict）"><a href="#1-1-过期字典（expires-dict）" class="headerlink" title="1.1 过期字典（expires dict）"></a>1.1 过期字典（expires dict）</h3><p>每个 Redis 数据库（db）里有两张哈希表：</p>
+<ul>
+<li><code>dict</code>：键空间，存所有键值对</li>
+<li><code>expires</code>：过期字典，<strong>key 相同，value 是过期时间戳</strong>（毫秒）</li>
+</ul>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">+----------------+       +----------------+</span><br><span class="line">|     dict       |       |    expires     |</span><br><span class="line">| key1 -&gt; value1 |       | key1 -&gt; 过期时间|</span><br><span class="line">| key2 -&gt; value2 |       | key2 -&gt; 过期时间|</span><br><span class="line">+----------------+       +----------------+</span><br></pre></td></tr></table></figure>
+
+<p>设置过期时间时（<code>EXPIRE</code>、<code>SETEX</code>、<code>SET ... EX</code>），Redis 会在 expires 字典里写入到期时间；<code>PERSIST</code> 则从 expires 字典移除该键。</p>
+<h3 id="1-2-过期时间的判定"><a href="#1-2-过期时间的判定" class="headerlink" title="1.2 过期时间的判定"></a>1.2 过期时间的判定</h3><figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Redis 源码 db.c 中的关键逻辑</span></span><br><span class="line"><span class="type">int</span> <span class="title function_">expireIfNeeded</span><span class="params">(redisDb *db, robj *key, <span class="type">int</span> flags)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 查 expires 字典</span></span><br><span class="line">    dictEntry *de = dictFind(db-&gt;expires,key-&gt;ptr);</span><br><span class="line">    <span class="keyword">if</span> (de == <span class="literal">NULL</span>) <span class="keyword">return</span> <span class="number">0</span>;                    <span class="comment">// 没有过期时间</span></span><br><span class="line">    <span class="type">mstime_t</span> when = dictGetSignedIntegerVal(de);</span><br><span class="line">    <span class="keyword">if</span> (mstime() &lt;= when) <span class="keyword">return</span> <span class="number">0</span>;              <span class="comment">// 还没到过期时间</span></span><br><span class="line">    <span class="comment">// 2. 已过期：删除或逻辑过期</span></span><br><span class="line">    ...</span><br><span class="line">    <span class="keyword">return</span> <span class="number">1</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、三种删除策略对比（先讲理论）"><a href="#二、三种删除策略对比（先讲理论）" class="headerlink" title="二、三种删除策略对比（先讲理论）"></a>二、三种删除策略对比（先讲理论）</h2><table>
+<thead>
+<tr>
+<th>策略</th>
+<th>原理</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>定时删除</td>
+<td>到期立刻删，设置定时器</td>
+<td>内存友好，及时释放</td>
+<td>大量过期键时 CPU 开销巨大，Redis 未采用</td>
+</tr>
+<tr>
+<td>惰性删除</td>
+<td>访问时发现过期才删</td>
+<td>CPU 友好</td>
+<td>过期键长期驻留内存，浪费内存</td>
+</tr>
+<tr>
+<td>定期删除</td>
+<td>周期性抽查删除</td>
+<td>CPU&#x2F;内存折中</td>
+<td>删除不及时，需与惰性删除配合</td>
+</tr>
+</tbody></table>
+<p><strong>Redis 实际采用的是：惰性删除 + 定期删除 配合使用。</strong></p>
+<hr>
+<h2 id="三、惰性删除（Lazy-Delete）原理"><a href="#三、惰性删除（Lazy-Delete）原理" class="headerlink" title="三、惰性删除（Lazy Delete）原理"></a>三、惰性删除（Lazy Delete）原理</h2><h3 id="3-1-触发时机"><a href="#3-1-触发时机" class="headerlink" title="3.1 触发时机"></a>3.1 触发时机</h3><p>所有读写命令入口都会先调用 <code>expireIfNeeded()</code> 检查键是否过期：</p>
+<ul>
+<li>读命令：<code>GET</code>、<code>HGET</code>、<code>MGET</code> 等</li>
+<li>写命令：<code>SET</code>、<code>INCR</code>、<code>LPUSH</code> 等（对已过期键写入相当于覆盖）</li>
+<li>管理命令：<code>EXISTS</code>、<code>TTL</code> 等</li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">&gt; SET k1 v1 EX 10</span><br><span class="line">&gt; TTL k1</span><br><span class="line">(<span class="built_in">integer</span>) 8</span><br><span class="line">&gt; GET k1          <span class="comment"># 10 秒后访问</span></span><br><span class="line">(nil)             <span class="comment"># 访问时发现已过期，立刻删除并返回 nil</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-关键特性"><a href="#3-2-关键特性" class="headerlink" title="3.2 关键特性"></a>3.2 关键特性</h3><ul>
+<li><strong>过期键被访问到的那一刻才删除</strong>，删除动作和命令执行是原子的</li>
+<li>从未被访问的过期键会一直占着内存（这就是为什么要配合定期删除）</li>
+<li><strong>注意：<code>EXISTS</code> 命令对过期键也返回 0</strong>，因为它在执行前就做了过期检查</li>
+</ul>
+<hr>
+<h2 id="四、定期删除（Active-Expire）原理"><a href="#四、定期删除（Active-Expire）原理" class="headerlink" title="四、定期删除（Active Expire）原理"></a>四、定期删除（Active Expire）原理</h2><h3 id="4-1-执行时机与算法"><a href="#4-1-执行时机与算法" class="headerlink" title="4.1 执行时机与算法"></a>4.1 执行时机与算法</h3><p>Redis 的<strong>事件循环</strong>（aeEventLoop）中，每次 <code>beforeSleep</code> 和每个 <code>serverCron</code>（默认每秒 10 次）都会调用 <code>activeExpireCycle()</code>。</p>
+<p>核心算法（重要，面试常问）：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 伪代码：activeExpireCycle</span></span><br><span class="line"><span class="number">1.</span> 从 expires 字典中随机取 <span class="number">20</span> 个 key（随机采样，不是遍历全表）</span><br><span class="line"><span class="number">2.</span> 删除其中已过期的 key</span><br><span class="line"><span class="number">3.</span> 如果过期比例超过 <span class="number">25</span>%（删掉的 &gt; <span class="number">5</span> 个），</span><br><span class="line">   继续下一轮采样删除，最多执行 <span class="number">16</span> 轮（或累计耗时超限）</span><br><span class="line"><span class="number">4.</span> 每轮之间会检查时间预算，避免长时间阻塞</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-设计要点"><a href="#4-2-设计要点" class="headerlink" title="4.2 设计要点"></a>4.2 设计要点</h3><ul>
+<li><strong>随机采样而非全表扫描</strong>：避免大 keyspace 下单次耗时过长</li>
+<li><strong>时间预算控制</strong>：<code>activeExpireCycle</code> 有耗时上限（默认约 25% 的 CPU 时间片），防止影响正常命令</li>
+<li><strong>自适应</strong>：过期键多就多删几轮，少就提前退出</li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 观察定期删除的运行统计（Redis 4.0+）</span></span><br><span class="line">&gt; INFO stats</span><br><span class="line"><span class="comment"># expired_keys: 12345     # 累计删除的过期键数量</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、惰性删除-定期删除-还有漏网之鱼吗？"><a href="#五、惰性删除-定期删除-还有漏网之鱼吗？" class="headerlink" title="五、惰性删除 + 定期删除 还有漏网之鱼吗？"></a>五、惰性删除 + 定期删除 还有漏网之鱼吗？</h2><p>有！<strong>大量 Key 同时过期且长时间不被访问</strong>，定期删除一轮处理不完：</p>
+<ul>
+<li>1000 万个 Key 同一秒过期</li>
+<li>定期删除 16 轮 × 每轮 20 个 ≈ 每次最多处理几百个</li>
+<li>剩下的过期键继续占内存，直到被访问或下一轮定期删除</li>
+</ul>
+<p><strong>这就是”缓存雪崩”的内存侧成因</strong>：大批 Key 同时过期时，Redis 内存不会立刻释放，期间新写入可能触发内存淘汰，也可能出现短暂的命令延迟升高。</p>
+<blockquote>
+<p>实战启示：给 Key 的过期时间加随机偏移（<code>EXPIRE k1 3600 + random(0, 300)</code>），既防雪崩，也避免过期键集中堆积。</p>
+</blockquote>
+<hr>
+<h2 id="六、进阶：主从复制下的过期键处理（高难度考点）"><a href="#六、进阶：主从复制下的过期键处理（高难度考点）" class="headerlink" title="六、进阶：主从复制下的过期键处理（高难度考点）"></a>六、进阶：主从复制下的过期键处理（高难度考点）</h2><h3 id="6-1-主库：真实删除"><a href="#6-1-主库：真实删除" class="headerlink" title="6.1 主库：真实删除"></a>6.1 主库：真实删除</h3><p>主库按”惰性 + 定期”策略<strong>真正删除</strong>过期键，并同步删除命令到从库：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">主库删除 k1 后，向从库发送：DEL k1</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-从库：逻辑过期，不主动删"><a href="#6-2-从库：逻辑过期，不主动删" class="headerlink" title="6.2 从库：逻辑过期，不主动删"></a>6.2 从库：逻辑过期，不主动删</h3><p>从库<strong>不会主动删除过期键</strong>（避免主从删除时机不一致），而是在读请求时做<strong>逻辑判断</strong>：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 从库处理读请求时</span></span><br><span class="line"><span class="keyword">if</span> (slave &amp;&amp; expireIfNeeded(db, key) == <span class="number">1</span>) &#123;</span><br><span class="line">    <span class="comment">// 返回 nil，但【不真正删除】</span></span><br><span class="line">    <span class="keyword">return</span> <span class="literal">NULL</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>也就是：<strong>从库读到已过期的键时，返回空，但键本身还留在内存里</strong>，等待主库的 DEL 命令到来后才物理删除。</p>
+<h3 id="6-3-两种模式的差异"><a href="#6-3-两种模式的差异" class="headerlink" title="6.3 两种模式的差异"></a>6.3 两种模式的差异</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>主库</th>
+<th>从库（默认异步复制）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>键过期</td>
+<td>立即物理删除</td>
+<td>读时逻辑过滤，等主库 DEL</td>
+</tr>
+<tr>
+<td>读请求</td>
+<td>返回 nil</td>
+<td>返回 nil（逻辑过期判断）</td>
+</tr>
+<tr>
+<td>内存占用</td>
+<td>及时释放</td>
+<td>可能短暂残留（等 DEL 同步）</td>
+</tr>
+<tr>
+<td>主从切换后</td>
+<td>—</td>
+<td>若从库升主，残留键由新主继续执行过期逻辑</td>
+</tr>
+</tbody></table>
+<h3 id="6-4-追问：从库能读到已过期的数据吗？"><a href="#6-4-追问：从库能读到已过期的数据吗？" class="headerlink" title="6.4 追问：从库能读到已过期的数据吗？"></a>6.4 追问：从库能读到已过期的数据吗？</h3><p><strong>不能读到</strong>（读命令会做逻辑过期判断返回 nil），但<strong>内存会短暂残留</strong>。唯一例外：如果主库 DEL 命令还没同步到从库，从库内存里有这个键，但读时依然返回 nil，所以业务上不会读到过期数据。</p>
+<blockquote>
+<p>补充：Redis 5.0 之前从库读过期键返回 nil 但<strong>不删除</strong>；Redis 5.0 之后有 <code>replica-read-only</code> 等演进，但”从库不主动物理删除”的设计核心没变。</p>
+</blockquote>
+<hr>
+<h2 id="七、过期删除-vs-内存淘汰（易混淆点）"><a href="#七、过期删除-vs-内存淘汰（易混淆点）" class="headerlink" title="七、过期删除 vs 内存淘汰（易混淆点）"></a>七、过期删除 vs 内存淘汰（易混淆点）</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>过期删除</th>
+<th>内存淘汰（Eviction）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>触发条件</td>
+<td>键设置了 TTL 且到期</td>
+<td>内存达到 maxmemory 上限</td>
+</tr>
+<tr>
+<td>处理对象</td>
+<td>仅限有过期时间的键</td>
+<td>所有键（取决于策略）</td>
+</tr>
+<tr>
+<td>策略</td>
+<td>惰性 + 定期</td>
+<td>LRU &#x2F; LFU &#x2F; TTL &#x2F; random &#x2F; noeviction</td>
+</tr>
+<tr>
+<td>目的</td>
+<td>释放过期数据</td>
+<td>保证 Redis 不 OOM</td>
+</tr>
+</tbody></table>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 查看内存淘汰策略</span></span><br><span class="line">&gt; CONFIG GET maxmemory-policy</span><br><span class="line">1) <span class="string">&quot;maxmemory-policy&quot;</span></span><br><span class="line">2) <span class="string">&quot;allkeys-lru&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>区别一句话</strong>：过期删除是”该删的删掉”，内存淘汰是”内存不够了挑着删”。</p>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：为什么不只用惰性删除？</strong><br>只用惰性删除，大量不被访问的过期键会永久占内存，极端情况下内存耗尽触发淘汰甚至 OOM。定期删除就是补这个洞的。</p>
+<p><strong>Q2：为什么不只用定期删除？</strong><br>定期删除是抽样，无法保证”所有过期键都被及时删除”；且为控制耗时不能扫全表。两者配合：定期删除控制总量，惰性删除兜底单个键的时效性。</p>
+<p><strong>Q3：SET 一个已过期但未删除的键会发生什么？</strong><br><code>expireIfNeeded</code> 先删除旧键，再执行 SET，表现如同普通的覆盖写，数据不会错乱。</p>
+<p><strong>Q4：大量 Key 同时过期会卡 Redis 吗？</strong><br>会。定期删除在”过期键比例高”时会连续多轮执行，虽然有时间预算，但删除 10 万个键的释放动作仍可能造成毫秒级延迟。所以生产上过期时间要加随机偏移。</p>
+<p><strong>Q5：主从切换后，新主库会有残留过期键吗？</strong><br>可能有（原从库内存里逻辑过期的键）。但新主库继续执行惰性 + 定期删除逻辑，这些键被访问或抽查到时会被真正删除，不会长期残留。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><ul>
+<li><strong>存储</strong>：expires 过期字典记录每个键的到期时间</li>
+<li><strong>删除策略</strong>：惰性删除（访问时删）+ 定期删除（随机采样 + 时间预算），Redis 未采用定时删除</li>
+<li><strong>主从场景</strong>：主库真删并广播 DEL，从库逻辑过期、读返回 nil、等主库 DEL 才物理删</li>
+<li><strong>易混淆</strong>：过期删除（TTL 到期）≠ 内存淘汰（maxmemory 触发）</li>
+<li><strong>工程建议</strong>：过期时间加随机偏移，监控 <code>expired_keys</code>，避免批量同时过期引发雪崩</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/02/redis-key-expiration-deep-dive/">https://jiweidong.github.io/2026/09/02/redis-key-expiration-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/09/02/redis-big-key-hot-key-deep-dive/" title="【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案面试官：线上 Redis 突然变慢、CPU 飙升、甚至发生阻塞，你会怎么排查？很多同学第一反应是”看慢日志、看 bigkeys”，但真正能系统讲清楚大 Key 和热 Key 的完整治理链路的人不多。今天我们从原理到实战，一次性把这两个”Redis 头号杀手”讲透。  一、什么是大 Key？什么是热 Key？1.1 大 Key（Big Key）大 Key 不是指某个 Key 的字符串值很长，而是指单个 Key 占用内存过大或元素数量过多。业界一般没有绝对标准，常用的判断线是：    类型 判定标准（参考） 举例    String value 超过 10KB 一个 JSON 序列化的大对象、一张 Base64 图片   Hash &#x2F; Set &#x2F; ZSet &#x2F; List 元素数量超过 5000 个，或总大小超过 10MB 一个存了几万条用户行为的 Hash   单个 value 过大 超过 1MB 就要警惕 缓存整张报表数据   1.2 热 Key（...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/03/redis-cache-breakdown-penetration-avalanche-guide/" title="【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析面试官：说说缓存穿透、缓存击穿、缓存雪崩，以及各自的解决方案？缓存三兄弟是 Redis 面试的开场必问题，但很多人只背了”布隆过滤器、互斥锁、随机过期时间”这几个词，被追问”为什么””怎么实现”就露馅。这篇从原理出发，把三个问题讲透，每个都带代码实现和面试追问。 一、三兄弟一句话区分先建立整体认知，它们都发生在”缓存 Miss 之后回源数据库”这个环节，但病因不同：    问题 本质 一句话描述 危害    缓存穿透 查询的 key 不存在 查一个缓存和 DB 都没有的数据，每次请求都打到 DB DB 被无效流量打爆   缓存击穿 热点 key 过期瞬间 一个热点 key 过期，大量并发同时回源 DB DB 单点压力瞬间飙升   缓存雪崩 大量 key 同时过期 或 Redis 宕机 缓存层大面积失效，流量全部涌向 DB DB 直接宕机，系统整体不可用   区别的关键：穿透是”没有数据”，击穿是”一个热点 key 过期”，雪崩是”一批 key 过期&#x2F;缓存层挂了”。 二、缓存穿透：查不存在的数据原理...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-db-cache-consistency-deep-dive/" title="【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案面试官：数据更新时，你是怎么保证 Redis 缓存和 MySQL 数据一致性的？这是 Redis 面试的”必考题”，也是生产环境最容易踩坑的地方。很多同学背了”先更新数据库，再删缓存”的口诀，但被追问一句”那并发情况下还有问题吗”就卡住了。今天我们把缓存一致性这个问题从方案到原理到代码彻底讲透。 一、先搞清楚：为什么会有缓存不一致？缓存不一致的根源只有一个：对同一份数据，MySQL 和 Redis 各存了一份，而更新操作不是原子的。  更新 MySQL 成功、更新 Redis 失败 → 不一致； 更新 Redis 成功、更新 MySQL 失败 → 不一致； 两个都成功，但执行顺序不同 → 中间态不一致； 并发读写交叉 → 旧数据覆盖新数据。  要理解各种方案，先看业界标准的四种缓存读写模式：    模式 读 写 特点    Cache Aside（旁路缓存） 读 Miss 后回源 DB 先更新 DB，再删缓存 最常用，简单可控   Read Through 缓存组件负责回源 同 Cache ...</div></div></div></a><a class="pagination-related" href="/2026/08/06/redis-transaction-deep-dive/" title="【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比面试官：Redis 的事务和 MySQL 的事务有什么区别？Redis 事务能回滚吗？Redis 事务是面试中高频且容易答错的考点。很多人的第一反应是「Redis 事务就是一组命令的批量执行」，但面试官往往会在后面连续追问：「它能回滚吗？」「有隔离性吗？」「WATCH 是什么？」「为什么不建议用事务而用 Lua？」 这篇文章把 Redis 事务从命令到原理、从对比到实战彻底讲透。  一、Redis 事务的核心命令Redis 事务通过四个命令实现：MULTI、EXEC、DISCARD、WATCH。    命令 作用    MULTI 开启事务，标记事务开始   EXEC 执行事务队列中的所有命令   DISCARD 取消事务，清空命令队列   WATCH 监视一个或多个 key，事务执行前若被修改则事务被打断   基本用法123456789127.0.0.1:6379&gt; MULTIOK127.0.0.1:6379&gt; SET account:1001...</div></div></div></a><a class="pagination-related" href="/2026/06/15/multi-level-cache-architecture/" title="多级缓存架构设计：从本地缓存到分布式缓存的实战演进"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-15</div><div class="info-item-2">多级缓存架构设计：从本地缓存到分布式缓存的实战演进</div></div><div class="info-2"><div class="info-item-1">多级缓存架构设计：从本地缓存到分布式缓存的实战演进 缓存是提升系统性能最有效的手段之一。本文从单机缓存开始，逐步演进到多级缓存架构，深入分析每层缓存的选型、策略和最佳实践。  一、为什么需要多级缓存1.1 缓存的层级123456789101112131415客户端缓存（浏览器/CDN）    │ 加速：最快，命中即返回    │ 成本：低    ▼本地缓存（Caffeine/Guava）    │ 加速：毫秒级，无网络开销    │ 成本：占用 JVM 堆内存    ▼分布式缓存（Redis）    │ 加速：亚毫秒级，共享数据    │ 成本：需要额外部署    ▼数据库（MySQL）    │ 加速：基础存储    │ 成本：最高  1.2 多级缓存的收益   场景 无缓存 单层 Redis 多级缓存    平均延迟 50ms 5ms &lt; 1ms   QPS 1000 50000 200000+   数据库压力 100% 30% 5%   系统成本 低 中 中高   二、第一层：本地缓存（Caffeine）2.1 Caffeine 基础使用123456789101112...</div></div></div></a><a class="pagination-related" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战前言Redis 作为内存数据库，其所有数据都存储在内存中。当写入速度超过内存容量时，Redis 必须决定应该删除哪些数据——这就是内存淘汰策略（Eviction Policy）。选错淘汰策略可能导致缓存命中率断崖式下跌、大量请求穿透到数据库，甚至引发雪崩。 很多开发者只知道 allkeys-lru 或 volatile-ttl 这些名字，但面试官一旦追问”Redis 的近似 LRU 和标准 LRU 有什么区别？””LFU 的 counter 是如何衰减的？”，就容易答不上来。 本文将对 Redis 的 8 种淘汰策略进行深度解析，从源码层面揭秘近 LRU&#x2F;LFU 的实现，并通过实战案例帮你做出最佳选择。  一、Redis 内存淘汰机制总览1.1 触发条件当以下条件满足时，Redis 会触发内存淘汰： 12345# 设置最大内存（默认不限制）maxmemory 4gb# 达到 maxmemory 后，Redis 会尝试淘汰数据# 如果无法释放足够内存，写入操作会返回 OOM 错...</div></div></div></a><a class="pagination-related" href="/2026/08/13/redis-event-loop-deep-dive/" title="【Redis 原理】Redis 事件循环深度解析：文件事件、时间事件与 IO 多路复用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-13</div><div class="info-item-2">【Redis 原理】Redis 事件循环深度解析：文件事件、时间事件与 IO 多路复用</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 事件循环深度解析：文件事件、时间事件与 IO 多路复用面试官：Redis 为什么快？单线程模型到底是怎么运作的？「Redis 基于内存、单线程、IO 多路复用」——这几乎是背烂了的答案。但再往深问一层：「单线程是怎么同时处理那么多连接的？文件事件和时间事件是什么关系？为什么 6.0 又引入了多线程？」 这篇文章从 Redis 源码（ae.c &#x2F; ae_epoll.c）出发，把事件循环（Event Loop）的底层机制彻底讲透。 一、Redis 为什么选单线程 + IO 多路复用？1.1 核心原因 内存操作极快：Redis 命令基本都是内存读写，微秒级完成，CPU 不是瓶颈； 避免上下文切换和锁竞争：多线程要处理并发安全（加锁、原子操作），单线程天然无锁，杜绝了线程切换开销； IO 多路复用：单个线程可以同时监听成千上万个 socket 连接的就绪事件，只在有数据可读&#x2F;可写时才处理，非阻塞 IO 让线程不会被某个慢连接拖住； 模型简单：没有竞态条件，没有死锁问题，调试和维护成本极低。  1.2 单线程模型的瓶颈单线程意味着一条慢命...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">557</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">692</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">179</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E5%8E%9F%E7%90%86%E3%80%91Redis-%E9%94%AE%E8%BF%87%E6%9C%9F%E5%88%A0%E9%99%A4%E7%AD%96%E7%95%A5%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E6%83%B0%E6%80%A7%E5%88%A0%E9%99%A4%E3%80%81%E5%AE%9A%E6%9C%9F%E5%88%A0%E9%99%A4%E4%B8%8E%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E4%B8%8B%E7%9A%84%E8%BF%87%E6%9C%9F%E4%B9%8B%E8%B0%9C"><span class="toc-number">1.</span> <span class="toc-text">【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E7%BB%99-Key-%E8%AE%BE%E7%BD%AE%E4%BA%86%E8%BF%87%E6%9C%9F%E6%97%B6%E9%97%B4%EF%BC%8CRedis-%E6%98%AF%E6%80%8E%E4%B9%88%E6%8A%8A%E5%AE%83%E5%88%A0%E6%8E%89%E7%9A%84%EF%BC%9F%E8%BF%87%E6%9C%9F%E9%94%AE%E4%BC%9A%E7%AB%8B%E5%88%BB%E6%B6%88%E5%A4%B1%E5%90%97%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：给 Key 设置了过期时间，Redis 是怎么把它删掉的？过期键会立刻消失吗？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E8%BF%87%E6%9C%9F%E9%94%AE%E6%98%AF%E6%80%8E%E4%B9%88%E5%AD%98%E7%9A%84%EF%BC%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、过期键是怎么存的？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E8%BF%87%E6%9C%9F%E5%AD%97%E5%85%B8%EF%BC%88expires-dict%EF%BC%89"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 过期字典（expires dict）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E8%BF%87%E6%9C%9F%E6%97%B6%E9%97%B4%E7%9A%84%E5%88%A4%E5%AE%9A"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 过期时间的判定</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%89%E7%A7%8D%E5%88%A0%E9%99%A4%E7%AD%96%E7%95%A5%E5%AF%B9%E6%AF%94%EF%BC%88%E5%85%88%E8%AE%B2%E7%90%86%E8%AE%BA%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、三种删除策略对比（先讲理论）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%83%B0%E6%80%A7%E5%88%A0%E9%99%A4%EF%BC%88Lazy-Delete%EF%BC%89%E5%8E%9F%E7%90%86"><span class="toc-number">1.4.</span> <span class="toc-text">三、惰性删除（Lazy Delete）原理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E8%A7%A6%E5%8F%91%E6%97%B6%E6%9C%BA"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 触发时机</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%85%B3%E9%94%AE%E7%89%B9%E6%80%A7"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 关键特性</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%AE%9A%E6%9C%9F%E5%88%A0%E9%99%A4%EF%BC%88Active-Expire%EF%BC%89%E5%8E%9F%E7%90%86"><span class="toc-number">1.5.</span> <span class="toc-text">四、定期删除（Active Expire）原理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%89%A7%E8%A1%8C%E6%97%B6%E6%9C%BA%E4%B8%8E%E7%AE%97%E6%B3%95"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 执行时机与算法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%AE%BE%E8%AE%A1%E8%A6%81%E7%82%B9"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 设计要点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%83%B0%E6%80%A7%E5%88%A0%E9%99%A4-%E5%AE%9A%E6%9C%9F%E5%88%A0%E9%99%A4-%E8%BF%98%E6%9C%89%E6%BC%8F%E7%BD%91%E4%B9%8B%E9%B1%BC%E5%90%97%EF%BC%9F"><span class="toc-number">1.6.</span> <span class="toc-text">五、惰性删除 + 定期删除 还有漏网之鱼吗？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E8%BF%9B%E9%98%B6%EF%BC%9A%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E4%B8%8B%E7%9A%84%E8%BF%87%E6%9C%9F%E9%94%AE%E5%A4%84%E7%90%86%EF%BC%88%E9%AB%98%E9%9A%BE%E5%BA%A6%E8%80%83%E7%82%B9%EF%BC%89"><span class="toc-number">1.7.</span> <span class="toc-text">六、进阶：主从复制下的过期键处理（高难度考点）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E4%B8%BB%E5%BA%93%EF%BC%9A%E7%9C%9F%E5%AE%9E%E5%88%A0%E9%99%A4"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 主库：真实删除</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E4%BB%8E%E5%BA%93%EF%BC%9A%E9%80%BB%E8%BE%91%E8%BF%87%E6%9C%9F%EF%BC%8C%E4%B8%8D%E4%B8%BB%E5%8A%A8%E5%88%A0"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 从库：逻辑过期，不主动删</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E4%B8%A4%E7%A7%8D%E6%A8%A1%E5%BC%8F%E7%9A%84%E5%B7%AE%E5%BC%82"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 两种模式的差异</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E8%BF%BD%E9%97%AE%EF%BC%9A%E4%BB%8E%E5%BA%93%E8%83%BD%E8%AF%BB%E5%88%B0%E5%B7%B2%E8%BF%87%E6%9C%9F%E7%9A%84%E6%95%B0%E6%8D%AE%E5%90%97%EF%BC%9F"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 追问：从库能读到已过期的数据吗？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E8%BF%87%E6%9C%9F%E5%88%A0%E9%99%A4-vs-%E5%86%85%E5%AD%98%E6%B7%98%E6%B1%B0%EF%BC%88%E6%98%93%E6%B7%B7%E6%B7%86%E7%82%B9%EF%BC%89"><span class="toc-number">1.8.</span> <span class="toc-text">七、过期删除 vs 内存淘汰（易混淆点）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/02/java-daemon-thread-shutdownhook-deep-dive/" title="【Java 并发】守护线程与 JVM 优雅退出深度解析：从 Daemon 线程原理到 ShutdownHook 实战">【Java 并发】守护线程与 JVM 优雅退出深度解析：从 Daemon 线程原理到 ShutdownHook 实战</a><time datetime="2026-09-02T00:00:00.000Z" title="发表于 2026-09-02 08:00:00">2026-09-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/02/mq-duplicate-consumption-deep-dive/" title="【消息队列】消息重复消费深度解析：从 at-least-once 原理到幂等消费的六种治理方案">【消息队列】消息重复消费深度解析：从 at-least-once 原理到幂等消费的六种治理方案</a><time datetime="2026-09-02T00:00:00.000Z" title="发表于 2026-09-02 08:00:00">2026-09-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/02/mysql-replication-lag-deep-dive/" title="【MySQL 高可用】MySQL 主从延迟深度解析：从复制原理、延迟成因到排查与治理实战">【MySQL 高可用】MySQL 主从延迟深度解析：从复制原理、延迟成因到排查与治理实战</a><time datetime="2026-09-02T00:00:00.000Z" title="发表于 2026-09-02 08:00:00">2026-09-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/02/redis-big-key-hot-key-deep-dive/" title="【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案</a><time datetime="2026-09-02T00:00:00.000Z" title="发表于 2026-09-02 08:00:00">2026-09-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/02/redis-key-expiration-deep-dive/" title="【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜">【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜</a><time datetime="2026-09-02T00:00:00.000Z" title="发表于 2026-09-02 08:00:00">2026-09-02</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
