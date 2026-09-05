@@ -1,0 +1,329 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全面试官：你们 Redis 集群是怎么搭的？从节点数据从哪来？“主从复制啊，主节点写，从节点同步数据，读写分离扛读流量……”——很多人能说出这句话，但再往下追问就卡壳了：  主从之间第一次怎么同步的？是全量还是增量？ 从节点断线重连后，是全量重来还是接着同步？ 主从切换后，新主的从节点要全量同步">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/05/redis-master-slave-replication-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全面试官：你们 Redis 集群是怎么搭的？从节点数据从哪来？“主从复制啊，主节点写，从节点同步数据，读写分离扛读流量……”——很多人能说出这句话，但再往下追问就卡壳了：  主从之间第一次怎么同步的？是全量还是增量？ 从节点断线重连后，是全量重来还是接着同步？ 主从切换后，新主的从节点要全量同步">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-05T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-05T00:03:39.595Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="缓存">
+<meta property="article:tag" content="高可用">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全",
+  "url": "https://jiweidong.github.io/2026/09/05/redis-master-slave-replication-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-05T00:00:00.000Z",
+  "dateModified": "2026-09-05T00:03:39.595Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/05/redis-master-slave-replication-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">572</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">696</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">180</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-05T00:00:00.000Z" title="发表于 2026-09-05 08:00:00">2026-09-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-05T00:03:39.595Z" title="更新于 2026-09-05 08:03:39">2026-09-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-原理】Redis-主从复制深度解析：从全量同步、增量同步到-psync2-断线续传与复制安全"><a href="#【Redis-原理】Redis-主从复制深度解析：从全量同步、增量同步到-psync2-断线续传与复制安全" class="headerlink" title="【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全"></a>【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全</h1><h2 id="面试官：你们-Redis-集群是怎么搭的？从节点数据从哪来？"><a href="#面试官：你们-Redis-集群是怎么搭的？从节点数据从哪来？" class="headerlink" title="面试官：你们 Redis 集群是怎么搭的？从节点数据从哪来？"></a>面试官：你们 Redis 集群是怎么搭的？从节点数据从哪来？</h2><p>“主从复制啊，主节点写，从节点同步数据，读写分离扛读流量……”——很多人能说出这句话，但再往下追问就卡壳了：</p>
+<ul>
+<li>主从之间<strong>第一次</strong>怎么同步的？是全量还是增量？</li>
+<li>从节点<strong>断线重连</strong>后，是全量重来还是接着同步？</li>
+<li>主从切换后，<strong>新主</strong>的从节点要全量同步吗？</li>
+<li><code>replid</code>、<code>repl_backlog</code>、<code>PSYNC</code>、<code>offset</code> 这些到底是什么？</li>
+</ul>
+<p>Redis 主从复制是哨兵、Cluster 高可用的地基，也是面试的高频深水区。今天从命令到源码，把它彻底拆开。</p>
+<h2 id="一、先搭一个主从，看现象"><a href="#一、先搭一个主从，看现象" class="headerlink" title="一、先搭一个主从，看现象"></a>一、先搭一个主从，看现象</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 主节点：6379</span></span><br><span class="line">redis-server --port 6379</span><br><span class="line"></span><br><span class="line"><span class="comment"># 从节点：6380，指向主节点</span></span><br><span class="line">redis-server --port 6380 --replicaof 127.0.0.1 6379</span><br></pre></td></tr></table></figure>
+
+<p>或者运行时用命令：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 在 6380 上执行</span></span><br><span class="line">127.0.0.1:6380&gt; REPLICAOF 127.0.0.1 6379</span><br><span class="line">OK</span><br><span class="line">127.0.0.1:6380&gt; INFO replication</span><br><span class="line"><span class="comment"># Replication</span></span><br><span class="line">role:slave</span><br><span class="line">master_host:127.0.0.1</span><br><span class="line">master_link_status:up</span><br><span class="line">slave_repl_offset:1234</span><br></pre></td></tr></table></figure>
+
+<p>主节点上能看到从节点信息：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">127.0.0.1:6379&gt; INFO replication</span><br><span class="line"><span class="comment"># Replication</span></span><br><span class="line">role:master</span><br><span class="line">connected_slaves:1</span><br><span class="line">slave0:ip=127.0.0.1,port=6380,state=online,offset=1234,lag=0</span><br></pre></td></tr></table></figure>
+
+<p><strong>验证同步</strong>：主节点 <code>SET foo bar</code>，从节点立刻能 <code>GET foo</code>。写主读从，读写分离的第一步就成了。</p>
+<h2 id="二、主从复制的完整流程（核心！）"><a href="#二、主从复制的完整流程（核心！）" class="headerlink" title="二、主从复制的完整流程（核心！）"></a>二、主从复制的完整流程（核心！）</h2><p>一次从节点上线，背后经历了 <strong>6 个阶段</strong>：</p>
+<h3 id="阶段-1：保存主节点信息"><a href="#阶段-1：保存主节点信息" class="headerlink" title="阶段 1：保存主节点信息"></a>阶段 1：保存主节点信息</h3><p>从节点执行 <code>REPLICAOF</code> 后，只是把主节点地址<strong>保存在内存</strong>（<code>server.masterhost/masterport</code>），此时并没有建立连接，也没开始同步。</p>
+<h3 id="阶段-2：建立-TCP-连接"><a href="#阶段-2：建立-TCP-连接" class="headerlink" title="阶段 2：建立 TCP 连接"></a>阶段 2：建立 TCP 连接</h3><p>从节点有个<strong>定时任务</strong>（每秒执行一次 <code>replicationCron</code>），发现配置了主节点但没连上，就发起 TCP 连接，并专门开一个 socket 用于接收主节点推送的写命令。注意：这个 socket 是<strong>独立的</strong>，不占从节点处理客户端命令的连接。</p>
+<h3 id="阶段-3：发送-PING"><a href="#阶段-3：发送-PING" class="headerlink" title="阶段 3：发送 PING"></a>阶段 3：发送 PING</h3><p>连接建立后，从节点先发 <code>PING</code> 探活。如果主节点没响应或超时，从节点断开重连。这一步能提前发现网络问题，避免后面同步到一半失败。</p>
+<h3 id="阶段-4：身份校验"><a href="#阶段-4：身份校验" class="headerlink" title="阶段 4：身份校验"></a>阶段 4：身份校验</h3><p>如果主节点配置了 <code>requirepass</code>，从节点需要配置 <code>masterauth</code>。校验通过才继续，否则断开。</p>
+<h3 id="阶段-5：发送-PSYNC，开始同步（关键！）"><a href="#阶段-5：发送-PSYNC，开始同步（关键！）" class="headerlink" title="阶段 5：发送 PSYNC，开始同步（关键！）"></a>阶段 5：发送 PSYNC，开始同步（关键！）</h3><p>从节点发送：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">PSYNC &lt;replid&gt; &lt;offset&gt;</span><br></pre></td></tr></table></figure>
+
+<p>这里分两种情况，先记住结论，后面细讲：</p>
+<ul>
+<li><strong>首次同步</strong>：从节点还没有任何复制历史，发送 <code>PSYNC ? -1</code>，主节点决定做<strong>全量同步</strong>（FULLRESYNC）；</li>
+<li><strong>断线重连</strong>：从节点带上自己之前的 <code>replid</code> 和复制偏移量 <code>offset</code>，主节点判断能不能<strong>增量续传</strong>（CONTINUE），能则只补差距数据。</li>
+</ul>
+<h3 id="阶段-6：命令传播"><a href="#阶段-6：命令传播" class="headerlink" title="阶段 6：命令传播"></a>阶段 6：命令传播</h3><p>同步完成后进入<strong>增量复制</strong>阶段：主节点每执行一条写命令，都会把命令<strong>写入复制缓冲区并推送给所有从节点</strong>。从节点执行同样的命令，保持数据一致。</p>
+<h2 id="三、全量同步（FULLRESYNC）到底传了什么？"><a href="#三、全量同步（FULLRESYNC）到底传了什么？" class="headerlink" title="三、全量同步（FULLRESYNC）到底传了什么？"></a>三、全量同步（FULLRESYNC）到底传了什么？</h2><p>很多人以为全量同步就是”主节点把 RDB 文件发给从节点”，其实完整过程是 <strong>RDB 快照 + 缓冲区命令补发</strong> 的组合，缺一不可。看时序：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">从节点                    主节点</span><br><span class="line">  |  PSYNC ? -1             |</span><br><span class="line">  |------------------------&gt;|</span><br><span class="line">  |  处理：执行 BGSAVE 生成 RDB</span><br><span class="line">  |  同时：把 BGSAVE 期间的新写命令</span><br><span class="line">  |        存入复制缓冲区 repl_backlog</span><br><span class="line">  |&lt;------- FULLRESYNC &lt;replid&gt; &lt;offset&gt;</span><br><span class="line">  |  RDB 文件流式传输       |</span><br><span class="line">  |&lt;========================|</span><br><span class="line">  |  清空旧数据，加载 RDB    |</span><br><span class="line">  |  发送 ACK               |</span><br><span class="line">  |------------------------&gt;|</span><br><span class="line">  |  补发缓冲区中的命令      |</span><br><span class="line">  |&lt;========================|  （从 BGSAVE 到 RDB 加载完</span><br><span class="line">  |                          |    之间的写命令都在这）</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么要补发缓冲区命令？</strong> 因为 <code>BGSAVE</code> 生成 RDB 需要时间（大实例可能几十秒），这期间主节点还在持续接收写命令。如果只传 RDB，从节点加载完的瞬间就已经落后了。所以 Redis 把 BGSAVE 开始后的写命令同时写进 <code>repl_backlog</code> 缓冲区，RDB 传完后再把缓冲区命令补发给从节点，保证<strong>从节点状态 &#x3D; 主节点开始 BGSAVE 时刻之后的所有变更</strong>。</p>
+<h3 id="3-1-从节点加载-RDB-时还能服务吗？"><a href="#3-1-从节点加载-RDB-时还能服务吗？" class="headerlink" title="3.1 从节点加载 RDB 时还能服务吗？"></a>3.1 从节点加载 RDB 时还能服务吗？</h3><p>默认<strong>不能</strong>。Redis 从节点加载 RDB 期间会阻塞，不响应客户端命令（这是从节点短暂的不可用窗口，大实例要格外注意）。加载完成后才恢复服务并开始接收增量命令。</p>
+<h3 id="3-2-全量同步的几个开销（面试加分点）"><a href="#3-2-全量同步的几个开销（面试加分点）" class="headerlink" title="3.2 全量同步的几个开销（面试加分点）"></a>3.2 全量同步的几个开销（面试加分点）</h3><table>
+<thead>
+<tr>
+<th>开销</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>主节点 BGSAVE fork</td>
+<td>fork 会阻塞主进程（毫秒级），且 Copy-On-Write 可能让内存翻倍式增长</td>
+</tr>
+<tr>
+<td>RDB 传输带宽</td>
+<td>大实例 RDB 几个 GB，传输占满内网带宽，可能拖慢主节点正常服务</td>
+</tr>
+<tr>
+<td>从节点清空+加载</td>
+<td>旧数据全清，加载期间阻塞</td>
+</tr>
+<tr>
+<td>级联同步</td>
+<td>多个从节点同时全量，主节点要 fork 多次 → <strong>用树状拓扑</strong>缓解</td>
+</tr>
+</tbody></table>
+<p><strong>优化手段</strong>：<code>repl-diskless-sync yes</code>（无盘复制：主节点不落盘，直接 socket 流式传 RDB）；多个从节点<strong>错峰</strong>上线，避免同时触发全量。</p>
+<h2 id="四、断线重连：psync-与增量续传"><a href="#四、断线重连：psync-与增量续传" class="headerlink" title="四、断线重连：psync 与增量续传"></a>四、断线重连：psync 与增量续传</h2><h3 id="4-1-老版本-SYNC-的痛点"><a href="#4-1-老版本-SYNC-的痛点" class="headerlink" title="4.1 老版本 SYNC 的痛点"></a>4.1 老版本 SYNC 的痛点</h3><p>Redis 2.8 之前只有 <code>SYNC</code> 命令：从节点只要断线重连，主节点就<strong>无条件全量同步</strong>。频繁断线 &#x3D; 频繁全量 &#x3D; 主节点反复 fork、带宽反复打满。</p>
+<h3 id="4-2-PSYNC-的增量续传"><a href="#4-2-PSYNC-的增量续传" class="headerlink" title="4.2 PSYNC 的增量续传"></a>4.2 PSYNC 的增量续传</h3><p>Redis 2.8 引入 <code>PSYNC</code>：主节点维护一个<strong>复制积压缓冲区 <code>repl_backlog</code></strong>（默认 1MB，环形），记录自己执行过的写命令和对应偏移量。从节点重连时带上自己的 <code>replid</code> 和 <code>offset</code>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">PSYNC &lt;replid&gt; &lt;offset&gt;</span><br></pre></td></tr></table></figure>
+
+<p>主节点判断：</p>
+<ul>
+<li><code>replid</code> 匹配 且 <code>offset</code> 之后的数据还在 <code>repl_backlog</code> 里 → 回复 <code>CONTINUE</code>，<strong>只补发缺失的命令</strong>（增量同步）；</li>
+<li><code>replid</code> 不匹配 或 offset 太旧、数据已被环形缓冲区覆盖 → 回复 <code>FULLRESYNC</code>，退回全量。</li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 从节点断线 10 秒重连后</span></span><br><span class="line">master_link_status:up</span><br><span class="line">master_sync_in_progress:0          <span class="comment"># 没有进行全量同步</span></span><br><span class="line">slave_repl_offset:2048             <span class="comment"># offset 连续增长</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>面试追问：repl_backlog 调多大？</strong> 太小 → 从节点断线稍久就追不上，被迫全量；太大 → 浪费内存。经验：<code>repl_backlog_size = 主节点每秒写命令量 × 期望容忍的断线秒数</code>，一般 64MB~256MB 起步，再按 <code>master_repl_offset - slave_repl_offset</code> 的监控值动态调。</p>
+<h3 id="4-3-psync2：主从切换不再全量（Redis-4-0）"><a href="#4-3-psync2：主从切换不再全量（Redis-4-0）" class="headerlink" title="4.3 psync2：主从切换不再全量（Redis 4.0）"></a>4.3 psync2：主从切换不再全量（Redis 4.0）</h3><p>4.0 之前有个大坑：主从切换后，<strong>新主</strong>（原从）的 <code>replid</code> 变了，其他从节点来同步时 replid 不匹配 → 全部被迫<strong>全量同步</strong>。切换一次，集群抖动一次。</p>
+<p>4.0 的 <code>psync2</code> 解决了它：</p>
+<ul>
+<li>主从复制时，<strong>从节点会记住主的 replid</strong>（<code>server.replid</code> 会传给从，从节点把它存为 <code>master_replid</code>，切换成主时沿用）；</li>
+<li>主从切换时，新主<strong>继承原主的 replid</strong>（<code>replid</code> 不变，<code>replid2</code> 记录旧值用于容错）；</li>
+<li>其他从节点用旧 replid + offset 来同步，新主发现数据还在 backlog 里 → <code>CONTINUE</code>，增量续传，<strong>避免全量</strong>。</li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 切换后的新主 INFO replication</span></span><br><span class="line">replid:1a2b3c...     <span class="comment"># 沿用原主 replid</span></span><br><span class="line">replid2:0000000000000000000000000000000000000000</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-4-replid-和-replid2-到底是啥？"><a href="#4-4-replid-和-replid2-到底是啥？" class="headerlink" title="4.4 replid 和 replid2 到底是啥？"></a>4.4 replid 和 replid2 到底是啥？</h3><ul>
+<li><strong>replid</strong>：当前实例的复制 ID，标识”我这条复制链路的历史”。主从一致时，从节点的 replid 与主节点相同（表示”我来自这条主线”）。实例第一次成为主（或执行 <code>REPLICAOF no one</code> 且没有继承）时生成新的 replid。</li>
+<li><strong>replid2</strong>：记录<strong>上一个</strong> replid，用于主从切换后的容错——让”旧主线”的从节点还能通过旧 replid 找到自己（走增量而不是全量）。</li>
+</ul>
+<p>一个从节点全量同步完成后，主节点会发来自己的 replid，从节点存下来。断线重连时用这个 replid 发 PSYNC，主节点比对一致才允许增量。</p>
+<h2 id="五、主从复制下的几个经典”坑”（面试高频）"><a href="#五、主从复制下的几个经典”坑”（面试高频）" class="headerlink" title="五、主从复制下的几个经典”坑”（面试高频）"></a>五、主从复制下的几个经典”坑”（面试高频）</h2><h3 id="5-1-主从数据不一致是必然的！"><a href="#5-1-主从数据不一致是必然的！" class="headerlink" title="5.1 主从数据不一致是必然的！"></a>5.1 主从数据不一致是必然的！</h3><p>复制是<strong>异步</strong>的：主节点执行完写命令就返回客户端，命令推送到从节点有网络延迟。所以：</p>
+<ul>
+<li><strong>强一致场景不能读从库</strong>（刚写完就读从库可能读不到）；</li>
+<li>缓解：<code>WAIT numreplicas timeout</code> 命令可以让主节点等待指定数量的从节点确认后再返回（牺牲可用性换一致性，用得很少）；</li>
+<li>监控：<code>master_repl_offset</code>（主）与 <code>slave_repl_offset</code>（从）的差就是复制延迟，Lag 告警就盯它。</li>
+</ul>
+<h3 id="5-2-从节点会执行过期键删除吗？"><a href="#5-2-从节点会执行过期键删除吗？" class="headerlink" title="5.2 从节点会执行过期键删除吗？"></a>5.2 从节点会执行过期键删除吗？</h3><p>会，但<strong>策略不同</strong>：主节点删除过期键时会<strong>显式发送 DEL 命令</strong>给从节点，从节点”听命令”删除；从节点自己<strong>不会主动惰性删除或定期删除</strong>过期键（避免主从删除时机不一致）。所以从节点上可能短暂读到”逻辑上已过期”的键——直到主节点的 DEL 到达。这也是读写分离下缓存不一致的一个隐蔽来源。</p>
+<h3 id="5-3-从节点只读，但别忘了这两个例外"><a href="#5-3-从节点只读，但别忘了这两个例外" class="headerlink" title="5.3 从节点只读，但别忘了这两个例外"></a>5.3 从节点只读，但别忘了这两个例外</h3><p>从节点默认 <code>replica-read-only yes</code>，但要注意：从节点<strong>可以</strong>执行 <code>FLUSHALL</code>、<code>SHUTDOWN</code> 这类管理命令（需要权限的人为操作）；另外如果配置了 <code>replica-read-only no</code>，从节点本地写入的数据在<strong>下次全量同步时会被清掉</strong>，别拿从节点当临时存储。</p>
+<h3 id="5-4-全量同步期间主节点挂了怎么办？"><a href="#5-4-全量同步期间主节点挂了怎么办？" class="headerlink" title="5.4 全量同步期间主节点挂了怎么办？"></a>5.4 全量同步期间主节点挂了怎么办？</h3><p>从节点正在接收 RDB 时主节点宕机 → 从节点会<strong>周期性重试</strong>（<code>repl-timeout</code> 默认 60s 内没收到数据就判定超时），重新发起 PSYNC。如果此时已经有哨兵在选主，从节点可能先完成重新同步、再响应哨兵的选举，逻辑上要小心处理”同步中不接受成为主节点”的竞态——哨兵协议里从节点在 <code>SLAVE_OF</code> 切换时如果正处于全量同步，会推迟应答。</p>
+<h3 id="5-5-从节点能写吗？为什么从节点挂了对主节点没影响？"><a href="#5-5-从节点能写吗？为什么从节点挂了对主节点没影响？" class="headerlink" title="5.5 从节点能写吗？为什么从节点挂了对主节点没影响？"></a>5.5 从节点能写吗？为什么从节点挂了对主节点没影响？</h3><p>从节点挂了，主节点只在 <code>INFO replication</code> 里把它标记为 <code>state:disconnected</code>，<strong>继续正常服务</strong>，不会阻塞写。这也是主从复制”高可用读、弱可用写”的定位——写的高可用要靠<strong>哨兵</strong>把从节点提升为主，或者 <strong>Cluster</strong> 的分片容错。</p>
+<h2 id="六、复制安全与一致性细节"><a href="#六、复制安全与一致性细节" class="headerlink" title="六、复制安全与一致性细节"></a>六、复制安全与一致性细节</h2><h3 id="6-1-认证与加密"><a href="#6-1-认证与加密" class="headerlink" title="6.1 认证与加密"></a>6.1 认证与加密</h3><ul>
+<li>主节点 <code>requirepass</code>，从节点必须配 <code>masterauth</code>（<strong>密码明文会出现在配置里，用 <code>redis-cli</code> 的 <code>CONFIG SET</code> 或密钥管理注入</strong>）；</li>
+<li>跨机房复制建议走 <strong>TLS</strong>（<code>tls-replication yes</code>）；</li>
+<li><code>rename-command</code> 可以禁用从节点上的危险命令。</li>
+</ul>
+<h3 id="6-2-复制拓扑怎么设计？"><a href="#6-2-复制拓扑怎么设计？" class="headerlink" title="6.2 复制拓扑怎么设计？"></a>6.2 复制拓扑怎么设计？</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">     [Master]</span><br><span class="line">     /  |  \</span><br><span class="line">[S1] [S2] [S3]        ← 星型：S3 全量时 Master fork 三次</span><br><span class="line">     |</span><br><span class="line">    [S4]               ← 树型：S4 从 S3 同步，减轻 Master 压力</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>从节点少于 10 个：星型即可；</li>
+<li>大量从节点&#x2F;跨机房：树型级联，从节点 <code>REPLICAOF</code> 另一个从节点；</li>
+<li>读流量大：读写分离 + 多从节点 + 客户端侧路由（或 Proxy）；</li>
+<li>注意级联从节点的延迟会<strong>逐级累加</strong>。</li>
+</ul>
+<h3 id="6-3-怎么监控复制健康？"><a href="#6-3-怎么监控复制健康？" class="headerlink" title="6.3 怎么监控复制健康？"></a>6.3 怎么监控复制健康？</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">redis-cli -p 6379 INFO replication    <span class="comment"># offset、lag、connected_slaves</span></span><br><span class="line">redis-cli -p 6380 INFO replication    <span class="comment"># master_link_status、master_sync_in_progress</span></span><br></pre></td></tr></table></figure>
+
+<p>关键指标：<code>master_link_status:up</code>、<code>slave_repl_offset</code> 追平速度、<code>master_sync_in_progress:0</code>（长时间为 1 说明全量同步卡住）、<code>lag</code>（心跳间隔，过大说明网络异常）。接入 Prometheus 的 redis_exporter 后，这几个指标直接配告警：lag &gt; 阈值、link 断开、全量同步超过 N 分钟。</p>
+<h2 id="七、一图流总结-面试话术"><a href="#七、一图流总结-面试话术" class="headerlink" title="七、一图流总结 + 面试话术"></a>七、一图流总结 + 面试话术</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">主从复制 = 全量同步（首次/RDB 兜底） + 增量同步（命令传播）</span><br><span class="line">         + psync 断点续传（repl_backlog 兜底）</span><br><span class="line">         + psync2 主从切换免全量（replid 继承）</span><br><span class="line"></span><br><span class="line">关键命令：REPLICAOF / PSYNC &lt;replid&gt; &lt;offset&gt; / FULLRESYNC / CONTINUE</span><br><span class="line">关键配置：repl-backlog-size、repl-diskless-sync、masterauth、replica-read-only</span><br></pre></td></tr></table></figure>
+
+<p><strong>面试话术模板</strong>：Redis 主从复制分全量与增量两个阶段。首次同步走全量：从节点发 <code>PSYNC ? -1</code>，主节点 <code>BGSAVE</code> 生成 RDB 并同时把新写命令缓存进 repl_backlog，RDB 传完后从节点加载，主节点再补发缓冲命令。之后进入命令传播的增量阶段。从节点断线重连时发 <code>PSYNC &lt;replid&gt; &lt;offset&gt;</code>，如果 offset 还在主节点的复制积压缓冲区内就 <code>CONTINUE</code> 增量续传，否则退化为全量。4.0 的 psync2 让主从切换后新主沿用旧 replid，其他从节点可以增量续传而不用全量。复制是异步的，所以读写分离有延迟窗口，强一致场景不能读从库。</p>
+<p>主从复制只是 Redis 高可用的第一步——它解决了”读的扩展”，写节点还是单点。下一篇可以接着聊哨兵（Sentinel）是怎么在主节点宕机时自动完成故障转移的，或者 Cluster 怎么把写也分片出去的。地基打牢了，上层建筑才稳。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/05/redis-master-slave-replication-deep-dive/">https://jiweidong.github.io/2026/09/05/redis-master-slave-replication-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%8F%AF%E7%94%A8/">高可用</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/05/spring-http-interface-deep-dive/" title="【Spring Boot 3.x 实战】HTTP Interface 声明式 HTTP 客户端深度解析：从 @HttpExchange 到与 OpenFeign/RestClient 全面对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Spring Boot 3.x 实战】HTTP Interface 声明式 HTTP 客户端深度解析：从 @HttpExchange 到与 OpenFeign/RestClient 全面对比</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 3.x 实战】HTTP Interface 声明式 HTTP 客户端深度解析：从 @HttpExchange 到与 OpenFeign&#x2F;RestClient 全面对比面试官：你们服务间调用用的什么？为什么不用 OpenFeign？“用的 OpenFeign，声明式接口很方便……”——如果面试官接着问”如果不用 OpenFeign，Spring 官方有没有原生的声明式 HTTP 客户端？“，很多人就懵了。 答案是：有，而且从 Spring 6.1 &#x2F; Spring Boot 3.2 开始正式可用——HTTP Interface（@HttpExchange 系列注解）。这是 Spring 官方钦定的声明式 HTTP 客户端，不需要引入任何 OpenFeign 依赖。本文从用法到源码，再和 OpenFeign、RestClient、WebClient 做一次全方位对比，帮你彻底搞懂怎么选型。 一、HTTP Interface 是什么？一句话：用 Java 接口 + 注解声明 HTTP 远程调用，Spring 在运行时自动生成实现——和 Op...</div></div></div></a><a class="pagination-related" href="/2026/09/05/kafka-kraft-mode-deep-dive/" title="【Kafka 原理】Kafka 3.x KRaft 模式深度解析：从 ZooKeeper 依赖到自我管理的元数据架构与迁移实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Kafka 原理】Kafka 3.x KRaft 模式深度解析：从 ZooKeeper 依赖到自我管理的元数据架构与迁移实战</div></div><div class="info-2"><div class="info-item-1">【Kafka 原理】Kafka 3.x KRaft 模式深度解析：从 ZooKeeper 依赖到自我管理的元数据架构与迁移实战面试官：Kafka 的控制器（Controller）是干什么的？它现在还依赖 ZooKeeper 吗？如果你还在回答”Kafka 用 ZooKeeper 做 Broker 注册、Topic 元数据存储、Controller 选举……”，那只能算答对了一半——那是 2.x 时代的答案。Kafka 3.3+ 已经支持 KRaft 模式（KIP-500），3.5 起 ZooKeeper 被标记为弃用，Kafka 4.0（2025 年发布）已经彻底移除 ZooKeeper。这个变化是 Kafka 近十年最大的一次架构革命，面试官现在最爱追问的就是它。 今天把 KRaft 一次讲透：为什么要去 ZooKeeper、KRaft 架构长什么样、元数据怎么同步、怎么部署和迁移、踩坑清单，一条龙。 一、为什么要干掉 ZooKeeper？先看 ZooKeeper 时代的痛点1.1 传统架构：Broker + ZooKeeper 双组件123456789101112┌─────...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/13/redis-core/" title="Redis 核心技术与实战（面试跳槽篇）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">Redis 核心技术与实战（面试跳槽篇）</div></div><div class="info-2"><div class="info-item-1">Redis 核心技术与实战（面试跳槽篇） Redis 是后端面试的”必考点”，本文从底层原理到生产实战，全面覆盖 Redis 核心知识点。  一、Redis 基础1.1 为什么这么快Redis 单机 QPS 可达 10 万+，主要归功于以下几点： 纯内存操作：数据全在内存中，读写速度远快于磁盘 IO。内存寻址是纳秒级，而磁盘寻址是毫秒级，差了三个数量级。 单线程模型：Redis 6.0 之前，核心命令执行是单线程的。单线程避免了线程切换和锁竞争的开销。值得注意的是，”单线程”指的是网络 IO 和命令执行在同一个线程中串行处理，但持久化、异步删除等操作由后台线程完成。 IO 多路复用（epoll）：Redis 使用基于 epoll 的 IO 多路复用技术，单线程可以监听多个套接字。当有事件就绪时，才会处理该事件，避免了阻塞等待。epoll 相比 select&#x2F;poll 的优势在于：没有最大连接数限制，使用红黑树管理 fd，通过事件回调避免轮询。 高效的数据结构：Redis 为每种数据类型设计了高效的底层编码，如压缩列表、跳表等。 1.2 五大核心数据结构   结构 底层编...</div></div></div></a><a class="pagination-related" href="/2026/06/20/redis-7-new-features-guide/" title="Redis 7新特性深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">Redis 7新特性深度解析</div></div><div class="info-2"><div class="info-item-1">Redis 7新特性深度解析Redis 7.0于2023年4月正式发布，是Redis历史上变化最大的版本之一。本文将从功能增强、性能优化、新数据结构、ACL改进、集群管理等多个维度深入解读Redis 7的重大变化，并附带生产级迁移和实践建议。 一、Redis 7核心特性总览   特性 Redis 6.2 Redis 7.0 变化    Redis Functions 不支持 原生支持 🆕 新功能   ACL v2 基础ACL 细粒度命令权限 ⬆️ 增强   多AOF文件 不支持 多文件+独立增量 🆕   SHUTDOWN改进 简单关闭 持久化策略控制 ⬆️   发布订阅增强 基础Pub&#x2F;Sub Sharded Pub&#x2F;Sub 🆕   内存效率 基础 更小的key元数据(8-&gt;4字节) ⬆️   复制改进 增加repl-diskless-sync 无盘复制默认启用 ⬆️   集群改进 基础 更好的failover和路由 ⬆️   Redis Stack 单独下载 合并到官方发布 🆕   RESP3协议 部分支持 全面支持 ⬆️   二、Redis ...</div></div></div></a><a class="pagination-related" href="/2026/09/02/redis-key-expiration-deep-dive/" title="【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-02</div><div class="info-item-2">【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 键过期删除策略深度解析：惰性删除、定期删除与主从复制下的过期之谜面试官：给 Key 设置了过期时间，Redis 是怎么把它删掉的？过期键会立刻消失吗？这是 Redis 面试的经典高频题，几乎必问。很多同学知道”惰性删除 + 定期删除”两个词，但说不清底层数据结构、删除时机、内存淘汰的关系，更答不上”主从复制下过期键怎么处理”这种进阶追问。今天一次讲透。  一、过期键是怎么存的？1.1 过期字典（expires dict）每个 Redis 数据库（db）里有两张哈希表：  dict：键空间，存所有键值对 expires：过期字典，key 相同，value 是过期时间戳（毫秒）  12345+----------------+       +----------------+|     dict       |       |    expires     || key1 -&gt; value1 |       | key1 -&gt; 过期时间|| key2 -&gt; value2 |       | key2 -&gt; 过期时间|+-----...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-cache-breakdown-penetration-avalanche-guide/" title="【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】缓存穿透、击穿、雪崩三兄弟：原理、区别与解决方案全解析面试官：说说缓存穿透、缓存击穿、缓存雪崩，以及各自的解决方案？缓存三兄弟是 Redis 面试的开场必问题，但很多人只背了”布隆过滤器、互斥锁、随机过期时间”这几个词，被追问”为什么””怎么实现”就露馅。这篇从原理出发，把三个问题讲透，每个都带代码实现和面试追问。 一、三兄弟一句话区分先建立整体认知，它们都发生在”缓存 Miss 之后回源数据库”这个环节，但病因不同：    问题 本质 一句话描述 危害    缓存穿透 查询的 key 不存在 查一个缓存和 DB 都没有的数据，每次请求都打到 DB DB 被无效流量打爆   缓存击穿 热点 key 过期瞬间 一个热点 key 过期，大量并发同时回源 DB DB 单点压力瞬间飙升   缓存雪崩 大量 key 同时过期 或 Redis 宕机 缓存层大面积失效，流量全部涌向 DB DB 直接宕机，系统整体不可用   区别的关键：穿透是”没有数据”，击穿是”一个热点 key 过期”，雪崩是”一批 key 过期&#x2F;缓存层挂了”。 二、缓存穿透：查不存在的数据原理...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-db-cache-consistency-deep-dive/" title="【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案面试官：数据更新时，你是怎么保证 Redis 缓存和 MySQL 数据一致性的？这是 Redis 面试的”必考题”，也是生产环境最容易踩坑的地方。很多同学背了”先更新数据库，再删缓存”的口诀，但被追问一句”那并发情况下还有问题吗”就卡住了。今天我们把缓存一致性这个问题从方案到原理到代码彻底讲透。 一、先搞清楚：为什么会有缓存不一致？缓存不一致的根源只有一个：对同一份数据，MySQL 和 Redis 各存了一份，而更新操作不是原子的。  更新 MySQL 成功、更新 Redis 失败 → 不一致； 更新 Redis 成功、更新 MySQL 失败 → 不一致； 两个都成功，但执行顺序不同 → 中间态不一致； 并发读写交叉 → 旧数据覆盖新数据。  要理解各种方案，先看业界标准的四种缓存读写模式：    模式 读 写 特点    Cache Aside（旁路缓存） 读 Miss 后回源 DB 先更新 DB，再删缓存 最常用，简单可控   Read Through 缓存组件负责回源 同 Cache ...</div></div></div></a><a class="pagination-related" href="/2026/06/15/multi-level-cache-architecture/" title="多级缓存架构设计：从本地缓存到分布式缓存的实战演进"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-15</div><div class="info-item-2">多级缓存架构设计：从本地缓存到分布式缓存的实战演进</div></div><div class="info-2"><div class="info-item-1">多级缓存架构设计：从本地缓存到分布式缓存的实战演进 缓存是提升系统性能最有效的手段之一。本文从单机缓存开始，逐步演进到多级缓存架构，深入分析每层缓存的选型、策略和最佳实践。  一、为什么需要多级缓存1.1 缓存的层级123456789101112131415客户端缓存（浏览器/CDN）    │ 加速：最快，命中即返回    │ 成本：低    ▼本地缓存（Caffeine/Guava）    │ 加速：毫秒级，无网络开销    │ 成本：占用 JVM 堆内存    ▼分布式缓存（Redis）    │ 加速：亚毫秒级，共享数据    │ 成本：需要额外部署    ▼数据库（MySQL）    │ 加速：基础存储    │ 成本：最高  1.2 多级缓存的收益   场景 无缓存 单层 Redis 多级缓存    平均延迟 50ms 5ms &lt; 1ms   QPS 1000 50000 200000+   数据库压力 100% 30% 5%   系统成本 低 中 中高   二、第一层：本地缓存（Caffeine）2.1 Caffeine 基础使用123456789101112...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">572</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">696</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">180</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E5%8E%9F%E7%90%86%E3%80%91Redis-%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E5%85%A8%E9%87%8F%E5%90%8C%E6%AD%A5%E3%80%81%E5%A2%9E%E9%87%8F%E5%90%8C%E6%AD%A5%E5%88%B0-psync2-%E6%96%AD%E7%BA%BF%E7%BB%AD%E4%BC%A0%E4%B8%8E%E5%A4%8D%E5%88%B6%E5%AE%89%E5%85%A8"><span class="toc-number">1.</span> <span class="toc-text">【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E4%BD%A0%E4%BB%AC-Redis-%E9%9B%86%E7%BE%A4%E6%98%AF%E6%80%8E%E4%B9%88%E6%90%AD%E7%9A%84%EF%BC%9F%E4%BB%8E%E8%8A%82%E7%82%B9%E6%95%B0%E6%8D%AE%E4%BB%8E%E5%93%AA%E6%9D%A5%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：你们 Redis 集群是怎么搭的？从节点数据从哪来？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%AD%E4%B8%80%E4%B8%AA%E4%B8%BB%E4%BB%8E%EF%BC%8C%E7%9C%8B%E7%8E%B0%E8%B1%A1"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搭一个主从，看现象</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E7%9A%84%E5%AE%8C%E6%95%B4%E6%B5%81%E7%A8%8B%EF%BC%88%E6%A0%B8%E5%BF%83%EF%BC%81%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、主从复制的完整流程（核心！）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5-1%EF%BC%9A%E4%BF%9D%E5%AD%98%E4%B8%BB%E8%8A%82%E7%82%B9%E4%BF%A1%E6%81%AF"><span class="toc-number">1.3.1.</span> <span class="toc-text">阶段 1：保存主节点信息</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5-2%EF%BC%9A%E5%BB%BA%E7%AB%8B-TCP-%E8%BF%9E%E6%8E%A5"><span class="toc-number">1.3.2.</span> <span class="toc-text">阶段 2：建立 TCP 连接</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5-3%EF%BC%9A%E5%8F%91%E9%80%81-PING"><span class="toc-number">1.3.3.</span> <span class="toc-text">阶段 3：发送 PING</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5-4%EF%BC%9A%E8%BA%AB%E4%BB%BD%E6%A0%A1%E9%AA%8C"><span class="toc-number">1.3.4.</span> <span class="toc-text">阶段 4：身份校验</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5-5%EF%BC%9A%E5%8F%91%E9%80%81-PSYNC%EF%BC%8C%E5%BC%80%E5%A7%8B%E5%90%8C%E6%AD%A5%EF%BC%88%E5%85%B3%E9%94%AE%EF%BC%81%EF%BC%89"><span class="toc-number">1.3.5.</span> <span class="toc-text">阶段 5：发送 PSYNC，开始同步（关键！）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%B6%E6%AE%B5-6%EF%BC%9A%E5%91%BD%E4%BB%A4%E4%BC%A0%E6%92%AD"><span class="toc-number">1.3.6.</span> <span class="toc-text">阶段 6：命令传播</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%85%A8%E9%87%8F%E5%90%8C%E6%AD%A5%EF%BC%88FULLRESYNC%EF%BC%89%E5%88%B0%E5%BA%95%E4%BC%A0%E4%BA%86%E4%BB%80%E4%B9%88%EF%BC%9F"><span class="toc-number">1.4.</span> <span class="toc-text">三、全量同步（FULLRESYNC）到底传了什么？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%BB%8E%E8%8A%82%E7%82%B9%E5%8A%A0%E8%BD%BD-RDB-%E6%97%B6%E8%BF%98%E8%83%BD%E6%9C%8D%E5%8A%A1%E5%90%97%EF%BC%9F"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 从节点加载 RDB 时还能服务吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%85%A8%E9%87%8F%E5%90%8C%E6%AD%A5%E7%9A%84%E5%87%A0%E4%B8%AA%E5%BC%80%E9%94%80%EF%BC%88%E9%9D%A2%E8%AF%95%E5%8A%A0%E5%88%86%E7%82%B9%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 全量同步的几个开销（面试加分点）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%96%AD%E7%BA%BF%E9%87%8D%E8%BF%9E%EF%BC%9Apsync-%E4%B8%8E%E5%A2%9E%E9%87%8F%E7%BB%AD%E4%BC%A0"><span class="toc-number">1.5.</span> <span class="toc-text">四、断线重连：psync 与增量续传</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E8%80%81%E7%89%88%E6%9C%AC-SYNC-%E7%9A%84%E7%97%9B%E7%82%B9"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 老版本 SYNC 的痛点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-PSYNC-%E7%9A%84%E5%A2%9E%E9%87%8F%E7%BB%AD%E4%BC%A0"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 PSYNC 的增量续传</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-psync2%EF%BC%9A%E4%B8%BB%E4%BB%8E%E5%88%87%E6%8D%A2%E4%B8%8D%E5%86%8D%E5%85%A8%E9%87%8F%EF%BC%88Redis-4-0%EF%BC%89"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 psync2：主从切换不再全量（Redis 4.0）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-replid-%E5%92%8C-replid2-%E5%88%B0%E5%BA%95%E6%98%AF%E5%95%A5%EF%BC%9F"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 replid 和 replid2 到底是啥？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6%E4%B8%8B%E7%9A%84%E5%87%A0%E4%B8%AA%E7%BB%8F%E5%85%B8%E2%80%9D%E5%9D%91%E2%80%9D%EF%BC%88%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、主从复制下的几个经典”坑”（面试高频）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%B8%BB%E4%BB%8E%E6%95%B0%E6%8D%AE%E4%B8%8D%E4%B8%80%E8%87%B4%E6%98%AF%E5%BF%85%E7%84%B6%E7%9A%84%EF%BC%81"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 主从数据不一致是必然的！</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E4%BB%8E%E8%8A%82%E7%82%B9%E4%BC%9A%E6%89%A7%E8%A1%8C%E8%BF%87%E6%9C%9F%E9%94%AE%E5%88%A0%E9%99%A4%E5%90%97%EF%BC%9F"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 从节点会执行过期键删除吗？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E4%BB%8E%E8%8A%82%E7%82%B9%E5%8F%AA%E8%AF%BB%EF%BC%8C%E4%BD%86%E5%88%AB%E5%BF%98%E4%BA%86%E8%BF%99%E4%B8%A4%E4%B8%AA%E4%BE%8B%E5%A4%96"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 从节点只读，但别忘了这两个例外</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E5%85%A8%E9%87%8F%E5%90%8C%E6%AD%A5%E6%9C%9F%E9%97%B4%E4%B8%BB%E8%8A%82%E7%82%B9%E6%8C%82%E4%BA%86%E6%80%8E%E4%B9%88%E5%8A%9E%EF%BC%9F"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 全量同步期间主节点挂了怎么办？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-5-%E4%BB%8E%E8%8A%82%E7%82%B9%E8%83%BD%E5%86%99%E5%90%97%EF%BC%9F%E4%B8%BA%E4%BB%80%E4%B9%88%E4%BB%8E%E8%8A%82%E7%82%B9%E6%8C%82%E4%BA%86%E5%AF%B9%E4%B8%BB%E8%8A%82%E7%82%B9%E6%B2%A1%E5%BD%B1%E5%93%8D%EF%BC%9F"><span class="toc-number">1.6.5.</span> <span class="toc-text">5.5 从节点能写吗？为什么从节点挂了对主节点没影响？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%A4%8D%E5%88%B6%E5%AE%89%E5%85%A8%E4%B8%8E%E4%B8%80%E8%87%B4%E6%80%A7%E7%BB%86%E8%8A%82"><span class="toc-number">1.7.</span> <span class="toc-text">六、复制安全与一致性细节</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E8%AE%A4%E8%AF%81%E4%B8%8E%E5%8A%A0%E5%AF%86"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 认证与加密</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%A4%8D%E5%88%B6%E6%8B%93%E6%89%91%E6%80%8E%E4%B9%88%E8%AE%BE%E8%AE%A1%EF%BC%9F"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 复制拓扑怎么设计？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E6%80%8E%E4%B9%88%E7%9B%91%E6%8E%A7%E5%A4%8D%E5%88%B6%E5%81%A5%E5%BA%B7%EF%BC%9F"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 怎么监控复制健康？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E4%B8%80%E5%9B%BE%E6%B5%81%E6%80%BB%E7%BB%93-%E9%9D%A2%E8%AF%95%E8%AF%9D%E6%9C%AF"><span class="toc-number">1.8.</span> <span class="toc-text">七、一图流总结 + 面试话术</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/05/facade-bridge-command-pattern-completion-deep-dive/" title="【设计模式】外观、桥接、命令三大模式补完深度解析：从支付门面到 JDBC 桥接与命令模式框架落地">【设计模式】外观、桥接、命令三大模式补完深度解析：从支付门面到 JDBC 桥接与命令模式框架落地</a><time datetime="2026-09-05T00:00:00.000Z" title="发表于 2026-09-05 08:00:00">2026-09-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/05/java-float-ieee754-deep-dive/" title="【面试必备】面试官：0.1 + 0.2 为什么不等于 0.3？浮点数 IEEE 754 深度解析">【面试必备】面试官：0.1 + 0.2 为什么不等于 0.3？浮点数 IEEE 754 深度解析</a><time datetime="2026-09-05T00:00:00.000Z" title="发表于 2026-09-05 08:00:00">2026-09-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/05/kafka-kraft-mode-deep-dive/" title="【Kafka 原理】Kafka 3.x KRaft 模式深度解析：从 ZooKeeper 依赖到自我管理的元数据架构与迁移实战">【Kafka 原理】Kafka 3.x KRaft 模式深度解析：从 ZooKeeper 依赖到自我管理的元数据架构与迁移实战</a><time datetime="2026-09-05T00:00:00.000Z" title="发表于 2026-09-05 08:00:00">2026-09-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/05/redis-master-slave-replication-deep-dive/" title="【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全">【Redis 原理】Redis 主从复制深度解析：从全量同步、增量同步到 psync2 断线续传与复制安全</a><time datetime="2026-09-05T00:00:00.000Z" title="发表于 2026-09-05 08:00:00">2026-09-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/05/spring-http-interface-deep-dive/" title="【Spring Boot 3.x 实战】HTTP Interface 声明式 HTTP 客户端深度解析：从 @HttpExchange 到与 OpenFeign/RestClient 全面对比">【Spring Boot 3.x 实战】HTTP Interface 声明式 HTTP 客户端深度解析：从 @HttpExchange 到与 OpenFeign/RestClient 全面对比</a><time datetime="2026-09-05T00:00:00.000Z" title="发表于 2026-09-05 08:00:00">2026-09-05</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
