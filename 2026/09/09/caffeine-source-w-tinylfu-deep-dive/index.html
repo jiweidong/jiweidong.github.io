@@ -1,0 +1,317 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构面试官：本地缓存你用过 Caffeine 吗？它比手写 LRU 强在哪？W-TinyLFU 是什么？背过八股的同学都能说出”Caffeine 是 Guava Cache 的继任者，基于 W-TinyLFU 淘汰算法，性能吊打 LRU”。但再追问一句 “W-TinyLFU 的 FrequencySketch">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/09/caffeine-source-w-tinylfu-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构面试官：本地缓存你用过 Caffeine 吗？它比手写 LRU 强在哪？W-TinyLFU 是什么？背过八股的同学都能说出”Caffeine 是 Guava Cache 的继任者，基于 W-TinyLFU 淘汰算法，性能吊打 LRU”。但再追问一句 “W-TinyLFU 的 FrequencySketch">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-09T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-09T00:06:42.580Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Caffeine">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="源码">
+<meta property="article:tag" content="缓存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构",
+  "url": "https://jiweidong.github.io/2026/09/09/caffeine-source-w-tinylfu-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-09T00:00:00.000Z",
+  "dateModified": "2026-09-09T00:06:42.580Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/09/caffeine-source-w-tinylfu-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">592</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">710</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">187</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-09T00:00:00.000Z" title="发表于 2026-09-09 08:00:00">2026-09-09</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-09T00:06:42.580Z" title="更新于 2026-09-09 08:06:42">2026-09-09</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【缓存源码】Caffeine-源码级深度解析：W-TinyLFU-淘汰算法与高性能本地缓存架构"><a href="#【缓存源码】Caffeine-源码级深度解析：W-TinyLFU-淘汰算法与高性能本地缓存架构" class="headerlink" title="【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构"></a>【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构</h1><h2 id="面试官：本地缓存你用过-Caffeine-吗？它比手写-LRU-强在哪？W-TinyLFU-是什么？"><a href="#面试官：本地缓存你用过-Caffeine-吗？它比手写-LRU-强在哪？W-TinyLFU-是什么？" class="headerlink" title="面试官：本地缓存你用过 Caffeine 吗？它比手写 LRU 强在哪？W-TinyLFU 是什么？"></a>面试官：本地缓存你用过 Caffeine 吗？它比手写 LRU 强在哪？W-TinyLFU 是什么？</h2><p>背过八股的同学都能说出”Caffeine 是 Guava Cache 的继任者，基于 W-TinyLFU 淘汰算法，性能吊打 LRU”。但再追问一句 <strong>“W-TinyLFU 的 FrequencySketch 为什么用 4 bit 计数？Window 区和 Main 区怎么协作？Caffeine 为什么读写那么快？”</strong> 很多人就卡壳了。</p>
+<p>本文直接扒 Caffeine 源码（基于 3.x），把<strong>淘汰算法、存储结构、读写路径</strong>三大块讲透。</p>
+<h2 id="一、Caffeine-的设计目标与整体架构"><a href="#一、Caffeine-的设计目标与整体架构" class="headerlink" title="一、Caffeine 的设计目标与整体架构"></a>一、Caffeine 的设计目标与整体架构</h2><p>Caffeine 是一个<strong>进程内缓存</strong>，对标 Guava Cache 但性能全面领先（官方 benchmark 在读写混合场景下吞吐是 Guava 的 6~10 倍）。它要同时解决三个问题：</p>
+<ol>
+<li><strong>淘汰要”聪明”</strong>：LRU 只认最近访问，扛不住”周期性热点”（如每天 9 点批量访问的报表数据）；LFU 又无法适应访问模式变化；</li>
+<li><strong>读写要快</strong>：本地缓存是超高频率访问，任何加锁都会成为瓶颈；</li>
+<li><strong>维护要异步</strong>：过期扫描、淘汰、监听器回调不能阻塞读线程。</li>
+</ol>
+<p>Caffeine 的答案：<strong>W-TinyLFU 淘汰策略 + 无锁读 + 读写缓冲 + 单线程异步维护</strong>。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">BoundedLocalCache（核心实现）</span><br><span class="line">├── Node 数组（哈希表，存 key-value 与访问元数据）</span><br><span class="line">├── 淘汰策略（W-TinyLFU）：</span><br><span class="line">│   ├── FrequencySketch（频率估计器）</span><br><span class="line">│   ├── Window LRU 队列（占 1%）</span><br><span class="line">│   └── Main 区（占 99%）：</span><br><span class="line">│       ├── 保护段 Probation（80%）</span><br><span class="line">│       └── 试用段 Protected（20%）</span><br><span class="line">├── 写缓冲 WriteBuffer（RingBuffer，MPSC）</span><br><span class="line">└── 读缓冲 ReadBuffer（RingBuffer）</span><br><span class="line">    └── 维护线程（单线程 Drainer，定期/按需执行）</span><br></pre></td></tr></table></figure>
+
+<h2 id="二、W-TinyLFU：比-LRU-LFU-聪明在哪？"><a href="#二、W-TinyLFU：比-LRU-LFU-聪明在哪？" class="headerlink" title="二、W-TinyLFU：比 LRU&#x2F;LFU 聪明在哪？"></a>二、W-TinyLFU：比 LRU&#x2F;LFU 聪明在哪？</h2><h3 id="2-1-TinyLFU-的频率估计：FrequencySketch"><a href="#2-1-TinyLFU-的频率估计：FrequencySketch" class="headerlink" title="2.1 TinyLFU 的频率估计：FrequencySketch"></a>2.1 TinyLFU 的频率估计：FrequencySketch</h3><p>真正的 LFU 要为每个 key 维护精确访问次数，内存不可接受。TinyLFU 的思路是<strong>用近似计数 + 概率老化</strong>：</p>
+<ul>
+<li>每个 key 通过<strong>多次哈希</strong>映射到一张计数表（<code>FrequencySketch</code> 内部是一个 <code>long[]</code>，每个 long 拆成 16 个 4-bit 槽位）；</li>
+<li>访问时对 key 做 4 个哈希，命中哪几个槽就给哪几个槽 +1（4 bit 最大计 15，溢出封顶）；</li>
+<li><strong>4 bit 计数的两个意义</strong>：省内存（一个 key 只占 4 个 4-bit 槽 ≈ 2 字节）；计数溢出封顶，避免老数据频率无限增长、新数据永远进不来——这就是 LFU 的”冷启动&#x2F;模式漂移”问题的对策之一。</li>
+</ul>
+<h3 id="2-2-概率老化（reset）：让计数”遗忘”旧热点"><a href="#2-2-概率老化（reset）：让计数”遗忘”旧热点" class="headerlink" title="2.2 概率老化（reset）：让计数”遗忘”旧热点"></a>2.2 概率老化（reset）：让计数”遗忘”旧热点</h3><p>只靠封顶还不够：长期运行的缓存里，老热点计数普遍偏高，新晋热点依然比不过。TinyLFU 的做法是<strong>周期性地把所有计数减半（reset）</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// FrequencySketch#reset 的核心逻辑（源码简化）</span></span><br><span class="line"><span class="keyword">void</span> <span class="title function_">reset</span><span class="params">()</span> &#123;</span><br><span class="line">  <span class="type">int</span> <span class="variable">count</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">  <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; table.length; i++) &#123;</span><br><span class="line">    count += Long.bitCount(table[i] &amp; ONE_MASK);   <span class="comment">// ONE_MASK = 0x1111111111111111</span></span><br><span class="line">  &#125;</span><br><span class="line">  <span class="comment">// 当总计数达到采样阈值（size 的 10 倍），把所有计数右移 1 位（整体减半）</span></span><br><span class="line">  <span class="keyword">if</span> (count &gt;= size * <span class="number">10</span>) &#123;</span><br><span class="line">    <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; table.length; i++) &#123;</span><br><span class="line">      table[i] = (table[i] &gt;&gt;&gt; <span class="number">1</span>) &amp; RESET_MASK;</span><br><span class="line">    &#125;</span><br><span class="line">  &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>&gt;&gt;&gt;1</code> 一下，所有频率减半——<strong>近期热点受影响小（减半后仍高），远古热点迅速归零</strong>，缓存就能持续”追踪”访问模式变化。</p>
+<h3 id="2-3-W-TinyLFU-的三段式结构"><a href="#2-3-W-TinyLFU-的三段式结构" class="headerlink" title="2.3 W-TinyLFU 的三段式结构"></a>2.3 W-TinyLFU 的三段式结构</h3><p>TinyLFU 的问题：<strong>新数据刚进缓存时频率为 0，永远竞争不过老数据，导致缓存无法吸收突发流量</strong>。W-TinyLFU 加了 <strong>Window 区</strong> 解决：</p>
+<ul>
+<li><strong>Window LRU 区</strong>（默认占总容量 <strong>1%</strong>）：新数据先进这里，按 LRU 淘汰，给新数据一个”试用期”；</li>
+<li>Window 区被淘汰的 key 进入 <strong>Main 区</strong>，与 Main 区”试用段（Probation）”的 victim <strong>b竞争</strong>：<ul>
+<li>谁的<strong>估算频率高</strong>谁留下；</li>
+<li>如果新来的频率 ≥ victim，则 victim 被淘汰、新 key 进入 Main 区保护段；</li>
+<li>如果新来的频率低，直接被淘汰（admission 拒绝）；</li>
+</ul>
+</li>
+<li><strong>Main 区内部</strong>：试用段（Probation，80%）里的 key 再次被访问就晋升到保护段（Protected，20%）；保护段满了再把最老的降级回试用段——这层设计保证<strong>高频率 key 留在缓存里，低频率 key 在试用段内互相淘汰</strong>。</li>
+</ul>
+<p>一句话：<strong>Window 区解决”新数据进得来”，频率计数解决”热点留得住”，概率老化解决”热点会过时”</strong>——这就是 W-TinyLFU 完胜纯 LRU 的核心。</p>
+<h2 id="三、性能为什么快？读写路径源码剖析"><a href="#三、性能为什么快？读写路径源码剖析" class="headerlink" title="三、性能为什么快？读写路径源码剖析"></a>三、性能为什么快？读写路径源码剖析</h2><h3 id="3-1-读路径：无锁-缓冲"><a href="#3-1-读路径：无锁-缓冲" class="headerlink" title="3.1 读路径：无锁 + 缓冲"></a>3.1 读路径：无锁 + 缓冲</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// BoundedLocalCache#get 的快速路径（源码简化）</span></span><br><span class="line"><span class="meta">@Nullable</span></span><br><span class="line">V <span class="title function_">get</span><span class="params">(K key)</span> &#123;</span><br><span class="line">  Node&lt;K, V&gt; node = data.get(key);   <span class="comment">// ConcurrentHashMap 式无锁读</span></span><br><span class="line">  <span class="keyword">if</span> (node == <span class="literal">null</span>) <span class="keyword">return</span> <span class="literal">null</span>;</span><br><span class="line">  <span class="comment">// 命中后不直接做 LRU 调整！只把访问事件丢进读缓冲</span></span><br><span class="line">  readBuffer.offer(node);</span><br><span class="line">  ...</span><br><span class="line">  <span class="keyword">return</span> node.getValue();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>关键设计：</p>
+<ol>
+<li><strong>哈希表本身无锁读</strong>（读 ConcurrentHashMap 的桶），读操作几乎没有竞争；</li>
+<li><strong>读不直接改链表</strong>！访问频率计数、LRU 顺序调整都通过 <code>readBuffer.offer()</code> 异步完成——读线程只做一个 <code>offer</code>（MPSC RingBuffer 的无锁入队），真正的维护由 Drainer 线程批量处理。</li>
+</ol>
+<h3 id="3-2-写路径与异步维护"><a href="#3-2-写路径与异步维护" class="headerlink" title="3.2 写路径与异步维护"></a>3.2 写路径与异步维护</h3><p>写操作（put）进入 <code>writeBuffer</code>，同样先快速入队；随后由<strong>单线程 Drainer</strong> 统一执行：</p>
+<ul>
+<li>处理读&#x2F;写缓冲里积压的访问记录 → 更新 FrequencySketch 与三段链表；</li>
+<li>执行淘汰：超过 <code>maximumSize</code> 时从 Window&#x2F;Probation 里挑 victim 淘汰；</li>
+<li>执行过期清理与 <code>RemovalListener</code> 回调（回调也是异步的，不阻塞调用线程）；</li>
+<li>通过 <code>scheduleDrainBuffers()</code> 在写入后<strong>按需唤醒</strong>，而不是起一个常驻线程空转（空闲时零开销）。</li>
+</ul>
+<p>这就是 Caffeine 高性能的完整链路：<strong>无锁读 + 无锁入队 + 单线程批量维护</strong>，把”读多写多”的竞争全部摊平。</p>
+<h3 id="3-3-过期策略：惰性-定期清扫"><a href="#3-3-过期策略：惰性-定期清扫" class="headerlink" title="3.3 过期策略：惰性 + 定期清扫"></a>3.3 过期策略：惰性 + 定期清扫</h3><ul>
+<li><code>expireAfterWrite</code> &#x2F; <code>expireAfterAccess</code>：节点上记录过期时间戳；<strong>读时惰性检查</strong> + Drainer 定期（约 1 秒）扫描<strong>按时间有序的淘汰队列</strong>（<code>TimerWheel</code>，Caffeine 用层级时间轮组织，复杂度 O(1) 均摊）清理到期节点；</li>
+<li><code>refreshAfterWrite</code>：到期后不阻塞删除，而是<strong>异步 reload</strong>（旧值继续可用），适合”读多、允许短暂旧值”的场景——注意 refresh 需要配 <code>CacheLoader</code>。</li>
+</ul>
+<h2 id="四、手写-LRU-vs-Caffeine：差距在哪？"><a href="#四、手写-LRU-vs-Caffeine：差距在哪？" class="headerlink" title="四、手写 LRU vs Caffeine：差距在哪？"></a>四、手写 LRU vs Caffeine：差距在哪？</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>手写 LinkedHashMap LRU</th>
+<th>Caffeine</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>淘汰质量</td>
+<td>只认最近访问，热点漂移适应差</td>
+<td>W-TinyLFU，抗扫描、跟热点</td>
+</tr>
+<tr>
+<td>并发</td>
+<td>全局锁或分段锁</td>
+<td>无锁读 + 缓冲批量维护</td>
+</tr>
+<tr>
+<td>过期</td>
+<td>无&#x2F;需自己实现</td>
+<td>惰性+时间轮定期清理</td>
+</tr>
+<tr>
+<td>监听器&#x2F;统计</td>
+<td>无</td>
+<td>RemovalListener、命中率统计内置</td>
+</tr>
+<tr>
+<td>异步加载</td>
+<td>无</td>
+<td>refreshAfterWrite + async loader</td>
+</tr>
+</tbody></table>
+<h2 id="五、生产配置实战"><a href="#五、生产配置实战" class="headerlink" title="五、生产配置实战"></a>五、生产配置实战</h2><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">Cache&lt;String, Product&gt; cache = Caffeine.newBuilder()</span><br><span class="line">        .maximumSize(<span class="number">10_000</span>)                          <span class="comment">// 容量上限</span></span><br><span class="line">        .expireAfterWrite(Duration.ofMinutes(<span class="number">30</span>))     <span class="comment">// 写后过期</span></span><br><span class="line">        .refreshAfterWrite(Duration.ofMinutes(<span class="number">5</span>))     <span class="comment">// 5 分钟异步刷新（需 loader）</span></span><br><span class="line">        .recordStats()                                <span class="comment">// 开启命中率统计</span></span><br><span class="line">        .removalListener((key, value, cause) -&gt;</span><br><span class="line">                log.info(<span class="string">&quot;evict &#123;&#125; cause=&#123;&#125;&quot;</span>, key, cause))  <span class="comment">// 淘汰监听</span></span><br><span class="line">        .build(key -&gt; loadFromDb(key));               <span class="comment">// CacheLoader</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// Spring Boot 集成：CacheManager 指定 Caffeine 即可，@Cacheable 直接可用</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>最佳实践</strong>：</p>
+<ol>
+<li>本地缓存是<strong>堆内存缓存</strong>，容量要按 JVM 堆预算，配 <code>maximumSize</code> 或 <code>maximumWeight</code>，别不设上限；</li>
+<li><strong>多级缓存</strong>：Caffeine（毫秒级）→ Redis（分布式）→ DB，注意 Caffeine 里只放”热点中的热点”，并设置较短 TTL 减少不一致窗口；</li>
+<li>缓存值尽量<strong>不可变</strong>，避免外部修改污染缓存；</li>
+<li>监控 <code>stats().hitRate()</code>，命中率长期过低说明容量配置不合理或淘汰策略不适配。</li>
+</ol>
+<h2 id="六、面试高频追问"><a href="#六、面试高频追问" class="headerlink" title="六、面试高频追问"></a>六、面试高频追问</h2><ul>
+<li>W-TinyLFU 三个区各解决什么问题？→ Window 吸收新数据、Main 保热点、频率计数抗扫描</li>
+<li>FrequencySketch 为什么用 4 bit？→ 省内存 + 计数封顶防老热点垄断</li>
+<li>计数减半（reset）什么时候触发？→ 总计数超过容量 10 倍时，整体 &gt;&gt;&gt;1</li>
+<li>Caffeine 为什么读快？→ 无锁哈希读 + 读缓冲异步维护，读路径零竞争</li>
+<li>维护线程是常驻的吗？→ 不是，写后按需唤醒（scheduleDrainBuffers）</li>
+<li>Guava Cache 和 Caffeine 怎么选？→ 新项目无脑 Caffeine，淘汰算法和并发模型全面领先</li>
+</ul>
+<p><strong>一句话总结：Caffeine 的强不是某一个点，而是”W-TinyLFU 聪明的淘汰 + 无锁读 + 缓冲异步维护”的组合拳。理解这三层，本地缓存面试题基本通杀，也为你看其他高性能组件（Netty、Disruptor）打下了方法论基础。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/09/caffeine-source-w-tinylfu-deep-dive/">https://jiweidong.github.io/2026/09/09/caffeine-source-w-tinylfu-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a><a class="post-meta__tags" href="/tags/Caffeine/">Caffeine</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/09/java-mail-smtp-spring-mail-deep-practice/" title="【Java 实战】企业邮件发送深度实战：从 SMTP 协议、JavaMail API 原理到 Spring Mail 的完整落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 实战】企业邮件发送深度实战：从 SMTP 协议、JavaMail API 原理到 Spring Mail 的完整落地</div></div><div class="info-2"><div class="info-item-1">【Java 实战】企业邮件发送深度实战：从 SMTP 协议、JavaMail API 原理到 Spring Mail 的完整落地面试官：你们的注册验证码、告警通知邮件是怎么发的？JavaMail 的底层原理讲一下？邮件发送是每个企业应用都躲不开的”脏活”：注册验证码、工单通知、账单推送、监控告警……多数人只会照着博客抄一段 JavaMailSender 配置，发出去就完事。一旦遇到乱码、被当垃圾邮件、附件打不开、线上发不出去，就抓瞎了。 本文从 SMTP 协议本身讲起，把 JavaMail 的 API 设计、Spring Boot 集成、以及生产环境的坑一次讲透。 一、先搞懂 SMTP：邮件是怎么”寄”出去的？邮件发送走的是 SMTP（Simple Mail Transfer Protocol，简单邮件传输协议），TCP 25&#x2F;465&#x2F;587 端口，纯文本命令交互： 123456789101112131415161718192021C: EHLO smtp.example.com          # 打招呼，声明身份S: 250-smtp.example.c...</div></div></div></a><a class="pagination-related" href="/2026/09/09/canal-mysql-binlog-incremental-sync-deep-practice/" title="【数据同步实战】Canal 增量同步深度解析：从 binlog 主从协议伪装、HA 故障转移到缓存/ES 双写一致性落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【数据同步实战】Canal 增量同步深度解析：从 binlog 主从协议伪装、HA 故障转移到缓存/ES 双写一致性落地</div></div><div class="info-2"><div class="info-item-1">【数据同步实战】Canal 增量同步深度解析：从 binlog 主从协议伪装、HA 故障转移到缓存&#x2F;ES 双写一致性落地面试官：缓存和数据库一致性，除了延迟双删你们还怎么做的？知道 Canal 吗？只要做过”先更新 DB 再删缓存”之外的方案，就一定绕不开一个痛点：业务双写（写 MySQL 又写 ES&#x2F;Redis）本质是分布式事务，要么引入 MQ 增加链路复杂度，要么忍受双删窗口期的脏读。而 Canal（阿里开源，基于 MySQL binlog 的增量订阅&amp;消费组件） 给出了第三条路：让 MySQL 自己”开口说话”——主从复制协议本来就是 MySQL 同步数据的官方机制，Canal 只是伪装成一个从库，把 binlog 解析成结构化事件推给下游。 本文从”伪装从库”的底层原理讲到 HA 部署与缓存&#x2F;ES 同步落地，属于中间件原理 + 实战的硬核内容。 一、Canal 到底做了什么？一句话：Canal 把自己伪装成 MySQL 的一个 slave，向主库发送 dump 协议请求，拿到 binlog 后解析成 JSON 事件，再推送给自己的客户...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/17/cache-eviction-algorithms-deep-dive/" title="缓存淘汰算法深度解析：LRU、LFU 到 TinyLFU 的原理与Java实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">缓存淘汰算法深度解析：LRU、LFU 到 TinyLFU 的原理与Java实现</div></div><div class="info-2"><div class="info-item-1">缓存淘汰算法深度解析：LRU、LFU 到 TinyLFU 的原理与Java实现一、引言缓存是计算机科学中”以空间换时间”的经典思想体现。无论是 CPU 的 L1&#x2F;L2&#x2F;L3 Cache、操作系统的页面置换、数据库的 Buffer Pool，还是应用层的 Redis 和本地缓存，核心都面临同一个问题：当缓存空间满时，应该淘汰哪些数据？ 选择正确的淘汰策略直接决定了缓存的命中率，进而影响系统整体性能。本文将从最基础的 FIFO 开始，逐步深入分析 LRU、LFU、ARC、TinyLFU 等主流淘汰算法的原理、实现与适用场景。 二、缓存淘汰算法基础2.1 什么是缓存淘汰当缓存达到容量上限时，需要按照一定的策略删除部分缓存项，为新数据腾出空间。这个策略就是 Cache Eviction Policy（缓存淘汰策略）。 2.2 评价指标   指标 说明 重要性    命中率 缓存命中的请求占总请求比例 核心指标   时间复杂度 读写操作的时间复杂度 影响性能   空间复杂度 额外内存开销 影响资源占用   实现复杂度 代码实现与维护难度 工程成本   三、经典淘汰算法详...</div></div></div></a><a class="pagination-related" href="/2026/08/11/spring-boot-auto-configuration-deep-dive/" title="【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-11</div><div class="info-item-2">【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter面试官：Spring Boot 为什么”开箱即用”？说说自动装配的原理这是 Spring Boot 面试中出场率最高的题目，没有之一。很多人能背出 @SpringBootApplication 由三个注解组成，但被追问到「AutoConfiguration.imports 文件是什么时候被加载的」「@ConditionalOnMissingBean 的判定时机」时就卡壳了。 本文从源码层面把自动装配这条链路完整走一遍，并手把手写一个自定义 Starter，彻底根治这个面试死角。   一、自动装配的入口：@SpringBootApplication123456789101112@Target(ElementType.TYPE)@Retention(RetentionPolicy.RUNTIME)@Documented@Inherited@SpringBootConfiguration   // 本质是 @Configuration@EnableAutoCo...</div></div></div></a><a class="pagination-related" href="/2026/07/28/ehcache-jcache-deep-practice/" title="【缓存实战】EhCache 与 JCache（JSR 107）缓存规范深度实战：从入门到集群"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-28</div><div class="info-item-2">【缓存实战】EhCache 与 JCache（JSR 107）缓存规范深度实战：从入门到集群</div></div><div class="info-2"><div class="info-item-1">【缓存实战】EhCache 与 JCache（JSR 107）缓存规范深度实战：从入门到集群一、EhCache 是什么？为什么还在用它？在 Caffeine 大行其道的今天，EhCache 似乎有些「过气」。但实际上，EhCache 依然在许多场景中不可替代：    特性 EhCache 3.x Caffeine Redis    JCache (JSR 107) 兼容 ✅ 原生支持 ❌ 需适配 ❌   磁盘持久化 ✅ ❌ 本身已持久化   集群缓存 ✅ (Terracotta&#x2F;RMI&#x2F;JGroups) ❌ 本身就支持   堆外内存 ✅ ❌ 不适用   Spring Boot 集成 ✅ 自动配置 ✅ 自动配置 ✅   分布式事务 ✅ 支持 XA ❌ ❌   EhCache 最适合的场景：  本地缓存需要突破堆内存限制（堆外内存&#x2F;磁盘） 需要 JCache 标准 API 兼容 小型集群需要分布式缓存但不想引入 Redis 需要持久化缓存的离线处理  二、JCache（JSR 107）标准2.1 核心 APIJCache（JSR 107）定义了 Java...</div></div></div></a><a class="pagination-related" href="/2026/08/26/java-array-arrays-util-deep-dive/" title="【Java 基础】Java 数组深度解析：从内存布局到 Arrays 工具类的排序与二分源码"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-26</div><div class="info-item-2">【Java 基础】Java 数组深度解析：从内存布局到 Arrays 工具类的排序与二分源码</div></div><div class="info-2"><div class="info-item-1">【Java 基础】Java 数组深度解析：从内存布局到 Arrays 工具类的排序与二分源码面试官：数组是对象吗？为什么数组打印出来是地址？Arrays.sort 底层用的什么排序算法？数组是 Java 里最「古老」也最容易被忽视的数据结构——人人都会用，但问到内存布局、协变特性、Arrays.sort 的双轴快排，很多人就卡壳了。本文把数组从底层到工具类一次讲透。 一、数组的本质：一个特殊的对象1.1 数组是对象，但和普通对象不一样123456int[] arr = new int[10];System.out.println(arr.getClass());         // class [ISystem.out.println(arr.getClass().getSuperclass());  // class java.lang.ObjectString[] strs = new String[3];System.out.println(strs.getClass());        // class [Ljava.lang.String;   数组的运行时类型由 ...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-db-cache-consistency-deep-dive/" title="【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案面试官：数据更新时，你是怎么保证 Redis 缓存和 MySQL 数据一致性的？这是 Redis 面试的”必考题”，也是生产环境最容易踩坑的地方。很多同学背了”先更新数据库，再删缓存”的口诀，但被追问一句”那并发情况下还有问题吗”就卡住了。今天我们把缓存一致性这个问题从方案到原理到代码彻底讲透。 一、先搞清楚：为什么会有缓存不一致？缓存不一致的根源只有一个：对同一份数据，MySQL 和 Redis 各存了一份，而更新操作不是原子的。  更新 MySQL 成功、更新 Redis 失败 → 不一致； 更新 Redis 成功、更新 MySQL 失败 → 不一致； 两个都成功，但执行顺序不同 → 中间态不一致； 并发读写交叉 → 旧数据覆盖新数据。  要理解各种方案，先看业界标准的四种缓存读写模式：    模式 读 写 特点    Cache Aside（旁路缓存） 读 Miss 后回源 DB 先更新 DB，再删缓存 最常用，简单可控   Read Through 缓存组件负责回源 同 Cache ...</div></div></div></a><a class="pagination-related" href="/2026/08/06/futuretask-source-deep-dive/" title="【并发编程】FutureTask 源码深度解析：从 Callable 到异步任务状态机"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【并发编程】FutureTask 源码深度解析：从 Callable 到异步任务状态机</div></div><div class="info-2"><div class="info-item-1">【并发编程】FutureTask 源码深度解析：从 Callable 到异步任务状态机面试官：说说 FutureTask 是怎么实现异步获取结果的？很多同学对 Future 的印象停留在”线程池 submit 后返回一个 Future，调 get() 能拿到结果”，但一旦被追问：  get() 是怎么阻塞的？为什么调用后线程会停下来？ cancel(true) 之后任务真的被取消了吗？ 为什么同一个 FutureTask 的 run() 只能执行一次？ FutureTask 和 CompletableFuture 有什么本质区别？  就会卡壳。本文从 JDK 8 源码出发，把 FutureTask 的状态机、阻塞唤醒机制、取消语义彻底讲透。   一、FutureTask 的身世：接口与类体系先看类定义： 123456public class FutureTask&lt;V&gt; implements RunnableFuture&lt;V&gt; &#123;    // RunnableFuture 同时继承了 Runnable 和 Future    public inte...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">592</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">710</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">187</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%BC%93%E5%AD%98%E6%BA%90%E7%A0%81%E3%80%91Caffeine-%E6%BA%90%E7%A0%81%E7%BA%A7%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AW-TinyLFU-%E6%B7%98%E6%B1%B0%E7%AE%97%E6%B3%95%E4%B8%8E%E9%AB%98%E6%80%A7%E8%83%BD%E6%9C%AC%E5%9C%B0%E7%BC%93%E5%AD%98%E6%9E%B6%E6%9E%84"><span class="toc-number">1.</span> <span class="toc-text">【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%9C%AC%E5%9C%B0%E7%BC%93%E5%AD%98%E4%BD%A0%E7%94%A8%E8%BF%87-Caffeine-%E5%90%97%EF%BC%9F%E5%AE%83%E6%AF%94%E6%89%8B%E5%86%99-LRU-%E5%BC%BA%E5%9C%A8%E5%93%AA%EF%BC%9FW-TinyLFU-%E6%98%AF%E4%BB%80%E4%B9%88%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：本地缓存你用过 Caffeine 吗？它比手写 LRU 强在哪？W-TinyLFU 是什么？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81Caffeine-%E7%9A%84%E8%AE%BE%E8%AE%A1%E7%9B%AE%E6%A0%87%E4%B8%8E%E6%95%B4%E4%BD%93%E6%9E%B6%E6%9E%84"><span class="toc-number">1.2.</span> <span class="toc-text">一、Caffeine 的设计目标与整体架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81W-TinyLFU%EF%BC%9A%E6%AF%94-LRU-LFU-%E8%81%AA%E6%98%8E%E5%9C%A8%E5%93%AA%EF%BC%9F"><span class="toc-number">1.3.</span> <span class="toc-text">二、W-TinyLFU：比 LRU&#x2F;LFU 聪明在哪？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-TinyLFU-%E7%9A%84%E9%A2%91%E7%8E%87%E4%BC%B0%E8%AE%A1%EF%BC%9AFrequencySketch"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 TinyLFU 的频率估计：FrequencySketch</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E6%A6%82%E7%8E%87%E8%80%81%E5%8C%96%EF%BC%88reset%EF%BC%89%EF%BC%9A%E8%AE%A9%E8%AE%A1%E6%95%B0%E2%80%9D%E9%81%97%E5%BF%98%E2%80%9D%E6%97%A7%E7%83%AD%E7%82%B9"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 概率老化（reset）：让计数”遗忘”旧热点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-W-TinyLFU-%E7%9A%84%E4%B8%89%E6%AE%B5%E5%BC%8F%E7%BB%93%E6%9E%84"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 W-TinyLFU 的三段式结构</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%80%A7%E8%83%BD%E4%B8%BA%E4%BB%80%E4%B9%88%E5%BF%AB%EF%BC%9F%E8%AF%BB%E5%86%99%E8%B7%AF%E5%BE%84%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90"><span class="toc-number">1.4.</span> <span class="toc-text">三、性能为什么快？读写路径源码剖析</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E8%AF%BB%E8%B7%AF%E5%BE%84%EF%BC%9A%E6%97%A0%E9%94%81-%E7%BC%93%E5%86%B2"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 读路径：无锁 + 缓冲</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%86%99%E8%B7%AF%E5%BE%84%E4%B8%8E%E5%BC%82%E6%AD%A5%E7%BB%B4%E6%8A%A4"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 写路径与异步维护</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E8%BF%87%E6%9C%9F%E7%AD%96%E7%95%A5%EF%BC%9A%E6%83%B0%E6%80%A7-%E5%AE%9A%E6%9C%9F%E6%B8%85%E6%89%AB"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 过期策略：惰性 + 定期清扫</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%89%8B%E5%86%99-LRU-vs-Caffeine%EF%BC%9A%E5%B7%AE%E8%B7%9D%E5%9C%A8%E5%93%AA%EF%BC%9F"><span class="toc-number">1.5.</span> <span class="toc-text">四、手写 LRU vs Caffeine：差距在哪？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%94%9F%E4%BA%A7%E9%85%8D%E7%BD%AE%E5%AE%9E%E6%88%98"><span class="toc-number">1.6.</span> <span class="toc-text">五、生产配置实战</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试高频追问</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/09/canal-mysql-binlog-incremental-sync-deep-practice/" title="【数据同步实战】Canal 增量同步深度解析：从 binlog 主从协议伪装、HA 故障转移到缓存/ES 双写一致性落地">【数据同步实战】Canal 增量同步深度解析：从 binlog 主从协议伪装、HA 故障转移到缓存/ES 双写一致性落地</a><time datetime="2026-09-09T00:00:00.000Z" title="发表于 2026-09-09 08:00:00">2026-09-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/09/caffeine-source-w-tinylfu-deep-dive/" title="【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构">【缓存源码】Caffeine 源码级深度解析：W-TinyLFU 淘汰算法与高性能本地缓存架构</a><time datetime="2026-09-09T00:00:00.000Z" title="发表于 2026-09-09 08:00:00">2026-09-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/09/java-mail-smtp-spring-mail-deep-practice/" title="【Java 实战】企业邮件发送深度实战：从 SMTP 协议、JavaMail API 原理到 Spring Mail 的完整落地">【Java 实战】企业邮件发送深度实战：从 SMTP 协议、JavaMail API 原理到 Spring Mail 的完整落地</a><time datetime="2026-09-09T00:00:00.000Z" title="发表于 2026-09-09 08:00:00">2026-09-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/09/mysql-gtid-parallel-replication-deep-dive/" title="【MySQL 高可用】MySQL GTID 复制深度解析：从位点同步痛点、GTID 生命周期到并行复制与主从切换实战">【MySQL 高可用】MySQL GTID 复制深度解析：从位点同步痛点、GTID 生命周期到并行复制与主从切换实战</a><time datetime="2026-09-09T00:00:00.000Z" title="发表于 2026-09-09 08:00:00">2026-09-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/09/xxl-job-scheduler-executor-source-deep-dive/" title="【任务调度源码】XXL-Job 深度解析：调度中心触发机制、执行器注册发现与路由分片策略源码级剖析">【任务调度源码】XXL-Job 深度解析：调度中心触发机制、执行器注册发现与路由分片策略源码级剖析</a><time datetime="2026-09-09T00:00:00.000Z" title="发表于 2026-09-09 08:00:00">2026-09-09</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
