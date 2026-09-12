@@ -1,0 +1,424 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战面试官：一个索引建几个分片？分片是不是越多越好？这是 Elasticsearch 面试里出现频率最高、也最容易答错的问题。很多人第一反应是「分片越多，并行度越高，当然越快」—— 这个直觉在 ES 里是错的，分片数量配置不当是生产集群性能问题最常见的根源之一。 这篇从分片的本质讲起，把「分片数">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战面试官：一个索引建几个分片？分片是不是越多越好？这是 Elasticsearch 面试里出现频率最高、也最容易答错的问题。很多人第一反应是「分片越多，并行度越高，当然越快」—— 这个直觉在 ES 里是错的，分片数量配置不当是生产集群性能问题最常见的根源之一。 这篇从分片的本质讲起，把「分片数">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-12T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-12T00:06:49.820Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="架构设计">
+<meta property="article:tag" content="运维">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战",
+  "url": "https://jiweidong.github.io/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-12T00:00:00.000Z",
+  "dateModified": "2026-09-12T00:06:49.820Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">607</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">717</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">196</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-12T00:00:00.000Z" title="发表于 2026-09-12 08:00:00">2026-09-12</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-12T00:06:49.820Z" title="更新于 2026-09-12 08:06:49">2026-09-12</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【ES-运维】Elasticsearch-分片策略深度解析：分片数量设计、路由、扩容与-reindex-实战"><a href="#【ES-运维】Elasticsearch-分片策略深度解析：分片数量设计、路由、扩容与-reindex-实战" class="headerlink" title="【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战"></a>【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战</h1><h2 id="面试官：一个索引建几个分片？分片是不是越多越好？"><a href="#面试官：一个索引建几个分片？分片是不是越多越好？" class="headerlink" title="面试官：一个索引建几个分片？分片是不是越多越好？"></a>面试官：一个索引建几个分片？分片是不是越多越好？</h2><p>这是 Elasticsearch 面试里出现频率最高、也最容易答错的问题。很多人第一反应是「分片越多，并行度越高，当然越快」—— 这个直觉在 ES 里是<strong>错的</strong>，分片数量配置不当是生产集群性能问题最常见的根源之一。</p>
+<p>这篇从分片的本质讲起，把「分片数量怎么定 → 数据怎么路由 → 集群怎么扩容 → 主分片建错了怎么救」这条完整链路讲清楚。</p>
+<h2 id="一、分片到底是什么"><a href="#一、分片到底是什么" class="headerlink" title="一、分片到底是什么"></a>一、分片到底是什么</h2><p>ES 的一个索引（index）在物理上被拆成若干 <strong>主分片（primary shard）</strong>，每个主分片是一个<strong>独立的 Lucene 索引</strong>（拥有自己的倒排索引、段文件、translog）。副本分片（replica shard）是主分片的完整拷贝，负责高可用与分担读请求。</p>
+<p>关键事实：</p>
+<ul>
+<li><strong>主分片数量在索引创建时就固定了，之后不能改</strong>（这是所有扩容问题的根源）；</li>
+<li>副本数量可以随时调整；</li>
+<li>一个分片只能分配到一个节点上，<strong>不能被进一步拆分并行</strong>（Lucene 索引内部可以并行搜索，但分片本身是最小分配单位）；</li>
+<li>所以：<strong>分片 &#x3D; 并行度单位 &#x3D; 资源分配单位 &#x3D; 故障恢复单位</strong>。</li>
+</ul>
+<h2 id="二、分片数量设计：三个约束条件"><a href="#二、分片数量设计：三个约束条件" class="headerlink" title="二、分片数量设计：三个约束条件"></a>二、分片数量设计：三个约束条件</h2><h3 id="2-1-单个分片大小：10GB-50GB"><a href="#2-1-单个分片大小：10GB-50GB" class="headerlink" title="2.1 单个分片大小：10GB ~ 50GB"></a>2.1 单个分片大小：10GB ~ 50GB</h3><p>这是官方推荐区间，也是实践中最稳的经验值：</p>
+<ul>
+<li><strong>太小（&lt; 1GB）</strong>：分片数暴涨，元数据、段合并、集群状态开销压过收益；</li>
+<li><strong>太大（&gt; 50GB）</strong>：单分片恢复慢（一个分片挂了要重放很久）、段合并压力大、查询在单分片内并行度受限。</li>
+</ul>
+<p>一个典型业务索引「每天 20GB，保留 30 天」的算法：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">总分片 ≈ 单日数据量 × 保留天数 ÷ 目标分片大小</span><br><span class="line">     ≈ 20GB × 30 ÷ 30GB ≈ 20 个主分片</span><br></pre></td></tr></table></figure>
+
+<p>但注意：<strong>不要一开始就按 30 天的量去建</strong>，更好的做法是<strong>按天&#x2F;按时间滚动（rollover）</strong>，每个小索引用少量分片。</p>
+<h3 id="2-2-堆内存与分片比例：每-GB-堆最多-20-个分片"><a href="#2-2-堆内存与分片比例：每-GB-堆最多-20-个分片" class="headerlink" title="2.2 堆内存与分片比例：每 GB 堆最多 20 个分片"></a>2.2 堆内存与分片比例：每 GB 堆最多 20 个分片</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">节点建议堆内存 ≤ 31GB（压缩指针边界）</span><br><span class="line">20 个分片 / GB 堆 → 30GB 堆 ≈ 600 个分片/节点（上限，不是目标）</span><br></pre></td></tr></table></figure>
+
+<p>超过这个量级会出现：</p>
+<ul>
+<li><strong>集群状态（cluster state）膨胀</strong>：每个分片都会在集群状态里留元数据，分片数上万后，master 更新集群状态变慢，全集群出现「卡顿式」停顿；</li>
+<li><strong>文件句柄耗尽</strong>：每个分片都有多组文件句柄；</li>
+<li><strong>段合并线程争抢</strong>：分片多 → 段多 → 合并压力大 → IO 打满。</li>
+</ul>
+<p>所以<strong>分片数的第一原则是「在满足单分片大小合理的前提下，尽量少」</strong>。</p>
+<h3 id="2-3-数据节点数与副本数"><a href="#2-3-数据节点数与副本数" class="headerlink" title="2.3 数据节点数与副本数"></a>2.3 数据节点数与副本数</h3><ul>
+<li><code>总分片数（主+副本）</code> 最好能被 <code>数据节点数</code> 整除，这样分片分布均匀，不会出现「某个节点分片特别多」的热点；</li>
+<li>副本数 ≥ 1 保证高可用；读多写少的场景可以提高副本数以扩展读吞吐，但副本会放大写入（每次写都要同步到所有副本）。</li>
+</ul>
+<p><strong>举例</strong>：3 个数据节点、每节点 1 个副本、想每个节点分 2 个主分片 → 主分片数 &#x3D; <code>3 × 2 = 6</code>，总分片 &#x3D; 12。</p>
+<h2 id="三、分片路由：数据到底进哪个分片"><a href="#三、分片路由：数据到底进哪个分片" class="headerlink" title="三、分片路由：数据到底进哪个分片"></a>三、分片路由：数据到底进哪个分片</h2><h3 id="默认路由"><a href="#默认路由" class="headerlink" title="默认路由"></a>默认路由</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">shard = hash(routing) % number_of_primary_shards</span><br></pre></td></tr></table></figure>
+
+<p>其中 <code>routing</code> 默认是文档 <code>_id</code>。</p>
+<p><strong>这里藏着最重要的一条规则</strong>：公式里的 <code>number_of_primary_shards</code> 是分母。如果主分片数可以改，那么所有已存文档的路由就全错了。<strong>这正是「主分片数不可变」的根本原因</strong> —— 不是 ES 不想支持，而是路由算法的数学约束。</p>
+<h3 id="自定义路由"><a href="#自定义路由" class="headerlink" title="自定义路由"></a>自定义路由</h3><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">PUT /orders/_doc/<span class="number">1001</span>?routing=user_9527</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;user_id&quot;</span><span class="punctuation">:</span> <span class="number">9527</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;amount&quot;</span><span class="punctuation">:</span> <span class="number">199</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">GET</span> <span class="operator">/</span>orders<span class="operator">/</span>_search</span><br><span class="line">&#123;</span><br><span class="line">  &quot;query&quot;: &#123; &quot;match&quot;: &#123; &quot;user_id&quot;: <span class="number">9527</span> &#125; &#125;,</span><br><span class="line">  &quot;_source&quot;: [&quot;amount&quot;],</span><br><span class="line">  &quot;size&quot;: <span class="number">10</span></span><br><span class="line">&#125;</span><br><span class="line"><span class="comment">-- 查询时指定 routing，可以只广播到一个分片</span></span><br></pre></td></tr></table></figure>
+
+<p>自定义路由的价值：</p>
+<ul>
+<li><strong>相关数据聚到同一分片</strong>：如按 <code>user_id</code> 路由，则「查某个用户的所有订单」只需命中 1 个分片，而不是广播到 N 个分片再合并；</li>
+<li><strong>降低查询扇出（fan-out）</strong>，显著降低协调节点的合并开销。</li>
+</ul>
+<p>代价：</p>
+<ul>
+<li><strong>数据倾斜风险</strong>：如果按 <code>tenant_id</code> 路由，而某个租户数据量占 60%，就会形成热分片（hot shard），负载严重不均；</li>
+<li>需要业务上保证「查询条件里总能带上 routing 值」，否则优势全无。</li>
+</ul>
+<p><strong>选择建议</strong>：只有当「某个维度的数据总是被一起查询」且「该维度分布足够均匀」时，才用自定义路由。否则用默认。</p>
+<h2 id="四、集群扩容：三种路径"><a href="#四、集群扩容：三种路径" class="headerlink" title="四、集群扩容：三种路径"></a>四、集群扩容：三种路径</h2><h3 id="4-1-加节点-副本重分配（最平滑）"><a href="#4-1-加节点-副本重分配（最平滑）" class="headerlink" title="4.1 加节点 + 副本重分配（最平滑）"></a>4.1 加节点 + 副本重分配（最平滑）</h3><p>数据量增长但<strong>还没到单分片上限</strong>时，加数据节点即可。ES 会自动触发分片重分配（rebalance），把部分分片搬到新节点。</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">PUT _cluster/settings</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;persistent&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;cluster.routing.allocation.enable&quot;</span><span class="punctuation">:</span> <span class="string">&quot;all&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;cluster.routing.rebalance.enable&quot;</span><span class="punctuation">:</span> <span class="string">&quot;all&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;indices.recovery.max_bytes_per_sec&quot;</span><span class="punctuation">:</span> <span class="string">&quot;200mb&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;cluster.routing.allocation.node_concurrent_recoveries&quot;</span><span class="punctuation">:</span> <span class="number">4</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>重分配会消耗网络与磁盘 IO。生产上建议：<br>① 手动搬迁热点分片（<code>POST _cluster/reroute</code> 的 <code>move</code> 指令）而不是全量 rebalance；<br>② 限制 <code>max_bytes_per_sec</code>，避免抢走业务 IO；<br>③ 大集群扩容放在低峰期。</p>
+</blockquote>
+<h3 id="4-2-主分片不够了：split-shrink"><a href="#4-2-主分片不够了：split-shrink" class="headerlink" title="4.2 主分片不够了：split &#x2F; shrink"></a>4.2 主分片不够了：split &#x2F; shrink</h3><p><strong>split</strong> 把主分片数翻倍（3 → 6 → 12），分摊单分片体积；<strong>shrink</strong> 反过来合并分片。两者都是<strong>索引级别</strong>的操作，且要求索引只读（或先设为只读）。</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// split 前置：索引必须只读且健康</span></span><br><span class="line">PUT /orders<span class="number">-2026.09</span>/_settings</span><br><span class="line"><span class="punctuation">&#123;</span> <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;index.blocks.write&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span> <span class="punctuation">&#125;</span> <span class="punctuation">&#125;</span></span><br><span class="line"></span><br><span class="line">POST /orders<span class="number">-2026.09</span>/_split/orders<span class="number">-2026.09</span>-split</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;index.number_of_shards&quot;</span><span class="punctuation">:</span> <span class="number">6</span> <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// shrink：先迁移到同节点的少量分片</span></span><br><span class="line">POST /orders<span class="number">-2026.09</span>/_shrink/orders<span class="number">-2026.09</span>-shrink</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;index.number_of_shards&quot;</span><span class="punctuation">:</span> <span class="number">1</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;index.routing.allocation.require._name&quot;</span><span class="punctuation">:</span> <span class="string">&quot;node-1&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-主分片严重不足-需要改结构：reindex"><a href="#4-3-主分片严重不足-需要改结构：reindex" class="headerlink" title="4.3 主分片严重不足 &#x2F; 需要改结构：reindex"></a>4.3 主分片严重不足 &#x2F; 需要改结构：reindex</h3><p><strong>reindex</strong> 是通关大招：从源索引用 <code>_reindex</code> 把数据搬到目标索引（可以指定目标分片数、副本数、mapping），必要时配合别名原子切换。</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">POST _reindex?wait_for_completion=<span class="literal"><span class="keyword">false</span></span>&amp;scroll=<span class="number">5</span>m</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;source&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-v1&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;_source&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span><span class="string">&quot;user_id&quot;</span><span class="punctuation">,</span> <span class="string">&quot;amount&quot;</span><span class="punctuation">,</span> <span class="string">&quot;created_at&quot;</span><span class="punctuation">]</span></span><br><span class="line">  <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;dest&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-v2&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;routing&quot;</span><span class="punctuation">:</span> <span class="string">&quot;=user_id&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;conflicts&quot;</span><span class="punctuation">:</span> <span class="string">&quot;proceed&quot;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 切换别名：原子操作</span></span><br><span class="line">POST _aliases</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span></span><br><span class="line">    <span class="punctuation">&#123;</span> <span class="attr">&quot;remove&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-v1&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;alias&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders&quot;</span> <span class="punctuation">&#125;</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="punctuation">&#123;</span> <span class="attr">&quot;add&quot;</span><span class="punctuation">:</span>    <span class="punctuation">&#123;</span> <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-v2&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;alias&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders&quot;</span> <span class="punctuation">&#125;</span> <span class="punctuation">&#125;</span></span><br><span class="line">  <span class="punctuation">]</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>reindex 的注意事项：</p>
+<ul>
+<li><strong>不保证实时</strong>：只复制执行时的快照，增量写入需要额外追（双写 &#x2F; CDC &#x2F; 滚动推进）；</li>
+<li><strong>必须设 <code>wait_for_completion=false</code></strong>：否则 HTTP 连接会被大索引拖断；</li>
+<li><strong>限流</strong>：<code>&quot;size&quot;: 5000</code>、<code>&quot;slices&quot;</code>（切片并行）、<code>requests_per_second</code> 控制对生产的影响；</li>
+<li><strong>版本冲突</strong>：目标已有文档时用 <code>version_type: external</code> 或 <code>conflicts: proceed</code>；</li>
+<li><strong>v2 写入双写</strong>：生产切换通常要「双写 → 回填 → 校验 → 切别名 → 停旧写」四步。</li>
+</ul>
+<h3 id="三种方式对比"><a href="#三种方式对比" class="headerlink" title="三种方式对比"></a>三种方式对比</h3><table>
+<thead>
+<tr>
+<th>方式</th>
+<th>主分片数</th>
+<th>数据量</th>
+<th>阻断写入</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>加节点</td>
+<td>不变</td>
+<td>不变</td>
+<td>否</td>
+<td>单分片还小、只是负载高</td>
+</tr>
+<tr>
+<td>split</td>
+<td>翻倍</td>
+<td>不变</td>
+<td>需只读</td>
+<td>单分片过大、需提升并行度</td>
+</tr>
+<tr>
+<td>shrink</td>
+<td>减少</td>
+<td>不变</td>
+<td>需只读</td>
+<td>小分片碎片过多、需要治理</td>
+</tr>
+<tr>
+<td>reindex</td>
+<td>任意</td>
+<td>重写</td>
+<td>通常可不停</td>
+<td>改分片数+改 mapping+换路由</td>
+</tr>
+</tbody></table>
+<h2 id="五、滚动索引与-ILM：从一开始就做对"><a href="#五、滚动索引与-ILM：从一开始就做对" class="headerlink" title="五、滚动索引与 ILM：从一开始就做对"></a>五、滚动索引与 ILM：从一开始就做对</h2><p><strong>分片设计最好的实践不是「算准分片数」，而是「用小索引 + 滚动 + 别名」让分片数不再是难题。</strong></p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 创建带 rollover 别名的初始索引</span></span><br><span class="line">PUT /orders<span class="number">-000001</span></span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;aliases&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;orders&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;is_write_index&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span> <span class="punctuation">&#125;</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;index.number_of_shards&quot;</span><span class="punctuation">:</span> <span class="number">3</span> <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 达到条件自动滚动</span></span><br><span class="line">POST /orders/_rollover</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;conditions&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;max_size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;30gb&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;max_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;7d&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;max_docs&quot;</span><span class="punctuation">:</span> <span class="number">200000000</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;index.number_of_shards&quot;</span><span class="punctuation">:</span> <span class="number">3</span> <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>配合 <strong>ILM（Index Lifecycle Management）</strong> 实现自动化：</p>
+<ul>
+<li>hot：写入，<code>rollover</code>；</li>
+<li>warm：不再写，<code>force_merge</code> + <code>shrink</code>；</li>
+<li>cold：<code>read_only</code>，迁到廉价节点；</li>
+<li>delete：到期删除。</li>
+</ul>
+<p>这样每个索引永远只有 30GB 左右、分片数恒定，集群规模增长时只需调整 <code>max_size</code> 门槛。</p>
+<h2 id="六、分片分配与磁盘水位线"><a href="#六、分片分配与磁盘水位线" class="headerlink" title="六、分片分配与磁盘水位线"></a>六、分片分配与磁盘水位线</h2><p>ES 用磁盘水位线决定是否继续往某节点分配分片：</p>
+<table>
+<thead>
+<tr>
+<th>水位线</th>
+<th>默认值</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>low</code></td>
+<td>85%</td>
+<td>不再分配新分片到该节点</td>
+</tr>
+<tr>
+<td><code>high</code></td>
+<td>90%</td>
+<td>开始把分片从该节点迁走</td>
+</tr>
+<tr>
+<td><code>flood_stage</code></td>
+<td>95%</td>
+<td>将索引置为只读（<code>index.blocks.read_only_allow_delete</code>）</td>
+</tr>
+</tbody></table>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">PUT _cluster/settings</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;persistent&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;cluster.routing.allocation.disk.watermark.low&quot;</span><span class="punctuation">:</span> <span class="string">&quot;85%&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;cluster.routing.allocation.disk.watermark.high&quot;</span><span class="punctuation">:</span> <span class="string">&quot;90%&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;cluster.routing.allocation.disk.watermark.flood_stage&quot;</span><span class="punctuation">:</span> <span class="string">&quot;95%&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>flood_stage 是生产事故高发区</strong>：一旦触发，所有写入失败，报 <code>FORBIDDEN/12/index read-only</code>。处理步骤：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 清理磁盘后解除只读</span></span><br><span class="line">PUT _all/_settings</span><br><span class="line"><span class="punctuation">&#123;</span> <span class="attr">&quot;index.blocks.read_only_allow_delete&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">null</span></span> <span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="七、常见分片陷阱"><a href="#七、常见分片陷阱" class="headerlink" title="七、常见分片陷阱"></a>七、常见分片陷阱</h2><p><strong>陷阱一：分片数拍脑袋定 5 或 10。</strong><br>没有依据，一年后单分片 200GB，查询慢、恢复更慢，只能 reindex。</p>
+<p><strong>陷阱二：分片数远超节点数，且没有副本。</strong><br>单节点故障 &#x3D; 大量未分配分片，集群进入 yellow&#x2F;red，恢复窗口极长。</p>
+<p><strong>陷阱三：小索引建了 12 个分片。</strong><br>例如每个用户一个索引、每个索引 12 分片 —— 分片数瞬间上万，master 压力爆炸。<strong>小索引就该用 1 个分片。</strong></p>
+<p><strong>陷阱四：热分片。</strong><br>自定义 routing 不均、或时间序列数据按 <code>_id</code> 随机路由而查询总按时间范围 —— 结果是查询广播到所有分片，只有部分分片有数据却都要扫描。时间序列索引应按 <code>_routing</code> 或干脆按天建索引。</p>
+<p><strong>陷阱五：随时扩主分片数。</strong><br>做不到。主分片数在创建时固定，唯一出路是 split &#x2F; shrink &#x2F; reindex。</p>
+<h2 id="八、监控与排查命令"><a href="#八、监控与排查命令" class="headerlink" title="八、监控与排查命令"></a>八、监控与排查命令</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 分片分布与大小</span></span><br><span class="line">GET _cat/shards/orders?v&amp;s=store:desc</span><br><span class="line"></span><br><span class="line"><span class="comment"># 未分配分片及其原因</span></span><br><span class="line">GET _cat/shards?v&amp;h=index,shard,prirep,state,unassigned.reason</span><br><span class="line"></span><br><span class="line"><span class="comment"># 集群健康与分片统计</span></span><br><span class="line">GET _cluster/health?level=indices</span><br><span class="line"></span><br><span class="line"><span class="comment"># 单节点分片数（找热点节点）</span></span><br><span class="line">GET _cat/allocation?v</span><br><span class="line"></span><br><span class="line"><span class="comment"># 分片级别的索引大小/文档数</span></span><br><span class="line">GET _cat/indices?v&amp;s=store.size:desc</span><br></pre></td></tr></table></figure>
+
+<p>判断「分片是否合适」的经验指标：</p>
+<ul>
+<li>单分片 &gt; 50GB → 考虑 split 或滚动；</li>
+<li>单节点分片数 &gt; 20 × 堆GB → 需要治理；</li>
+<li>未分配分片持续存在 → 检查水位线、节点状态、<code>allocation.explain</code>。</li>
+</ul>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">GET /_cluster/allocation/explain</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-2026.09&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;shard&quot;</span><span class="punctuation">:</span> <span class="number">0</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;primary&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>这个 API 会直接告诉你「为什么这个分片分配不出去」，是排查 unassigned shard 的第一工具。</p>
+<h2 id="九、面试常见追问"><a href="#九、面试常见追问" class="headerlink" title="九、面试常见追问"></a>九、面试常见追问</h2><p><strong>Q1：为什么主分片数不能改？</strong><br>因为路由公式 <code>hash(routing) % number_of_primary_shards</code> 用主分片数做模。一旦改变分母，已有文档按新公式计算出的目标分片与它实际所在的分片不一致，会导致<strong>数据大量「丢失」</strong>（其实还在旧分片，但查询按新路由找不到）。所以只能通过 split&#x2F;shrink&#x2F;reindex 重建。</p>
+<p><strong>Q2：分片越多查询越快吗？</strong><br>不是。分片带来并行度，但也带来：① 每个分片独立的段与查询开销；② 协调节点需要合并更多分片的结果（merge overhead）；③ 集群状态与元数据膨胀。存在一个最优区间，超过后<strong>性能反而下降</strong>。对小数据集，1 个分片往往是最快的。</p>
+<p><strong>Q3：副本能提升写入性能吗？</strong><br>不能，反而降低。每次写入要同步到所有副本（分布式一致性要求），副本越多写入放大越严重。副本提升的是<strong>读吞吐</strong>和<strong>可用性</strong>。</p>
+<p><strong>Q4：集群扩容后旧数据没有分布到新节点怎么办？</strong><br>分片重分配（rebalance）是自动的，但受 <code>cluster.routing.rebalance.enable</code>、水位线、<code>max_bytes_per_sec</code> 影响。也可以用 <code>POST _cluster/reroute</code> 手动 move 指定的热点分片。若要真正重排数据布局，仍推荐「滚动新索引 + 逐步切别名」的路线，而不是搬迁旧分片。</p>
+<p><strong>Q5：如何为时间序列数据设计分片？</strong><br>按时间滚动建索引（如 <code>logs-2026.09.12</code>），每个索引分片数少（1~3），用别名统一查询，用 ILM 管理生命周期。查询时用时间范围过滤 + 别名，ES 会自动跳过不相关的索引（索引裁剪），比「一个大索引 + 多分片」高效得多。</p>
+<h2 id="十、小结"><a href="#十、小结" class="headerlink" title="十、小结"></a>十、小结</h2><table>
+<thead>
+<tr>
+<th>主题</th>
+<th>关键结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>分片大小</td>
+<td>单分片 10~50GB 为宜</td>
+</tr>
+<tr>
+<td>分片数量</td>
+<td>在满足大小前提下尽量少；单节点 ≤ 20×堆GB</td>
+</tr>
+<tr>
+<td>主分片数</td>
+<td>创建时固定，靠 split&#x2F;shrink&#x2F;reindex 变更</td>
+</tr>
+<tr>
+<td>路由</td>
+<td>默认 <code>hash(_id) % 主分片数</code>；可按需自定义 routing</td>
+</tr>
+<tr>
+<td>扩容</td>
+<td>加节点 → split&#x2F;shrink → reindex，能力依次递增</td>
+</tr>
+<tr>
+<td>最佳实践</td>
+<td>小索引 + rollover + 别名 + ILM，让分片数不再是问题</td>
+</tr>
+<tr>
+<td>排查</td>
+<td><code>_cat/shards</code>、<code>_cluster/allocation/explain</code>、水位线设置</td>
+</tr>
+</tbody></table>
+<p>分片设计的核心心法只有一句：<strong>把「分片数量」当成一个架构决策，而不是一个可以随便填的配置项。</strong> 想清楚数据量、增长曲线、查询模式和扩容路径之后再按下创建键，能省掉未来无数次痛苦的 reindex。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/">https://jiweidong.github.io/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/%E8%BF%90%E7%BB%B4/">运维</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/12/mysql-hash-join-deep-dive/" title="【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优</div></div><div class="info-2"><div class="info-item-1">【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优面试官：MySQL 8.0 之后，EXPLAIN 里的 Block Nested Loop 去哪了？如果你从 MySQL 5.7 升级到 8.0，重新看一条两表 JOIN 的执行计划，很可能发现原来熟悉的： 1Extra: Using where; Using join buffer (Block Nested Loop)  变成了： 1Extra: Using where; Using join buffer (hash join)  这不是显示文案的改动，而是执行引擎的实质升级 —— MySQL 8.0.18 引入了真正的 Hash Join，用来替代经典的 Block Nested Loop（BNL）作为「被驱动表无索引可用」时的默认方案。 这篇我们从原理、执行流程、内存控制、执行计划解读到调优实战，把 Hash Join 讲透。 一、先回顾：没有索引时，JOIN 有多惨假设： 1234SELECT o.id, u.nameFROM t_ord...</div></div></div></a><a class="pagination-related" href="/2026/09/12/archunit-architecture-guard-testing/" title="【工程实战】ArchUnit 架构守护测试深度实战：把架构约束写进单元测试"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【工程实战】ArchUnit 架构守护测试深度实战：把架构约束写进单元测试</div></div><div class="info-2"><div class="info-item-1">【工程实战】ArchUnit 架构守护测试深度实战：把架构约束写进单元测试面试官：你们团队怎么保证架构不被写烂？这个问题如果只回答「靠 Code Review 和文档」，基本就废了。真实项目里，架构腐化从来不是某一次大改动造成的，而是无数个「我就临时调一下」叠加出来的：  Controller 里直接注入了 Mapper，Controller → DAO 的依赖倒挂了； 有人在 domain 包里面 import 了 spring-web，领域层被框架污染； 两个模块互相调用，A 依赖 B、B 又依赖 A，形成循环依赖，每次改都得一起改、一起发； 团队约定「service 层只能被 controller 调用」，半年后没人记得这条约定。  这些问题的共同点是：编译器不管、单测不管、CI 也不管，等发现的时候已经改不动了。 解决思路很直接 —— 把架构约束变成可执行的测试。这就是 ArchUnit 要解决的问题。 一、ArchUnit 是什么ArchUnit 是一个轻量级的 Java 架构测试库，核心能力是：  用普通的单元测试（JUnit 4&#x2F;5、TestNG）来断言代...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/23/spring-boot-graceful-shutdown-guide/" title="Spring Boot 优雅关闭与平滑上线：生产环境必知的最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-23</div><div class="info-item-2">Spring Boot 优雅关闭与平滑上线：生产环境必知的最佳实践</div></div><div class="info-2"><div class="info-item-1">Spring Boot 优雅关闭与平滑上线：生产环境必知的最佳实践问题场景凌晨两点，你收到告警：服务实例正在重启，同时线上出现大量 5xx 错误。用户反馈”页面打不开”。 123[Pod 删除] → [SIGTERM] → [Spring Boot 关闭] → [K8s 移除 Endpoint]                                     ↑                              ↑                              还有请求正在处理                可能有时间差  核心问题： 关闭时正在处理的请求被强行中断，同时上游负载均衡还没摘除这个实例的新流量。 一、Spring Boot 优雅关闭1.1 传统关闭的问题Spring Boot 2.2 之前，默认的关闭方式是粗暴切断： 123451. 收到 SIGTERM2. 立即关闭 ApplicationContext3. 销毁所有 Bean4. DispatcherServlet 停止服务   └── 正在处理的请求 → 连接断开 → 502/500...</div></div></div></a><a class="pagination-related" href="/2026/08/31/mysql-misoperation-flashback-practice/" title="【MySQL 运维】MySQL 误删数据急救实战：从 binlog 闪回到延时从库的完整恢复方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-31</div><div class="info-item-2">【MySQL 运维】MySQL 误删数据急救实战：从 binlog 闪回到延时从库的完整恢复方案</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】MySQL 误删数据急救实战：从 binlog 闪回到延时从库的完整恢复方案面试官：生产环境有人执行了 DELETE 忘带 WHERE，全表数据没了，你怎么恢复？这是运维和 DBA 面试的经典场景题，也是每个后端工程师迟早会遇到的真实事故。先别慌，更别急着重启 —— 只要 binlog 开着、日志还在，数据大概率能找回来。本文给出完整的误删应急手册。 一、事故发生后的第一分钟：止血与保护现场误删发生后，按顺序做这几件事（顺序很重要）：  停止写入：如果是 UPDATE&#x2F;DELETE 误操作，立刻 FLUSH TABLES WITH READ LOCK 或者直接停掉业务流量，防止新数据覆盖现场； 确认 binlog 状态：SHOW MASTER STATUS; 确认 binlog 是否开启、当前文件与位置； 立即备份现有 binlog：把 binlog 文件拷贝到安全位置（cp 到别的目录&#x2F;机器），防止后续操作或重启清掉日志； 记录当前时间点：误删发生的大致时间窗口，用于后面定位 binlog 位置； 评估损失范围：SHOW BINLOG E...</div></div></div></a><a class="pagination-related" href="/2026/08/31/elasticsearch-inverted-index-write-deep-dive/" title="【ES 底层】Elasticsearch 倒排索引与写入原理深度解析：从分词、索引结构到 Lucene 段合并"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-31</div><div class="info-item-2">【ES 底层】Elasticsearch 倒排索引与写入原理深度解析：从分词、索引结构到 Lucene 段合并</div></div><div class="info-2"><div class="info-item-1">【ES 底层】Elasticsearch 倒排索引与写入原理深度解析：从分词、索引结构到 Lucene 段合并面试官：ES 为什么搜索那么快？它和 MySQL 的索引有什么区别？一上来就答「ES 用了倒排索引」只能拿及格分。面试官真正想听的是：倒排索引长什么样、为什么对搜索友好、写入为什么是近实时的、段合并又是怎么回事。本文从 Lucene 底层把这些一次讲透。 一、正排 vs 倒排：搜索为什么必须用倒排？正排索引（MySQL InnoDB 主键索引）以文档 ID 为 key，存文档内容。查「包含 Java 的文档」时，只能全表扫描：逐行读内容、逐词匹配，复杂度 O(N)。 1234文档ID → 内容  1   →  &quot;Java 面试指南&quot;  2   →  &quot;Kafka 实战笔记&quot;  3   →  &quot;Java 与 Spring 微服务&quot;  倒排索引（ES&#x2F;Lucene）反过来，以**词（Term）**为 key，存「哪些文档包含这个词」： 1234词(Term) → 文档列表(Posting List)  ja...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mysql-read-write-splitting-deep-dive/" title="MySQL 读写分离架构深度解析：主从复制、延迟问题与一致性实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">MySQL 读写分离架构深度解析：主从复制、延迟问题与一致性实战</div></div><div class="info-2"><div class="info-item-1">MySQL 读写分离架构深度解析：主从复制、延迟问题与一致性实战面试官：你们的数据库读写分离怎么做的？主从延迟怎么解决？读写分离是互联网后端最基础的数据库架构升级，但很多人只停留在”一个主库写、多个从库读”的概念层面。面试官真正想考察的是：复制原理、延迟的根源、一致性方案的取舍、以及框架层面的落地细节。 本文从复制原理讲到延迟治理，再到代码落地，一条线讲透。 一、为什么需要读写分离？单库实例的瓶颈：    问题 单库 读写分离    读写争抢 读和写抢 CPU、IO、锁 主库专职写，从库专职读   读扩展 读多写少也扛不住 加从库横向扩展读能力   可用性 实例挂了全挂 从库可顶读流量   分析查询 慢查询拖垮在线业务 分析类查询丢到从库&#x2F;离线库   典型比例：互联网业务读:写 ≈ 10:1 ~ 100:1，把读流量分走，主库压力立减 80% 以上。 二、主从复制原理（快速回顾）123456789101112Master                                     Slave  事务提交    │    ├── Binlog 写入（row 格...</div></div></div></a><a class="pagination-related" href="/2026/06/17/elk-log-collection-system/" title="ELK（Elasticsearch + Logstash + Kibana）日志收集体系实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">ELK（Elasticsearch + Logstash + Kibana）日志收集体系实战</div></div><div class="info-2"><div class="info-item-1">ELK（Elasticsearch + Logstash + Kibana）日志收集体系实战一、引言在分布式系统中，日志是排查问题、监控系统健康、分析用户行为的核心数据源。然而随着微服务数量激增，传统登录服务器 tail -f 查看日志的方式已完全不可行。ELK 栈（Elasticsearch + Logstash + Kibana）凭借其强大的搜索能力、灵活的管道处理和美观的可视化，成为日志收集领域的事实标准。 本文将深入讲解 ELK 架构的演进路线、Logstash 管道的详细配置、Filebeat 的轻量采集方案、结构化日志的最佳实践、索引生命周期管理（ILM），以及 Spring Boot 项目与 ELK 的完整集成方案。 二、ELK 架构演进2.1 经典 3 节点架构1App → Logstash → Elasticsearch → Kibana  最简单的架构，App 直接将日志通过 TCP&#x2F;UDP 发送给 Logstash，Logstash 处理后写入 ES，Kibana 展示。 优点：部署简单，适合小规模场景。缺点：Logstash 作为集中式采集端，资...</div></div></div></a><a class="pagination-related" href="/2026/07/06/jmx-jvm-monitoring-deep-practice/" title="【JVM实战】JMX 与 JVM 远程监控实战：MBean 管理与生产级监控方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-06</div><div class="info-item-2">【JVM实战】JMX 与 JVM 远程监控实战：MBean 管理与生产级监控方案</div></div><div class="info-2"><div class="info-item-1">JMX 与 JVM 远程监控实战：从 MBean 到生产实践一、引言JMX（Java Management Extensions，Java 管理扩展）是 Java 平台内置的管理监控框架，从 JDK 1.5 开始成为 Java 标准的一部分。它提供了一种标准化的方式来监控和管理 Java 应用程序的运行状态。 无论是 JVM 内存使用情况、线程状态、GC 次数，还是自定义的业务指标，都可以通过 JMX 暴露出来。配合 JConsole、VisualVM、Prometheus 等工具，JMX 是 Java 应用监控的基石。 本文将深入解析 JMX 的核心架构、MBean 编程模型、远程连接配置，以及在生产环境中的最佳实践。  二、JMX 架构总览2.1 三层架构JMX 采用三层架构设计： 1234567891011┌─────────────────────────────────────┐│     管理层（Manageability Layer）    ││   JConsole / VisualVM / Prometheus   │├─────────────────────...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">607</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">717</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">196</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90ES-%E8%BF%90%E7%BB%B4%E3%80%91Elasticsearch-%E5%88%86%E7%89%87%E7%AD%96%E7%95%A5%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%88%86%E7%89%87%E6%95%B0%E9%87%8F%E8%AE%BE%E8%AE%A1%E3%80%81%E8%B7%AF%E7%94%B1%E3%80%81%E6%89%A9%E5%AE%B9%E4%B8%8E-reindex-%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E4%B8%80%E4%B8%AA%E7%B4%A2%E5%BC%95%E5%BB%BA%E5%87%A0%E4%B8%AA%E5%88%86%E7%89%87%EF%BC%9F%E5%88%86%E7%89%87%E6%98%AF%E4%B8%8D%E6%98%AF%E8%B6%8A%E5%A4%9A%E8%B6%8A%E5%A5%BD%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：一个索引建几个分片？分片是不是越多越好？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%88%86%E7%89%87%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、分片到底是什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%88%86%E7%89%87%E6%95%B0%E9%87%8F%E8%AE%BE%E8%AE%A1%EF%BC%9A%E4%B8%89%E4%B8%AA%E7%BA%A6%E6%9D%9F%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.3.</span> <span class="toc-text">二、分片数量设计：三个约束条件</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%8D%95%E4%B8%AA%E5%88%86%E7%89%87%E5%A4%A7%E5%B0%8F%EF%BC%9A10GB-50GB"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 单个分片大小：10GB ~ 50GB</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%A0%86%E5%86%85%E5%AD%98%E4%B8%8E%E5%88%86%E7%89%87%E6%AF%94%E4%BE%8B%EF%BC%9A%E6%AF%8F-GB-%E5%A0%86%E6%9C%80%E5%A4%9A-20-%E4%B8%AA%E5%88%86%E7%89%87"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 堆内存与分片比例：每 GB 堆最多 20 个分片</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E6%95%B0%E6%8D%AE%E8%8A%82%E7%82%B9%E6%95%B0%E4%B8%8E%E5%89%AF%E6%9C%AC%E6%95%B0"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 数据节点数与副本数</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%88%86%E7%89%87%E8%B7%AF%E7%94%B1%EF%BC%9A%E6%95%B0%E6%8D%AE%E5%88%B0%E5%BA%95%E8%BF%9B%E5%93%AA%E4%B8%AA%E5%88%86%E7%89%87"><span class="toc-number">1.4.</span> <span class="toc-text">三、分片路由：数据到底进哪个分片</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%BB%98%E8%AE%A4%E8%B7%AF%E7%94%B1"><span class="toc-number">1.4.1.</span> <span class="toc-text">默认路由</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%87%AA%E5%AE%9A%E4%B9%89%E8%B7%AF%E7%94%B1"><span class="toc-number">1.4.2.</span> <span class="toc-text">自定义路由</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E9%9B%86%E7%BE%A4%E6%89%A9%E5%AE%B9%EF%BC%9A%E4%B8%89%E7%A7%8D%E8%B7%AF%E5%BE%84"><span class="toc-number">1.5.</span> <span class="toc-text">四、集群扩容：三种路径</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%8A%A0%E8%8A%82%E7%82%B9-%E5%89%AF%E6%9C%AC%E9%87%8D%E5%88%86%E9%85%8D%EF%BC%88%E6%9C%80%E5%B9%B3%E6%BB%91%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 加节点 + 副本重分配（最平滑）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%BB%E5%88%86%E7%89%87%E4%B8%8D%E5%A4%9F%E4%BA%86%EF%BC%9Asplit-shrink"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 主分片不够了：split &#x2F; shrink</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E4%B8%BB%E5%88%86%E7%89%87%E4%B8%A5%E9%87%8D%E4%B8%8D%E8%B6%B3-%E9%9C%80%E8%A6%81%E6%94%B9%E7%BB%93%E6%9E%84%EF%BC%9Areindex"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 主分片严重不足 &#x2F; 需要改结构：reindex</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%89%E7%A7%8D%E6%96%B9%E5%BC%8F%E5%AF%B9%E6%AF%94"><span class="toc-number">1.5.4.</span> <span class="toc-text">三种方式对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%BB%9A%E5%8A%A8%E7%B4%A2%E5%BC%95%E4%B8%8E-ILM%EF%BC%9A%E4%BB%8E%E4%B8%80%E5%BC%80%E5%A7%8B%E5%B0%B1%E5%81%9A%E5%AF%B9"><span class="toc-number">1.6.</span> <span class="toc-text">五、滚动索引与 ILM：从一开始就做对</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%88%86%E7%89%87%E5%88%86%E9%85%8D%E4%B8%8E%E7%A3%81%E7%9B%98%E6%B0%B4%E4%BD%8D%E7%BA%BF"><span class="toc-number">1.7.</span> <span class="toc-text">六、分片分配与磁盘水位线</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%B8%B8%E8%A7%81%E5%88%86%E7%89%87%E9%99%B7%E9%98%B1"><span class="toc-number">1.8.</span> <span class="toc-text">七、常见分片陷阱</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E7%9B%91%E6%8E%A7%E4%B8%8E%E6%8E%92%E6%9F%A5%E5%91%BD%E4%BB%A4"><span class="toc-number">1.9.</span> <span class="toc-text">八、监控与排查命令</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E5%B0%8F%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/12/archunit-architecture-guard-testing/" title="【工程实战】ArchUnit 架构守护测试深度实战：把架构约束写进单元测试">【工程实战】ArchUnit 架构守护测试深度实战：把架构约束写进单元测试</a><time datetime="2026-09-12T00:00:00.000Z" title="发表于 2026-09-12 08:00:00">2026-09-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/" title="【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战">【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战</a><time datetime="2026-09-12T00:00:00.000Z" title="发表于 2026-09-12 08:00:00">2026-09-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/12/mysql-hash-join-deep-dive/" title="【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优">【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优</a><time datetime="2026-09-12T00:00:00.000Z" title="发表于 2026-09-12 08:00:00">2026-09-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/12/mysql-index-merge-optimization-deep-dive/" title="【MySQL 优化】索引合并（Index Merge）深度解析：Intersection、Union 与 Sort-Union 的底层原理与实战">【MySQL 优化】索引合并（Index Merge）深度解析：Intersection、Union 与 Sort-Union 的底层原理与实战</a><time datetime="2026-09-12T00:00:00.000Z" title="发表于 2026-09-12 08:00:00">2026-09-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/12/paxos-consensus-algorithm-deep-dive/" title="【分布式理论】Paxos 算法深度解析：从 Basic Paxos 到 Multi-Paxos 与工程落地">【分布式理论】Paxos 算法深度解析：从 Basic Paxos 到 Multi-Paxos 与工程落地</a><time datetime="2026-09-12T00:00:00.000Z" title="发表于 2026-09-12 08:00:00">2026-09-12</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
