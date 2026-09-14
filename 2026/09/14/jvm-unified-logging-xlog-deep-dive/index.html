@@ -1,0 +1,606 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置面试官：线上要排查 GC 问题，你怎么开日志？-XX:+PrintGCDetails 还是 -Xloggc？如果你的答案是上面两个，那面试官下一句一定是：「这两套参数在 JDK 17 上还能用吗？」 答案是不能——-XX:+PrintGC* 系列在 JDK 9 被标记废弃，JDK 11 之后大量">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/14/jvm-unified-logging-xlog-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置面试官：线上要排查 GC 问题，你怎么开日志？-XX:+PrintGCDetails 还是 -Xloggc？如果你的答案是上面两个，那面试官下一句一定是：「这两套参数在 JDK 17 上还能用吗？」 答案是不能——-XX:+PrintGC* 系列在 JDK 9 被标记废弃，JDK 11 之后大量">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-14T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-14T00:03:53.510Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="GC">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="调优">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置",
+  "url": "https://jiweidong.github.io/2026/09/14/jvm-unified-logging-xlog-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-14T00:00:00.000Z",
+  "dateModified": "2026-09-14T00:03:53.510Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/14/jvm-unified-logging-xlog-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">617</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">730</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-14T00:00:00.000Z" title="发表于 2026-09-14 08:00:00">2026-09-14</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-14T00:03:53.510Z" title="更新于 2026-09-14 08:03:53">2026-09-14</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM/">JVM</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-底层】JVM-统一日志框架（-Xlog）深度解析：从-PrintGC-到结构化日志与生产级配置"><a href="#【JVM-底层】JVM-统一日志框架（-Xlog）深度解析：从-PrintGC-到结构化日志与生产级配置" class="headerlink" title="【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置"></a>【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置</h1><h2 id="面试官：线上要排查-GC-问题，你怎么开日志？-XX-PrintGCDetails-还是-Xloggc？"><a href="#面试官：线上要排查-GC-问题，你怎么开日志？-XX-PrintGCDetails-还是-Xloggc？" class="headerlink" title="面试官：线上要排查 GC 问题，你怎么开日志？-XX:+PrintGCDetails 还是 -Xloggc？"></a>面试官：线上要排查 GC 问题，你怎么开日志？<code>-XX:+PrintGCDetails</code> 还是 <code>-Xloggc</code>？</h2><p>如果你的答案是上面两个，那面试官下一句一定是：<strong>「这两套参数在 JDK 17 上还能用吗？」</strong></p>
+<p>答案是不能——<code>-XX:+PrintGC*</code> 系列在 JDK 9 被标记废弃，JDK 11 之后大量参数虽然还能识别，但输出会被映射到新框架，且提示已废弃；到 JDK 14+（以及后续 LTS）很多参数直接报错或彻底移除。<strong>统一日志框架（Unified Logging, JEP 158）</strong> 才是现代 JVM 唯一的日志方式。</p>
+<p>这篇文章系统讲清 <code>-Xlog</code> 的语法、标签体系、装饰器、输出控制和 GC 日志的实战阅读方法。</p>
+<hr>
+<h2 id="一、为什么需要统一日志？JDK-8-时代的四套日志体系"><a href="#一、为什么需要统一日志？JDK-8-时代的四套日志体系" class="headerlink" title="一、为什么需要统一日志？JDK 8 时代的四套日志体系"></a>一、为什么需要统一日志？JDK 8 时代的四套日志体系</h2><p>JDK 8 的 JVM 日志是「各自为政」的：</p>
+<table>
+<thead>
+<tr>
+<th>日志系统</th>
+<th>开关参数</th>
+<th>输出内容</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GC 日志</td>
+<td><code>-XX:+PrintGC</code>、<code>-XX:+PrintGCDetails</code>、<code>-Xloggc:file</code></td>
+<td>垃圾回收</td>
+</tr>
+<tr>
+<td>类加载日志</td>
+<td><code>-XX:+TraceClassLoading</code>、<code>-XX:+TraceClassUnloading</code></td>
+<td>类加载&#x2F;卸载</td>
+</tr>
+<tr>
+<td>JIT 日志</td>
+<td><code>-XX:+PrintCompilation</code>、<code>-XX:+PrintInlining</code></td>
+<td>编译活动</td>
+</tr>
+<tr>
+<td>安全&#x2F;其他</td>
+<td><code>-verbose:gc</code>、<code>-verbose:class</code>、<code>-Djava.security.debug</code></td>
+<td>杂项</td>
+</tr>
+</tbody></table>
+<p>痛点非常明显：</p>
+<ul>
+<li><strong>无法组合过滤</strong>：想看「GC + 类加载同时带时间戳」？做不到，两套格式互不相通</li>
+<li><strong>无法统一输出到文件</strong>：<code>-Xloggc</code> 只管 GC，其他日志还在 stdout</li>
+<li><strong>没有级别概念</strong>：打开 <code>-XX:+PrintInlining</code> 直接刷屏几十万行，无法降噪</li>
+<li><strong>格式各不相同</strong>，日志采集系统要做多套正则</li>
+<li><strong>无法运行时动态开关</strong>：想临时开个 <code>PrintSafepointStatistics</code>？得重启</li>
+</ul>
+<p>JEP 158 的目标就是：<strong>一套统一的、有级别的、可标签过滤的、可运行时控制的日志框架</strong>。</p>
+<hr>
+<h2 id="二、-Xlog-完整语法"><a href="#二、-Xlog-完整语法" class="headerlink" title="二、-Xlog 完整语法"></a>二、-Xlog 完整语法</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-Xlog:&lt;tag-set&gt;=&lt;level&gt;:&lt;output&gt;:&lt;decorators&gt;:&lt;output-options&gt;</span><br></pre></td></tr></table></figure>
+
+<p>四个部分用冒号分隔，除了第一段，其余都可省略。</p>
+<h3 id="2-1-tag-set（标签集）"><a href="#2-1-tag-set（标签集）" class="headerlink" title="2.1 tag-set（标签集）"></a>2.1 tag-set（标签集）</h3><p><code>tag1+tag2+...</code> 或通配 <code>tag*</code>，多个 tag-set 用逗号分隔。<strong><code>+</code> 是 AND（同时具备这些标签），<code>,</code> 是 OR（另一条规则）。</strong></p>
+<p>常见标签（JVM 启动时用 <code>-Xlog:help</code> 或 <code>java -Xlog:all=trace</code> 观察）：</p>
+<table>
+<thead>
+<tr>
+<th>分类</th>
+<th>标签</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GC</td>
+<td><code>gc</code></td>
+<td>GC 基础事件</td>
+</tr>
+<tr>
+<td></td>
+<td><code>gc+heap</code></td>
+<td>堆使用量与容量变化</td>
+</tr>
+<tr>
+<td></td>
+<td><code>gc+phases</code></td>
+<td>各 GC 阶段耗时（G1&#x2F;ZGC 很有用）</td>
+</tr>
+<tr>
+<td></td>
+<td><code>gc+age</code></td>
+<td>对象年龄分布（<code>-XX:+PrintTenuringDistribution</code> 替代）</td>
+</tr>
+<tr>
+<td></td>
+<td><code>gc+ergo</code></td>
+<td>人机工程学决策过程</td>
+</tr>
+<tr>
+<td></td>
+<td><code>gc+start</code> &#x2F; <code>gc+exit</code></td>
+<td>GC 线程启停</td>
+</tr>
+<tr>
+<td>内存</td>
+<td><code>safepoint</code></td>
+<td>安全点耗时（排查 STW 元凶）</td>
+</tr>
+<tr>
+<td></td>
+<td><code>metaspace</code></td>
+<td>元空间</td>
+</tr>
+<tr>
+<td>类</td>
+<td><code>class+load</code> &#x2F; <code>class+unload</code></td>
+<td>类加载&#x2F;卸载</td>
+</tr>
+<tr>
+<td>编译</td>
+<td><code>compilation</code>、<code>jit+inlining</code></td>
+<td>JIT 编译与内联</td>
+</tr>
+<tr>
+<td>运行时</td>
+<td><code>os</code>、<code>thread</code>、<code>pagesize</code></td>
+<td>操作系统、线程、页大小</td>
+</tr>
+<tr>
+<td>其他</td>
+<td><code>logging</code></td>
+<td>JVM 日志系统自身的日志（集成 log4j 时用）</td>
+</tr>
+</tbody></table>
+<p><strong>注意 <code>gc</code> 是一个前缀标签，<code>gc*</code> 能匹配所有以 gc 开头的标签组合。</strong></p>
+<h3 id="2-2-level（级别）"><a href="#2-2-level（级别）" class="headerlink" title="2.2 level（级别）"></a>2.2 level（级别）</h3><p><code>trace &lt; debug &lt; info &lt; warning &lt; error</code>。默认继承规则：指定 <code>gc=debug</code> 时，更严重的 <code>info/warning/error</code> 也会输出。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 只输出 GC 的 info 及以上</span></span><br><span class="line">-Xlog:gc=info</span><br><span class="line"></span><br><span class="line"><span class="comment"># 输出 GC 相关的所有细节（含 debug/trace）</span></span><br><span class="line">-Xlog:gc*=debug</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-3-output（输出目标）"><a href="#2-3-output（输出目标）" class="headerlink" title="2.3 output（输出目标）"></a>2.3 output（输出目标）</h3><table>
+<thead>
+<tr>
+<th>写法</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>stdout</code></td>
+<td>标准输出（默认）</td>
+</tr>
+<tr>
+<td><code>stderr</code></td>
+<td>标准错误</td>
+</tr>
+<tr>
+<td><code>file=/var/log/jvm/gc.log</code></td>
+<td>写入文件</td>
+</tr>
+</tbody></table>
+<h3 id="2-4-decorators（装饰器）——让日志结构化"><a href="#2-4-decorators（装饰器）——让日志结构化" class="headerlink" title="2.4 decorators（装饰器）——让日志结构化"></a>2.4 decorators（装饰器）——让日志结构化</h3><p>这是最实用的部分，输出前缀可自由组合：</p>
+<table>
+<thead>
+<tr>
+<th>装饰器</th>
+<th>输出示例</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>time</code></td>
+<td><code>[2026-09-14T08:00:00.123+0800]</code></td>
+<td>ISO-8601 绝对时间</td>
+</tr>
+<tr>
+<td><code>utctime</code></td>
+<td><code>[2026-09-14T00:00:00.123+0000]</code></td>
+<td>UTC 绝对时间</td>
+</tr>
+<tr>
+<td><code>uptime</code></td>
+<td><code>[123.456s]</code></td>
+<td>JVM 启动后秒数</td>
+</tr>
+<tr>
+<td><code>millis</code></td>
+<td><code>[123456ms]</code></td>
+<td>毫秒数</td>
+</tr>
+<tr>
+<td><code>timen</code>（JDK 11+）</td>
+<td><code>[123.456789s]</code></td>
+<td>纳秒级 uptime</td>
+</tr>
+<tr>
+<td><code>level</code></td>
+<td><code>[info][warning]</code></td>
+<td>日志级别</td>
+</tr>
+<tr>
+<td><code>tags</code></td>
+<td><code>[gc,heap]</code></td>
+<td>标签集</td>
+</tr>
+<tr>
+<td><code>pid</code></td>
+<td><code>[12345]</code></td>
+<td>进程 ID</td>
+</tr>
+<tr>
+<td><code>tid</code></td>
+<td><code>[123]</code></td>
+<td>线程 ID</td>
+</tr>
+<tr>
+<td><code>hostname</code></td>
+<td><code>[node-01]</code></td>
+<td>主机名</td>
+</tr>
+</tbody></table>
+<p>不写装饰器时，默认是 <code>uptime</code> + <code>level</code> + <code>tags</code>。</p>
+<h3 id="2-5-output-options（文件轮转）"><a href="#2-5-output-options（文件轮转）" class="headerlink" title="2.5 output-options（文件轮转）"></a>2.5 output-options（文件轮转）</h3><table>
+<thead>
+<tr>
+<th>选项</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>filecount=N</code></td>
+<td>保留 N 个轮转文件（<code>0</code> 表示不轮转）</td>
+</tr>
+<tr>
+<td><code>filesize=SIZE</code></td>
+<td>单文件大小，支持 <code>k/m/g</code></td>
+</tr>
+<tr>
+<td><code>-XX:+UseGCLogFileRotation</code> 已被取代</td>
+<td>现在用 <code>filecount</code> + <code>filesize</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="三、常用配置清单（可直接抄）"><a href="#三、常用配置清单（可直接抄）" class="headerlink" title="三、常用配置清单（可直接抄）"></a>三、常用配置清单（可直接抄）</h2><h3 id="3-1-生产环境推荐（GC-日志落文件-轮转）"><a href="#3-1-生产环境推荐（GC-日志落文件-轮转）" class="headerlink" title="3.1 生产环境推荐（GC 日志落文件 + 轮转）"></a>3.1 生产环境推荐（GC 日志落文件 + 轮转）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">java -Xms4g -Xmx4g \</span><br><span class="line">  -Xlog:gc*,gc+heap=debug,gc+age=trace,safepoint=info:file=/var/log/app/gc-%p.log:<span class="keyword">time</span>,<span class="built_in">uptime</span>,level,tags:filecount=10,filesize=50M \</span><br><span class="line">  -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>要点：</p>
+<ul>
+<li><code>%p</code> 是 PID 占位符（还有 <code>%t</code> 时间戳、<code>%%</code> 百分号），多实例部署必备，避免日志互相覆盖</li>
+<li><code>filecount=10,filesize=50M</code> → 最多占 500MB 磁盘，必须设上限，否则日志撑爆磁盘把服务搞挂</li>
+<li><code>safepoint=info</code> 在排查「GC 不长但停顿很长」时非常关键</li>
+</ul>
+<h3 id="3-2-排查类加载问题"><a href="#3-2-排查类加载问题" class="headerlink" title="3.2 排查类加载问题"></a>3.2 排查类加载问题</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-Xlog:class+load=info,class+unload=info:file=/var/log/app/class.log:<span class="keyword">time</span>,<span class="built_in">uptime</span>,level,tags</span><br></pre></td></tr></table></figure>
+
+<p>用于定位「<code>Metaspace OOM</code>」「类加载器泄漏」——观察是否有类被反复加载而不卸载。</p>
+<h3 id="3-3-排查-JIT-与启动优化"><a href="#3-3-排查-JIT-与启动优化" class="headerlink" title="3.3 排查 JIT 与启动优化"></a>3.3 排查 JIT 与启动优化</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-Xlog:compilation=info,jit+inlining=debug:file=/var/log/app/jit.log:<span class="built_in">uptime</span>,level,tags</span><br></pre></td></tr></table></figure>
+
+<p><code>jit+inlining=debug</code> 会打印内联决策树，用于验证热点方法是否被内联。</p>
+<h3 id="3-4-打开-JVM-日志系统自身的调试（对接-log4j）"><a href="#3-4-打开-JVM-日志系统自身的调试（对接-log4j）" class="headerlink" title="3.4 打开 JVM 日志系统自身的调试（对接 log4j）"></a>3.4 打开 JVM 日志系统自身的调试（对接 log4j）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-Xlog:logging=debug:file=jvm-logs.log</span><br></pre></td></tr></table></figure>
+
+<p>这样能看到「哪条日志规则匹配了哪个输出器」，规则写错时非常有用。</p>
+<h3 id="3-5-同时输出到多个目标"><a href="#3-5-同时输出到多个目标" class="headerlink" title="3.5 同时输出到多个目标"></a>3.5 同时输出到多个目标</h3><p>多条规则用逗号分隔：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-Xlog:gc=info:stdout:<span class="built_in">uptime</span>,level,tags,gc*=debug:file=/var/log/app/gc.log:<span class="keyword">time</span>,level,tags</span><br></pre></td></tr></table></figure>
+
+<p>注意：<code>stdout</code> 那条后面还要跟装饰器，语法上是「第一段 tag-set 无冒号时视为 stdout + 装饰器」，简写要小心。<strong>推荐显式写全</strong>，可读性更好。</p>
+<h3 id="3-6-运行时动态调整（jcmd）"><a href="#3-6-运行时动态调整（jcmd）" class="headerlink" title="3.6 运行时动态调整（jcmd）"></a>3.6 运行时动态调整（jcmd）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 查看当前规则</span></span><br><span class="line">jcmd &lt;pid&gt; VM.<span class="built_in">log</span> list</span><br><span class="line"></span><br><span class="line"><span class="comment"># 动态加日志，无需重启</span></span><br><span class="line">jcmd &lt;pid&gt; VM.<span class="built_in">log</span> output=/tmp/tmp-gc.log what=gc* decorators=<span class="keyword">time</span>,<span class="built_in">uptime</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 关闭</span></span><br><span class="line">jcmd &lt;pid&gt; VM.<span class="built_in">log</span> <span class="built_in">disable</span></span><br></pre></td></tr></table></figure>
+
+<p>这是统一日志最被低估的能力：<strong>线上临时开 GC 细节日志，不用重启</strong>。</p>
+<hr>
+<h2 id="四-读懂一行-G1-GC-日志"><a href="#四-读懂一行-G1-GC-日志" class="headerlink" title="四. 读懂一行 G1 GC 日志"></a>四. 读懂一行 G1 GC 日志</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">[2026-09-14T08:00:01.234+0800][info][gc] GC(42) Pause Young (Normal) (G1 Evacuation Pause) 512M-&gt;180M(2048M) 23.456ms</span><br></pre></td></tr></table></figure>
+
+<p>逐段拆解：</p>
+<table>
+<thead>
+<tr>
+<th>片段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GC(42)</code></td>
+<td>第 42 次 GC，用于和并发阶段日志关联</td>
+</tr>
+<tr>
+<td><code>Pause Young (Normal)</code></td>
+<td>年轻代停顿（Normal 表示普通 YGC，Concurrent Start 表示并发标记启动）</td>
+</tr>
+<tr>
+<td><code>(G1 Evacuation Pause)</code></td>
+<td>具体原因：转移暂停</td>
+</tr>
+<tr>
+<td><code>512M-&gt;180M</code></td>
+<td>GC 前堆占用 → GC 后堆占用</td>
+</tr>
+<tr>
+<td><code>(2048M)</code></td>
+<td>当前总容量（注意不等于 <code>-Xmx</code>，G1 会动态扩缩）</td>
+</tr>
+<tr>
+<td><code>23.456ms</code></td>
+<td>本次停顿耗时</td>
+</tr>
+</tbody></table>
+<p>再看并发阶段（<code>-Xlog:gc+phases=debug</code>）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">[info][gc,phases] GC(42)   Concurrent Mark Cycle 45.678ms</span><br><span class="line">[info][gc,phases] GC(42)     Scan Root Region 3.210ms</span><br><span class="line">[info][gc,phases] GC(42)     Mark From Roots  12.345ms</span><br><span class="line">[info][gc,phases] GC(42)     Preclean   5.678ms</span><br><span class="line">[info][gc,phases] GC(42)     Remark   8.901ms</span><br><span class="line">[info][gc,phases] GC(42)     Cleanup  2.345ms</span><br></pre></td></tr></table></figure>
+
+<p>并发阶段不 STW，但<strong>长时间占用 CPU</strong>，如果应用是 CPU 密集型，并发标记会直接抢走算力，表现为「吞吐下降但停顿正常」。</p>
+<p>堆容量变化（<code>-Xlog:gc+heap=debug</code>）可以看到 G1 的动态扩缩：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">[debug][gc,heap] GC(42) Heap before GC invocations=42 (full 0): ... </span><br><span class="line">[debug][gc,heap] GC(42)  eden: 512M(536M)-&gt;0B(536M)</span><br><span class="line">[debug][gc,heap] GC(42)  survivors: 0B(32M)-&gt;32M(32M)</span><br><span class="line">[debug][gc,heap] GC(42)  free regions: 1200</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、用-GC-日志做判断：4-个典型模式"><a href="#五、用-GC-日志做判断：4-个典型模式" class="headerlink" title="五、用 GC 日志做判断：4 个典型模式"></a>五、用 GC 日志做判断：4 个典型模式</h2><h3 id="模式-1：Young-GC-频繁，间隔-1s"><a href="#模式-1：Young-GC-频繁，间隔-1s" class="headerlink" title="模式 1：Young GC 频繁，间隔 &lt; 1s"></a>模式 1：Young GC 频繁，间隔 &lt; 1s</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">GC(100) Pause Young (Normal) 180M-&gt;160M(1024M) 15ms</span><br><span class="line">GC(101) Pause Young (Normal) 175M-&gt;158M(1024M) 14ms   // 间隔 600ms</span><br><span class="line">GC(102) Pause Young (Normal) 178M-&gt;162M(1024M) 16ms</span><br></pre></td></tr></table></figure>
+
+<p><strong>特征</strong>：每次回收后存活对象几乎没变（160M→158M），说明都是短命对象。<br><strong>结论</strong>：正常但过于频繁，可适当增大 Eden（<code>-Xmn</code> &#x2F; <code>-XX:G1NewSizePercent</code>）或检查是否创建了过多临时对象。</p>
+<h3 id="模式-2：Full-GC-反复出现（G1-应尽量避免）"><a href="#模式-2：Full-GC-反复出现（G1-应尽量避免）" class="headerlink" title="模式 2：Full GC 反复出现（G1 应尽量避免）"></a>模式 2：Full GC 反复出现（G1 应尽量避免）</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">GC(500) Pause Full (G1 Compaction Pause) 1900M-&gt;1200M(2048M) 3200ms</span><br></pre></td></tr></table></figure>
+
+<p><strong>原因候选</strong>：晋升失败（Humongous 大对象）、元空间不足、显式 <code>System.gc()</code>。<br><strong>排查</strong>：配合 <code>-Xlog:gc+ergo*=debug</code> 与 <code>-XX:+ExplicitGCInvokesConcurrent</code>。</p>
+<h3 id="模式-3：停顿时间忽高忽低"><a href="#模式-3：停顿时间忽高忽低" class="headerlink" title="模式 3：停顿时间忽高忽低"></a>模式 3：停顿时间忽高忽低</h3><p>开 <code>safepoint</code> 日志对比：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">[safepoint] Safepoint &quot;G1CollectFull&quot;, Time since last: 12345 ms, Reaching safepoint: 150us, At safepoint: 3200us, Total: 4500us</span><br></pre></td></tr></table></figure>
+
+<p>若 <code>Time since last</code>（到上次安全点的间隔）异常大，说明有线程长时间没到安全点——典型元凶是<strong>编译后的大循环</strong>（可数循环会在循环末尾插安全点，但 JIT 优化后可能消除），或 <code>Thread.sleep</code> 之外的长阻塞。</p>
+<h3 id="模式-4：日志里出现-to-space-exhausted"><a href="#模式-4：日志里出现-to-space-exhausted" class="headerlink" title="模式 4：日志里出现 to-space exhausted"></a>模式 4：日志里出现 <code>to-space exhausted</code></h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">GC(77) Pause Young (Normal) (G1 Evacuation Pause) 2000M-&gt;1950M(2048M) 450ms</span><br><span class="line">      to-space exhausted</span><br></pre></td></tr></table></figure>
+
+<p>存活对象多到 Survivor 装不下，转移失败退化成 Full GC。<strong>对策</strong>：加 <code>-XX:InitiatingHeapOccupancyPercent</code>（提前启动并发标记）、增大 <code>-XX:G1ReservePercent</code>、或根本原因是内存泄漏（先看 GC 后占用是否持续上涨）。</p>
+<hr>
+<h2 id="六、从旧参数到新参数的映射（迁移必看）"><a href="#六、从旧参数到新参数的映射（迁移必看）" class="headerlink" title="六、从旧参数到新参数的映射（迁移必看）"></a>六、从旧参数到新参数的映射（迁移必看）</h2><table>
+<thead>
+<tr>
+<th>JDK 8 参数</th>
+<th>JDK 9+ 等价写法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>-XX:+PrintGC</code></td>
+<td><code>-Xlog:gc</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintGCDetails</code></td>
+<td><code>-Xlog:gc*</code></td>
+</tr>
+<tr>
+<td><code>-Xloggc:/path/gc.log</code></td>
+<td><code>-Xlog:gc:file=/path/gc.log</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintGCTimeStamps</code></td>
+<td>装饰器 <code>uptime</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintGCDateStamps</code></td>
+<td>装饰器 <code>time</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintTenuringDistribution</code></td>
+<td><code>-Xlog:gc+age=trace</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintHeapAtGC</code></td>
+<td><code>-Xlog:gc+heap=debug</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintClassHistogram</code></td>
+<td><code>-Xlog:class+histo=trace</code>（JDK 8 后期）</td>
+</tr>
+<tr>
+<td><code>-XX:+PrintCompilation</code></td>
+<td><code>-Xlog:compilation=info</code></td>
+</tr>
+<tr>
+<td><code>-XX:+TraceClassLoading</code></td>
+<td><code>-Xlog:class+load=info</code></td>
+</tr>
+<tr>
+<td><code>-XX:+PrintSafepointStatistics</code></td>
+<td><code>-Xlog:safepoint</code></td>
+</tr>
+<tr>
+<td><code>-XX:GCLogFileSize</code> &#x2F; <code>NumberOfGCLogFiles</code></td>
+<td><code>filesize</code> &#x2F; <code>filecount</code> output-options</td>
+</tr>
+<tr>
+<td><code>-verbose:gc</code></td>
+<td><code>-Xlog:gc</code></td>
+</tr>
+</tbody></table>
+<p><strong>别在 JDK 17+ 上继续用左边这些</strong>：JDK 9 起废弃警告，JDK 11 后部分参数被忽略，JDK 14+ 很多直接 <code>Unrecognized VM option</code> 启动失败。</p>
+<hr>
+<h2 id="七、生产环境-7-个注意事项"><a href="#七、生产环境-7-个注意事项" class="headerlink" title="七、生产环境 7 个注意事项"></a>七、生产环境 7 个注意事项</h2><ol>
+<li><strong>一定要限制磁盘占用</strong>。<code>filecount</code> + <code>filesize</code> 缺一不可，见过因为 GC 日志写满磁盘导致整个 Pod 崩溃的案例。</li>
+<li><strong>多实例必须用 <code>%p</code></strong>。否则同一台机器上多个 JVM 会互相覆盖日志。</li>
+<li><strong>文件路径要提前创建并赋予写权限</strong>。JVM 不会自动创建目录。</li>
+<li><strong><code>-Xlog:gc*</code> 在高频 GC 场景下日志量极大</strong>。QPS 高、Young GC 每秒一次时，一天可能几 GB。建议生产用 <code>gc*=debug</code> 而不是 <code>gc*=trace</code>，或配合异步日志（<code>-Xlog:async</code>，JDK 13+）。</li>
+<li><strong><code>-Xlog:async</code> 降低日志对业务线程的影响</strong>（日志写入转移到单独的线程），但会丢失崩溃前最后一部分缓冲日志，排查启动崩溃时慎用。</li>
+<li><strong>别用 stdout 输出 GC 日志</strong>。在容器里 stdout 会进日志采集系统，把业务日志淹没；也可能被 <code>System.out</code> 重定向而混淆。</li>
+<li><strong>GC 日志与监控系统对接</strong>。推荐用 <code>gc-viewer</code>（JDK 自带，<code>jdk/bin/gcviewer</code>）、GCeasy、或 Prometheus 的 <code>jvm_gc_*</code> 指标做长期趋势。<strong>日志用于事后深度分析，指标用于实时报警。</strong></li>
+</ol>
+<hr>
+<h2 id="八、面试追问连环炮"><a href="#八、面试追问连环炮" class="headerlink" title="八、面试追问连环炮"></a>八、面试追问连环炮</h2><p><strong>Q1：<code>-Xlog:gc</code> 和 <code>-Xlog:gc*</code> 有什么区别？</strong><br><code>gc</code> 是精确匹配「只带 gc 标签」的事件；<code>gc*</code> 是前缀通配，匹配 <code>gc</code>、<code>gc+heap</code>、<code>gc+phases</code>、<code>gc+age</code> 等所有组合。日常排查用 <code>gc*</code>。</p>
+<p><strong>Q2：<code>-Xlog</code> 里的 <code>+</code> 和 <code>,</code> 分别是什么语义？</strong><br><code>+</code> 是标签求交集（AND），<code>gc+heap</code> 表示同时带 gc 和 heap 标签的事件；<code>,</code> 分隔多条独立规则（OR &#x2F; 分别配置输出）。</p>
+<p><strong>Q3：怎么在不重启的情况下临时开 GC 日志？</strong><br><code>jcmd &lt;pid&gt; VM.log output=/tmp/gc.log what=gc* decorators=time,uptime,level,tags</code>，用 <code>jcmd VM.log list</code> 查看，<code>VM.log disable</code> 关闭。</p>
+<p><strong>Q4：为什么 GC 停顿不长，但应用还是卡顿？</strong><br>打开 <code>-Xlog:safepoint</code> 看到达安全点的耗时；再把 <code>gc+phases</code> 打开看并发阶段耗时（抢 CPU）；另外考虑 JIT 去优化（<code>-Xlog:jit+deopt</code>）。卡顿不一定来自 GC。</p>
+<p><strong>Q5：容器里 GC 日志时间戳不对怎么办？</strong><br>容器默认 UTC，加 <code>-Duser.timezone=Asia/Shanghai</code> 或用 <code>utctime</code> 装饰器统一按 UTC 分析，避免跨时区误判。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><ul>
+<li><strong>JDK 9 之后只有一套日志</strong>：<code>-Xlog</code>，四段式语法 <code>tag-set=level:output:decorators:output-options</code></li>
+<li><strong>标签是维度</strong>：<code>gc</code>、<code>safepoint</code>、<code>class+load</code>、<code>compilation</code>、<code>gc+phases</code>，<code>+</code> 是交集、<code>*</code> 是通配</li>
+<li><strong>装饰器决定结构化程度</strong>：生产必备 <code>time,uptime,level,tags</code>，多实例加 <code>pid</code></li>
+<li><strong>必须设轮转上限</strong>：<code>filecount=10,filesize=50M</code>，否则日志撑爆磁盘</li>
+<li><strong><code>jcmd VM.log</code> 可以运行时动态调整</strong>，是线上排查的杀手锏</li>
+<li><strong>看懂日志的四种模式</strong>：YGC 频繁、Full GC 反复、停顿抖动、to-space exhausted</li>
+</ul>
+<p>GC 日志不是「开了就行」的摆设，它是把 JVM 内部状态外化的唯一低成本手段。会开、会读、会用，才是真正的调优能力。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/14/jvm-unified-logging-xlog-deep-dive/">https://jiweidong.github.io/2026/09/14/jvm-unified-logging-xlog-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/GC/">GC</a><a class="post-meta__tags" href="/tags/%E8%B0%83%E4%BC%98/">调优</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/14/kafka-broker-performance-tuning-deep-practice/" title="【Kafka 实战】Kafka Broker 端性能调优深度实战：从操作系统、JVM 到副本同步的全链路参数优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Kafka 实战】Kafka Broker 端性能调优深度实战：从操作系统、JVM 到副本同步的全链路参数优化</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】Kafka Broker 端性能调优深度实战：从操作系统、JVM 到副本同步的全链路参数优化面试官：Kafka 单机吞吐能到多少？如果让你调优一个吞吐上不去的集群，你会从哪几层入手？「Kafka 很快」这句话人人会说，但为什么快、瓶颈在哪、参数怎么调，能答清楚的人不多。 更实际的问题是：Kafka 集群上线后吞吐上不去，消息积压，但你不知道是磁盘、网络、JVM、还是参数配置的问题。 这篇按「操作系统 → JVM → Broker 参数 → 副本与 ISR → 监控与压测」五个层次，给出完整的调优方法论和可直接落地的配置。  一、先理解 Kafka 为什么快：四个核心机制调优必须从原理出发，否则就是瞎调参数。 1.1 顺序写（Sequential Write）Kafka 的消息是追加写到 partition 对应的 log segment 文件。机械硬盘顺序写可达 300~600 MB&#x2F;s，随机写只有约 100 IOPS。顺序写让 Kafka 用廉价硬件就能获得高吞吐。 关键参数：  log.segment.bytes：单个 segment 大小，默认...</div></div></div></a><a class="pagination-related" href="/2026/09/13/unit-test-coverage-jacoco-pit-practice/" title="【工程实战】单元测试覆盖率治理深度实战：JaCoCo 原理、增量覆盖率与变异测试（PIT）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【工程实战】单元测试覆盖率治理深度实战：JaCoCo 原理、增量覆盖率与变异测试（PIT）</div></div><div class="info-2"><div class="info-item-1">【工程实战】单元测试覆盖率治理深度实战：JaCoCo 原理、增量覆盖率与变异测试（PIT）面试官：你们团队的单元测试覆盖率多少？「85%。」 「那……覆盖率 85% 就说明代码质量好吗？」 这个问题一问，很多人就卡住了。更狠的追问是：  覆盖率是怎么算出来的？行覆盖、分支覆盖、路径覆盖有什么区别？ 为什么覆盖率能到 90%，线上还是天天出 Bug？ JaCoCo 是怎么知道哪一行被执行了？它改了我的字节码吗？ 只统计新增代码的覆盖率怎么做？CI 里怎么卡住不达标的分支？ 变异测试和覆盖率是什么关系？  这篇文章从 JaCoCo 的字节码探针原理讲到 增量覆盖率门禁，再到 PIT 变异测试，把「覆盖率」这件事彻底讲清楚。  一、覆盖率的度量体系：别只知道「行覆盖」1.1 五种覆盖率指标假设有这样一段代码： 123456789public int discount(int price, boolean vip) &#123;    if (price &gt; 100) &#123;          // 分支 1        if (vip) &#123;           ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/11/jvm-memory-gc/" title="JVM 内存模型与垃圾回收机制全面解读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">JVM 内存模型与垃圾回收机制全面解读</div></div><div class="info-2"><div class="info-item-1">前言JVM 是 Java 跨平台的基石，也是面试中的”必考题”。理解 JVM 内存模型和 GC 机制，不仅能帮你通过面试，更是解决线上 OOM、CPU 飙升、GC 频繁等问题的必备技能。  一、JVM 内存区域划分1.1 整体架构12345678910111213┌─────────────────────────────────────────────────┐│               JVM 内存结构                        ││  ┌───────────────────┐  ┌─────────────────────┐  ││  │    堆 (Heap)      │  │    元空间 (MetaSpace) │  ││  │  - 新生代          │  │  - 类元信息          │  ││  │    · Eden          │  │  - 运行时常量池      │  ││  │    · S0 / S1       │  │                     │  ││  │  - 老年代    ...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-gc-g1-zgc-shenandoah-deep-dive/" title="「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践</div></div><div class="info-2"><div class="info-item-1">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践从 Serial 到 ZGC，Java 垃圾收集器已经发展了近三十年。面对低延迟还是高吞吐的抉择，我们常常陷入选择困难。本文系统梳理 G1、ZGC 和 Shenandoah 三大主流收集器的核心原理、关键参数和调优实践。  一、GC 发展的演进路线123456789101112Serial (单线程, STW)  │  ├── ParNew (多线程年轻代)  │     └── Parallel Scavenge (吞吐量优先)  │  ├── Parallel Old (老年代并行)  │  └── CMS (并发低延迟) ──→ G1 (分区化, 可预测停顿)                                  │                                  ├── ZGC (超低延迟, 不分区)                                  │                                  └── Shenan...</div></div></div></a><a class="pagination-related" href="/2026/06/15/java-performance-tuning/" title="Java 性能调优实战：从 JVM 到代码优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-15</div><div class="info-item-2">Java 性能调优实战：从 JVM 到代码优化</div></div><div class="info-2"><div class="info-item-1">Java 性能调优实战：从 JVM 到代码优化 性能调优是后端工程师的核心技能。本文从 JVM 内存调优、GC 优化、代码微优化、工具使用四个维度，系统梳理 Java 性能调优的方法论和实战技巧。  一、性能调优方法论1.1 调优原则12345调优 ≠ 炫技，请遵循以下原则：1. 先测量，后优化（没有数据就没有真相）2. 避免过早优化（大部分瓶颈不在你想象的地方）3. 从全局出发（不要为了局部性能牺牲整体）4. 以业务指标为准（TP99、吞吐量、可用性）  1.2 性能指标   指标 含义 黄金法则    TP99 99% 的请求在 Xms 内完成 互联网服务 &lt; 200ms   TP999 99.9% 的请求在 Xms 内完成 &lt; 1s   QPS&#x2F;TPS 每秒查询&#x2F;事务数 越高越好   GC 暂停 垃圾回收导致的停顿 单次 &lt; 50ms   内存占用 堆内存使用量 不频繁 Full GC   CPU 使用率 CPU 繁忙程度 平均 &lt; 80%   IO 等待 磁盘&#x2F;网络 IO 等待时间 越低越好   二、JVM 内存调优2...</div></div></div></a><a class="pagination-related" href="/2026/08/25/tri-color-marking-algorithm-deep-dive/" title="【JVM 底层】三色标记算法深度解析：从 CMS 到 G1 的并发标记、漏标与写屏障"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-25</div><div class="info-item-2">【JVM 底层】三色标记算法深度解析：从 CMS 到 G1 的并发标记、漏标与写屏障</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】三色标记算法深度解析：从 CMS 到 G1 的并发标记、漏标与写屏障面试官：CMS 和 G1 的并发标记阶段是怎么实现的？为什么需要写屏障？“三色标记”是 JVM 面试从 30K 到 50K 的分水岭。懂的人能讲清楚”为什么并发标记会漏标、SATB 和增量更新怎么解决、写屏障在干什么”。本文从可达性分析讲起，把并发标记的底层逻辑完整拆开。 一、为什么需要并发标记？1. 可达性分析：GC Roots 出发的图遍历JVM 判定对象存活靠可达性分析：从 GC Roots（栈帧局部变量、静态变量、JNI 引用、常量池引用等）出发，沿着引用链遍历，所有不可达的对象就是垃圾。 123Object a = new Object();   // a 是 GC RootObject b = a;              // b 通过 a 可达，存活Object c = new Object();   // 没有引用指向 c，垃圾  2. 标记期间不能乱动：STW 的由来如果标记过程中引用关系还在变化（应用线程在跑），标记结果可能失真。所以早期的标记（如 Serial&#x2F;...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 System.gc() 产生千丝万缕的联系。 本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：  System.gc() 到底做了什么 JVM 在什么情况下会自动触发 GC -XX:+DisableExplicitGC 和其它 GC 相关参数的作用 DirectBuffer 回收与 System.gc() 的关系 如何正确进行 GC 调优   一、System.gc() 调用链全解析1.1 从 Java 代码到 JVM 实现先看一个最简单的调用链： 1234...</div></div></div></a><a class="pagination-related" href="/2026/06/17/jvm-production-tuning-practice/" title="JVM 生产环境性能调优实战：案例、工具与参数精讲"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">JVM 生产环境性能调优实战：案例、工具与参数精讲</div></div><div class="info-2"><div class="info-item-1">JVM 生产环境性能调优实战：案例、工具与参数精讲一、JVM 调优的本质JVM 调优的核心目标不是”把 GC 延迟降到 0”——这是不可能的。真正的目标是在可用资源范围内，找到 GC 频率、GC 停顿时间和吞吐量之间的最优平衡。 1.1 调优三角12345678910111213      吞吐量      ▲     /|\    / | \   /  |  \  /   |   \ /    |    \────────────► 低延迟      \       \        \         ▼       内存占用  三种指标互斥：不能既要吞吐高、又要延迟低、还要内存省。    场景 优先级排序 调优方向    在线交易系统 延迟 &gt; 吞吐 &gt; 内存 G1 &#x2F; ZGC，减少 STW   批处理系统 吞吐 &gt; 内存 &gt; 延迟 Parallel GC，拉大堆内存   流式计算 吞吐 &gt; 延迟 &gt; 内存 G1 &#x2F; Parallel，调优新生代   微服务（边缘） 内存 &gt; 延迟 &gt; 吞吐 减小堆内存，Z...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">617</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">730</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%BA%95%E5%B1%82%E3%80%91JVM-%E7%BB%9F%E4%B8%80%E6%97%A5%E5%BF%97%E6%A1%86%E6%9E%B6%EF%BC%88-Xlog%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E-PrintGC-%E5%88%B0%E7%BB%93%E6%9E%84%E5%8C%96%E6%97%A5%E5%BF%97%E4%B8%8E%E7%94%9F%E4%BA%A7%E7%BA%A7%E9%85%8D%E7%BD%AE"><span class="toc-number">1.</span> <span class="toc-text">【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E7%BA%BF%E4%B8%8A%E8%A6%81%E6%8E%92%E6%9F%A5-GC-%E9%97%AE%E9%A2%98%EF%BC%8C%E4%BD%A0%E6%80%8E%E4%B9%88%E5%BC%80%E6%97%A5%E5%BF%97%EF%BC%9F-XX-PrintGCDetails-%E8%BF%98%E6%98%AF-Xloggc%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：线上要排查 GC 问题，你怎么开日志？-XX:+PrintGCDetails 还是 -Xloggc？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E7%BB%9F%E4%B8%80%E6%97%A5%E5%BF%97%EF%BC%9FJDK-8-%E6%97%B6%E4%BB%A3%E7%9A%84%E5%9B%9B%E5%A5%97%E6%97%A5%E5%BF%97%E4%BD%93%E7%B3%BB"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么需要统一日志？JDK 8 时代的四套日志体系</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81-Xlog-%E5%AE%8C%E6%95%B4%E8%AF%AD%E6%B3%95"><span class="toc-number">1.3.</span> <span class="toc-text">二、-Xlog 完整语法</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-tag-set%EF%BC%88%E6%A0%87%E7%AD%BE%E9%9B%86%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 tag-set（标签集）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-level%EF%BC%88%E7%BA%A7%E5%88%AB%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 level（级别）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-output%EF%BC%88%E8%BE%93%E5%87%BA%E7%9B%AE%E6%A0%87%EF%BC%89"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 output（输出目标）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-decorators%EF%BC%88%E8%A3%85%E9%A5%B0%E5%99%A8%EF%BC%89%E2%80%94%E2%80%94%E8%AE%A9%E6%97%A5%E5%BF%97%E7%BB%93%E6%9E%84%E5%8C%96"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 decorators（装饰器）——让日志结构化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-output-options%EF%BC%88%E6%96%87%E4%BB%B6%E8%BD%AE%E8%BD%AC%EF%BC%89"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 output-options（文件轮转）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%B8%B8%E7%94%A8%E9%85%8D%E7%BD%AE%E6%B8%85%E5%8D%95%EF%BC%88%E5%8F%AF%E7%9B%B4%E6%8E%A5%E6%8A%84%EF%BC%89"><span class="toc-number">1.4.</span> <span class="toc-text">三、常用配置清单（可直接抄）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E7%94%9F%E4%BA%A7%E7%8E%AF%E5%A2%83%E6%8E%A8%E8%8D%90%EF%BC%88GC-%E6%97%A5%E5%BF%97%E8%90%BD%E6%96%87%E4%BB%B6-%E8%BD%AE%E8%BD%AC%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 生产环境推荐（GC 日志落文件 + 轮转）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E6%8E%92%E6%9F%A5%E7%B1%BB%E5%8A%A0%E8%BD%BD%E9%97%AE%E9%A2%98"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 排查类加载问题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E6%8E%92%E6%9F%A5-JIT-%E4%B8%8E%E5%90%AF%E5%8A%A8%E4%BC%98%E5%8C%96"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 排查 JIT 与启动优化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E6%89%93%E5%BC%80-JVM-%E6%97%A5%E5%BF%97%E7%B3%BB%E7%BB%9F%E8%87%AA%E8%BA%AB%E7%9A%84%E8%B0%83%E8%AF%95%EF%BC%88%E5%AF%B9%E6%8E%A5-log4j%EF%BC%89"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 打开 JVM 日志系统自身的调试（对接 log4j）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-5-%E5%90%8C%E6%97%B6%E8%BE%93%E5%87%BA%E5%88%B0%E5%A4%9A%E4%B8%AA%E7%9B%AE%E6%A0%87"><span class="toc-number">1.4.5.</span> <span class="toc-text">3.5 同时输出到多个目标</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-6-%E8%BF%90%E8%A1%8C%E6%97%B6%E5%8A%A8%E6%80%81%E8%B0%83%E6%95%B4%EF%BC%88jcmd%EF%BC%89"><span class="toc-number">1.4.6.</span> <span class="toc-text">3.6 运行时动态调整（jcmd）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B-%E8%AF%BB%E6%87%82%E4%B8%80%E8%A1%8C-G1-GC-%E6%97%A5%E5%BF%97"><span class="toc-number">1.5.</span> <span class="toc-text">四. 读懂一行 G1 GC 日志</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%94%A8-GC-%E6%97%A5%E5%BF%97%E5%81%9A%E5%88%A4%E6%96%AD%EF%BC%9A4-%E4%B8%AA%E5%85%B8%E5%9E%8B%E6%A8%A1%E5%BC%8F"><span class="toc-number">1.6.</span> <span class="toc-text">五、用 GC 日志做判断：4 个典型模式</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F-1%EF%BC%9AYoung-GC-%E9%A2%91%E7%B9%81%EF%BC%8C%E9%97%B4%E9%9A%94-1s"><span class="toc-number">1.6.1.</span> <span class="toc-text">模式 1：Young GC 频繁，间隔 &lt; 1s</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F-2%EF%BC%9AFull-GC-%E5%8F%8D%E5%A4%8D%E5%87%BA%E7%8E%B0%EF%BC%88G1-%E5%BA%94%E5%B0%BD%E9%87%8F%E9%81%BF%E5%85%8D%EF%BC%89"><span class="toc-number">1.6.2.</span> <span class="toc-text">模式 2：Full GC 反复出现（G1 应尽量避免）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F-3%EF%BC%9A%E5%81%9C%E9%A1%BF%E6%97%B6%E9%97%B4%E5%BF%BD%E9%AB%98%E5%BF%BD%E4%BD%8E"><span class="toc-number">1.6.3.</span> <span class="toc-text">模式 3：停顿时间忽高忽低</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A8%A1%E5%BC%8F-4%EF%BC%9A%E6%97%A5%E5%BF%97%E9%87%8C%E5%87%BA%E7%8E%B0-to-space-exhausted"><span class="toc-number">1.6.4.</span> <span class="toc-text">模式 4：日志里出现 to-space exhausted</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BB%8E%E6%97%A7%E5%8F%82%E6%95%B0%E5%88%B0%E6%96%B0%E5%8F%82%E6%95%B0%E7%9A%84%E6%98%A0%E5%B0%84%EF%BC%88%E8%BF%81%E7%A7%BB%E5%BF%85%E7%9C%8B%EF%BC%89"><span class="toc-number">1.7.</span> <span class="toc-text">六、从旧参数到新参数的映射（迁移必看）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%94%9F%E4%BA%A7%E7%8E%AF%E5%A2%83-7-%E4%B8%AA%E6%B3%A8%E6%84%8F%E4%BA%8B%E9%A1%B9"><span class="toc-number">1.8.</span> <span class="toc-text">七、生产环境 7 个注意事项</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E8%BF%9E%E7%8E%AF%E7%82%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问连环炮</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/14/jvm-unified-logging-xlog-deep-dive/" title="【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置">【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置</a><time datetime="2026-09-14T00:00:00.000Z" title="发表于 2026-09-14 08:00:00">2026-09-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/14/kafka-broker-performance-tuning-deep-practice/" title="【Kafka 实战】Kafka Broker 端性能调优深度实战：从操作系统、JVM 到副本同步的全链路参数优化">【Kafka 实战】Kafka Broker 端性能调优深度实战：从操作系统、JVM 到副本同步的全链路参数优化</a><time datetime="2026-09-14T00:00:00.000Z" title="发表于 2026-09-14 08:00:00">2026-09-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/14/mysql-performance-schema-diagnostics-deep-practice/" title="【MySQL 运维】Performance Schema 深度实战：从 SQL 画像、等待事件到 sys 视图的性能诊断体系">【MySQL 运维】Performance Schema 深度实战：从 SQL 画像、等待事件到 sys 视图的性能诊断体系</a><time datetime="2026-09-14T00:00:00.000Z" title="发表于 2026-09-14 08:00:00">2026-09-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/14/spring-mvc-data-binding-type-conversion-deep-dive/" title="【Spring MVC 源码】数据绑定与类型转换深度解析：PropertyEditor、Converter、Formatter 与 WebDataBinder">【Spring MVC 源码】数据绑定与类型转换深度解析：PropertyEditor、Converter、Formatter 与 WebDataBinder</a><time datetime="2026-09-14T00:00:00.000Z" title="发表于 2026-09-14 08:00:00">2026-09-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/14/tcpdump-wireshark-network-troubleshooting-java/" title="【网络排查】tcpdump 与 Wireshark 抓包实战：Java 服务偶发超时、连接异常与丢包定位全流程">【网络排查】tcpdump 与 Wireshark 抓包实战：Java 服务偶发超时、连接异常与丢包定位全流程</a><time datetime="2026-09-14T00:00:00.000Z" title="发表于 2026-09-14 08:00:00">2026-09-14</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
