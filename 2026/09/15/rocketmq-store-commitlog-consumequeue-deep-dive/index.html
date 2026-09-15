@@ -1,0 +1,545 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？大部分人答「写一次」，然后就被追问到哑口无言。 真实答案是：一次写入调用，但数据落到了三份文件里——CommitLog、ConsumeQueue、IndexFile（可选）。更麻烦的是，这三份文件写入时机">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？大部分人答「写一次」，然后就被追问到哑口无言。 真实答案是：一次写入调用，但数据落到了三份文件里——CommitLog、ConsumeQueue、IndexFile（可选）。更麻烦的是，这三份文件写入时机">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-15T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-15T00:02:21.079Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="RocketMQ">
+<meta property="article:tag" content="存储引擎">
+<meta property="article:tag" content="消息队列">
+<meta property="article:tag" content="源码">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制",
+  "url": "https://jiweidong.github.io/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-15T00:00:00.000Z",
+  "dateModified": "2026-09-15T00:02:21.079Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">622</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">731</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-15T00:02:21.079Z" title="更新于 2026-09-15 08:02:21">2026-09-15</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【消息队列】RocketMQ-存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile-与-mmap-刷盘机制"><a href="#【消息队列】RocketMQ-存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile-与-mmap-刷盘机制" class="headerlink" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制"></a>【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</h1><h2 id="面试官：RocketMQ-一条消息写进去，到底写了几次磁盘？"><a href="#面试官：RocketMQ-一条消息写进去，到底写了几次磁盘？" class="headerlink" title="面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？"></a>面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？</h2><p>大部分人答「写一次」，然后就被追问到哑口无言。</p>
+<p>真实答案是：<strong>一次写入调用，但数据落到了三份文件里</strong>——CommitLog、ConsumeQueue、IndexFile（可选）。更麻烦的是，这三份文件<strong>写入时机不同、刷盘策略不同、丢失后果也不同</strong>。</p>
+<p>这套设计是 RocketMQ 高吞吐 + 高可靠的核心，也是面试里最能拉开差距的地方。本文按「文件布局 → 写入链路 → 读取链路 → 刷盘与复制 → 故障恢复 → 调优」六段讲透。</p>
+<hr>
+<h2 id="一、为什么不用「一条消息一个文件」"><a href="#一、为什么不用「一条消息一个文件」" class="headerlink" title="一、为什么不用「一条消息一个文件」"></a>一、为什么不用「一条消息一个文件」</h2><p>先看反面教材。如果每条消息独立存一个文件，会立刻遇到三个问题：</p>
+<ol>
+<li><strong>文件数爆炸</strong>：每秒 10 万条消息 → 每天 86 亿个文件，<code>inode</code> 直接耗尽</li>
+<li><strong>写入变随机</strong>：文件创建本身是元数据随机写，无法利用磁盘顺序写特性</li>
+<li><strong>读取低效</strong>：按 Topic 拉取消息需要遍历大量文件</li>
+</ol>
+<p>Kafka 的思路是「partition &#x3D; 一个目录，消息顺序追加」。RocketMQ 更进一步：<strong>所有 Topic 的所有消息，混写进同一个 CommitLog</strong>。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line">$HOME/store/</span><br><span class="line">├── commitlog/</span><br><span class="line">│   ├── 00000000000000000000   # 每个文件默认 1GB，写满就切下一个</span><br><span class="line">│   ├── 00000000001073741824</span><br><span class="line">│   └── ...</span><br><span class="line">├── consumequeue/</span><br><span class="line">│   └── &#123;topic&#125;/</span><br><span class="line">│       └── &#123;queueId&#125;/</span><br><span class="line">│           ├── 00000000000000000000   # 每个文件 30 万条 * 20 字节 ≈ 5.72MB</span><br><span class="line">│           └── ...</span><br><span class="line">├── index/</span><br><span class="line">│   └── 20260915083000         # 按时间命名的索引文件</span><br><span class="line">├── checkpoint                 # 刷盘点位（commitlog / consumequeue / index 各自）</span><br><span class="line">└── abort                      # 异常退出标记文件</span><br></pre></td></tr></table></figure>
+
+<p><strong>「单 CommitLog + 多 ConsumeQueue」是 RocketMQ 存储的核心解耦</strong>：</p>
+<ul>
+<li>写入侧：所有消息<strong>全局顺序追加</strong>，只写 CommitLog，写入路径极致简单</li>
+<li>读取侧：每个 Topic&#x2F;Queue 维护独立的<strong>轻量索引文件</strong>（ConsumeQueue），消费时读索引再回查 CommitLog</li>
+</ul>
+<h3 id="为什么写入要全局混写？高并发下的锁竞争"><a href="#为什么写入要全局混写？高并发下的锁竞争" class="headerlink" title="为什么写入要全局混写？高并发下的锁竞争"></a>为什么写入要全局混写？高并发下的锁竞争</h3><p>这是设计的关键动机。如果按 Topic 分文件写，那么每个 Topic 的写入需要<strong>独立的锁</strong>去维护自己的「当前写偏移」。Topic 一多，锁的粒度和竞争就失控了。</p>
+<p>而全局单 CommitLog 只需要<strong>一把写锁</strong>（<code>PutMessageLock</code>，实现有 <code>PutMessageSpinLock</code> 自旋锁和 <code>PutMessageReentrantLock</code>），写入偏移完全顺序，几乎无冲突。</p>
+<p>代价是<strong>读取时要「索引回查」</strong>，但 RocketMQ 认为「写路径比读路径更关键」——写不进去是事故，读慢一点可以靠缓存和并行弥补。</p>
+<hr>
+<h2 id="二、三类文件的存储结构"><a href="#二、三类文件的存储结构" class="headerlink" title="二、三类文件的存储结构"></a>二、三类文件的存储结构</h2><h3 id="2-1-CommitLog：消息的真实仓库"><a href="#2-1-CommitLog：消息的真实仓库" class="headerlink" title="2.1 CommitLog：消息的真实仓库"></a>2.1 CommitLog：消息的真实仓库</h3><p>CommitLog 里存的是<strong>完整的消息体 + 元数据</strong>。单条消息的存储格式（<code>DefaultMessageStore</code> 的 <code>CommitLog</code> 类）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>长度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>TOTALSIZE</td>
+<td>4B</td>
+<td>整条消息的总长度</td>
+</tr>
+<tr>
+<td>MAGICCODE</td>
+<td>4B</td>
+<td>魔数，<code>0xdaa320a7</code>（正常）&#x2F; <code>0xcbd431f8</code>（压缩）</td>
+</tr>
+<tr>
+<td>BODYCRC</td>
+<td>4B</td>
+<td>消息体 CRC32 校验和</td>
+</tr>
+<tr>
+<td>QUEUEID</td>
+<td>4B</td>
+<td>队列 ID</td>
+</tr>
+<tr>
+<td>FLAG</td>
+<td>4B</td>
+<td>消息标志（如事务、压缩标记）</td>
+</tr>
+<tr>
+<td>QUEUEOFFSET</td>
+<td>8B</td>
+<td><strong>在 ConsumeQueue 中的偏移</strong>（反查用）</td>
+</tr>
+<tr>
+<td>PHYSICALOFFSET</td>
+<td>8B</td>
+<td><strong>物理偏移</strong>，即消息在 CommitLog 中的起始位置</td>
+</tr>
+<tr>
+<td>SYSFLAG</td>
+<td>4B</td>
+<td>系统标志</td>
+</tr>
+<tr>
+<td>BORNTIMESTAMP</td>
+<td>8B</td>
+<td>消息产生时间戳</td>
+</tr>
+<tr>
+<td>BORNHOST</td>
+<td>16B</td>
+<td>生产者地址</td>
+</tr>
+<tr>
+<td>STORETIMESTAMP</td>
+<td>8B</td>
+<td>消息存储时间戳</td>
+</tr>
+<tr>
+<td>STOREHOSTADDRESS</td>
+<td>16B</td>
+<td>Broker 地址</td>
+</tr>
+<tr>
+<td>RECONSUMETIMES</td>
+<td>4B</td>
+<td>重试次数</td>
+</tr>
+<tr>
+<td>PreparedMessageQueueOffset</td>
+<td>8B</td>
+<td>事务消息的预提交 offset</td>
+</tr>
+<tr>
+<td>PreparedMessageQueueId</td>
+<td>4B</td>
+<td>事务消息的预提交 queueId</td>
+</tr>
+<tr>
+<td>BODY LENGTH</td>
+<td>4B</td>
+<td>消息体长度</td>
+</tr>
+<tr>
+<td>BODY</td>
+<td>变长</td>
+<td>消息体（可能是压缩后的）</td>
+</tr>
+<tr>
+<td>TOPIC LENGTH + TOPIC</td>
+<td>1B + 变长</td>
+<td>Topic 名称</td>
+</tr>
+</tbody></table>
+<p><strong>关键点</strong>：<code>QUEUEOFFSET</code> 和 <code>PHYSICALOFFSET</code> 这两个字段是<strong>双向索引的桥梁</strong>——</p>
+<ul>
+<li><code>PHYSICALOFFSET</code> 让消费时能直接从 ConsumeQueue 定位到 CommitLog</li>
+<li><code>QUEUEOFFSET</code> 在刷盘异常、消息重建（<code>RecoverMessageStore</code>）时用于反向修复 ConsumeQueue</li>
+</ul>
+<h3 id="2-2-ConsumeQueue：轻量级消费索引"><a href="#2-2-ConsumeQueue：轻量级消费索引" class="headerlink" title="2.2 ConsumeQueue：轻量级消费索引"></a>2.2 ConsumeQueue：轻量级消费索引</h3><p>ConsumeQueue 是<strong>定长 20 字节</strong>的索引条目数组：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>长度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>COMMITLOG OFFSET</td>
+<td>8B</td>
+<td>消息在 CommitLog 的物理偏移</td>
+</tr>
+<tr>
+<td>SIZE</td>
+<td>4B</td>
+<td>消息在 CommitLog 中的总长度</td>
+</tr>
+<tr>
+<td>TAGS CODE</td>
+<td>8B</td>
+<td>Tag 的哈希值（用于服务端过滤）</td>
+</tr>
+</tbody></table>
+<p><strong>为什么是 20 字节且定长？</strong> 因为定长数组可以 <strong>O(1) 随机寻址</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">第 N 条消息在 ConsumeQueue 文件的偏移 = N * 20</span><br></pre></td></tr></table></figure>
+
+<p>消费时根据 <code>consumerOffset</code> 算出文件内位置，读 20 字节拿到 <code>(commitlogOffset, size, tagsCode)</code>，再去 CommitLog 读完整消息。<strong>两次随机读（其实都走页缓存，见后文），换取写入的极致顺序化。</strong></p>
+<p><code>TAGS CODE</code> 的存在是为了<strong>服务端过滤</strong>：消费者带 Tag 过滤时，不匹配的消息只读 20 字节索引就能跳过，不用读 CommitLog 里的完整消息体。这是 RocketMQ 相比「客户端全量拉取再过滤」的重要优势。</p>
+<h3 id="2-3-IndexFile：按-Key-时间查消息"><a href="#2-3-IndexFile：按-Key-时间查消息" class="headerlink" title="2.3 IndexFile：按 Key &#x2F; 时间查消息"></a>2.3 IndexFile：按 Key &#x2F; 时间查消息</h3><p>CommitLog 是顺序追加的，无法按 Message Key 查找。RocketMQ 用 <strong>Hash 索引</strong>解决：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line">IndexFile 结构：</span><br><span class="line">┌──────────────────────────────────────┐</span><br><span class="line">│ IndexHeader (40 字节)                 │</span><br><span class="line">│  - beginTimestamp  索引文件起始时间    │</span><br><span class="line">│  - endTimestamp    索引文件结束时间    │</span><br><span class="line">│  - beginPhyOffset  起始物理偏移        │</span><br><span class="line">│  - endPhyOffset    结束物理偏移        │</span><br><span class="line">│  - hashSlotCount   哈希槽数量          │</span><br><span class="line">│  - indexCount      索引条目数量        │</span><br><span class="line">├──────────────────────────────────────┤</span><br><span class="line">│ HashSlot 数组 (500 万个 * 4 字节 = 20MB)│  ← 每个槽存「最新 index 条目的编号」</span><br><span class="line">├──────────────────────────────────────┤</span><br><span class="line">│ IndexEntry 数组 (每个 20 字节)         │  ← 真正的索引数据</span><br><span class="line">└──────────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>Hash 冲突用「链表 + 头插法」解决</strong>：HashSlot[i] 存的是该槽对应链表的头节点编号，IndexEntry 里的 <code>nextIndex</code> 指向下一个条目。</p>
+<p>单个 IndexFile 默认包含 <strong>500 万个哈希槽 + 2000 万个 IndexEntry</strong>，文件大小约 <strong>420MB</strong>（<code>20MB + 2000万*20B</code>），由 <code>maxIndexFileSize</code> 间接控制。</p>
+<p><strong>使用场景</strong>：<code>Message Key</code> 精确查询、按时间区间查询（<code>beginTimestamp</code>&#x2F;<code>endTimestamp</code> 范围过滤）。运维排查问题消息时，<code>mqadmin queryMsgByKey</code> 就是走这条路。</p>
+<hr>
+<h2 id="三、写入链路：一次-putMessage-做了什么"><a href="#三、写入链路：一次-putMessage-做了什么" class="headerlink" title="三、写入链路：一次 putMessage 做了什么"></a>三、写入链路：一次 putMessage 做了什么</h2><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// DefaultMessageStore#asyncPutMessage 核心流程（简化）</span></span><br><span class="line"><span class="keyword">public</span> CompletableFuture&lt;PutMessageResult&gt; <span class="title function_">asyncPutMessage</span><span class="params">(MessageExtBrokerInner msg)</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 1. 检查存储状态：是否 shutdown、是否拒绝写入、是否 slava 不可写</span></span><br><span class="line">    <span class="type">PutMessageStatus</span> <span class="variable">checkStoreStatus</span> <span class="operator">=</span> <span class="built_in">this</span>.checkStoreStatus();</span><br><span class="line">    <span class="keyword">if</span> (checkStoreStatus != PutMessageStatus.PUT_OK) &#123;</span><br><span class="line">        <span class="keyword">return</span> CompletableFuture.completedFuture(<span class="keyword">new</span> <span class="title class_">PutMessageResult</span>(checkStoreStatus, <span class="literal">null</span>));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 2. 检查消息合法性（Topic 长度、Body 大小、属性长度）</span></span><br><span class="line">    <span class="type">PutMessageStatus</span> <span class="variable">checkMessageStatus</span> <span class="operator">=</span> checkMessage(msg, PUT_MESSAGE_MAX_BYTES);</span><br><span class="line">    <span class="keyword">if</span> (checkMessageStatus != PutMessageStatus.PUT_OK) &#123;</span><br><span class="line">        <span class="keyword">return</span> CompletableFuture.completedFuture(<span class="keyword">new</span> <span class="title class_">PutMessageResult</span>(checkMessageStatus, <span class="literal">null</span>));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 3. 页缓存忙检查（PageCacheBusy）—— 防止写页缓存阻塞触发假死</span></span><br><span class="line">    <span class="type">PutMessageStatus</span> <span class="variable">checkPageCacheStatus</span> <span class="operator">=</span> <span class="built_in">this</span>.checkPageCacheBusy();</span><br><span class="line">    <span class="keyword">if</span> (checkPageCacheStatus != PutMessageStatus.PUT_OK) &#123;</span><br><span class="line">        <span class="keyword">return</span> CompletableFuture.completedFuture(<span class="keyword">new</span> <span class="title class_">PutMessageResult</span>(checkPageCacheStatus, <span class="literal">null</span>));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 4. 获取写锁（自旋锁或可重入锁）</span></span><br><span class="line">    putMessageLock.lock();</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="comment">// 5. 写入 MappedFile 的页缓存（写入即返回）</span></span><br><span class="line">        result = asyncPutMessageToCommitLog(msg);</span><br><span class="line">    &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">        putMessageLock.unlock();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">return</span> result;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-1-mmap：为什么能这么快"><a href="#3-1-mmap：为什么能这么快" class="headerlink" title="3.1 mmap：为什么能这么快"></a>3.1 mmap：为什么能这么快</h3><p><code>MappedFile</code> 基于 **mmap（内存映射文件）**实现：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">this</span>.mappedByteBuffer = <span class="built_in">this</span>.fileChannel.map(MapMode.READ_WRITE, <span class="number">0</span>, fileSize);</span><br></pre></td></tr></table></figure>
+
+<p><strong>写 CommitLog 的过程，本质是「往一块内存地址写字节」</strong>——不涉及 <code>write()</code> 系统调用：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">putMessage</span><br><span class="line">  → MappedFile.appendMessage()</span><br><span class="line">     → mappedByteBuffer.put(...)   ← 纯内存操作，纳秒级</span><br></pre></td></tr></table></figure>
+
+<p>数据先进入<strong>操作系统的 Page Cache</strong>（脏页），由内核按 <code>vm.dirty_ratio</code> 等策略异步回写磁盘。<strong>这就是 RocketMQ 高吞吐的根本原因：写入即返回，不等待磁盘。</strong></p>
+<p>代价是<strong>宕机时页缓存中的数据会丢</strong>——因此需要刷盘策略来定义「多可靠」。</p>
+<h3 id="3-2-三份文件的写入顺序"><a href="#3-2-三份文件的写入顺序" class="headerlink" title="3.2 三份文件的写入顺序"></a>3.2 三份文件的写入顺序</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// CommitLog 写完后的分发（ReputMessageService 异步完成，非写路径阻塞点）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">doDispatch</span><span class="params">(DispatchRequest req)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 写 ConsumeQueue（通过 ConsumeQueue.putMessagePositionInfo）</span></span><br><span class="line">    <span class="keyword">for</span> (CommitLogDispatcher dispatcher : <span class="built_in">this</span>.dispatcherList) &#123;</span><br><span class="line">        dispatcher.dispatch(req);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 默认 dispatcherList = [CommitLogDispatcherBuildConsumeQueue, CommitLogDispatcherBuildIndex]</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>关键设计</strong>：ConsumeQueue 和 IndexFile 的构建是<strong>异步的</strong>！由 <code>ReputMessageService</code> 线程（默认 1 秒唤醒一次，或消息到达时唤醒）负责从 CommitLog 重新「重放」并写入索引。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ReputMessageService#run 核心逻辑</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">while</span> (!<span class="built_in">this</span>.isStopped()) &#123;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            Thread.sleep(<span class="number">1</span>);        <span class="comment">// 默认 1ms</span></span><br><span class="line">            <span class="type">boolean</span> <span class="variable">doNext</span> <span class="operator">=</span> doReput();   <span class="comment">// 重放 CommitLog，构建 ConsumeQueue/Index</span></span><br><span class="line">        &#125; <span class="keyword">catch</span> (Throwable e) &#123;</span><br><span class="line">            log.error(<span class="string">&quot;MessageStore reput service error&quot;</span>, e);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>重放（Reput）机制的精妙之处</strong>：它让索引构建变成了「可重放的纯函数」。如果 ConsumeQueue 损坏、丢失或落后，直接从 CommitLog 重新重放即可修复——<strong>因为 CommitLog 才是唯一事实来源（Source of Truth）</strong>。</p>
+<p>这也解释了为什么 RocketMQ 的 ConsumeQueue&#x2F;Index 可以<strong>放心删除重建</strong>：<code>mqadmin deleteConsumeQueue</code> 后重启，Broker 会自动从 CommitLog 重放恢复。</p>
+<hr>
+<h2 id="四、刷盘策略：同步-vs-异步"><a href="#四、刷盘策略：同步-vs-异步" class="headerlink" title="四、刷盘策略：同步 vs 异步"></a>四、刷盘策略：同步 vs 异步</h2><p>这是可靠性设计的核心开关。</p>
+<h3 id="4-1-异步刷盘（ASYNC-FLUSH，默认）"><a href="#4-1-异步刷盘（ASYNC-FLUSH，默认）" class="headerlink" title="4.1 异步刷盘（ASYNC_FLUSH，默认）"></a>4.1 异步刷盘（ASYNC_FLUSH，默认）</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">flushDiskType=ASYNC_FLUSH</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>消息写入页缓存后<strong>立即返回</strong>成功给生产者</li>
+<li>由 <code>FlushRealTimeService</code> 线程后台刷盘，默认每 500ms 一次</li>
+<li>可靠性：<strong>Broker 进程崩溃不丢（页缓存在内核），机器断电会丢最多 500ms 数据</strong></li>
+</ul>
+<h3 id="4-2-同步刷盘（SYNC-FLUSH）"><a href="#4-2-同步刷盘（SYNC-FLUSH）" class="headerlink" title="4.2 同步刷盘（SYNC_FLUSH）"></a>4.2 同步刷盘（SYNC_FLUSH）</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">flushDiskType=SYNC_FLUSH</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>写入页缓存后，<strong>阻塞等待</strong>刷盘完成才返回</li>
+<li>由 <code>GroupCommitService</code> 批量刷（攒批后一次 <code>force()</code>，减少 fsync 次数）</li>
+<li>可靠性：单机不丢消息（除非磁盘损坏）</li>
+<li>代价：TPS 下降一个数量级（因为涉及 fsync）</li>
+</ul>
+<p><strong>GroupCommitService 的攒批优化</strong>是同步刷盘性能的关键：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 每 10ms 唤醒一次，把这段时间内所有等待刷盘的消息一次性 force</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">while</span> (!<span class="built_in">this</span>.isStopped()) &#123;</span><br><span class="line">        <span class="built_in">this</span>.waitForRunning(<span class="number">10</span>);   <span class="comment">// 攒 10ms 的请求</span></span><br><span class="line">        <span class="built_in">this</span>.doCommit();           <span class="comment">// 一次 force 刷盘，唤醒所有等待者</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-选型建议"><a href="#4-3-选型建议" class="headerlink" title="4.3 选型建议"></a>4.3 选型建议</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>刷盘策略</th>
+<th>副本策略</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>日志、监控、埋点</td>
+<td>ASYNC_FLUSH</td>
+<td>ASYNC_MASTER</td>
+<td>允许少量丢失</td>
+</tr>
+<tr>
+<td>普通业务消息</td>
+<td>ASYNC_FLUSH</td>
+<td><strong>SYNC_MASTER</strong></td>
+<td>靠主从复制兜底（推荐）</td>
+</tr>
+<tr>
+<td>金融、支付、订单</td>
+<td>SYNC_FLUSH</td>
+<td>SYNC_MASTER</td>
+<td>双保险，性能代价可接受</td>
+</tr>
+<tr>
+<td>极致吞吐、允许重放</td>
+<td>ASYNC_FLUSH</td>
+<td>ASYNC_MASTER</td>
+<td>配合幂等消费</td>
+</tr>
+</tbody></table>
+<p><strong>重要提醒</strong>：<code>SYNC_FLUSH</code> 只保证「单机不丢」。如果 Broker 磁盘整套挂掉，仍然会丢。所以<strong>真正的高可靠是 <code>SYNC_FLUSH + SYNC_MASTER</code>（主从同步复制）</strong>，这也叫 RocketMQ 的「双写」可靠性。</p>
+<hr>
+<h2 id="五、故障恢复：abort-文件与消息重建"><a href="#五、故障恢复：abort-文件与消息重建" class="headerlink" title="五、故障恢复：abort 文件与消息重建"></a>五、故障恢复：abort 文件与消息重建</h2><p>RocketMQ 用 <code>$HOME/store/abort</code> 文件标记<strong>是否正常退出</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 启动时：若存在 abort 文件，说明上次是异常退出</span></span><br><span class="line"><span class="keyword">private</span> <span class="type">boolean</span> <span class="title function_">isTempFileExist</span><span class="params">()</span> &#123; ... &#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// DefaultMessageStore#load</span></span><br><span class="line"><span class="type">boolean</span> <span class="variable">lastExitOK</span> <span class="operator">=</span> !<span class="built_in">this</span>.isTempFileExist();</span><br><span class="line"><span class="keyword">if</span> (lastExitOK) &#123;</span><br><span class="line">    <span class="comment">// 正常退出：按 checkpoint 恢复，只重放 checkpoint 之后的数据</span></span><br><span class="line">&#125; <span class="keyword">else</span> &#123;</span><br><span class="line">    <span class="comment">// 异常退出：从 checkpoint 往前「回退」到最近的可信位置</span></span><br><span class="line">    recoverAbnormally();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-1-正常退出的恢复流程"><a href="#5-1-正常退出的恢复流程" class="headerlink" title="5.1 正常退出的恢复流程"></a>5.1 正常退出的恢复流程</h3><ol>
+<li>读 <code>checkpoint</code> 拿到 <code>commitlog / consumequeue / index</code> 三个刷盘点位</li>
+<li>从 commitlog 的 <code>phyOffset</code> 开始，<strong>重放</strong>后续消息，重建 ConsumeQueue 与 Index</li>
+<li>完成后开始对外提供服务</li>
+</ol>
+<h3 id="5-2-异常退出的恢复：为什么-1-也要回退"><a href="#5-2-异常退出的恢复：为什么-1-也要回退" class="headerlink" title="5.2 异常退出的恢复：为什么 &lt; 1 也要回退"></a>5.2 异常退出的恢复：为什么 <code>&lt; 1</code> 也要回退</h3><p>异常退出（kill -9、断电）时，页缓存里的数据可能<strong>部分落盘</strong>：</p>
+<ul>
+<li>CommitLog 可能写了一半（消息体不完整）</li>
+<li>ConsumeQueue 可能落后于 CommitLog</li>
+<li>甚至出现「CommitLog 有、ConsumeQueue 没有」</li>
+</ul>
+<p><strong>恢复策略（<code>recoverAbnormally</code>）</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 从 checkpoint 中取出 commitlog 刷盘点位，再往前回退一段（getCommitLogStoreTimestamp）</span></span><br><span class="line"><span class="type">long</span> <span class="variable">checkCommitLogOffset</span> <span class="operator">=</span> ...;</span><br><span class="line"><span class="type">long</span> <span class="variable">reducedOffset</span> <span class="operator">=</span> checkCommitLogOffset - someReduction;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 2. 从 reducedOffset 开始逐条扫描消息</span></span><br><span class="line"><span class="comment">// 3. 校验 CRC：如果消息头/体大小异常、CRC 不匹配 → 认为消息被截断</span></span><br><span class="line"><span class="comment">// 4. 截断（truncate）CommitLog 到最后一个完整消息的末尾</span></span><br><span class="line"><span class="comment">// 5. 从该位置向后重放，重建 ConsumeQueue / Index</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>核心思想：以 CRC 校验为准，宁可截断（丢失最后几条），也不留下不完整消息。</strong> 这是 RocketMQ 保证「不乱序、不读到脏数据」的关键。</p>
+<h3 id="5-3-ConsumeQueue-损坏的独立恢复"><a href="#5-3-ConsumeQueue-损坏的独立恢复" class="headerlink" title="5.3 ConsumeQueue 损坏的独立恢复"></a>5.3 ConsumeQueue 损坏的独立恢复</h3><p>如果 ConsumeQueue 文件被误删（运维事故常见）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 停止写入（优雅下线 broker）</span></span><br><span class="line">mqadmin shutdown</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. 删除损坏的 consumequeue 目录</span></span><br><span class="line"><span class="built_in">rm</span> -rf <span class="variable">$HOME</span>/store/consumequeue/&#123;topic&#125;/&#123;queueId&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. 重启会自动从 CommitLog 重放重建</span></span><br><span class="line">mqbroker -c broker.conf</span><br></pre></td></tr></table></figure>
+
+<p><strong>但要注意</strong>：重建过程需要扫描整个 CommitLog（可能几十 GB），耗时长，且重建期间该 Queue 无法消费。<strong>所以生产环境建议提前备份 <code>consumequeue</code> 目录，或者依赖 <code>checkpoint</code> 而不是全量重建。</strong></p>
+<hr>
+<h2 id="六、性能调优与监控"><a href="#六、性能调优与监控" class="headerlink" title="六、性能调优与监控"></a>六、性能调优与监控</h2><h3 id="6-1-核心参数"><a href="#6-1-核心参数" class="headerlink" title="6.1 核心参数"></a>6.1 核心参数</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"># ---- 文件大小 ----</span><br><span class="line">mapedFileSizeCommitLog=1073741824      # CommitLog 单文件 1GB（官方建议不改）</span><br><span class="line">mapedFileSizeConsumeQueue=300000       # 每个 ConsumeQueue 文件 30 万条</span><br><span class="line"></span><br><span class="line"># ---- 刷盘 ----</span><br><span class="line">flushDiskType=ASYNC_FLUSH              # 或 SYNC_FLUSH</span><br><span class="line">flushIntervalCommitLog=500             # 异步刷盘间隔 ms</span><br><span class="line">flushCommitLogLeastPages=4             # 至少攒够 4 页（16KB）才刷</span><br><span class="line">flushCommitLogThoroughInterval=10000   # 无论是否有新数据，10s 必刷一次</span><br><span class="line"></span><br><span class="line"># ---- 页缓存与内存 ----</span><br><span class="line">osPageCacheBusyTimeOutMills=1000       # 页缓存忙超时，超过则拒绝写入</span><br><span class="line">transientStorePoolEnable=true          # 堆外内存池（仅 ASYNC_FLUSH 可用）</span><br><span class="line">transientStorePoolSize=5               # 内存池中的 buffer 数量（每个 1GB）</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-transientStorePool：高手选项"><a href="#6-2-transientStorePool：高手选项" class="headerlink" title="6.2 transientStorePool：高手选项"></a>6.2 transientStorePool：高手选项</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">默认：写入 → MappedByteBuffer（页缓存）→ OS 刷盘</span><br><span class="line">开启后：写入 → DirectByteBuffer（堆外内存池）→ 提交到 FileChannel → 页缓存 → 刷盘</span><br></pre></td></tr></table></figure>
+
+<p><strong>它的作用是解耦「写」与「刷」</strong>：写线程写堆外内存，由独立线程负责 commit 到 mmap。这能在高并发下有更好的写入表现（msync 时不阻塞 putMessage）。</p>
+<p><strong>但注意两条硬约束</strong>：</p>
+<ol>
+<li><strong>只有 ASYNC_FLUSH 才能开</strong>——同步刷盘语义下必须先落页缓存</li>
+<li><strong>开启后进程崩溃会丢更多数据</strong>，因为堆外内存不在页缓存里</li>
+</ol>
+<h3 id="6-3-监控指标（mqadmin-与-mqadmin-statsAll）"><a href="#6-3-监控指标（mqadmin-与-mqadmin-statsAll）" class="headerlink" title="6.3 监控指标（mqadmin 与 mqadmin statsAll）"></a>6.3 监控指标（<code>mqadmin</code> 与 <code>mqadmin statsAll</code>）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># ConsumeQueue 积压情况</span></span><br><span class="line">mqadmin consumerProgress -g my-group</span><br><span class="line"></span><br><span class="line"><span class="comment"># Broker 存储统计</span></span><br><span class="line">mqadmin statsAll | grep -A 20 <span class="string">&quot;broker&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 页缓存忙次数（关键告警项）</span></span><br><span class="line">mqadmin getBrokerRuntimeInfo | grep -i pagecache</span><br></pre></td></tr></table></figure>
+
+<p><strong>重点告警指标</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>阈值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>pageCacheBusy</code></td>
+<td>&gt; 0 持续出现</td>
+<td>刷盘速度跟不上写入，写页缓存阻塞</td>
+</tr>
+<tr>
+<td><code>commitlog disk ratio</code></td>
+<td>&gt; 80%</td>
+<td>CommitLog 目录磁盘使用率</td>
+</tr>
+<tr>
+<td><code>consumequeue disk ratio</code></td>
+<td>&gt; 80%</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>dispatchBehindBytes</code></td>
+<td>持续增长</td>
+<td>Reput 线程落后，ConsumeQueue 追不上</td>
+</tr>
+<tr>
+<td><code>putMessageTimesTotal - putMessageOK</code></td>
+<td>有差值</td>
+<td>写入失败，通常是被拒绝</td>
+</tr>
+</tbody></table>
+<p><strong><code>dispatchBehindBytes</code> 是容易被忽略的关键指标</strong>：它表示 CommitLog 已写入但索引还没构建的字节数。持续增长意味着 <code>ReputMessageService</code> 跟不上，一般是因为 ConsumeQueue 所在磁盘 IO 抖动或 CPU 不足。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：RocketMQ 一条消息写几次磁盘？</strong></p>
+<p>写路径上是<strong>一次 mmap 内存写</strong>（CommitLog），异步分发到 ConsumeQueue 和 Index（两次内存写），最终由内核刷盘到 3 个文件。<strong>“写几次磁盘”取决于刷盘策略，而”写几次内存”是 3 次。</strong></p>
+<p><strong>Q2：为什么 ConsumeQueue 是 20 字节定长？</strong></p>
+<p>为了 <strong>O(1) 随机寻址</strong>。定长数组可以用 <code>offset = index * 20</code> 直接定位，无需任何查找结构。代价是 <code>TAGS CODE</code> 只有 8 字节（哈希值），所以 Tag 过滤需要「先哈希粗筛，再读 CommitLog 精确匹配」。</p>
+<p><strong>Q3：IndexFile 为什么用 HashSlot + 链表，不用 B+ 树？</strong></p>
+<p>因为索引是<strong>内存映射 + 只读查询</strong>场景，Hash 的查询复杂度是 O(1)（冲突链短）；而 B+ 树的优势在于范围查询和磁盘友好，但 RocketMQ 的 Index 主要服务「Key 精确查询」，Hash 更合适。范围查询（按时间）通过 <code>IndexHeader</code> 的 <code>beginTimestamp/endTimestamp</code> 先筛文件再遍历链表实现。</p>
+<p><strong>Q4：消息写入后多久能被消费到？</strong></p>
+<p>取决于消费模式：<strong>Push 模式</strong>下，Broker 长轮询（<code>LongPollingService</code>）在消息到达后<strong>立即唤醒</strong>等待的消费者（毫秒级）；<strong>Pull 模式</strong>下，消费者按 <code>pullInterval</code> 轮询（默认可能几百毫秒）。所以「写入延迟」远小于「消费延迟」，而消费延迟由拉取策略决定。</p>
+<p><strong>Q5：CommitLog 文件被删了会怎样？</strong></p>
+<p><strong>不可恢复</strong>——CommitLog 是唯一事实来源。所有 ConsumeQueue 和 Index 都只是它的投影。删除 CommitLog 后，Broker 启动时会发现文件缺失，从 checkpoint 之后的 offset 无法寻址，会报错并重置。<strong>这是 RocketMQ 运维的绝对红线。</strong></p>
+<p><strong>Q6：为什么 RocketMQ 用 mmap 而 Kafka 用 sendfile？</strong></p>
+<p>两者场景不同：</p>
+<ul>
+<li><strong>RocketMQ 需要「读索引 + 回查」</strong>：ConsumeQueue 的随机读必须走 mmap，否则每次消费都触发 <code>read()</code> 系统调用（用户态&#x2F;内核态拷贝）</li>
+<li><strong>Kafka 是 partition 内直接顺序读</strong>，可以用 <code>sendfile</code> 做「零拷贝」——数据从页缓存直接 DMA 到网卡，完全不进用户态</li>
+</ul>
+<p><strong>本质上：RocketMQ 牺牲了零拷贝的极致，换来了「单 CommitLog 的全局顺序写」和「索引解耦」。</strong></p>
+<hr>
+<h2 id="八、一句话总结"><a href="#八、一句话总结" class="headerlink" title="八、一句话总结"></a>八、一句话总结</h2><blockquote>
+<p><strong>CommitLog 是唯一事实来源，ConsumeQueue 是定长索引，IndexFile 是哈希索引。</strong></p>
+<p>写入是「mmap 内存写 + 异步索引分发」，可靠性由「刷盘策略（flushDiskType）× 复制策略（SYNC_MASTER&#x2F;ASYNC_MASTER）」共同决定。</p>
+<p>记住三条红线：<strong>CommitLog 不能删、<code>dispatchBehindBytes</code> 不能持续涨、<code>pageCacheBusy</code> 不能持续有。</strong></p>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/">https://jiweidong.github.io/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/RocketMQ/">RocketMQ</a><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E/">存储引擎</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</div></div><div class="info-2"><div class="info-item-1">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？这是 Redis 运维里最容易被误判的告警之一。 监控告警一响，多数人的第一反应是「内存泄漏了」或者「是不是大 Key」。但真实原因经常是另一回事：内存碎片（Memory Fragmentation）。 更微妙的是，碎片这件事在 Redis 里有一堆反直觉的细节：  mem_fragmentation_ratio &lt; 1 通常不报错，但它其实是交换分区正在被使用的严重信号； 内存碎片率超过 1.5 就该告警，但不是所有场景都该开 activedefrag； 有时候碎片率很高，activedefrag 却一动不动——因为它被主从复制、持久化、集群模式悄悄拦住了。  这篇文章把碎片的成因、观测、治理讲完整，并重点说清 activedefrag 为什么经常「失效」。  一、Redis 内存到底花在哪了在看碎片之前，先建立完整的内存全景。INFO memory 输出的关键字段...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/25/mq-ordered-message-deep-dive/" title="【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-25</div><div class="info-item-2">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现</div></div><div class="info-2"><div class="info-item-1">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现面试官：你们的订单消息需要保证顺序吗？Kafka 怎么保证顺序？“消息顺序”是 MQ 面试的钉子户。很多人知道”Kafka 只能保证分区内有序”，但说不清为什么只能分区内有序、怎么做到分区内有序、哪些场景会悄悄破坏顺序。本文从存储模型讲到生产消费全链路，一次讲透。 一、什么是顺序消息？全局有序 vs 分区有序 全局有序：所有消息严格按照发送顺序被消费（要求单分区&#x2F;单队列 + 单消费者） 分区有序（局部有序）：同一业务维度（如同一订单、同一用户）的消息有序，不同维度之间不要求有序  现实业务几乎只用分区有序：订单的”创建→支付→发货”必须有序，但订单 A 和订单 B 之间无所谓。全局有序的代价是吞吐量断崖式下跌（退化成单队列单消费者），没人这么用。 二、Kafka 的顺序保证：分区内有序1. 存储模型决定了”分区 &#x3D; 顺序的天然边界”Kafka 的 Topic 被切成多个 Partition，每个 Partition 是追加写的日志（log segment）： 123Top...</div></div></div></a><a class="pagination-related" href="/2026/06/15/rocketmq-deep-dive/" title="Apache RocketMQ 深度解析：原理、架构与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-15</div><div class="info-item-2">Apache RocketMQ 深度解析：原理、架构与最佳实践</div></div><div class="info-2"><div class="info-item-1">Apache RocketMQ 深度解析：原理、架构与最佳实践 RocketMQ 是阿里巴巴开源的分布式消息中间件，以高吞吐、低延迟、强一致性著称。本文从源码层面深入 RocketMQ 的架构设计、存储机制和最佳实践。  一、RocketMQ 架构总览1.1 核心组件12345678910111213141516171819202122┌─────────────────────────────────────────────────────┐│                     Producer                         │└──────────────────────┬──────────────────────────────┘                       │┌──────────────────────▼──────────────────────────────┐│                   Name Server                        ││              (路由注册中心，无状态)...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/06/13/message-queue-kafka-rocketmq/" title="消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇</div></div><div class="info-2"><div class="info-item-1">消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇一、消息队列基础1.1 四大核心作用消息队列（Message Queue，MQ）是分布式系统中不可或缺的中间件，它的核心价值体现在四个方面： 异步解耦：通过引入 MQ，上下游系统之间的直接依赖被打破。发送方只管发送消息，接收方自行消费，双方互不阻塞。例如订单系统创建订单后发送消息到 MQ，库存系统、积分系统各自订阅消费，即使某个系统临时不可用，也不会影响主流程。 流量削峰：秒杀、大促等场景下，瞬时流量可能达到正常值的几十倍。MQ 充当缓冲区，将海量请求暂存，下游系统按自身处理能力拉取消费，避免被流量冲垮。这就像水库在汛期蓄水、旱期放水一样平滑流量。 数据缓冲：当上下游处理能力不匹配时，MQ 作为缓冲层，允许生产者高速生产、消费者从容消费，实现最终一致性。 日志收集：Kafka 最初由 LinkedIn 开发时就是为了解决日志收集问题。大量日志通过 Kafka 聚合、分发，再交由 ELK 等系统处理。这是 MQ 在数据 pipeline 领域的经典应用。 1.2 消息模型点对点模型（P2P, Point-to-Poin...</div></div></div></a><a class="pagination-related" href="/2026/07/23/spring-boot-rocketmq-practice/" title="【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-23</div><div class="info-item-2">【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程一、RocketMQ 与 Spring Boot 集成概述RocketMQ 是阿里巴巴开源的分布式消息中间件，在阿里内部经历了多年双 11 的洗礼，具备高吞吐、低延迟、强一致性的特点。相比 Kafka，RocketMQ 在事务消息、延迟消息、消息重试、死信队列等企业级特性上更加完善。 Spring Boot 集成 RocketMQ 主要有两种方式：    集成方式 说明 适用场景    RocketMQ-Spring-Boot-Starter 官方 Starter，声明式注解 大多数 Spring Boot 项目   RocketMQ原生 Client 直接使用 producer&#x2F;consumer API 需要精细控制或特殊配置   本文默认使用官方 Starter 方式。 二、环境搭建与依赖配置2.1 Maven 依赖12345&lt;dependency&gt;    &lt;groupId&gt;org.apache.rocketmq&lt;/gro...</div></div></div></a><a class="pagination-related" href="/2026/08/09/kafka-replication-isr-deep-dive/" title="【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-09</div><div class="info-item-2">【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性</div></div><div class="info-2"><div class="info-item-1">【Kafka 原理】Kafka 副本机制与 ISR 深度解析：从副本同步到 Leader 选举与数据可靠性面试官：Kafka 的副本是怎么同步的？ISR 是什么？为什么 Kafka 用 ISR 而不用 Raft？Kafka 高可靠性的基石是副本机制（Replication），而理解副本机制的核心钥匙是 ISR（In-Sync Replicas，同步副本集合）。面试中关于「Kafka 为什么不会丢消息」「Leader 挂了怎么办」「acks 参数到底影响什么」的问题，答案全藏在 ISR 里。 今天我们从分区副本的架构讲起，深入 ISR 的判定与收缩扩张机制、HW 与 LEO 的推进逻辑、Leader 选举的细节，最后对比 Raft 选举，把 Kafka 副本机制一网打尽。 一、副本机制基础架构1.1 分区与副本的关系1234567891011Topic: orders（3 个分区 × 3 个副本 = 9 个副本，分布在 3 个 Broker 上）Broker 1           Broker 2           Broker 3┌────────────┐    ┌────...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">622</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">731</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E3%80%91RocketMQ-%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9ACommitLog%E3%80%81ConsumeQueue%E3%80%81IndexFile-%E4%B8%8E-mmap-%E5%88%B7%E7%9B%98%E6%9C%BA%E5%88%B6"><span class="toc-number">1.</span> <span class="toc-text">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9ARocketMQ-%E4%B8%80%E6%9D%A1%E6%B6%88%E6%81%AF%E5%86%99%E8%BF%9B%E5%8E%BB%EF%BC%8C%E5%88%B0%E5%BA%95%E5%86%99%E4%BA%86%E5%87%A0%E6%AC%A1%E7%A3%81%E7%9B%98%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E7%94%A8%E3%80%8C%E4%B8%80%E6%9D%A1%E6%B6%88%E6%81%AF%E4%B8%80%E4%B8%AA%E6%96%87%E4%BB%B6%E3%80%8D"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么不用「一条消息一个文件」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%BA%E4%BB%80%E4%B9%88%E5%86%99%E5%85%A5%E8%A6%81%E5%85%A8%E5%B1%80%E6%B7%B7%E5%86%99%EF%BC%9F%E9%AB%98%E5%B9%B6%E5%8F%91%E4%B8%8B%E7%9A%84%E9%94%81%E7%AB%9E%E4%BA%89"><span class="toc-number">1.2.1.</span> <span class="toc-text">为什么写入要全局混写？高并发下的锁竞争</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%89%E7%B1%BB%E6%96%87%E4%BB%B6%E7%9A%84%E5%AD%98%E5%82%A8%E7%BB%93%E6%9E%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、三类文件的存储结构</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-CommitLog%EF%BC%9A%E6%B6%88%E6%81%AF%E7%9A%84%E7%9C%9F%E5%AE%9E%E4%BB%93%E5%BA%93"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 CommitLog：消息的真实仓库</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-ConsumeQueue%EF%BC%9A%E8%BD%BB%E9%87%8F%E7%BA%A7%E6%B6%88%E8%B4%B9%E7%B4%A2%E5%BC%95"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 ConsumeQueue：轻量级消费索引</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-IndexFile%EF%BC%9A%E6%8C%89-Key-%E6%97%B6%E9%97%B4%E6%9F%A5%E6%B6%88%E6%81%AF"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 IndexFile：按 Key &#x2F; 时间查消息</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%86%99%E5%85%A5%E9%93%BE%E8%B7%AF%EF%BC%9A%E4%B8%80%E6%AC%A1-putMessage-%E5%81%9A%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.4.</span> <span class="toc-text">三、写入链路：一次 putMessage 做了什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-mmap%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E8%83%BD%E8%BF%99%E4%B9%88%E5%BF%AB"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 mmap：为什么能这么快</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E4%B8%89%E4%BB%BD%E6%96%87%E4%BB%B6%E7%9A%84%E5%86%99%E5%85%A5%E9%A1%BA%E5%BA%8F"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 三份文件的写入顺序</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%88%B7%E7%9B%98%E7%AD%96%E7%95%A5%EF%BC%9A%E5%90%8C%E6%AD%A5-vs-%E5%BC%82%E6%AD%A5"><span class="toc-number">1.5.</span> <span class="toc-text">四、刷盘策略：同步 vs 异步</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%BC%82%E6%AD%A5%E5%88%B7%E7%9B%98%EF%BC%88ASYNC-FLUSH%EF%BC%8C%E9%BB%98%E8%AE%A4%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 异步刷盘（ASYNC_FLUSH，默认）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%90%8C%E6%AD%A5%E5%88%B7%E7%9B%98%EF%BC%88SYNC-FLUSH%EF%BC%89"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 同步刷盘（SYNC_FLUSH）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E9%80%89%E5%9E%8B%E5%BB%BA%E8%AE%AE"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 选型建议</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%95%85%E9%9A%9C%E6%81%A2%E5%A4%8D%EF%BC%9Aabort-%E6%96%87%E4%BB%B6%E4%B8%8E%E6%B6%88%E6%81%AF%E9%87%8D%E5%BB%BA"><span class="toc-number">1.6.</span> <span class="toc-text">五、故障恢复：abort 文件与消息重建</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%AD%A3%E5%B8%B8%E9%80%80%E5%87%BA%E7%9A%84%E6%81%A2%E5%A4%8D%E6%B5%81%E7%A8%8B"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 正常退出的恢复流程</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%BC%82%E5%B8%B8%E9%80%80%E5%87%BA%E7%9A%84%E6%81%A2%E5%A4%8D%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88-1-%E4%B9%9F%E8%A6%81%E5%9B%9E%E9%80%80"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 异常退出的恢复：为什么 &lt; 1 也要回退</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-ConsumeQueue-%E6%8D%9F%E5%9D%8F%E7%9A%84%E7%8B%AC%E7%AB%8B%E6%81%A2%E5%A4%8D"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 ConsumeQueue 损坏的独立恢复</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E4%B8%8E%E7%9B%91%E6%8E%A7"><span class="toc-number">1.7.</span> <span class="toc-text">六、性能调优与监控</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E6%A0%B8%E5%BF%83%E5%8F%82%E6%95%B0"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 核心参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-transientStorePool%EF%BC%9A%E9%AB%98%E6%89%8B%E9%80%89%E9%A1%B9"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 transientStorePool：高手选项</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E7%9B%91%E6%8E%A7%E6%8C%87%E6%A0%87%EF%BC%88mqadmin-%E4%B8%8E-mqadmin-statsAll%EF%BC%89"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 监控指标（mqadmin 与 mqadmin statsAll）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E4%B8%80%E5%8F%A5%E8%AF%9D%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、一句话总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/java-delayqueue-delayed-queue-deep-dive/" title="【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战">【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/large-table-hot-cold-data-archiving-deep-practice/" title="【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移">【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/mysql-internal-temporary-table-deep-dive/" title="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

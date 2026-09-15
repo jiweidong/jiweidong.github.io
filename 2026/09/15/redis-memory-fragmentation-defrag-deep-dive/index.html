@@ -1,0 +1,413 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？这是 Redis 运维里最容易被误判的告警之一。 监控告警一响，多数人的第一反应是「内存泄漏了」或者「是不是大 Key」。但真实原因经常是另一回事：内存碎片（Memory Fragmenta">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？这是 Redis 运维里最容易被误判的告警之一。 监控告警一响，多数人的第一反应是「内存泄漏了」或者「是不是大 Key」。但真实原因经常是另一回事：内存碎片（Memory Fragmenta">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-15T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-15T00:01:38.746Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="内存管理">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="运维">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战",
+  "url": "https://jiweidong.github.io/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-15T00:00:00.000Z",
+  "dateModified": "2026-09-15T00:01:38.746Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">622</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">731</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-15T00:01:38.746Z" title="更新于 2026-09-15 08:01:38">2026-09-15</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Redis/">Redis</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Redis/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-运维】内存碎片深度解析与治理：mem-fragmentation-ratio-背后的真相与-activedefrag-实战"><a href="#【Redis-运维】内存碎片深度解析与治理：mem-fragmentation-ratio-背后的真相与-activedefrag-实战" class="headerlink" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战"></a>【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</h1><h2 id="面试官：Redis-实际占用-8G，但数据只有-4G，多出来的内存去哪了？"><a href="#面试官：Redis-实际占用-8G，但数据只有-4G，多出来的内存去哪了？" class="headerlink" title="面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？"></a>面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？</h2><p>这是 Redis 运维里最容易被误判的告警之一。</p>
+<p>监控告警一响，多数人的第一反应是「内存泄漏了」或者「是不是大 Key」。但真实原因经常是另一回事：<strong>内存碎片（Memory Fragmentation）</strong>。</p>
+<p>更微妙的是，碎片这件事在 Redis 里有一堆<strong>反直觉</strong>的细节：</p>
+<ul>
+<li><code>mem_fragmentation_ratio &lt; 1</code> 通常不报错，但它其实是<strong>交换分区正在被使用</strong>的严重信号；</li>
+<li>内存碎片率超过 1.5 就该告警，但<strong>不是所有场景都该开 <code>activedefrag</code></strong>；</li>
+<li>有时候碎片率很高，<code>activedefrag</code> 却一动不动——因为它被主从复制、持久化、集群模式悄悄拦住了。</li>
+</ul>
+<p>这篇文章把碎片的<strong>成因、观测、治理</strong>讲完整，并重点说清 <code>activedefrag</code> 为什么经常「失效」。</p>
+<hr>
+<h2 id="一、Redis-内存到底花在哪了"><a href="#一、Redis-内存到底花在哪了" class="headerlink" title="一、Redis 内存到底花在哪了"></a>一、Redis 内存到底花在哪了</h2><p>在看碎片之前，先建立完整的内存全景。<code>INFO memory</code> 输出的关键字段：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line">127.0.0.1:6379&gt; INFO memory</span><br><span class="line"><span class="comment"># Memory</span></span><br><span class="line">used_memory:4294967296                     <span class="comment"># Redis 自己统计的「数据」内存（字节）</span></span><br><span class="line">used_memory_human:4.00G</span><br><span class="line">used_memory_rss:8589934592                 <span class="comment"># 操作系统看到的「进程实际驻留物理内存」</span></span><br><span class="line">used_memory_rss_human:8.00G</span><br><span class="line">used_memory_peak:4831838208</span><br><span class="line">used_memory_lua:37888</span><br><span class="line">used_memory_scripts:0</span><br><span class="line">maxmemory:10737418240</span><br><span class="line">maxmemory_policy:allkeys-lru</span><br><span class="line">mem_fragmentation_ratio:2.00               <span class="comment"># = rss / used_memory</span></span><br><span class="line">mem_allocator:jemalloc-5.1.0</span><br></pre></td></tr></table></figure>
+
+<p><strong>第一个关键等式：</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">mem_fragmentation_ratio = used_memory_rss / used_memory</span><br></pre></td></tr></table></figure>
+
+<p>它衡量的是「操作系统给我的物理内存」与「Redis 自己认为的数据内存」的比值。</p>
+<p>但这里有个必须先破除的误区：<strong><code>used_memory</code> 不包含内存碎片，也不包含分配器开销。</strong> 所以：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">used_memory  = 数据 + 各种缓存/缓冲区（客户端缓冲、复制缓冲、AOF 缓冲、Lua 等）</span><br><span class="line">used_memory_rss = used_memory + 碎片 + 分配器元数据 + 进程其他开销</span><br></pre></td></tr></table></figure>
+
+<p>因此：</p>
+<table>
+<thead>
+<tr>
+<th>比值</th>
+<th>含义</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>≈ 1.0 ~ 1.3</td>
+<td>健康</td>
+<td>无需处理</td>
+</tr>
+<tr>
+<td>&gt; 1.5</td>
+<td><strong>碎片率偏高</strong></td>
+<td>考虑 <code>activedefrag</code> 或重启</td>
+</tr>
+<tr>
+<td>&gt;&gt; 1.5（如 2.0+）</td>
+<td>碎片严重</td>
+<td>必须治理</td>
+</tr>
+<tr>
+<td><strong>&lt; 1.0</strong></td>
+<td><strong>极度危险</strong></td>
+<td>说明发生了 swap，性能已崩</td>
+</tr>
+</tbody></table>
+<h3 id="为什么-1-是灾难而不是好事？"><a href="#为什么-1-是灾难而不是好事？" class="headerlink" title="为什么 &lt; 1 是灾难而不是好事？"></a>为什么 <code>&lt; 1</code> 是灾难而不是好事？</h3><p>比率小于 1，意味着 <code>rss</code> 比 <code>used_memory</code> 还小。物理内存怎么会比数据还少？<strong>因为一部分内存被换出到 swap 了。</strong></p>
+<p>操作系统把 Redis 的页换到磁盘，<code>rss</code> 统计里就”少”了。而 Redis 是延迟敏感型服务，任何一次访问触发缺页中断（page fault）从磁盘换入，延迟会从微秒级直接跳到毫秒级甚至更高。</p>
+<p><strong>所以监控规则应该是</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">mem_fragmentation_ratio &lt; 0.9  → P0 告警（swap 已发生）</span><br><span class="line">mem_fragmentation_ratio &gt; 1.5  → P2 告警（碎片偏高）</span><br></pre></td></tr></table></figure>
+
+<p>顺带一句：<strong>生产环境 Redis 机器不建议开 swap</strong>（或者把 <code>vm.swappiness</code> 调到很低）。让 Redis 因为 OOM 快速失败，比让它悄无声息地变慢要好得多。</p>
+<hr>
+<h2 id="二、碎片是怎么产生的"><a href="#二、碎片是怎么产生的" class="headerlink" title="二、碎片是怎么产生的"></a>二、碎片是怎么产生的</h2><p>碎片不是「泄漏」，内存没有被丢掉，只是<strong>被切得太碎、无法复用</strong>。产生路径主要有四条。</p>
+<h3 id="2-1-jemalloc-的分层分配机制"><a href="#2-1-jemalloc-的分层分配机制" class="headerlink" title="2.1 jemalloc 的分层分配机制"></a>2.1 jemalloc 的分层分配机制</h3><p>Redis 默认使用 <strong>jemalloc</strong> 作为内存分配器（<code>mem_allocator:jemalloc-5.x</code>）。jemalloc 用「size class + arena + bin」的分层结构来加速分配：</p>
+<ul>
+<li>请求的内存会被<strong>向上取整到最近的 size class</strong>（例如请求 100 字节，实际给 112 字节）</li>
+<li>每个 size class 有自己的一组 bin（空闲块链表）</li>
+<li>每个线程绑定一个 arena，减少锁竞争</li>
+</ul>
+<p>这套设计大幅提升了分配性能，代价是：</p>
+<ol>
+<li><strong>内部碎片</strong>：请求 100 字节拿到 112 字节，浪费 12 字节</li>
+<li><strong>外部碎片</strong>：不同 size class 的空闲块不能互相复用——一个 112 字节的空闲块，永远无法满足 256 字节的请求</li>
+</ol>
+<h3 id="2-2-数据频繁增删导致的不均匀释放"><a href="#2-2-数据频繁增删导致的不均匀释放" class="headerlink" title="2.2 数据频繁增删导致的不均匀释放"></a>2.2 数据频繁增删导致的不均匀释放</h3><p>这是生产环境最常见的成因。典型场景：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">写入 100 万个小 String（占满 arena 的小块区）</span><br><span class="line">→ 删除一半（释放出大量散落的小块）</span><br><span class="line">→ 写入 10 万个 Hash（需要中大块）</span><br><span class="line">→ 小块无法复用，新申请中大块 → RSS 涨了，used_memory 没涨那么多 → 碎片率上升</span><br></pre></td></tr></table></figure>
+
+<p><strong>碎片率高的本质是「释放的块」和「需要的块」形状不匹配。</strong></p>
+<h3 id="2-3-大-Key-增删造成的锯齿"><a href="#2-3-大-Key-增删造成的锯齿" class="headerlink" title="2.3 大 Key 增删造成的锯齿"></a>2.3 大 Key 增删造成的锯齿</h3><p>一个 500 万元素的 Hash，如果 Redis 7.2 之前一次性删除，会在一瞬间释放大量不连续内存；如果这些内存分布在不同 size class 上，回收后很难被重新组织利用。</p>
+<p>Redis 后来引入了 <code>lazyfree</code>（<code>UNLINK</code>、<code>lazyfree-lazy-*</code> 系列参数）解决删除卡顿，但<strong>懒删除并不解决碎片</strong>——它只是把释放动作异步化。</p>
+<h3 id="2-4-过期删除的影响"><a href="#2-4-过期删除的影响" class="headerlink" title="2.4 过期删除的影响"></a>2.4 过期删除的影响</h3><p><code>actively-expire</code> 的定时删除和内存淘汰策略都会在运行时摘除数据，效果同 2.2。<strong>也就是说：一个持续有过期键在循环写入的实例，天然就是碎片生产机。</strong></p>
+<hr>
+<h2 id="三、观测：怎么判断碎片是「问题」还是「正常」"><a href="#三、观测：怎么判断碎片是「问题」还是「正常」" class="headerlink" title="三、观测：怎么判断碎片是「问题」还是「正常」"></a>三、观测：怎么判断碎片是「问题」还是「正常」</h2><h3 id="3-1-基础字段"><a href="#3-1-基础字段" class="headerlink" title="3.1 基础字段"></a>3.1 基础字段</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">INFO memory | grep -E <span class="string">&quot;used_memory:|used_memory_rss:|mem_fragmentation_ratio|allocator_frag&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>Redis 4.0+ 还暴露了 <strong>分配器视角的碎片指标</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">127.0.0.1:6379&gt; INFO memory</span><br><span class="line">allocator_active:5368709120</span><br><span class="line">allocator_allocated:4294967296</span><br><span class="line">allocator_resident:8589934592</span><br><span class="line">allocator_frag_ratio:1.25          <span class="comment"># allocator_active / allocator_allocated</span></span><br><span class="line">allocator_frag_bytes:1073741824</span><br><span class="line">allocator_rss_ratio:1.60           <span class="comment"># allocator_resident / allocator_active</span></span><br><span class="line">allocator_rss_bytes:3221225472</span><br><span class="line">rss_overhead_ratio:1.02            <span class="comment"># rss / allocator_resident</span></span><br><span class="line">rss_overhead_bytes:167772160</span><br></pre></td></tr></table></figure>
+
+<p>它们的关系是层层向上的：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">allocator_allocated  （Redis 请求的字节总数，含对齐开销）</span><br><span class="line">    ↓ ×allocator_frag_ratio</span><br><span class="line">allocator_active     （jemalloc 实际持有的 arena 内存，含未使用的空闲块）</span><br><span class="line">    ↓ ×allocator_rss_ratio</span><br><span class="line">allocator_resident   （物理驻留内存，含脏页/未归还页）</span><br><span class="line">    ↓ ×rss_overhead_ratio</span><br><span class="line">used_memory_rss      （进程总驻留内存）</span><br></pre></td></tr></table></figure>
+
+<p><strong>这套指标的价值</strong>在于精确定位碎片来源：</p>
+<table>
+<thead>
+<tr>
+<th>指标偏高</th>
+<th>说明什么</th>
+<th>对策</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>allocator_frag_ratio</code> 高</td>
+<td><strong>jemalloc 层面碎片</strong>，空闲块无法复用</td>
+<td><code>activedefrag</code> 最有效</td>
+</tr>
+<tr>
+<td><code>allocator_rss_ratio</code> 高</td>
+<td>分配器持有但 OS 未回收的页</td>
+<td>部分归还可通过重启；<code>activedefrag</code> 有限</td>
+</tr>
+<tr>
+<td><code>rss_overhead_ratio</code> 高</td>
+<td>非分配器开销（如 fork COW、THP 等）</td>
+<td>查持久化&#x2F;fork 与 THP 配置</td>
+</tr>
+</tbody></table>
+<h3 id="3-2-对比-used-memory-peak"><a href="#3-2-对比-used-memory-peak" class="headerlink" title="3.2 对比 used_memory_peak"></a>3.2 对比 <code>used_memory_peak</code></h3><p>如果 <code>used_memory_peak</code> 很高（历史曾到 9G）但当前只有 4G，说明<strong>曾经有过大规模数据</strong>，碎片很可能是它留下的遗迹。这时碎片率高低是「历史遗留」而非「当前压力」。</p>
+<h3 id="3-3-压测基准法"><a href="#3-3-压测基准法" class="headerlink" title="3.3 压测基准法"></a>3.3 压测基准法</h3><p>最靠谱的判断方式：<strong>在业务量稳定的窗口期，对比重启前后的 <code>used_memory_rss</code></strong>。</p>
+<p>如果重启后 RSS 从 8G 掉到 4.5G，且业务数据量没变，那 3.5G 就是货真价实的碎片。</p>
+<hr>
+<h2 id="四、治理方案一：activedefrag-主动碎片整理"><a href="#四、治理方案一：activedefrag-主动碎片整理" class="headerlink" title="四、治理方案一：activedefrag 主动碎片整理"></a>四、治理方案一：activedefrag 主动碎片整理</h2><p>Redis 4.0 引入了 <code>activedefrag</code>，可以在运行时把碎片整理掉，不用重启。</p>
+<h3 id="4-1-开启方式"><a href="#4-1-开启方式" class="headerlink" title="4.1 开启方式"></a>4.1 开启方式</h3><p><strong>运行时开启：</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">CONFIG SET activedefrag <span class="built_in">yes</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>配置文件中（推荐，可持久化）：</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"># 开关</span><br><span class="line">activedefrag yes</span><br><span class="line"></span><br><span class="line"># 触发阈值：碎片字节数下限（默认 100MB）</span><br><span class="line">active-defrag-ignore-bytes 100mb</span><br><span class="line"></span><br><span class="line"># 触发阈值：碎片率下限（默认 1.1）</span><br><span class="line">active-defrag-threshold-lower 10</span><br><span class="line"></span><br><span class="line"># 触发上限：碎片率超过此值则全速整理（默认 1.5）</span><br><span class="line">active-defrag-threshold-upper 100</span><br><span class="line"></span><br><span class="line"># 每次整理的 CPU 占用下限/上限（百分比）</span><br><span class="line">active-defrag-cycle-min 1</span><br><span class="line">active-defrag-cycle-max 25</span><br><span class="line"></span><br><span class="line"># 单次扫描的最大字典/跳跃表/列表节点数占比</span><br><span class="line">active-defrag-max-scan-fields 1000</span><br></pre></td></tr></table></figure>
+
+<p><code>active-defrag-threshold-lower/upper</code> 的语义容易看错，这里说清：</p>
+<ul>
+<li>碎片率 <strong>低于</strong> <code>lower</code>（默认 10%）→ 完全不整理</li>
+<li>碎片率 <strong>在 lower 和 upper 之间</strong> → 按 <code>active-defrag-cycle-min</code> 的 CPU 比例<strong>渐进整理</strong></li>
+<li>碎片率 <strong>高于</strong> <code>upper</code> → <strong>全速整理</strong>（最多吃到 <code>cycle-max</code> 的 CPU）</li>
+</ul>
+<h3 id="4-2-效果验证"><a href="#4-2-效果验证" class="headerlink" title="4.2 效果验证"></a>4.2 效果验证</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">INFO memory | grep -E <span class="string">&quot;mem_fragmentation_ratio|allocator_frag_ratio&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>观察 <code>allocator_frag_ratio</code>（不是 <code>mem_fragmentation_ratio</code>）才是正确姿势——<strong>activedefrag 整理的是 jemalloc 的 arena 碎片，通常表现为 <code>allocator_frag_ratio</code> 下降明显，而 <code>mem_fragmentation_ratio</code> 下降有限。</strong></p>
+<p>这是很多人误以为「activedefrag 没用」的原因。</p>
+<h3 id="4-3-⚠️-activedefrag-失效的四个场景"><a href="#4-3-⚠️-activedefrag-失效的四个场景" class="headerlink" title="4.3 ⚠️ activedefrag 失效的四个场景"></a>4.3 ⚠️ activedefrag 失效的四个场景</h3><p>这是本文最值钱的部分。<strong>开了 activedefrag 却一点不动，通常是下面四条之一：</strong></p>
+<p><strong>① 启用了 RDB&#x2F;AOF 持久化的 fork 期间</strong></p>
+<p><code>activedefrag</code> 依赖对内存的搬迁，期间会触发页的写时复制（COW）。如果同时在做 RDB fork 或 AOF rewrite，Redis 会主动抑制&#x2F;降低 defrag 强度以避免放大 COW。</p>
+<p><strong>② 主从复制场景下的 slave</strong></p>
+<p>复制链路要求主从数据一致，defrag 的搬迁会加大复制缓冲区压力，因此在特定版本&#x2F;配置下会被限制。</p>
+<p><strong>③ 集群模式（cluster-enabled yes）</strong></p>
+<p>官方向来对集群下的 activedefrag 持保守态度：节点间搬迁与迁移（migrate）操作可能冲突。</p>
+<p><strong>④ 碎片率没到阈值</strong></p>
+<p>前面说的 <code>active-defrag-ignore-bytes</code>（100MB）和 <code>active-defrag-threshold-lower</code>（10%）是<strong>同时满足</strong>才触发。默认配置下，很多「看着很高」的碎片率其实没到触发线——比如 <code>mem_fragmentation_ratio=1.3</code> 但 <code>allocator_frag_ratio</code> 只有 1.05，那确实没什么好整理的。</p>
+<p><strong>排查命令：</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 看当前是否在 defrag、整理了多少</span></span><br><span class="line">INFO stats | grep -E <span class="string">&quot;active_defrag&quot;</span></span><br><span class="line"><span class="comment"># active_defrag_running:0</span></span><br><span class="line"><span class="comment"># lazyfree_pending_objects:0</span></span><br></pre></td></tr></table></figure>
+
+<p><code>active_defrag_running</code> 长期为 0 而碎片率又很高，就按上面四条逐一排除。</p>
+<hr>
+<h2 id="五、治理方案二：重启与主从切换"><a href="#五、治理方案二：重启与主从切换" class="headerlink" title="五、治理方案二：重启与主从切换"></a>五、治理方案二：重启与主从切换</h2><p>当 <code>activedefrag</code> 无力回天（比如 <code>allocator_rss_ratio</code> 高，即页已归还 OS 却未释放），最干脆的方案是<strong>滚动重启</strong>。</p>
+<p>标准操作（利用主从切换做到不停机）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 重启从节点</span></span><br><span class="line">redis-cli -h slave-1 SHUTDOWN NOSAVE</span><br><span class="line"><span class="comment"># 启动 slave-1，等待全量/增量同步完成</span></span><br><span class="line">redis-cli -h master INFO replication | grep slave1</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. slave-1 与 master 做角色切换</span></span><br><span class="line">redis-cli -h slave-1 REPLICAOF NO ONE</span><br><span class="line">redis-cli -h master  REPLICAOF slave-1</span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. 重启旧的 master（现为从节点），完成后等待同步</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>注意事项：</strong></p>
+<ul>
+<li>重启前确认 <code>maxmemory</code> 小于机器物理内存的 70%~80%，否则重启后可能直接 OOM</li>
+<li>重启会触发全量同步（RDB 传输 + 加载），耗时与数据量成正比，务必在业务低峰期</li>
+<li><code>SHUTDOWN NOSAVE</code> 避免重启前又写一次 RDB</li>
+<li>客户端需要能自动感知主从切换（Sentinel &#x2F; Cluster &#x2F; 客户端多分片配置）</li>
+</ul>
+<h3 id="5-1-不重启的「折中方案」：配置回收"><a href="#5-1-不重启的「折中方案」：配置回收" class="headerlink" title="5.1 不重启的「折中方案」：配置回收"></a>5.1 不重启的「折中方案」：配置回收</h3><p>jemalloc 有一个行为：<strong>只有在特定条件下才会把空闲的脏页归还 OS</strong>（<code>madvise(MADV_DONTNEED)</code>）。可以通过环境变量微调：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 调整 jemalloc 的脏页衰减时间（毫秒），默认 10000ms</span></span><br><span class="line">MALLOC_CONF=<span class="string">&quot;dirty_decay_ms:1000,muzzy_decay_ms:0&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>这个手段收益不稳定（取决于版本和碎片分布），属于「可以试试，别指望它」的级别。</p>
+<hr>
+<h2 id="六、预防：从源头减少碎片"><a href="#六、预防：从源头减少碎片" class="headerlink" title="六、预防：从源头减少碎片"></a>六、预防：从源头减少碎片</h2><p>治不如防。下面六条是长期有效的工程实践。</p>
+<h3 id="6-1-规划好数据结构的尺寸"><a href="#6-1-规划好数据结构的尺寸" class="headerlink" title="6.1 规划好数据结构的尺寸"></a>6.1 规划好数据结构的尺寸</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 差：把 100 万字段塞进一个 Hash</span></span><br><span class="line">HSET big:<span class="built_in">hash</span> field1 v1 field2 v2 ...  <span class="comment"># 百万次</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 好：按业务维度分片</span></span><br><span class="line">HSET user:&#123;1..10000&#125;:profile field1 v1</span><br></pre></td></tr></table></figure>
+
+<p><strong>单 Key 元素数量控制在几千以内</strong>，既避免大 Key，也让内存块形状更均匀。</p>
+<h3 id="6-2-用-UNLINK-代替-DEL"><a href="#6-2-用-UNLINK-代替-DEL" class="headerlink" title="6.2 用 UNLINK 代替 DEL"></a>6.2 用 UNLINK 代替 DEL</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 优雅删除大 Key，避免主线程阻塞</span></span><br><span class="line">UNLINK big:<span class="built_in">hash</span></span><br></pre></td></tr></table></figure>
+
+<p>配置层面全局开启：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">lazyfree-lazy-eviction yes     # 淘汰时异步释放</span><br><span class="line">lazyfree-lazy-expire yes       # 过期时异步释放</span><br><span class="line">lazyfree-lazy-server-del yes   # 隐式 DEL 异步化</span><br><span class="line">replica-lazy-flush yes         # 从节点加载前 flush 异步化</span><br><span class="line">lazyfree-lazy-user-del yes     # 用户 DEL 异步化</span><br><span class="line">lazyfree-lazy-user-flush yes</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-避免「大进大出」的缓存模式"><a href="#6-3-避免「大进大出」的缓存模式" class="headerlink" title="6.3 避免「大进大出」的缓存模式"></a>6.3 避免「大进大出」的缓存模式</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 差：整批写入、整批删除，产生剧烈的内存形状变化</span></span><br><span class="line">redisTemplate.delete(keyList);</span><br><span class="line">redisTemplate.opsForValue().multiSet(bigMap);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 好：控制批大小，保持内存分配平稳</span></span><br><span class="line"><span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; list.size(); i += <span class="number">500</span>) &#123;</span><br><span class="line">    <span class="comment">// 分批处理</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-4-处理-jemalloc-arena-与线程的关系"><a href="#6-4-处理-jemalloc-arena-与线程的关系" class="headerlink" title="6.4 处理 jemalloc arena 与线程的关系"></a>6.4 处理 jemalloc arena 与线程的关系</h3><p>Redis 是单线程处理命令的（6.0 的 IO 多线程只处理网络读写），因此 arena 竞争不严重。但 <code>io-threads</code> 开启后会有多个线程，可以显式设置：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">MALLOC_CONF=<span class="string">&quot;background_thread:true&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p><code>background_thread</code> 让 jemalloc 在后台线程做内存整理&#x2F;归还，能显著减少碎片堆积——<strong>这是最容易被忽略、但收益最实在的一条配置。</strong></p>
+<h3 id="6-5-关闭透明大页（THP）"><a href="#6-5-关闭透明大页（THP）" class="headerlink" title="6.5 关闭透明大页（THP）"></a>6.5 关闭透明大页（THP）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 检查</span></span><br><span class="line"><span class="built_in">cat</span> /sys/kernel/mm/transparent_hugepage/enabled</span><br><span class="line"><span class="comment"># [always] madvise never  ← 中括号在 always 表示已开启，需要关掉</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 永久关闭</span></span><br><span class="line"><span class="built_in">echo</span> never &gt; /sys/kernel/mm/transparent_hugepage/enabled</span><br></pre></td></tr></table></figure>
+
+<p>THP 会导致 fork 时 COW 放大、内存归还粒度变粗（2MB 大页难以部分释放），是 Redis 官方明确建议关闭的项。<strong>它同时恶化碎片和持久化延迟。</strong></p>
+<h3 id="6-6-合理设置-maxmemory"><a href="#6-6-合理设置-maxmemory" class="headerlink" title="6.6 合理设置 maxmemory"></a>6.6 合理设置 maxmemory</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">maxmemory 8gb                  # 留出 20%~30% 给碎片和开销</span><br><span class="line">maxmemory-policy allkeys-lru</span><br><span class="line">maxmemory-samples 5</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键原则：不要把 <code>maxmemory</code> 设成机器内存的全量。</strong> 碎片、复制缓冲、客户端缓冲都会额外占用，设置过满会在碎片高企时直接触发 OS OOM Killer。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：<code>mem_fragmentation_ratio &lt; 1</code> 说明什么？</strong></p>
+<p>说明 <code>used_memory_rss &lt; used_memory</code>，即部分内存已被换出到 swap。这是<strong>性能事故的前兆</strong>，不是”内存利用得好”。处理方式是检查 swap 配置、<code>vm.swappiness</code>、并确认机器内存是否被其他进程挤占。</p>
+<p><strong>Q2：碎片率高一定要处理吗？</strong></p>
+<p>不一定。判断标准是「是否影响可用内存与稳定性」：如果 <code>maxmemory</code> 还有充足余量、没有触发淘汰、延迟 P99 正常，<code>ratio=1.4</code> 完全可以接受。<strong>碎片是成本问题，不是正确性问题。</strong></p>
+<p><strong>Q3：activedefrag 会影响性能吗？</strong></p>
+<p>会，但可控。通过 <code>active-defrag-cycle-min/max</code> 把 CPU 占用限制在 1%~25%，且 <code>activedefrag</code> 的整理工作是<strong>在事件循环的空闲时间分片执行</strong>的，不会长时间阻塞主线程。但它会加剧 fork COW，所以<strong>不要在 RDB&#x2F;AOF 重写期间全速整理</strong>。</p>
+<p><strong>Q4：为什么我开了 activedefrag，<code>mem_fragmentation_ratio</code> 还是很高？</strong></p>
+<p>因为 <code>activedefrag</code> 整理的是 <strong>jemalloc 的 arena 内部碎片</strong>，它能让空闲块重新可用（<code>allocator_frag_ratio</code> 下降），但<strong>不负责把整页归还给操作系统</strong>。判断 activedefrag 是否生效，要看 <code>allocator_frag_ratio</code> 和 <code>INFO stats</code> 里的 <code>active_defrag_running</code>，而不是 <code>mem_fragmentation_ratio</code>。</p>
+<p><strong>Q5：Redis 6 的 IO 多线程对碎片有影响吗？</strong></p>
+<p>有间接影响。IO 线程不执行命令，但会带来更多的内存分配路径。可以配合 <code>MALLOC_CONF=&quot;background_thread:true&quot;</code> 让 jemalloc 的后台线程处理碎片，收益比调 <code>io-threads</code> 更明显。</p>
+<p><strong>Q6：怎么预估重启能回收多少内存？</strong></p>
+<p>在业务稳定期采集 <code>used_memory_peak</code> 与当前 <code>used_memory</code>。两者的差值加上 <code>allocator_frag_bytes</code>，大致就是重启后能回收的上限。<strong>更稳妥的做法是先在从节点重启一次，实测 RSS 变化后再决定是否滚动全量重启。</strong></p>
+<hr>
+<h2 id="八、一句话总结"><a href="#八、一句话总结" class="headerlink" title="八、一句话总结"></a>八、一句话总结</h2><blockquote>
+<p><code>mem_fragmentation_ratio = rss / used_memory</code>，<strong>&gt;1.5 是碎片，&lt;1 是 swap，两者是完全不同的事故等级。</strong></p>
+<p>治理顺序：<strong>先看 <code>allocator_frag_ratio</code> 定位碎片层级 → 开 <code>activedefrag</code> 并调好阈值 → 用 <code>background_thread</code> + 关 THP 从源头抑制 → 最后才考虑滚动重启。</strong></p>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/">https://jiweidong.github.io/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E8%BF%90%E7%BB%B4/">运维</a><a class="post-meta__tags" href="/tags/%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/">内存管理</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</div></div><div class="info-2"><div class="info-item-1">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？大部分人答「写一次」，然后就被追问到哑口无言。 真实答案是：一次写入调用，但数据落到了三份文件里——CommitLog、ConsumeQueue、IndexFile（可选）。更麻烦的是，这三份文件写入时机不同、刷盘策略不同、丢失后果也不同。 这套设计是 RocketMQ 高吞吐 + 高可靠的核心，也是面试里最能拉开差距的地方。本文按「文件布局 → 写入链路 → 读取链路 → 刷盘与复制 → 故障恢复 → 调优」六段讲透。  一、为什么不用「一条消息一个文件」先看反面教材。如果每条消息独立存一个文件，会立刻遇到三个问题：  文件数爆炸：每秒 10 万条消息 → 每天 86 亿个文件，inode 直接耗尽 写入变随机：文件创建本身是元数据随机写，无法利用磁盘顺序写特性 读取低效：按 Topic 拉取消息需要遍历大量文件  Kafka 的思路是「partition &#x3D; 一个目录，消息...</div></div></div></a><a class="pagination-related" href="/2026/09/15/mysql-internal-temporary-table-deep-dive/" title="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？这是线上非常经典的一幕：一条看起来「不复杂」的 SQL，执行时间 4 秒，iostat 显示写盘量飙到几百 MB，而表本身只有几十万行，结果集也不大。 排查到最后，元凶往往是同一个东西：内部临时表（Internal Temporary Table）落盘。 这篇文章把内部临时表从「什么时候产生 → 放在哪 → 怎么一步步被逼到磁盘 → 怎么监控 → 怎么根治」整条链路讲透。这部分内容在面试里属于典型的「区分度考点」——能背 tmp_table_size 的人很多，能说清 TempTable 引擎、temptable_max_mmap 和派生表物化的人很少。  一、先搞清楚：什么是内部临时表MySQL 中「临时表」分两种，很多人混着说：    类型 创建方式 生命周期 典型用途    用户临时表 CREATE TEMPORARY TABLE 会话级，SESSION 断开即删 业务临时存中间结果、复杂报表   内部临时表 优化器...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战前言Redis 作为内存数据库，其所有数据都存储在内存中。当写入速度超过内存容量时，Redis 必须决定应该删除哪些数据——这就是内存淘汰策略（Eviction Policy）。选错淘汰策略可能导致缓存命中率断崖式下跌、大量请求穿透到数据库，甚至引发雪崩。 很多开发者只知道 allkeys-lru 或 volatile-ttl 这些名字，但面试官一旦追问”Redis 的近似 LRU 和标准 LRU 有什么区别？””LFU 的 counter 是如何衰减的？”，就容易答不上来。 本文将对 Redis 的 8 种淘汰策略进行深度解析，从源码层面揭秘近 LRU&#x2F;LFU 的实现，并通过实战案例帮你做出最佳选择。  一、Redis 内存淘汰机制总览1.1 触发条件当以下条件满足时，Redis 会触发内存淘汰： 12345# 设置最大内存（默认不限制）maxmemory 4gb# 达到 maxmemory 后，Redis 会尝试淘汰数据# 如果无法释放足够内存，写入操作会返回 OOM 错...</div></div></div></a><a class="pagination-related" href="/2026/09/13/redis-cluster-resharding-scale-deep-practice/" title="【Redis 运维】Redis Cluster 扩缩容深度实战：16384 槽位、MOVED&#x2F;ASK 重定向与平滑迁移"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-13</div><div class="info-item-2">【Redis 运维】Redis Cluster 扩缩容深度实战：16384 槽位、MOVED&#x2F;ASK 重定向与平滑迁移</div></div><div class="info-2"><div class="info-item-1">【Redis 运维】Redis Cluster 扩缩容深度实战：16384 槽位、MOVED&#x2F;ASK 重定向与平滑迁移面试官：Redis Cluster 扩容的时候，线上请求会受影响吗？「会吧……会有一段时间不可用。」 「具体是什么不可用？是全部失败，还是部分失败？失败的原因是什么？客户端要改代码吗？为什么是 16384 个槽而不是 65536 个？」 这一串追问，能把「用过 Redis Cluster」和「运维过 Redis Cluster」的人彻底分开。 这篇不讲「Cluster 是什么」（那是选型文章的事），而是只讲集群运维：  16384 个槽的内部结构，以及为什么是 16384； MOVED 和 ASK 的区别——这是理解平滑迁移的唯一钥匙； 扩缩容的完整操作流程与每一步的观测点； 迁移过程中的性能影响与流量控制参数； 集群故障、脑裂、槽丢失的处置； 客户端（Jedis &#x2F; Lettuce &#x2F; Redisson）在集群模式下的避坑。   一、Cluster 的内部结构：认识三个关键概念1.1 数据分片：16384 个哈希槽Redis Clu...</div></div></div></a><a class="pagination-related" href="/2026/09/07/mysql-table-fragmentation-optimize-rebuild/" title="【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-07</div><div class="info-item-2">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化一个线上事故：删除一半数据，表反而更慢了？某订单归档系统上线半年后，运维定期把 3 个月前的订单从 order 表 DELETE 掉。某天 DBA 发现：这张表明明只剩 2000 万行（高峰期 6000 万），但查询却越来越慢，磁盘占用还有 30GB 不降。 问题出在哪？答案就是表碎片（fragmentation）。DELETE 掉的行并没有真正释放空间，InnoDB 只是把它们标记为”可复用”，数据页里留下大量空洞；而频繁的随机更新又让索引页不断分裂，物理存储的连续性被破坏——InnoDB 不得不扫描大量”半空”的页来找到数据。 一、碎片是怎么产生的？三种来源1. DELETE 留下的空洞InnoDB 以 页（Page，默认 16KB） 为单位管理数据。DELETE 一行并不会立即把页里的空间归还给文件系统，而是在行记录上打删除标记，页内留下空洞。这些空洞只能被后续插入的、大小相近的行复用： 12-- 大量删除后，页内空间分布变成这样（示意）-- | 行1 | 空...</div></div></div></a><a class="pagination-related" href="/2026/08/01/redis-big-key-hot-key-governance/" title="Redis 大 Key 与热 Key 问题排查与治理实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-01</div><div class="info-item-2">Redis 大 Key 与热 Key 问题排查与治理实战</div></div><div class="info-2"><div class="info-item-1">Redis 大 Key 与热 Key 问题排查与治理实战线上 Redis 突然延迟飙升、CPU 打满、请求超时？十有八九是大 Key 或热 Key在作祟。这两个问题是 Redis 生产事故的头号元凶，也是面试必问的高频题。本文从判定标准、危害原理、排查手段到治理方案，给你一套完整的实战方法论。   一、什么是大 Key 和热 Key？大 Key（Big Key）指单个 Key 的 value 体积过大或元素数量过多：    类型 判定标准 典型案例    String value 超过 10KB（严格标准 100KB） 大 JSON、图片 Base64   Hash &#x2F; Set &#x2F; ZSet &#x2F; List 元素超过 5000 个，或总大小超 10MB 全量用户标签、日活名单   热 Key（Hot Key）指在极短时间内被极高频率访问的 Key，比如：  热点新闻、秒杀商品、爆款直播间数据 某个 Key 的 QPS 占实例总 QPS 的 30% 以上即为严重热 Key  危害对比   问题 大 Key 热 Key    主要危害 阻塞单线程、网络拥塞...</div></div></div></a><a class="pagination-related" href="/2026/09/07/redis-latency-slow-request-troubleshooting/" title="【Redis 运维】Redis 变慢排查实战：从延迟基线、slowlog 到内核网络的全链路诊断"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-07</div><div class="info-item-2">【Redis 运维】Redis 变慢排查实战：从延迟基线、slowlog 到内核网络的全链路诊断</div></div><div class="info-2"><div class="info-item-1">【Redis 运维】Redis 变慢排查实战：从延迟基线、slowlog 到内核网络的全链路诊断现象：接口偶发 2 秒超时，Redis 却”看起来”没问题线上告警：某核心接口 P99 从 30ms 飙到 1.8s，链路追踪显示耗时几乎全在 Redis 调用上。运维登上 Redis 一看：INFO 输出正常、CPU 不高、内存没满、hit_rate 也还行——但业务就是慢。最后排查出来，是一台 Redis 所在物理机的网卡软中断被打满，而 Redis 进程自己毫不知情。 Redis 是单线程模型，它的”慢”通常不是自己一个进程的事：可能是命令本身慢、可能是 fork 阻塞、可能是内核&#x2F;网络&#x2F;邻居干扰。本文给出一套从客户端视角到服务器内核视角的完整排查路径。 一、先建立基线：你到底有多慢？没有基线，”变慢”无从谈起。三个必查指标： 12345678910# 1. 本机 intrinsic 延迟（排除网络，纯看 Redis 进程 + 内核调度）redis-cli --intrinsic-latency 100# 输出示例：Max latency so far: 1 ...</div></div></div></a><a class="pagination-related" href="/2026/09/11/elasticsearch-geo-spatial-search-deep-practice/" title="【ES 实战】Elasticsearch 地理位置搜索深度实战：geo_point、geo_shape 与距离排序的底层原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-11</div><div class="info-item-2">【ES 实战】Elasticsearch 地理位置搜索深度实战：geo_point、geo_shape 与距离排序的底层原理</div></div><div class="info-2"><div class="info-item-1">【ES 实战】Elasticsearch 地理位置搜索深度实战：geo_point、geo_shape 与距离排序的底层原理面试官：做一个”附近的商家”功能，为什么 Elasticsearch 比 MySQL 更合适？“找出我周围 3 公里内的商家，按距离排序”，如果直接用 MySQL： 1234567891011-- 经纬度两个 DOUBLE 列 + 边界框粗筛 + 球面距离精算SELECT id, name,       6371 * ACOS(COS(RADIANS(lat)) * COS(RADIANS(:lat)) *                   COS(RADIANS(:lon) - RADIANS(lng)) +                   SIN(RADIANS(lat)) * SIN(RADIANS(:lat))) AS distanceFROM shopWHERE lat BETWEEN :lat - 0.027 AND :lat + 0.027  AND lng BETWEEN :lng - 0.036 AND :lng + 0.036HAV...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">622</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">731</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E8%BF%90%E7%BB%B4%E3%80%91%E5%86%85%E5%AD%98%E7%A2%8E%E7%89%87%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%E4%B8%8E%E6%B2%BB%E7%90%86%EF%BC%9Amem-fragmentation-ratio-%E8%83%8C%E5%90%8E%E7%9A%84%E7%9C%9F%E7%9B%B8%E4%B8%8E-activedefrag-%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9ARedis-%E5%AE%9E%E9%99%85%E5%8D%A0%E7%94%A8-8G%EF%BC%8C%E4%BD%86%E6%95%B0%E6%8D%AE%E5%8F%AA%E6%9C%89-4G%EF%BC%8C%E5%A4%9A%E5%87%BA%E6%9D%A5%E7%9A%84%E5%86%85%E5%AD%98%E5%8E%BB%E5%93%AA%E4%BA%86%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81Redis-%E5%86%85%E5%AD%98%E5%88%B0%E5%BA%95%E8%8A%B1%E5%9C%A8%E5%93%AA%E4%BA%86"><span class="toc-number">1.2.</span> <span class="toc-text">一、Redis 内存到底花在哪了</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%BA%E4%BB%80%E4%B9%88-1-%E6%98%AF%E7%81%BE%E9%9A%BE%E8%80%8C%E4%B8%8D%E6%98%AF%E5%A5%BD%E4%BA%8B%EF%BC%9F"><span class="toc-number">1.2.1.</span> <span class="toc-text">为什么 &lt; 1 是灾难而不是好事？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%A2%8E%E7%89%87%E6%98%AF%E6%80%8E%E4%B9%88%E4%BA%A7%E7%94%9F%E7%9A%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、碎片是怎么产生的</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-jemalloc-%E7%9A%84%E5%88%86%E5%B1%82%E5%88%86%E9%85%8D%E6%9C%BA%E5%88%B6"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 jemalloc 的分层分配机制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E6%95%B0%E6%8D%AE%E9%A2%91%E7%B9%81%E5%A2%9E%E5%88%A0%E5%AF%BC%E8%87%B4%E7%9A%84%E4%B8%8D%E5%9D%87%E5%8C%80%E9%87%8A%E6%94%BE"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 数据频繁增删导致的不均匀释放</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%A4%A7-Key-%E5%A2%9E%E5%88%A0%E9%80%A0%E6%88%90%E7%9A%84%E9%94%AF%E9%BD%BF"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 大 Key 增删造成的锯齿</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E8%BF%87%E6%9C%9F%E5%88%A0%E9%99%A4%E7%9A%84%E5%BD%B1%E5%93%8D"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 过期删除的影响</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E8%A7%82%E6%B5%8B%EF%BC%9A%E6%80%8E%E4%B9%88%E5%88%A4%E6%96%AD%E7%A2%8E%E7%89%87%E6%98%AF%E3%80%8C%E9%97%AE%E9%A2%98%E3%80%8D%E8%BF%98%E6%98%AF%E3%80%8C%E6%AD%A3%E5%B8%B8%E3%80%8D"><span class="toc-number">1.4.</span> <span class="toc-text">三、观测：怎么判断碎片是「问题」还是「正常」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%9F%BA%E7%A1%80%E5%AD%97%E6%AE%B5"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 基础字段</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%AF%B9%E6%AF%94-used-memory-peak"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 对比 used_memory_peak</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%8E%8B%E6%B5%8B%E5%9F%BA%E5%87%86%E6%B3%95"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 压测基准法</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%B2%BB%E7%90%86%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9Aactivedefrag-%E4%B8%BB%E5%8A%A8%E7%A2%8E%E7%89%87%E6%95%B4%E7%90%86"><span class="toc-number">1.5.</span> <span class="toc-text">四、治理方案一：activedefrag 主动碎片整理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%BC%80%E5%90%AF%E6%96%B9%E5%BC%8F"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 开启方式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%95%88%E6%9E%9C%E9%AA%8C%E8%AF%81"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 效果验证</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E2%9A%A0%EF%B8%8F-activedefrag-%E5%A4%B1%E6%95%88%E7%9A%84%E5%9B%9B%E4%B8%AA%E5%9C%BA%E6%99%AF"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 ⚠️ activedefrag 失效的四个场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%B2%BB%E7%90%86%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E9%87%8D%E5%90%AF%E4%B8%8E%E4%B8%BB%E4%BB%8E%E5%88%87%E6%8D%A2"><span class="toc-number">1.6.</span> <span class="toc-text">五、治理方案二：重启与主从切换</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%B8%8D%E9%87%8D%E5%90%AF%E7%9A%84%E3%80%8C%E6%8A%98%E4%B8%AD%E6%96%B9%E6%A1%88%E3%80%8D%EF%BC%9A%E9%85%8D%E7%BD%AE%E5%9B%9E%E6%94%B6"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 不重启的「折中方案」：配置回收</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%A2%84%E9%98%B2%EF%BC%9A%E4%BB%8E%E6%BA%90%E5%A4%B4%E5%87%8F%E5%B0%91%E7%A2%8E%E7%89%87"><span class="toc-number">1.7.</span> <span class="toc-text">六、预防：从源头减少碎片</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E8%A7%84%E5%88%92%E5%A5%BD%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E7%9A%84%E5%B0%BA%E5%AF%B8"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 规划好数据结构的尺寸</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E7%94%A8-UNLINK-%E4%BB%A3%E6%9B%BF-DEL"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 用 UNLINK 代替 DEL</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E9%81%BF%E5%85%8D%E3%80%8C%E5%A4%A7%E8%BF%9B%E5%A4%A7%E5%87%BA%E3%80%8D%E7%9A%84%E7%BC%93%E5%AD%98%E6%A8%A1%E5%BC%8F"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 避免「大进大出」的缓存模式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E5%A4%84%E7%90%86-jemalloc-arena-%E4%B8%8E%E7%BA%BF%E7%A8%8B%E7%9A%84%E5%85%B3%E7%B3%BB"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 处理 jemalloc arena 与线程的关系</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-5-%E5%85%B3%E9%97%AD%E9%80%8F%E6%98%8E%E5%A4%A7%E9%A1%B5%EF%BC%88THP%EF%BC%89"><span class="toc-number">1.7.5.</span> <span class="toc-text">6.5 关闭透明大页（THP）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-6-%E5%90%88%E7%90%86%E8%AE%BE%E7%BD%AE-maxmemory"><span class="toc-number">1.7.6.</span> <span class="toc-text">6.6 合理设置 maxmemory</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E4%B8%80%E5%8F%A5%E8%AF%9D%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、一句话总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/java-delayqueue-delayed-queue-deep-dive/" title="【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战">【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/large-table-hot-cold-data-archiving-deep-practice/" title="【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移">【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/mysql-internal-temporary-table-deep-dive/" title="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

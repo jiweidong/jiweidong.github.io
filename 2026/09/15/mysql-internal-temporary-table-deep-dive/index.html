@@ -1,0 +1,425 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？这是线上非常经典的一幕：一条看起来「不复杂」的 SQL，执行时间 4 秒，iostat 显示写盘量飙到几百 MB，而表本身只有几十万行，结果集也不大。 排查到最后，元凶往往是同一个东西：内部临时表（Internal Temporary Ta">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/15/mysql-internal-temporary-table-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？这是线上非常经典的一幕：一条看起来「不复杂」的 SQL，执行时间 4 秒，iostat 显示写盘量飙到几百 MB，而表本身只有几十万行，结果集也不大。 排查到最后，元凶往往是同一个东西：内部临时表（Internal Temporary Ta">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-15T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-15T00:01:38.746Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="执行计划">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战",
+  "url": "https://jiweidong.github.io/2026/09/15/mysql-internal-temporary-table-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-15T00:00:00.000Z",
+  "dateModified": "2026-09-15T00:01:38.746Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/15/mysql-internal-temporary-table-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">622</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">731</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-15T00:01:38.746Z" title="更新于 2026-09-15 08:01:38">2026-09-15</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%95%B0%E6%8D%AE%E5%BA%93/MySQL/">MySQL</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战"><a href="#【MySQL-原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战" class="headerlink" title="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战"></a>【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</h1><h2 id="面试官：我这条-SQL-只查了-3-万行，为什么磁盘-IO-打了-800MB？"><a href="#面试官：我这条-SQL-只查了-3-万行，为什么磁盘-IO-打了-800MB？" class="headerlink" title="面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？"></a>面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？</h2><p>这是线上非常经典的一幕：一条看起来「不复杂」的 SQL，执行时间 4 秒，<code>iostat</code> 显示写盘量飙到几百 MB，而表本身只有几十万行，结果集也不大。</p>
+<p>排查到最后，元凶往往是同一个东西：<strong>内部临时表（Internal Temporary Table）落盘</strong>。</p>
+<p>这篇文章把内部临时表从「什么时候产生 → 放在哪 → 怎么一步步被逼到磁盘 → 怎么监控 → 怎么根治」整条链路讲透。这部分内容在面试里属于典型的「区分度考点」——能背 <code>tmp_table_size</code> 的人很多，能说清 TempTable 引擎、<code>temptable_max_mmap</code> 和派生表物化的人很少。</p>
+<hr>
+<h2 id="一、先搞清楚：什么是内部临时表"><a href="#一、先搞清楚：什么是内部临时表" class="headerlink" title="一、先搞清楚：什么是内部临时表"></a>一、先搞清楚：什么是内部临时表</h2><p>MySQL 中「临时表」分两种，很多人混着说：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>创建方式</th>
+<th>生命周期</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>用户临时表</strong></td>
+<td><code>CREATE TEMPORARY TABLE</code></td>
+<td>会话级，<code>SESSION</code> 断开即删</td>
+<td>业务临时存中间结果、复杂报表</td>
+</tr>
+<tr>
+<td><strong>内部临时表</strong></td>
+<td>优化器&#x2F;执行器自动创建</td>
+<td>语句级，语句结束即释放</td>
+<td>排序、分组、去重、物化、窗口函数</td>
+</tr>
+</tbody></table>
+<p>内部临时表是<strong>执行引擎自己用的草稿纸</strong>，对用户不可见。它存在的唯一理由是：某些算子在执行时，必须先把中间结果落地，才能继续下一步运算。</p>
+<p>关键点：<strong>内部临时表不是「一定会慢」的东西</strong>。它的性能完全取决于一件事——它到底待在<strong>内存</strong>里，还是被<strong>被迫写到了磁盘</strong>。</p>
+<hr>
+<h2 id="二、什么操作会产生内部临时表"><a href="#二、什么操作会产生内部临时表" class="headerlink" title="二、什么操作会产生内部临时表"></a>二、什么操作会产生内部临时表</h2><p>这是面试第一个高频问题。按产生频率排序：</p>
+<h3 id="2-1-GROUP-BY（最高频）"><a href="#2-1-GROUP-BY（最高频）" class="headerlink" title="2.1 GROUP BY（最高频）"></a>2.1 GROUP BY（最高频）</h3><p>MySQL 8.0 之前，<code>GROUP BY</code> 的默认实现就是「建临时表 + 排序」。8.0 引入了 <code>Hash Aggregation</code>，但<strong>这不代表不再用临时表</strong>：当分组数据超出内存限制时，Hash Agg 依然会 spill 到磁盘上的临时文件。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 典型：分组字段没有可用索引</span></span><br><span class="line"><span class="keyword">SELECT</span> user_id, <span class="built_in">COUNT</span>(<span class="operator">*</span>), <span class="built_in">SUM</span>(amount)</span><br><span class="line"><span class="keyword">FROM</span> orders</span><br><span class="line"><span class="keyword">WHERE</span> created_at <span class="operator">&gt;=</span> <span class="string">&#x27;2026-01-01&#x27;</span></span><br><span class="line"><span class="keyword">GROUP</span> <span class="keyword">BY</span> user_id;</span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>user_id</code> 上没有可用索引（或 <code>created_at</code> 过滤后仍需回表），优化器就会走「临时表 + Filesort」。</p>
+<h3 id="2-2-ORDER-BY-Filesort"><a href="#2-2-ORDER-BY-Filesort" class="headerlink" title="2.2 ORDER BY + Filesort"></a>2.2 ORDER BY + Filesort</h3><p><code>ORDER BY</code> 时如果<strong>无法利用索引天然有序</strong>，就要排序。MySQL 排序有两种：</p>
+<ul>
+<li><strong>全字段排序</strong>：把 <code>SELECT</code> 需要的所有列都放进排序缓冲区（<code>sort_buffer_size</code>），够就内存排，不够就<strong>用临时文件做外部归并排序</strong>（这不是内部临时表，但同样落盘，二者常一起出现）。</li>
+<li><strong>rowid 排序</strong>：当单行长度超过 <code>max_length_for_sort_data</code> 时，只排 rowid + 排序字段，然后回表取数据——<strong>会有两次回表</strong>。</li>
+</ul>
+<h3 id="2-3-DISTINCT"><a href="#2-3-DISTINCT" class="headerlink" title="2.3 DISTINCT"></a>2.3 DISTINCT</h3><p><code>DISTINCT</code> 语义上等价于「按全部输出列 GROUP BY」，因此同样可能物化。</p>
+<h3 id="2-4-UNION-UNION-ALL"><a href="#2-4-UNION-UNION-ALL" class="headerlink" title="2.4 UNION &#x2F; UNION ALL"></a>2.4 UNION &#x2F; UNION ALL</h3><p>这是最容易踩坑的一条，值得单独强调：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> a <span class="keyword">FROM</span> t1 <span class="keyword">UNION</span> <span class="keyword">SELECT</span> a <span class="keyword">FROM</span> t2;      <span class="comment">-- 会产生临时表（需要去重）</span></span><br><span class="line"><span class="keyword">SELECT</span> a <span class="keyword">FROM</span> t1 <span class="keyword">UNION</span> <span class="keyword">ALL</span> <span class="keyword">SELECT</span> a <span class="keyword">FROM</span> t2;  <span class="comment">-- 不会（直接追加）</span></span><br></pre></td></tr></table></figure>
+
+<p><code>UNION</code> 需要去重 → MySQL 会把两个结果集写进一张内部临时表，再去重。<strong><code>UNION ALL</code> 是完全不同的执行路径</strong>，只要业务允许重复，改成 <code>UNION ALL</code> 收益立竿见影。</p>
+<h3 id="2-5-派生表（Derived-Table）物化"><a href="#2-5-派生表（Derived-Table）物化" class="headerlink" title="2.5 派生表（Derived Table）物化"></a>2.5 派生表（Derived Table）物化</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span></span><br><span class="line"><span class="keyword">FROM</span> (</span><br><span class="line">  <span class="keyword">SELECT</span> user_id, <span class="built_in">COUNT</span>(<span class="operator">*</span>) <span class="keyword">AS</span> cnt <span class="keyword">FROM</span> orders <span class="keyword">GROUP</span> <span class="keyword">BY</span> user_id</span><br><span class="line">) <span class="keyword">AS</span> d</span><br><span class="line"><span class="keyword">WHERE</span> d.cnt <span class="operator">&gt;</span> <span class="number">10</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这个子查询在 <code>FROM</code> 中的表叫派生表。优化器有两种处理策略：</p>
+<ol>
+<li><strong>派生表合并（Derived Merge）</strong>：把外层条件「下推」进子查询，和普通 JOIN 一样优化。这是 5.7 引入的 <code>derived_merge</code> 优化，默认开启。</li>
+<li><strong>派生表物化（Materialization）</strong>：如果无法合并（比如子查询里有 <code>GROUP BY</code> + <code>LIMIT</code>、聚合函数、<code>UNION</code>、窗口函数），就把整个子查询结果物化到<strong>内部临时表</strong>里，然后外层再查这张临时表。</li>
+</ol>
+<p>上面这个例子就属于第 2 种——<strong>内层有 <code>GROUP BY</code> 且外层条件作用在聚合结果 <code>cnt</code> 上，无法下推</strong>，于是必然物化。数据量大时直接落盘。</p>
+<h3 id="2-6-半连接与子查询物化"><a href="#2-6-半连接与子查询物化" class="headerlink" title="2.6 半连接与子查询物化"></a>2.6 半连接与子查询物化</h3><p><code>IN</code>、<code>EXISTS</code> 类子查询，优化器可能选择 <code>Materialization</code> 策略：把子查询结果物化到临时表并加索引（这是内部临时表<strong>唯一会自动建索引</strong>的场景，叫 auto-generated index），再与外层表做 JOIN。</p>
+<h3 id="2-7-窗口函数"><a href="#2-7-窗口函数" class="headerlink" title="2.7 窗口函数"></a>2.7 窗口函数</h3><p><code>ROW_NUMBER()</code>、<code>RANK()</code>、<code>SUM() OVER()</code> 等窗口函数，本质是「分组内排序 + 累计计算」，8.0 的实现强依赖内部临时表来缓存窗口帧。</p>
+<h3 id="2-8-其他"><a href="#2-8-其他" class="headerlink" title="2.8 其他"></a>2.8 其他</h3><ul>
+<li><code>INSERT ... SELECT</code>（当 binlog 为 <code>STATEMENT</code> 格式时，MySQL 强制物化以保证主从一致）</li>
+<li>多表 <code>UPDATE</code> &#x2F; <code>DELETE</code></li>
+<li><code>SELECT ... FOR UPDATE</code> 中涉及排序的场景</li>
+<li><code>information_schema</code> 查询（<code>SHOW</code> 类语句几乎必然物化）</li>
+</ul>
+<hr>
+<h2 id="三、内存临时表：从-MEMORY-引擎到-TempTable"><a href="#三、内存临时表：从-MEMORY-引擎到-TempTable" class="headerlink" title="三、内存临时表：从 MEMORY 引擎到 TempTable"></a>三、内存临时表：从 MEMORY 引擎到 TempTable</h2><h3 id="3-1-5-7-时代：MEMORY-引擎"><a href="#3-1-5-7-时代：MEMORY-引擎" class="headerlink" title="3.1 5.7 时代：MEMORY 引擎"></a>3.1 5.7 时代：MEMORY 引擎</h3><p>MySQL 5.7 的内部临时表默认使用 <strong>MEMORY 存储引擎</strong>，特点：</p>
+<ul>
+<li>数据全在内存，<strong>哈希索引</strong>（不支持 B+ 树，不支持 <code>TEXT</code>&#x2F;<code>BLOB</code>）</li>
+<li>一旦包含 <code>TEXT</code>&#x2F;<code>BLOB</code> 列，<strong>立刻退化为磁盘临时表</strong>（InnoDB 或 MyISAM）</li>
+</ul>
+<p>这就是那个经典结论的来源：<strong><code>SELECT</code> 里带了 <code>TEXT</code> 字段，临时表必落盘。</strong></p>
+<p>判断内存临时表容量的参数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;tmp_table_size&#x27;</span>;         <span class="comment">-- 默认 16MB</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;max_heap_table_size&#x27;</span>;    <span class="comment">-- 默认 16MB</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>生效上限取两者较小值</strong>：</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">/* 伪代码：实际生效的内存临时表上限 */</span></span><br><span class="line">effective_limit = MIN(tmp_table_size, max_heap_table_size);</span><br></pre></td></tr></table></figure>
+
+<p>超过上限 → <code>Created_tmp_disk_tables</code> +1，数据转存磁盘。</p>
+<h3 id="3-2-8-0-时代：TempTable-存储引擎"><a href="#3-2-8-0-时代：TempTable-存储引擎" class="headerlink" title="3.2 8.0 时代：TempTable 存储引擎"></a>3.2 8.0 时代：TempTable 存储引擎</h3><p>8.0 引入了一个全新的内部临时表引擎叫 <strong>TempTable</strong>，替代 MEMORY 引擎作为内存临时表的默认实现。核心改进：</p>
+<ul>
+<li>支持变长列（<code>VARCHAR</code>&#x2F;<code>TEXT</code> 不再强制落盘）</li>
+<li>用 <strong>lock-free 的 concurrent hash &#x2F; 树</strong>结构，高并发下比 MEMORY 引擎的页级锁好得多</li>
+<li>内存分配用 <strong>内存块池</strong>，避免频繁 malloc&#x2F;free</li>
+<li>支持 <strong>溢出到 mmap 文件</strong>（不是普通磁盘文件，走 page cache），比直接写盘轻得多</li>
+</ul>
+<p>相关参数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;internal_tmp_mem_storage_engine&#x27;</span>; <span class="comment">-- TempTable（默认）或 MEMORY</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;temptable_max_ram&#x27;</span>;               <span class="comment">-- 默认 1GB，TempTable 可用 RAM 上限</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;temptable_max_mmap&#x27;</span>;              <span class="comment">-- 默认 1GB，溢出可用 mmap 上限</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;temptable_use_mmap&#x27;</span>;              <span class="comment">-- 8.0.26+ 默认 OFF（用磁盘文件）</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>8.0 的落盘路径变成了三级</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">TempTable 内存块（temptable_max_ram）</span><br><span class="line">    ↓ 超限</span><br><span class="line">mmap 匿名映射文件（temptable_max_mmap，若 temptable_use_mmap=ON）</span><br><span class="line">    ↓ 超限</span><br><span class="line">InnoDB 磁盘临时表（ibtmp1 表空间）</span><br></pre></td></tr></table></figure>
+
+<p>这一点非常关键：<strong>很多资料还在说「超过 tmp_table_size 就写磁盘」，那是 5.7 的知识。</strong> 在 8.0 里，<code>tmp_table_size</code> 对 TempTable 引擎<strong>已经不生效</strong>了，真正管事的是 <code>temptable_max_ram</code>。</p>
+<h3 id="3-3-磁盘临时表又分两种"><a href="#3-3-磁盘临时表又分两种" class="headerlink" title="3.3 磁盘临时表又分两种"></a>3.3 磁盘临时表又分两种</h3><p>当内存扛不住：</p>
+<table>
+<thead>
+<tr>
+<th>磁盘临时表</th>
+<th>存储位置</th>
+<th>是否共享</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>InnoDB 临时表</strong></td>
+<td>全局 <code>ibtmp1</code> 文件</td>
+<td>所有连接共享同一文件</td>
+<td>8.0 默认；每次重启重建，<strong>不会被持久化</strong></td>
+</tr>
+<tr>
+<td><strong>MyISAM 临时表</strong></td>
+<td>独立 <code>.MYD</code>&#x2F;<code>.MYI</code> 文件</td>
+<td>每连接独立</td>
+<td>老版本遗留</td>
+</tr>
+</tbody></table>
+<p><code>ibtmp1</code> 有一个致命特性：<strong>它只增不减</strong>。大量内部临时表跑过之后，<code>ibtmp1</code> 会涨到几个 GB 并且不自动收缩，磁盘空间就这么被吃掉了。相关参数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_temp_data_file_path&#x27;</span>;</span><br><span class="line"><span class="comment">-- 默认 ibtmp1:12M:autoextend</span></span><br></pre></td></tr></table></figure>
+
+<p>如果需要收缩，只能重启实例（或用 <code>innodb_temp_tablespaces_dir</code> 下的会话级临时表空间配合）。</p>
+<hr>
+<h2 id="四、怎么确认「我的-SQL-用了临时表」"><a href="#四、怎么确认「我的-SQL-用了临时表」" class="headerlink" title="四、怎么确认「我的 SQL 用了临时表」"></a>四、怎么确认「我的 SQL 用了临时表」</h2><h3 id="4-1-执行计划里看"><a href="#4-1-执行计划里看" class="headerlink" title="4.1 执行计划里看"></a>4.1 执行计划里看</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN <span class="keyword">SELECT</span> ...;</span><br></pre></td></tr></table></figure>
+
+<p>关注 <code>Extra</code> 列：</p>
+<table>
+<thead>
+<tr>
+<th>Extra 输出</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Using temporary</code></td>
+<td><strong>产生了内部临时表</strong></td>
+</tr>
+<tr>
+<td><code>Using filesort</code></td>
+<td>需要额外排序（可能伴随临时文件）</td>
+</tr>
+<tr>
+<td><code>Using index; Using temporary</code></td>
+<td>已用覆盖索引，但分组&#x2F;去重仍需物化</td>
+</tr>
+<tr>
+<td><code>Using temporary; Using filesort</code></td>
+<td>最糟：物化 + 排序</td>
+</tr>
+</tbody></table>
+<p><code>Using temporary</code> 出现的位置很关键：它在<strong>派生表那一行</strong>出现，说明是派生表物化；在最外层出现，说明是 <code>GROUP BY</code>&#x2F;<code>DISTINCT</code>&#x2F;<code>UNION</code> 物化。</p>
+<h3 id="4-2-全局状态计数器"><a href="#4-2-全局状态计数器" class="headerlink" title="4.2 全局状态计数器"></a>4.2 全局状态计数器</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> <span class="keyword">GLOBAL</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Created_tmp%&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- Created_tmp_tables       本次启动以来创建过的临时表总数（含内存）</span></span><br><span class="line"><span class="comment">-- Created_tmp_disk_tables  其中落盘的数量</span></span><br><span class="line"><span class="comment">-- Created_tmp_files        临时文件数量</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>经验阈值</strong>：<code>Created_tmp_disk_tables / Created_tmp_tables &gt; 25%</code> 就要开始查了。</p>
+<h3 id="4-3-定位到具体-SQL"><a href="#4-3-定位到具体-SQL" class="headerlink" title="4.3 定位到具体 SQL"></a>4.3 定位到具体 SQL</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 从 performance_schema 看每条语句的临时表情况</span></span><br><span class="line"><span class="keyword">SELECT</span></span><br><span class="line">  DIGEST_TEXT,</span><br><span class="line">  SUM_CREATED_TMP_TABLES,</span><br><span class="line">  SUM_CREATED_TMP_DISK_TABLES,</span><br><span class="line">  SUM_SORT_MERGE_PASSES,</span><br><span class="line">  SUM_NO_INDEX_USED</span><br><span class="line"><span class="keyword">FROM</span> performance_schema.events_statements_summary_by_digest</span><br><span class="line"><span class="keyword">WHERE</span> SUM_CREATED_TMP_DISK_TABLES <span class="operator">&gt;</span> <span class="number">0</span></span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> SUM_CREATED_TMP_DISK_TABLES <span class="keyword">DESC</span></span><br><span class="line">LIMIT <span class="number">10</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 或在会话里直接查</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> performance_schema.session_status</span><br><span class="line"><span class="keyword">WHERE</span> VARIABLE_NAME <span class="keyword">LIKE</span> <span class="string">&#x27;Created_tmp%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这一步是<strong>线上排查的关键</strong>：不要猜，直接按 <code>SUM_CREATED_TMP_DISK_TABLES</code> 排序，Top N 就是元凶。</p>
+<hr>
+<h2 id="五、五个实战优化套路"><a href="#五、五个实战优化套路" class="headerlink" title="五、五个实战优化套路"></a>五、五个实战优化套路</h2><h3 id="5-1-用索引消灭-GROUP-BY-临时表"><a href="#5-1-用索引消灭-GROUP-BY-临时表" class="headerlink" title="5.1 用索引消灭 GROUP BY 临时表"></a>5.1 用索引消灭 GROUP BY 临时表</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 优化前：Using temporary; Using filesort</span></span><br><span class="line"><span class="keyword">SELECT</span> user_id, <span class="built_in">COUNT</span>(<span class="operator">*</span>) <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">GROUP</span> <span class="keyword">BY</span> user_id;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 建立联合索引后，使用松散索引扫描 / 有序分组</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> orders <span class="keyword">ADD</span> INDEX idx_status_user (status, user_id);</span><br><span class="line"><span class="comment">-- 优化后：Using index（可能利用 Loose Index Scan，直接跳过临时表）</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>核心思路</strong>：如果 <code>GROUP BY</code> 的列是某索引的<strong>最左前缀</strong>，且索引有序，优化器有机会直接利用索引顺序做分组，不再物化。</p>
+<h3 id="5-2-避免大字段进入临时表"><a href="#5-2-避免大字段进入临时表" class="headerlink" title="5.2 避免大字段进入临时表"></a>5.2 避免大字段进入临时表</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 差：content 是 TEXT，临时表必落盘</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="keyword">DISTINCT</span> id, content <span class="keyword">FROM</span> articles <span class="keyword">WHERE</span> tag <span class="operator">=</span> <span class="string">&#x27;java&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 好：先在「窄表」里去重，再回表取内容</span></span><br><span class="line"><span class="keyword">SELECT</span> a.id, a.content</span><br><span class="line"><span class="keyword">FROM</span> articles a</span><br><span class="line"><span class="keyword">JOIN</span> (<span class="keyword">SELECT</span> <span class="keyword">DISTINCT</span> id <span class="keyword">FROM</span> articles <span class="keyword">WHERE</span> tag <span class="operator">=</span> <span class="string">&#x27;java&#x27;</span>) <span class="keyword">AS</span> t <span class="keyword">ON</span> t.id <span class="operator">=</span> a.id;</span><br></pre></td></tr></table></figure>
+
+<p>8.0 的 TempTable 引擎虽然支持变长列，但大字段仍会迅速吃满 <code>temptable_max_ram</code>。<strong>「先去重，再取宽字段」是通用套路。</strong></p>
+<h3 id="5-3-UNION-→-UNION-ALL"><a href="#5-3-UNION-→-UNION-ALL" class="headerlink" title="5.3 UNION → UNION ALL"></a>5.3 UNION → UNION ALL</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 优化前：物化 + 去重</span></span><br><span class="line"><span class="keyword">SELECT</span> id <span class="keyword">FROM</span> t1 <span class="keyword">UNION</span> <span class="keyword">SELECT</span> id <span class="keyword">FROM</span> t2;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 优化后：若业务可接受重复（或后续会再聚合）</span></span><br><span class="line"><span class="keyword">SELECT</span> id <span class="keyword">FROM</span> t1 <span class="keyword">UNION</span> <span class="keyword">ALL</span> <span class="keyword">SELECT</span> id <span class="keyword">FROM</span> t2;</span><br></pre></td></tr></table></figure>
+
+<p>如果业务必须去重，也可以考虑把去重交给<strong>唯一索引&#x2F;临时结果表 + INSERT IGNORE</strong>，让 InnoDB 来干这件事，通常比内存临时表哈希去重更省内存。</p>
+<h3 id="5-4-派生表改写为-JOIN"><a href="#5-4-派生表改写为-JOIN" class="headerlink" title="5.4 派生表改写为 JOIN"></a>5.4 派生表改写为 JOIN</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 优化前：派生表物化</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> (</span><br><span class="line">  <span class="keyword">SELECT</span> user_id, <span class="built_in">SUM</span>(amount) <span class="keyword">AS</span> total <span class="keyword">FROM</span> orders <span class="keyword">GROUP</span> <span class="keyword">BY</span> user_id</span><br><span class="line">) d <span class="keyword">WHERE</span> d.total <span class="operator">&gt;</span> <span class="number">1000</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 优化后：用 HAVING 下推条件</span></span><br><span class="line"><span class="keyword">SELECT</span> user_id, <span class="built_in">SUM</span>(amount) <span class="keyword">AS</span> total</span><br><span class="line"><span class="keyword">FROM</span> orders</span><br><span class="line"><span class="keyword">GROUP</span> <span class="keyword">BY</span> user_id</span><br><span class="line"><span class="keyword">HAVING</span> total <span class="operator">&gt;</span> <span class="number">1000</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>这不是等价改写</strong>：<code>HAVING</code> 在分组过程中就过滤，优化的本质是让「过滤」提前发生，减少需要物化的行数。8.0 还有 <code>derived_condition_pushdown</code>（默认 ON），会把外层条件下推到派生表内部，进一步减少物化数据量。</p>
+<h3 id="5-5-谨慎用-SQL-BIG-RESULT-SQL-SMALL-RESULT"><a href="#5-5-谨慎用-SQL-BIG-RESULT-SQL-SMALL-RESULT" class="headerlink" title="5.5 谨慎用 SQL_BIG_RESULT &#x2F; SQL_SMALL_RESULT"></a>5.5 谨慎用 <code>SQL_BIG_RESULT</code> &#x2F; <code>SQL_SMALL_RESULT</code></h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> SQL_BIG_RESULT user_id, <span class="built_in">COUNT</span>(<span class="operator">*</span>) <span class="keyword">FROM</span> orders <span class="keyword">GROUP</span> <span class="keyword">BY</span> user_id;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>SQL_SMALL_RESULT</code>：告诉优化器结果集小，用内存临时表 + 哈希索引即可</li>
+<li><code>SQL_BIG_RESULT</code>：告诉优化器结果集大，<strong>直接用磁盘临时表 + 排序</strong>，跳过内存哈希</li>
+</ul>
+<p>这两个提示是「用确定性换取可控性」，在明确知道数据规模时有用，但滥用会适得其反。日常优先改写 SQL 而不是加 hint。</p>
+<hr>
+<h2 id="六、一个完整的线上排查案例"><a href="#六、一个完整的线上排查案例" class="headerlink" title="六、一个完整的线上排查案例"></a>六、一个完整的线上排查案例</h2><p><strong>现象</strong>：报表接口 P99 从 800ms 涨到 4.2s，<code>iostat</code> 显示 <code>vda</code> 写 IOPS 从 200 飙到 3000+。</p>
+<p><strong>第一步：确认是不是临时表</strong></p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> <span class="keyword">GLOBAL</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Created_tmp_disk_tables&#x27;</span>;</span><br><span class="line"><span class="comment">-- 比昨天基准值高出 40 倍 → 基本确认</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>第二步：定位 SQL</strong></p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> DIGEST_TEXT, SUM_CREATED_TMP_DISK_TABLES</span><br><span class="line"><span class="keyword">FROM</span> performance_schema.events_statements_summary_by_digest</span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> SUM_CREATED_TMP_DISK_TABLES <span class="keyword">DESC</span> LIMIT <span class="number">5</span>;</span><br></pre></td></tr></table></figure>
+
+<p>定位到一条报表 SQL，结构正是：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> (</span><br><span class="line">  <span class="keyword">SELECT</span> shop_id, channel, <span class="built_in">SUM</span>(amount) total, <span class="built_in">COUNT</span>(<span class="keyword">DISTINCT</span> buyer_id) uv</span><br><span class="line">  <span class="keyword">FROM</span> orders</span><br><span class="line">  <span class="keyword">WHERE</span> created_at <span class="keyword">BETWEEN</span> ? <span class="keyword">AND</span> ?</span><br><span class="line">  <span class="keyword">GROUP</span> <span class="keyword">BY</span> shop_id, channel</span><br><span class="line">) d <span class="keyword">ORDER</span> <span class="keyword">BY</span> d.total <span class="keyword">DESC</span> LIMIT <span class="number">20</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>第三步：分析原因</strong></p>
+<ul>
+<li>派生表含 <code>GROUP BY</code> + 聚合 → <strong>无法合并，必须物化</strong></li>
+<li><code>SELECT *</code> 把宽字段全带进临时表</li>
+<li><code>COUNT(DISTINCT)</code> 在 8.0 中会额外触发一次「按 <code>(shop_id, channel, buyer_id)</code> 去重」的物化</li>
+<li>时间范围从 7 天扩大到 90 天 → 中间结果从 5 万行涨到 300 万行 → 直接突破 <code>temptable_max_ram</code></li>
+</ul>
+<p><strong>第四步：解决方案</strong></p>
+<ol>
+<li>短期：把 <code>COUNT(DISTINCT)</code> 拆成独立子查询并加 <code>(created_at, shop_id, channel, buyer_id)</code> 复合索引</li>
+<li>中期：<code>SELECT *</code> 改为只选必要列，把宽字段（备注、JSON）移出派生表</li>
+<li>长期：报表改走 <strong>预聚合 + 冷热分层</strong>（按天写汇总表，查询命中打好的宽表）</li>
+</ol>
+<p><strong>结果</strong>：<code>Created_tmp_disk_tables</code> 回落到基线，P99 回到 900ms 以内。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：<code>tmp_table_size</code> 和 <code>max_heap_table_size</code> 到底谁生效？</strong></p>
+<p>取<strong>较小值</strong>。而且这两个参数在 8.0 + TempTable 引擎下<strong>已经不管内部临时表了</strong>（只对 MEMORY 引擎的临时表和用户建的内存表生效），8.0 要看 <code>temptable_max_ram</code>。这是最能筛人的一问。</p>
+<p><strong>Q2：为什么 <code>ibtmp1</code> 越来越大，删数据也没用？</strong></p>
+<p><code>ibtmp1</code> 是<strong>所有会话共享的 InnoDB 临时表空间</strong>，内部临时表释放后它只做空闲标记、不归还磁盘，<code>autoextend</code> 只增不减。解决只能靠控制单次临时表规模（配合 <code>innodb_temp_data_file_path</code> 设置上限），或者重启（会重建）。</p>
+<p><strong>Q3：<code>Using temporary</code> 一定是坏事吗？</strong></p>
+<p>不一定。如果临时表很小且全程在内存（TempTable 内存块），成本可以忽略。<strong>真正要警惕的是 <code>Using temporary</code> 与 <code>Created_tmp_disk_tables</code> 同时增长</strong>。把「有没有用临时表」当成问题、而不是「临时表有没有落盘」，是典型的新手误区。</p>
+<p><strong>Q4：如何彻底避免内部临时表？</strong></p>
+<p>不可能也不需要。<code>DISTINCT</code>、<code>UNION</code>、窗口函数在语义上就要求中间结果，<strong>只能优化规模、不能消除机制</strong>。要消除的是「大」临时表，而不是「有」临时表。</p>
+<p><strong>Q5：派生表合并失败的条件有哪些？</strong></p>
+<p>常见有：子查询含聚合函数（<code>SUM</code>&#x2F;<code>COUNT</code>&#x2F;<code>GROUP BY</code>）、<code>LIMIT</code>、<code>UNION</code>、窗口函数、<code>DISTINCT</code>（部分场景）、用户变量赋值。可以用 <code>EXPLAIN FORMAT=JSON</code> 看 <code>materialized_from_subquery</code> 字段确认走了物化。</p>
+<hr>
+<h2 id="八、一句话总结"><a href="#八、一句话总结" class="headerlink" title="八、一句话总结"></a>八、一句话总结</h2><blockquote>
+<p>内部临时表是优化器的草稿纸。<strong>内存里的是同事，磁盘上的是事故。</strong></p>
+<p>排查靠 <code>Created_tmp_disk_tables</code> + <code>performance_schema</code>，优化靠「索引消除分组 → 窄表去重 → UNION ALL → HAVING 下推」这套组合拳，8.0 请盯住 <code>temptable_max_ram</code> 而不是 <code>tmp_table_size</code>。</p>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/15/mysql-internal-temporary-table-deep-dive/">https://jiweidong.github.io/2026/09/15/mysql-internal-temporary-table-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92/">执行计划</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</div></div><div class="info-2"><div class="info-item-1">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？这是 Redis 运维里最容易被误判的告警之一。 监控告警一响，多数人的第一反应是「内存泄漏了」或者「是不是大 Key」。但真实原因经常是另一回事：内存碎片（Memory Fragmentation）。 更微妙的是，碎片这件事在 Redis 里有一堆反直觉的细节：  mem_fragmentation_ratio &lt; 1 通常不报错，但它其实是交换分区正在被使用的严重信号； 内存碎片率超过 1.5 就该告警，但不是所有场景都该开 activedefrag； 有时候碎片率很高，activedefrag 却一动不动——因为它被主从复制、持久化、集群模式悄悄拦住了。  这篇文章把碎片的成因、观测、治理讲完整，并重点说清 activedefrag 为什么经常「失效」。  一、Redis 内存到底花在哪了在看碎片之前，先建立完整的内存全景。INFO memory 输出的关键字段...</div></div></div></a><a class="pagination-related" href="/2026/09/15/large-table-hot-cold-data-archiving-deep-practice/" title="【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移</div></div><div class="info-2"><div class="info-item-1">【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移面试官：订单表 8 亿行，最近半年只有 5% 的数据被访问，你怎么处理？这道题是「数据库架构」面试里最有区分度的一类——它不是考某个知识点，而是考你有没有真正处理过「数据会一直长」这件事。 大多数候选人的答案会停在「分库分表」。但分库分表解决的是写入扩展和单表容量，它不解决「90% 的数据其实没人看」这个根本问题。把 8 亿行均匀拆到 64 张表，每张还有 1250 万行，慢查询依然存在。 真正的答案是：先把数据按「价值」分层，再对每层用不同的存储与访问策略。 这篇文章完整讲清：冷热判定 → 分层存储选型 → 在线归档的工程实现 → 路由与查询改造 → 数据校验 → 生产事故复盘。  一、什么是冷热数据：先定义，再动手「冷热」不是玄学，它有三个可量化的判定维度。 1.1 访问频率维度这是最本质的维度。典型业务系统的数据访问呈强幂律分布：    数据年龄 占比（行） 占比（查询量） 归属    最近 7 天 2% 约 65% 热   7~30 天 5% 约 25% 温   30 天~6 个月 20% 约 ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/12/mysql-hash-join-deep-dive/" title="【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-12</div><div class="info-item-2">【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优</div></div><div class="info-2"><div class="info-item-1">【MySQL 原理】MySQL 8.0 Hash Join 深度解析：从 BNL 到 Hash Join 的演进、内存控制与实战调优面试官：MySQL 8.0 之后，EXPLAIN 里的 Block Nested Loop 去哪了？如果你从 MySQL 5.7 升级到 8.0，重新看一条两表 JOIN 的执行计划，很可能发现原来熟悉的： 1Extra: Using where; Using join buffer (Block Nested Loop)  变成了： 1Extra: Using where; Using join buffer (hash join)  这不是显示文案的改动，而是执行引擎的实质升级 —— MySQL 8.0.18 引入了真正的 Hash Join，用来替代经典的 Block Nested Loop（BNL）作为「被驱动表无索引可用」时的默认方案。 这篇我们从原理、执行流程、内存控制、执行计划解读到调优实战，把 Hash Join 讲透。 一、先回顾：没有索引时，JOIN 有多惨假设： 1234SELECT o.id, u.nameFROM t_ord...</div></div></div></a><a class="pagination-related" href="/2026/08/15/mysql-back-to-table-covering-index-deep-dive/" title="【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战面试官：什么是回表？什么是覆盖索引？为什么 select * 和 select 指定字段性能差这么多？“回表”和”覆盖索引”是 MySQL 索引面试中最核心的两个概念，也是 SQL 优化的基本功。很多同学知道”要建联合索引、不要 select *”，但说不清背后的原理——为什么覆盖索引能避免回表？为什么联合索引能覆盖更多查询？ 本文从 InnoDB 索引结构出发，把回表、覆盖索引、索引下推（ICP）的关系一次讲透，最后给出可直接落地的优化 checklist。 一、先从 InnoDB 索引结构说起1.1 聚簇索引（Clustered Index）InnoDB 的表本身就是一棵 B+ 树，主键索引就是聚簇索引：  叶子节点直接存放整行数据（包括所有字段）； 每张表只有一个聚簇索引（通常是主键，没有主键就用第一个非空唯一索引，再没有就隐藏的 rowid）； 数据行按照主键顺序物理排列（逻辑顺序）。  123456789聚簇索引 B+ 树（主键 id）┌─────────┐│  根节点   │  ...</div></div></div></a><a class="pagination-related" href="/2026/09/11/mysql-json-type-functional-index-deep-practice/" title="【MySQL 实战】MySQL JSON 数据类型深度实战：二进制存储、JSON 函数、虚拟列与函数索引"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-11</div><div class="info-item-2">【MySQL 实战】MySQL JSON 数据类型深度实战：二进制存储、JSON 函数、虚拟列与函数索引</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】MySQL JSON 数据类型深度实战：二进制存储、JSON 函数、虚拟列与函数索引面试官：你们表里有 JSON 字段吗？为什么要用 JSON？很多人第一反应是”扩展字段用 TEXT 存一段 JSON 字符串不就行了”。这就是典型的把 JSON 当成字符串。MySQL 5.7 引入的 JSON 类型和 TEXT 存 JSON 完全是两种东西：    维度 TEXT 存 JSON JSON 类型    合法性校验 无，脏数据随便进 写入即校验，非法直接报 3130   存储格式 原样字符串 二进制格式（BINARY JSON）   读写效率 每次全量解析 解析一次，按路径定位   中文&#x2F;转义 需要处理转义字符 不需转义   路径查询 LIKE &#39;%xxx%&#39; 全表扫 -&gt; &#x2F; JSON_EXTRACT 走路径   索引 只能靠生成列 生成列 + 索引 &#x2F; 函数索引   部分更新 整行重写 满足条件可只改片段   所以 JSON 类型的价值在于：半结构化数据的动态扩展（比如商品的多变属性、风控事件的上下文、埋点参...</div></div></div></a><a class="pagination-related" href="/2026/08/08/mysql-transaction-isolation-levels-deep-dive/" title="【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读面试官：MySQL 默认隔离级别是什么？为什么它能解决幻读？“MySQL 默认是 RR（可重复读）”——这句话几乎人人会背，但接下来的追问能刷掉 80% 的人：  脏读、不可重复读、幻读到底怎么演示？ READ COMMITTED 和 REPEATABLE READ 在 MVCC 下有什么区别？ MySQL 的 RR 为什么能解决幻读，而教科书说 RR 不能？ 什么时候应该把隔离级别改成 RC？  本文用 SQL 实验 + 原理分析，一次讲透。   一、三大并发问题：先建立直觉假设有一张表：user(id, name, balance)，初始数据 id=1, balance=100。 1.1 脏读（Dirty Read）：读到未提交的数据123事务 A：UPDATE user SET balance=200 WHERE id=1;   -- 未提交事务 B：SELECT balance FROM user WHERE id=1;      -- 读到 200 ❌事务 A：ROLLBACK;    ...</div></div></div></a><a class="pagination-related" href="/2026/08/24/mysql-gap-lock-next-key-lock-deep-dive/" title="【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 锁】间隙锁与临键锁深度解析：InnoDB 加锁规则、幻读与死锁实战面试官：说说 InnoDB 的间隙锁（Gap Lock）和临键锁（Next-Key Lock）？这道题是 MySQL 锁机制的”天花板”题目。先明确前提：间隙锁和临键锁只在 RR（可重复读）隔离级别下生效，RC 级别为了减少锁冲突，只保留记录锁。 一、为什么要引入间隙锁？——幻读问题先回顾三种读异常的级别：    隔离级别 脏读 不可重复读 幻读    READ UNCOMMITTED ❌可能 可能 可能   READ COMMITTED 不会 可能 可能   REPEATABLE READ 不会 不会 可能（InnoDB 已解决）   SERIALIZABLE 不会 不会 不会   幻读定义：在同一个事务里，两次相同条件的查询，第二次多出了第一次没有的行（插入型问题）。 注意区分：  不可重复读：同一行数据内容变了（UPDATE 造成）→ 用 MVCC 版本链 + 快照读解决 幻读：查询结果行数变多（INSERT 造成）→ 快照读靠 MVCC 解决，当前读要靠间隙锁解决  123456-- 事务 A...</div></div></div></a><a class="pagination-related" href="/2026/07/21/mysql-primary-key-design-deep-comparison/" title="【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-21</div><div class="info-item-2">【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】主键设计策略深度对比：自增主键 vs UUID vs 雪花算法 vs 业务主键前言 面试官：”你们的表主键是怎么设计的？为什么用自增ID？如果不用自增ID，你还能想到哪些主键方案？各自有什么优缺点？”  主键设计是数据库设计的”第一粒扣子”，一旦扣错，后续的索引性能、分库分表、数据迁移都会受到影响。本文从底层原理出发，逐一分析各种主键方案的优劣与适用场景。  一、主键设计的核心考量在深入对比之前，我们先明确主键设计的两条铁律： ① 唯一性：主键必须能唯一标识一行记录② 非空性：主键列不允许 NULL 但除此之外，高性能主键还应当满足：    考量维度 说明    写入性能 B+Tree 索引对写入顺序高度敏感，有序主键写入效率远高于随机主键   空间占用 InnoDB 聚簇索引中，二级索引叶子节点存储主键值，主键越大 &#x3D; 索引越占空间   可读性 是否方便 DBA 直接根据主键值定位问题   分布式友好 分库分表后是否还能保证全局唯一   安全性 是否防止 URL 遍历（如 &#x2F;order&#x2F;1001 → &#x2F;order&#x...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">622</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">731</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">200</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%8E%9F%E7%90%86%E3%80%91%E5%86%85%E9%83%A8%E4%B8%B4%E6%97%B6%E8%A1%A8%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E%E5%86%85%E5%AD%98%E4%B8%B4%E6%97%B6%E8%A1%A8%E5%88%B0%E7%A3%81%E7%9B%98%E8%90%BD%E5%9C%B0%E7%9A%84%E5%AE%8C%E6%95%B4%E9%93%BE%E8%B7%AF%E4%B8%8E%E4%BC%98%E5%8C%96%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%88%91%E8%BF%99%E6%9D%A1-SQL-%E5%8F%AA%E6%9F%A5%E4%BA%86-3-%E4%B8%87%E8%A1%8C%EF%BC%8C%E4%B8%BA%E4%BB%80%E4%B9%88%E7%A3%81%E7%9B%98-IO-%E6%89%93%E4%BA%86-800MB%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%9E%E6%B8%85%E6%A5%9A%EF%BC%9A%E4%BB%80%E4%B9%88%E6%98%AF%E5%86%85%E9%83%A8%E4%B8%B4%E6%97%B6%E8%A1%A8"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搞清楚：什么是内部临时表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%BB%80%E4%B9%88%E6%93%8D%E4%BD%9C%E4%BC%9A%E4%BA%A7%E7%94%9F%E5%86%85%E9%83%A8%E4%B8%B4%E6%97%B6%E8%A1%A8"><span class="toc-number">1.3.</span> <span class="toc-text">二、什么操作会产生内部临时表</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-GROUP-BY%EF%BC%88%E6%9C%80%E9%AB%98%E9%A2%91%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 GROUP BY（最高频）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-ORDER-BY-Filesort"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 ORDER BY + Filesort</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-DISTINCT"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 DISTINCT</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-UNION-UNION-ALL"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 UNION &#x2F; UNION ALL</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-%E6%B4%BE%E7%94%9F%E8%A1%A8%EF%BC%88Derived-Table%EF%BC%89%E7%89%A9%E5%8C%96"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 派生表（Derived Table）物化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-6-%E5%8D%8A%E8%BF%9E%E6%8E%A5%E4%B8%8E%E5%AD%90%E6%9F%A5%E8%AF%A2%E7%89%A9%E5%8C%96"><span class="toc-number">1.3.6.</span> <span class="toc-text">2.6 半连接与子查询物化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-7-%E7%AA%97%E5%8F%A3%E5%87%BD%E6%95%B0"><span class="toc-number">1.3.7.</span> <span class="toc-text">2.7 窗口函数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-8-%E5%85%B6%E4%BB%96"><span class="toc-number">1.3.8.</span> <span class="toc-text">2.8 其他</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%86%85%E5%AD%98%E4%B8%B4%E6%97%B6%E8%A1%A8%EF%BC%9A%E4%BB%8E-MEMORY-%E5%BC%95%E6%93%8E%E5%88%B0-TempTable"><span class="toc-number">1.4.</span> <span class="toc-text">三、内存临时表：从 MEMORY 引擎到 TempTable</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-5-7-%E6%97%B6%E4%BB%A3%EF%BC%9AMEMORY-%E5%BC%95%E6%93%8E"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 5.7 时代：MEMORY 引擎</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-8-0-%E6%97%B6%E4%BB%A3%EF%BC%9ATempTable-%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 8.0 时代：TempTable 存储引擎</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E7%A3%81%E7%9B%98%E4%B8%B4%E6%97%B6%E8%A1%A8%E5%8F%88%E5%88%86%E4%B8%A4%E7%A7%8D"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 磁盘临时表又分两种</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%80%8E%E4%B9%88%E7%A1%AE%E8%AE%A4%E3%80%8C%E6%88%91%E7%9A%84-SQL-%E7%94%A8%E4%BA%86%E4%B8%B4%E6%97%B6%E8%A1%A8%E3%80%8D"><span class="toc-number">1.5.</span> <span class="toc-text">四、怎么确认「我的 SQL 用了临时表」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92%E9%87%8C%E7%9C%8B"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 执行计划里看</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%85%A8%E5%B1%80%E7%8A%B6%E6%80%81%E8%AE%A1%E6%95%B0%E5%99%A8"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 全局状态计数器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%AE%9A%E4%BD%8D%E5%88%B0%E5%85%B7%E4%BD%93-SQL"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 定位到具体 SQL</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BA%94%E4%B8%AA%E5%AE%9E%E6%88%98%E4%BC%98%E5%8C%96%E5%A5%97%E8%B7%AF"><span class="toc-number">1.6.</span> <span class="toc-text">五、五个实战优化套路</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E7%94%A8%E7%B4%A2%E5%BC%95%E6%B6%88%E7%81%AD-GROUP-BY-%E4%B8%B4%E6%97%B6%E8%A1%A8"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 用索引消灭 GROUP BY 临时表</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E9%81%BF%E5%85%8D%E5%A4%A7%E5%AD%97%E6%AE%B5%E8%BF%9B%E5%85%A5%E4%B8%B4%E6%97%B6%E8%A1%A8"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 避免大字段进入临时表</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-UNION-%E2%86%92-UNION-ALL"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 UNION → UNION ALL</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E6%B4%BE%E7%94%9F%E8%A1%A8%E6%94%B9%E5%86%99%E4%B8%BA-JOIN"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 派生表改写为 JOIN</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-5-%E8%B0%A8%E6%85%8E%E7%94%A8-SQL-BIG-RESULT-SQL-SMALL-RESULT"><span class="toc-number">1.6.5.</span> <span class="toc-text">5.5 谨慎用 SQL_BIG_RESULT &#x2F; SQL_SMALL_RESULT</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%80%E4%B8%AA%E5%AE%8C%E6%95%B4%E7%9A%84%E7%BA%BF%E4%B8%8A%E6%8E%92%E6%9F%A5%E6%A1%88%E4%BE%8B"><span class="toc-number">1.7.</span> <span class="toc-text">六、一个完整的线上排查案例</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E4%B8%80%E5%8F%A5%E8%AF%9D%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、一句话总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/java-delayqueue-delayed-queue-deep-dive/" title="【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战">【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/large-table-hot-cold-data-archiving-deep-practice/" title="【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移">【架构实战】大表冷热数据分离与历史归档深度实战：从 8 亿行单表到在线无损迁移</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/mysql-internal-temporary-table-deep-dive/" title="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</a><time datetime="2026-09-15T00:00:00.000Z" title="发表于 2026-09-15 08:00:00">2026-09-15</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
