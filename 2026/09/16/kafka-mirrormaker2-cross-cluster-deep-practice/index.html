@@ -1,0 +1,593 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移面试官：我们做了两地三中心，Kafka 怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？这个问题的”坑”在于最后一句话。 如果面试官只想听”用 MirrorMaker 复制过去”，那这题只有 30 分。真正的考点是：  复制了数据 ≠ 能无缝切换。因为 Kafka 的消费位点（of">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移面试官：我们做了两地三中心，Kafka 怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？这个问题的”坑”在于最后一句话。 如果面试官只想听”用 MirrorMaker 复制过去”，那这题只有 30 分。真正的考点是：  复制了数据 ≠ 能无缝切换。因为 Kafka 的消费位点（of">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-16T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-16T00:05:03.801Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Kafka">
+<meta property="article:tag" content="MirrorMaker 2">
+<meta property="article:tag" content="异地容灾">
+<meta property="article:tag" content="消息队列">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移",
+  "url": "https://jiweidong.github.io/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-16T00:00:00.000Z",
+  "dateModified": "2026-09-16T00:05:03.801Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">627</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">740</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">204</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-16T00:05:03.801Z" title="更新于 2026-09-16 08:05:03">2026-09-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Kafka-架构】MirrorMaker-2-跨集群复制深度实战：异地容灾、双向同步与偏移量平移"><a href="#【Kafka-架构】MirrorMaker-2-跨集群复制深度实战：异地容灾、双向同步与偏移量平移" class="headerlink" title="【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移"></a>【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移</h1><h2 id="面试官：我们做了两地三中心，Kafka-怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？"><a href="#面试官：我们做了两地三中心，Kafka-怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？" class="headerlink" title="面试官：我们做了两地三中心，Kafka 怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？"></a>面试官：我们做了两地三中心，Kafka 怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？</h2><p>这个问题的”坑”在于最后一句话。</p>
+<p>如果面试官只想听”用 MirrorMaker 复制过去”，那这题只有 30 分。真正的考点是：</p>
+<blockquote>
+<p><strong>复制了数据 ≠ 能无缝切换。<strong>因为 Kafka 的消费位点（offset）是</strong>集群内自增的</strong>，A 集群的 topic <code>orders</code> 的 offset 1,000,000，在 B 集群复制过来后可能对应 offset 800,000。消费者切过去要么重复消费一大批，要么丢数据。</p>
+</blockquote>
+<p>而 <strong>MirrorMaker 2（MM2）</strong> 相比 MM1 最大的价值，恰恰就是<strong>偏移量平移（offset translation）<strong>与</strong>消费组位点同步</strong>。</p>
+<p>这篇文章从 MM2 的架构模型、三大 Connector、配置实战，讲到异地容灾切换的完整方案。</p>
+<hr>
+<h2 id="一、MM1-的痛：为什么要有-MM2"><a href="#一、MM1-的痛：为什么要有-MM2" class="headerlink" title="一、MM1 的痛：为什么要有 MM2"></a>一、MM1 的痛：为什么要有 MM2</h2><p>MirrorMaker 1 是一个简单的”消费者 + 生产者”循环：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">Consumer(源集群) → 过滤(whitelist/blacklist) → Producer(目标集群)</span><br></pre></td></tr></table></figure>
+
+<p>它的四个致命缺陷：</p>
+<table>
+<thead>
+<tr>
+<th>缺陷</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>无 offset 转换</strong></td>
+<td>切集群后消费者不知道该从哪继续，只能 <code>auto.offset.reset</code> 粗暴处理（丢或重）</td>
+</tr>
+<tr>
+<td><strong>无消费组位点同步</strong></td>
+<td>每个消费组都要手工重建位点</td>
+</tr>
+<tr>
+<td><strong>静态 topic 列表</strong></td>
+<td><code>whitelist</code>&#x2F;<code>blacklist</code> 在启动时确定，新增 topic 必须重启；靠正则勉强解决</td>
+</tr>
+<tr>
+<td><strong>无 topic 配置 &#x2F; ACL 同步</strong></td>
+<td>目标集群的 <code>retention.ms</code>、分区数、ACL 全靠人工对齐，极易漂移</td>
+</tr>
+<tr>
+<td>无细粒度监控</td>
+<td>只有一个全局吞吐指标，出问题无法定位到某个 topic</td>
+</tr>
+</tbody></table>
+<p>MM2 是<strong>在 Kafka Connect 框架上重写的复制方案</strong>，把上面五项全部补齐，并且天然支持”每个 topic 独立任务、独立指标、动态发现”。</p>
+<hr>
+<h2 id="二、MM2-架构：三个-Connector-分工"><a href="#二、MM2-架构：三个-Connector-分工" class="headerlink" title="二、MM2 架构：三个 Connector 分工"></a>二、MM2 架构：三个 Connector 分工</h2><p>MM2 不是”一个复制程序”，而是<strong>三个协同工作的 Connector</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>Connector</th>
+<th>职责</th>
+<th>关键配置前缀</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>MirrorSourceConnector</code></td>
+<td><strong>复制数据</strong>（topic 消息 + 分区 + topic 配置 + ACL）</td>
+<td><code>&lt;source&gt;-&gt;&lt;target&gt;.</code></td>
+</tr>
+<tr>
+<td><code>MirrorCheckpointConnector</code></td>
+<td><strong>同步消费组位点</strong>、写入 offset 映射（checkpoint）</td>
+<td><code>emit.checkpoints.</code>、<code>sync.group.offsets.</code></td>
+</tr>
+<tr>
+<td><code>MirrorHeartbeatConnector</code></td>
+<td><strong>心跳</strong>，用于端到端链路延迟监控</td>
+<td><code>emit.heartbeats.</code></td>
+</tr>
+</tbody></table>
+<h3 id="2-1-三个内部-Topic"><a href="#2-1-三个内部-Topic" class="headerlink" title="2.1 三个内部 Topic"></a>2.1 三个内部 Topic</h3><p>MM2 自己会产生几个内部 topic，<strong>必须理解它们，否则排障无从下手</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>内部 Topic</th>
+<th>写入方</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>heartbeats</code></td>
+<td>Heartbeat Connector</td>
+<td>每个源集群周期性发心跳，用来算跨集群延迟</td>
+</tr>
+<tr>
+<td><code>mm2-offset-syncs.&lt;target&gt;.internal</code></td>
+<td>Source Connector</td>
+<td><strong>offset 映射表</strong>：记录”源集群某 topic 某分区在时刻 T 的 offset”</td>
+</tr>
+<tr>
+<td><code>mm2-checkpoints.&lt;source&gt;.internal</code></td>
+<td>Checkpoint Connector</td>
+<td>消费组位点的检查点，用于把位点翻译到目标集群</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>注意 <code>offset-syncs</code> 的位置由 <code>offset-syncs.topic.location</code> 决定（默认 <code>target</code>）。**所有需要做 offset 转换的客户端，都必须能读到这个 topic。**这是”客户端切集群时该连哪个集群”的关键。</p>
+</blockquote>
+<h3 id="2-2-复制策略（ReplicationPolicy）"><a href="#2-2-复制策略（ReplicationPolicy）" class="headerlink" title="2.2 复制策略（ReplicationPolicy）"></a>2.2 复制策略（ReplicationPolicy）</h3><p><strong>这是 MM2 里最重要的概念，没有之一。</strong></p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>行为</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DefaultReplicationPolicy</code>（默认）</td>
+<td>目标集群里的 topic 名变成 <strong><code>&lt;源集群别名&gt;.&lt;原topic&gt;</code></strong>，如 <code>primary.orders</code></td>
+<td>单向复制、备份、聚合；<strong>能天然避免回环</strong></td>
+</tr>
+<tr>
+<td><code>IdentityReplicationPolicy</code></td>
+<td>目标集群里保持<strong>同名</strong> topic</td>
+<td><strong>双向 active-active</strong>、平滑迁移（客户端改地址即可）</td>
+</tr>
+</tbody></table>
+<p>为什么默认要加前缀？因为<strong>单向复制到”命名空间隔离”的目标</strong>，可以避免与目标集群本地同名 topic 冲突，也让”哪些是复制来的”一目了然。</p>
+<p>而双向复制<strong>必须</strong>用 <code>IdentityReplicationPolicy</code>：否则 A 的 <code>orders</code> 复制到 B 变成 <code>a.orders</code>，B 再复制回 A 变成 <code>b.a.orders</code>，A 再复制到 B 变成 <code>a.b.a.orders</code>……<strong>topic 名无限增长，集群爆炸。</strong></p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">replication.policy.class</span> = <span class="string">org.apache.kafka.connect.mirror.IdentityReplicationPolicy</span></span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>循环检测：MM2 会在被复制的消息上打标记，下游 MM2 跳过”已由自己复制过”的消息，避免双向场景下的回环。但不同版本实现细节有差异，<strong>双向方案上线前必须做真实压测验证</strong>（尤其是 topic 名与消息标记的交互）。这是我在实践中踩过的坑：单向跑得再好，双向配置一变就可能出现消息风暴。</p>
+</blockquote>
+<hr>
+<h2 id="三、配置实战：一份可直接上生产的-MM2-配置"><a href="#三、配置实战：一份可直接上生产的-MM2-配置" class="headerlink" title="三、配置实战：一份可直接上生产的 MM2 配置"></a>三、配置实战：一份可直接上生产的 MM2 配置</h2><p>MM2 的配置文件是”全局参数 + 链路参数（<code>&lt;source&gt;-&gt;&lt;target&gt;.</code>）”的混合体。</p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># ============ 集群定义 ============</span></span><br><span class="line"><span class="attr">clusters</span> = <span class="string">primary, secondary</span></span><br><span class="line"></span><br><span class="line"><span class="attr">primary.bootstrap.servers</span>    = <span class="string">kafka-1:9092,kafka-2:9092,kafka-3:9092</span></span><br><span class="line"><span class="attr">secondary.bootstrap.servers</span>  = <span class="string">kafka-dr-1:9092,kafka-dr-2:9092,kafka-dr-3:9092</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 安全（生产必配）</span></span><br><span class="line"><span class="attr">primary.security.protocol</span>    = <span class="string">SASL_SSL</span></span><br><span class="line"><span class="attr">primary.sasl.mechanism</span>       = <span class="string">SCRAM-SHA-512</span></span><br><span class="line"><span class="attr">primary.sasl.jaas.config</span>     = <span class="string">org.apache.kafka.common.security.scram.ScramLoginModule required \</span></span><br><span class="line"><span class="string">                               username=&quot;mirror&quot; password=&quot;$&#123;MM2_PASSWORD&#125;&quot;;</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># ============ 链路：primary -&gt; secondary ============</span></span><br><span class="line"><span class="attr">primary-&gt;secondary.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">primary-&gt;secondary.topics</span>  = <span class="string">orders, payments, inventory, user-events</span></span><br><span class="line"><span class="comment"># 或者用正则：primary-&gt;secondary.topics = (orders|payments).*</span></span><br><span class="line"><span class="attr">topics.exclude</span> = <span class="string">.*[\-\.]internal, .*\.replica, __consumer_offsets</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># ============ 复制参数 ============</span></span><br><span class="line"><span class="attr">replication.factor</span> = <span class="string">3</span></span><br><span class="line"><span class="attr">refresh.topics.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">refresh.topics.interval.seconds</span> = <span class="string">60       # 动态发现新 topic（默认 600s，按需调小）</span></span><br><span class="line"><span class="attr">sync.topic.configs.enabled</span> = <span class="string">true          # 同步 retention/cleanup.policy 等</span></span><br><span class="line"><span class="attr">sync.topic.acls.enabled</span> = <span class="string">true             # 同步 ACL</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># ============ 心跳（监控链路延迟） ============</span></span><br><span class="line"><span class="attr">emit.heartbeats.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">emit.heartbeats.interval.seconds</span> = <span class="string">1</span></span><br><span class="line"><span class="attr">heartbeats.topic.replication.factor</span> = <span class="string">3</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># ============ Checkpoint（offset 映射 + 位点同步） ============</span></span><br><span class="line"><span class="attr">emit.checkpoints.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">emit.checkpoints.interval.seconds</span> = <span class="string">60</span></span><br><span class="line"><span class="attr">checkpoints.topic.replication.factor</span> = <span class="string">3</span></span><br><span class="line"><span class="attr">offset-syncs.topic.replication.factor</span> = <span class="string">3</span></span><br><span class="line"><span class="attr">offset-syncs.topic.location</span> = <span class="string">target       # offset 映射表放在目标集群</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 【关键】是否把消费者位点直接同步到目标集群</span></span><br><span class="line"><span class="attr">sync.group.offsets.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">sync.group.offsets.interval.seconds</span> = <span class="string">60</span></span><br><span class="line"><span class="attr">refresh.groups.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">refresh.groups.interval.seconds</span> = <span class="string">60</span></span><br><span class="line"><span class="attr">groups.exclude</span> = <span class="string">console-consumer-.*, connect-.*</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># ============ 首次启动从最早开始（历史数据迁移） ============</span></span><br><span class="line"><span class="attr">primary-&gt;secondary.auto.offset.reset</span> = <span class="string">earliest</span></span><br></pre></td></tr></table></figure>
+
+<p>启动：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">bin/connect-mirror-maker.sh config/connect-mirror-maker.properties</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-1-三个致命配置项（90-的线上问题源于此）"><a href="#3-1-三个致命配置项（90-的线上问题源于此）" class="headerlink" title="3.1 三个致命配置项（90% 的线上问题源于此）"></a>3.1 三个致命配置项（90% 的线上问题源于此）</h3><p><strong>① <code>sync.group.offsets.enabled</code> 默认是 <code>false</code>！</strong></p>
+<p>这是最容易被忽略的一点。开启 <code>emit.checkpoints</code> 只是<strong>写了 offset 映射</strong>，但<strong>不会自动把消费组位点同步到目标集群</strong>。想让”备用集群上的消费者能直接从对应位点继续消费”，必须显式打开它：</p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">sync.group.offsets.enabled</span> = <span class="string">true</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>② <code>offset-syncs.topic.location</code> 决定客户端连哪边</strong></p>
+<ul>
+<li><code>target</code>（默认）：映射表在目标集群，客户端切到目标集群时<strong>本地可读</strong>，切换更顺；</li>
+<li><code>source</code>：映射表在源集群，目标集群的消费者要读源集群的 topic（跨集群访问），<strong>一般只在特殊网络拓扑下使用</strong>。</li>
+</ul>
+<p><strong>③ 内部 topic 的副本数必须 ≥ 3</strong></p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">heartbeats.topic.replication.factor</span> = <span class="string">3</span></span><br><span class="line"><span class="attr">checkpoints.topic.replication.factor</span> = <span class="string">3</span></span><br><span class="line"><span class="attr">offset-syncs.topic.replication.factor</span> = <span class="string">3</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>内部 topic 一旦创建就无法改副本数</strong>（只能重建）。默认值在生产多副本集群上如果建在了单副本 broker 上，容灾时这些映射数据先丢——位点平移能力直接失效。<strong>上线前先确认集群副本数配置。</strong></p>
+<hr>
+<h2 id="四、偏移量平移：让消费者无缝切换"><a href="#四、偏移量平移：让消费者无缝切换" class="headerlink" title="四、偏移量平移：让消费者无缝切换"></a>四、偏移量平移：让消费者无缝切换</h2><p>这是 MM2 最核心、也最容易被问倒的能力。</p>
+<h3 id="4-1-原理"><a href="#4-1-原理" class="headerlink" title="4.1 原理"></a>4.1 原理</h3><p><code>MirrorSourceConnector</code> 在复制过程中，会周期性把”源集群某 topic-partition 当时复制到哪个 offset”写进 <code>mm2-offset-syncs</code>。于是就有了：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">源集群 primary: orders-0  offset 1,000,000</span><br><span class="line">目标集群 secondary: orders-0  offset   800,000</span><br></pre></td></tr></table></figure>
+
+<p>有了这条映射，就能把源集群的消费位点”翻译”到目标集群。</p>
+<h3 id="4-2-用代码做平移（RemoteClusterUtils）"><a href="#4-2-用代码做平移（RemoteClusterUtils）" class="headerlink" title="4.2 用代码做平移（RemoteClusterUtils）"></a>4.2 用代码做平移（<code>RemoteClusterUtils</code>）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Properties</span> <span class="variable">props</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Properties</span>();</span><br><span class="line">props.put(<span class="string">&quot;bootstrap.servers&quot;</span>, <span class="string">&quot;kafka-dr-1:9092,kafka-dr-2:9092&quot;</span>); <span class="comment">// 目标集群</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 源集群某消费组在各分区的位点（从源集群 __consumer_offsets 读到）</span></span><br><span class="line">Map&lt;TopicPartition, Long&gt; sourceOffsets = Map.of(</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">TopicPartition</span>(<span class="string">&quot;orders&quot;</span>, <span class="number">0</span>), <span class="number">1_000_000L</span>,</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">TopicPartition</span>(<span class="string">&quot;orders&quot;</span>, <span class="number">1</span>),   <span class="number">950_000L</span></span><br><span class="line">);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 翻译成目标集群的位点</span></span><br><span class="line">Map&lt;TopicPartition, Long&gt; translated = RemoteClusterUtils.translateOffsets(</span><br><span class="line">        props, <span class="string">&quot;primary&quot;</span>, <span class="string">&quot;order-service-group&quot;</span>, sourceOffsets);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 在目标集群上 seek 到翻译后的位点继续消费</span></span><br><span class="line"><span class="keyword">for</span> (Map.Entry&lt;TopicPartition, Long&gt; e : translated.entrySet()) &#123;</span><br><span class="line">    consumer.seek(e.getKey(), e.getValue());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-位点同步（自动版）"><a href="#4-3-位点同步（自动版）" class="headerlink" title="4.3 位点同步（自动版）"></a>4.3 位点同步（自动版）</h3><p>打开 <code>sync.group.offsets.enabled=true</code> 后，Checkpoint Connector 会：</p>
+<ol>
+<li>读源集群 <code>__consumer_offsets</code> 里各消费组的提交位点；</li>
+<li>用 offset-syncs 映射把位点翻译成目标集群的位点；</li>
+<li><strong>把翻译后的位点直接写进目标集群的 <code>__consumer_offsets</code></strong>。</li>
+</ol>
+<p>结果：下游消费者把 bootstrap servers 一改，<strong>无需改代码、无需手工 seek，直接从对应位置继续消费</strong>。</p>
+<h3 id="4-4-平移的三个限制（面试加分点）"><a href="#4-4-平移的三个限制（面试加分点）" class="headerlink" title="4.4 平移的三个限制（面试加分点）"></a>4.4 平移的三个限制（面试加分点）</h3><table>
+<thead>
+<tr>
+<th>限制</th>
+<th>说明</th>
+<th>应对</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>有延迟</strong></td>
+<td>checkpoint 间隔（默认 60s）+ 心跳周期，切换时可能丢&#x2F;重几百 ms 到几十秒的数据</td>
+<td>缩短 <code>emit.checkpoints.interval.seconds</code>；业务侧幂等兜底</td>
+</tr>
+<tr>
+<td><strong>只对齐到”最近一次映射点”</strong></td>
+<td>映射点是周期性的，不是精确到每条消息</td>
+<td>期待”最多重复一小段”，用幂等消费解决</td>
+</tr>
+<tr>
+<td><strong>要求分组标识与顺序</strong></td>
+<td>分区数必须对齐，否则映射无法一一对应</td>
+<td>迁移前校验两端 topic 分区数一致</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>**实践建议：把 offset 平移当作”减少重复量”的手段，而不是”保证 exactly-once”的手段。**容灾切换的最终一致性永远要靠业务幂等。这一点在任何面试里都能拿分。</p>
+</blockquote>
+<hr>
+<h2 id="五、双向-Active-Active-方案"><a href="#五、双向-Active-Active-方案" class="headerlink" title="五、双向 Active-Active 方案"></a>五、双向 Active-Active 方案</h2><h3 id="5-1-拓扑"><a href="#5-1-拓扑" class="headerlink" title="5.1 拓扑"></a>5.1 拓扑</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">      ┌──────────── 双向复制 ────────────┐</span><br><span class="line">      ▼                                 │</span><br><span class="line">[Cluster A]  ──MM2(Identity)──▶  [Cluster B]</span><br><span class="line">      ▲                                 │</span><br><span class="line">      └──────MM2(Identity)──────────────┘</span><br></pre></td></tr></table></figure>
+
+<p>配置要点：</p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">clusters</span> = <span class="string">A, B</span></span><br><span class="line"><span class="attr">replication.policy.class</span> = <span class="string">org.apache.kafka.connect.mirror.IdentityReplicationPolicy</span></span><br><span class="line"></span><br><span class="line"><span class="attr">A-&gt;B.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="attr">B-&gt;A.enabled</span> = <span class="string">true</span></span><br><span class="line"><span class="comment"># 双方必须使用一致的 topic 集合与 exclude 规则，否则会出现&quot;单向可见&quot;</span></span><br><span class="line"><span class="attr">topics.exclude</span> = <span class="string">.*[\-\.]internal, .*\.replica, __consumer_offsets, mm2-.*</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-双向方案的四个难点"><a href="#5-2-双向方案的四个难点" class="headerlink" title="5.2 双向方案的四个难点"></a>5.2 双向方案的四个难点</h3><ol>
+<li><strong>回环</strong>：见上文，靠消息标记 + 版本行为，<strong>必须实测</strong>。</li>
+<li><strong>命名冲突</strong>：同名 topic 在两端各自被本地写入，语义上变成”两个独立 topic 的数据混合在一起”，业务必须能接受（通常靠分区按 key 隔离）。</li>
+<li><strong>配置冲突</strong>：两端 topic 配置（如 <code>retention.ms</code>）不一致时，MM2 的 sync 会来回覆盖，形成”配置抖动”。建议<strong>关掉</strong> <code>sync.topic.configs.enabled</code>，改由配置管理统一管控。</li>
+<li><strong>消费位点语义混乱</strong>：同一消费组在两端都有位点，<code>sync.group.offsets</code> 双向开启会互相覆盖。<strong>双向场景一般关闭位点同步</strong>，由业务层设计”就近读写”。</li>
+</ol>
+<blockquote>
+<p>我的建议：<strong>除非业务真的需要双写，否则优先选”单向复制 + 容灾切换”</strong>。Active-Active 的复杂度不是配置问题，而是数据冲突与业务语义问题，成本往往被严重低估。</p>
+</blockquote>
+<hr>
+<h2 id="六、监控与运维"><a href="#六、监控与运维" class="headerlink" title="六、监控与运维"></a>六、监控与运维</h2><h3 id="6-1-必看指标"><a href="#6-1-必看指标" class="headerlink" title="6.1 必看指标"></a>6.1 必看指标</h3><table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>告警建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>replication-latency-ms</code></td>
+<td>数据从源写入到目标可见的延迟</td>
+<td>&gt; 业务容忍值告警</td>
+</tr>
+<tr>
+<td><code>checkpoint-latency-ms</code></td>
+<td>消费组位点同步延迟</td>
+<td>&gt; 5min 告警（影响切换精度）</td>
+</tr>
+<tr>
+<td><code>record-age-ms</code></td>
+<td>复制记录的平均年龄</td>
+<td>持续增长 &#x3D; 复制落后</td>
+</tr>
+<tr>
+<td><code>record-error-rate</code></td>
+<td>复制失败率</td>
+<td>&gt; 0 立即排查（序列化&#x2F;权限&#x2F;配额）</td>
+</tr>
+<tr>
+<td><code>byte-rate</code> &#x2F; <code>record-count</code></td>
+<td>吞吐</td>
+<td>突降 &#x3D; 链路异常或源无数据</td>
+</tr>
+<tr>
+<td><code>mm2-offset-syncs</code> &#x2F; <code>mm2-checkpoints</code> 的 LEO 增长</td>
+<td>映射是否在推进</td>
+<td>停止增长 &#x3D; 平移能力失效</td>
+</tr>
+</tbody></table>
+<h3 id="6-2-常见故障排查表"><a href="#6-2-常见故障排查表" class="headerlink" title="6.2 常见故障排查表"></a>6.2 常见故障排查表</h3><table>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能原因</th>
+<th>定位方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>新 topic 没被复制</td>
+<td><code>refresh.topics.interval.seconds</code> 未到 &#x2F; 被 <code>topics.exclude</code> 命中</td>
+<td>查 Connect 任务日志；<code>topics.exclude</code> 正则是否误伤</td>
+</tr>
+<tr>
+<td>复制延迟持续增长</td>
+<td>网络带宽、目标集群写入配额、分区数不足（并发受限）</td>
+<td>看 <code>byte-rate</code>、目标集群 <code>throttle-time</code></td>
+</tr>
+<tr>
+<td>位点同步失效</td>
+<td><code>sync.group.offsets.enabled=false</code> &#x2F; 组名被 <code>groups.exclude</code> 命中</td>
+<td><code>ACL</code>&#x2F;日志 + 检查 <code>mm2-checkpoints</code></td>
+</tr>
+<tr>
+<td>任务反复重启</td>
+<td>序列化不兼容、topic 被删、内部 topic 副本不足</td>
+<td>Connect worker 日志里的 stack trace</td>
+</tr>
+<tr>
+<td>双向出现消息风暴</td>
+<td>回环未被正确检测</td>
+<td>立刻停一侧 MM2，比对 topic 名与消息标记</td>
+</tr>
+<tr>
+<td>目标集群磁盘爆</td>
+<td>retention 配置未同步 &#x2F; 同步被覆盖</td>
+<td>对比两端 topic 配置</td>
+</tr>
+</tbody></table>
+<h3 id="6-3-上线与演练清单"><a href="#6-3-上线与演练清单" class="headerlink" title="6.3 上线与演练清单"></a>6.3 上线与演练清单</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">1. 两端 topic 分区数一致（否则无法平移）</span><br><span class="line">2. 内部 topic 副本数 ≥ 3，且建在多副本 broker 上</span><br><span class="line">3. 首次启动观察全量同步进度（auto.offset.reset=earliest 会全量拉历史）</span><br><span class="line">4. 压测链路带宽：源集群出流量 = 复制流量，别忽略限流与配额</span><br><span class="line">5. 演练切换：停源集群写入 → 等 replication-latency 收敛 → 客户端改 bootstrap → 验证重复/丢失区间</span><br><span class="line">6. 演练回切：确认回切时的位点平移方向</span><br><span class="line">7. 监控接告警：延迟、错误率、映射推进</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、和替代方案比一比"><a href="#七、和替代方案比一比" class="headerlink" title="七、和替代方案比一比"></a>七、和替代方案比一比</h2><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>原理</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>MM2</strong></td>
+<td>Connect 应用层复制 + offset 映射</td>
+<td>开源、活跃、可定制、支持动态发现与 ACL&#x2F;配置同步</td>
+<td>需做 offset 平移；有延迟；双向复杂</td>
+</tr>
+<tr>
+<td>MM1</td>
+<td>消费-生产循环</td>
+<td>简单</td>
+<td>无平移、无位点同步、无动态发现</td>
+</tr>
+<tr>
+<td>Confluent Replicator &#x2F; Cluster Linking</td>
+<td>broker 层字节级复制，<strong>offset 完全一致</strong></td>
+<td>无需平移、延迟极低、切换天然无缝</td>
+<td>商业版特性，成本高</td>
+</tr>
+<tr>
+<td>自研双写</td>
+<td>业务代码同时写两个集群</td>
+<td>可控</td>
+<td>侵入大、一致性难保证、维护成本高</td>
+</tr>
+<tr>
+<td>应用级消息表 + 补偿</td>
+<td>事务消息&#x2F;本地表 + 定时补偿</td>
+<td>强一致可控</td>
+<td>延迟高、实现复杂</td>
+</tr>
+</tbody></table>
+<p><strong>选型结论</strong>：</p>
+<ul>
+<li>预算有限、需要开源方案 → <strong>MM2</strong>（配合业务幂等做容灾切换）；</li>
+<li>追求”切换零改造、offset 一致” → 上商业版 Cluster Linking；</li>
+<li>只做数据备份&#x2F;入湖，不涉及消费切换 → MM2 单向复制就够了。</li>
+</ul>
+<hr>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：为什么 MM2 复制过来的 offset 和源集群不一样？</strong></p>
+<p>Kafka 的 offset 是<strong>分区内自增的物理位置</strong>，由目标集群的分区写入顺序决定。复制是”重新生产”消息，因此起点不同。MM2 通过 <code>mm2-offset-syncs</code> 记录映射来解决”位点对齐”问题。</p>
+<p><strong>Q2：<code>emit.checkpoints</code> 和 <code>sync.group.offsets</code> 的区别？</strong></p>
+<p>前者是”<strong>写 offset 映射</strong>“（让客户端能自己翻译），后者是”<strong>把翻译后的位点写进目标集群</strong>“（让客户端无需改代码）。只开前者不解决问题，这是最经典的配置误区。</p>
+<p><strong>Q3：双向复制为什么要用 <code>IdentityReplicationPolicy</code>？</strong></p>
+<p>因为默认策略会给 topic 名加源集群前缀，双向场景下前缀会反复叠加（<code>a.b.a.orders</code>），导致 topic 数量与名字无限膨胀，最终拖垮集群。</p>
+<p><strong>Q4：MM2 能保证 exactly-once 吗？</strong></p>
+<p>不能严格保证端到端 exactly-once。MM2 的复制本质是 at-least-once（配合 offset 平移后表现为”可能重复”），端到端一致性依赖<strong>消费者幂等</strong>。Kafka 事务能保证单个集群内的 EOS，跨集群复制要另行设计。</p>
+<p><strong>Q5：切换时怎么把”丢&#x2F;重”控制到最小？</strong></p>
+<p>三点：① 缩短 <code>emit.checkpoints.interval.seconds</code>；② 切换前<strong>停写源集群</strong>（冻结流量）并等待复制延迟收敛到 0；③ 消费端做幂等 + 记录切换水位线，便于事后对账。</p>
+<hr>
+<h2 id="九、小结"><a href="#九、小结" class="headerlink" title="九、小结"></a>九、小结</h2><table>
+<thead>
+<tr>
+<th>要点</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>定位</td>
+<td>Kafka Connect 之上的官方跨集群复制方案，三个 Connector 分工</td>
+</tr>
+<tr>
+<td>核心价值</td>
+<td><strong>offset 映射 + 消费组位点同步</strong>，实现客户端无缝切换</td>
+</tr>
+<tr>
+<td>关键配置</td>
+<td><code>sync.group.offsets.enabled=true</code>（默认 false！）、<code>offset-syncs.topic.location</code>、内部 topic 副本数</td>
+</tr>
+<tr>
+<td>单双向差异</td>
+<td>单向用 <code>DefaultReplicationPolicy</code>（加前缀）；双向必须 <code>IdentityReplicationPolicy</code></td>
+</tr>
+<tr>
+<td>位点平移</td>
+<td><code>RemoteClusterUtils.translateOffsets</code>，有延迟，<strong>不能替代幂等</strong></td>
+</tr>
+<tr>
+<td>必看指标</td>
+<td><code>replication-latency-ms</code>、<code>checkpoint-latency-ms</code>、<code>record-error-rate</code></td>
+</tr>
+<tr>
+<td>演练铁律</td>
+<td>先在预发做完整切换&#x2F;回切演练，别把它当”配好就完事”的组件</td>
+</tr>
+<tr>
+<td>选型</td>
+<td>开源首选 MM2；要”零改造切换”看 Cluster Linking；只做备份则单向即可</td>
+</tr>
+</tbody></table>
+<p>MirrorMaker 2 真正解决的问题不是”把数据搬过去”——那是最简单的一半。它解决的是**”搬过去之后，消费者还能接着原来的位置继续干活”**。理解到这一层，才算真正理解了跨集群复制的工程本质。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/">https://jiweidong.github.io/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/Kafka/">Kafka</a><a class="post-meta__tags" href="/tags/MirrorMaker-2/">MirrorMaker 2</a><a class="post-meta__tags" href="/tags/%E5%BC%82%E5%9C%B0%E5%AE%B9%E7%81%BE/">异地容灾</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/16/redis-acl-security-hardening-deep-practice/" title="【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地</div></div><div class="info-2"><div class="info-item-1">【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地面试官：一个只暴露了 6379 端口、没有密码的 Redis，攻击者能做什么？很多人第一反应是：”Redis 只是缓存，里面没敏感数据，最坏就是被清库。” 这是极其危险的误判。一个未授权访问的 Redis，在攻击者眼里不是”缓存”，而是一台可以被利用来写文件、加载代码的远程命令执行入口。 这篇文章我们把攻击链完整拆开（知道怎么被打，才知道怎么防），再落到 Redis 6+ 的 ACL 权限体系上，给出一套可以直接上生产的加固方案。  一、先看攻击链：未授权 Redis 是怎么被打穿的前提条件只有一个：6379 可访问 + 无认证（或弱密码）。 1.1 利用一：写 SSH 公钥（最经典）12345redis-cli -h 10.0.0.5127.0.0.1:6379&gt; CONFIG SET dir /root/.ssh127.0.0.1:6379&gt; CONFIG SET dbfilename authorized_keys127.0.0.1:6379&gt; SET x ...</div></div></div></a><a class="pagination-related" href="/2026/09/16/java-stream-gatherers-deep-dive/" title="【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现</div></div><div class="info-2"><div class="info-item-1">【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现面试官：Stream 的中间操作只有 map&#x2F;filter&#x2F;flatMap，如果我要做”滑动窗口聚合”，你怎么办？这是一个非常经典的”能力边界”问题。 在 JDK 24 之前，标准答案通常有三种，而且都不体面：  用 collect 兜底：把整个流物化成一个 List，再用循环做窗口切分。问题是——流式语义没了，内存占用从 O(1) 变成 O(n)，遇到无限流直接卡死。 自己写 Spliterator：可行，但要同时处理串行、并行、tryAdvance&#x2F;forEachRemaining、characteristics 四个维度，代码量巨大且极易踩坑。 上第三方库（如 StreamEx、protonpack）：能用，但引入了额外依赖，团队里还得统一认知。  JDK 22 引入预览、JDK 24 正式转正的 Stream Gatherers（JEP 461 → JEP 473 → JEP 485） 就是为了填这个坑：它给 Stream...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/06/11/message-queue-kafka-rabbitmq/" title="消息队列核心原理与实战 — Kafka &amp; RabbitMQ 对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">消息队列核心原理与实战 — Kafka &amp; RabbitMQ 对比</div></div><div class="info-2"><div class="info-item-1">前言消息队列是分布式系统中的关键组件，承担着削峰填谷、异步解耦、流式处理等核心职责。市面上主流的消息中间件中，Kafka 和 RabbitMQ 最具代表性。本文将从原理到实战，系统讲解消息队列的核心知识点。  一、消息队列解决了什么问题？1.1 异步解耦123456789❌ 没有 MQ：下单 → 扣库存 → 发短信 → 发邮件 → 返回（串行等待，耗时 2s+）        每个步骤的延迟是累加的 → 用户体验差        任何一个环节挂掉 → 整个下单失败✅ 有 MQ：下单 → 写入 DB → 发消息到 MQ → 返回（耗时 50ms）            └── MQ ──→ 扣库存服务（异步）                  └──→ 短信服务（异步）                  └──→ 邮件服务（异步）        各消费者独立运行，互不影响  1.2 削峰填谷12345678910流量曲线：请求量 ↑ 3000│  ████████ 2000│  ████████████ 1000│  ████████████████     └──────────...</div></div></div></a><a class="pagination-related" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</div></div><div class="info-2"><div class="info-item-1">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践引言：为什么需要 Kafka Connect？很多团队接 Kafka 的方式是”写个消费者程序，把数据从 Topic 搬到数据库”。一个系统这么干没问题，当系统多起来：订单数据进 ES、埋点数据进 HDFS、MySQL 变更同步到 Redis……每个需求写一个消费程序，就要重复处理：  分区分配与 Rebalance 位移提交与 Exactly-Once 语义 断线重连、重试、死信 连接管理、线程池、资源释放  Kafka Connect 的价值就是把”搬数据”这件事框架化：你只需要写（或直接复用现成的）Source&#x2F;Sink Connector，框架帮你搞定分布式执行、容错、偏移量管理、负载均衡。本文从架构原理到生产落地，带你把 Kafka Connect 用明白。 一、核心架构：三个角色 + 两类组件1.1 三个运行时角色   角色 说明    Worker 运行 Connector 和 Task 的 JVM 进程。分 Standalone（单机）和 Distributed（集群）两种模式 ...</div></div></div></a><a class="pagination-related" href="/2026/07/02/kafka-consumer-rebalance-deep-dive/" title="【消息队列】Kafka 消费者组重平衡机制深度解析：从原理到性能调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【消息队列】Kafka 消费者组重平衡机制深度解析：从原理到性能调优</div></div><div class="info-2"><div class="info-item-1">【消息队列】Kafka 消费者组重平衡机制深度解析：从原理到性能调优概述消费者组重平衡（Rebalance）是 Kafka 核心机制之一，也是生产环境中引发消费延迟、重复消费、甚至消息积压的头号元凶。本文从源码层面深入拆解 Rebalance 的原理、演进和优化策略。 一、什么是 Rebalance？Rebalance 是 Kafka 消费者组内分区所有权重新分配的过程。当以下事件发生时触发： 12345// 触发 Rebalance 的四种场景1. 消费者组成员加入或离开（新服务上线/下线/崩溃）2. 消费者组订阅主题变化（subscribe() 新主题）3. 分区数变化（AdminClient.createPartitions()）4. 组协调者（Group Coordinator）变更  Rebalance 期间，消费者组内所有成员停止消费，等待新的分配方案生效。 二、Rebalance 协议演进2.1 Eager Rebalance（0.11.0 之前）1234567891011协调者               消费者A          消费者B          消...</div></div></div></a><a class="pagination-related" href="/2026/07/26/kafka-streams-dsl-state-store-deep-practice/" title="【消息队列】Kafka Streams 流处理 DSL 与状态存储深度实战：从入门到生产级应用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">【消息队列】Kafka Streams 流处理 DSL 与状态存储深度实战：从入门到生产级应用</div></div><div class="info-2"><div class="info-item-1">Kafka Streams 流处理 DSL 与状态存储深度实战：从入门到生产级应用一、为什么要用 Kafka Streams？当我们需要对 Kafka 中的数据进行实时处理（如过滤、聚合、JOIN 等），通常有以下选择：    方案 优点 缺点    普通 Consumer 处理 简单直接 缺乏状态管理，容错复杂   Apache Flink 功能强大，生态完善 部署运维成本高   Apache Spark Streaming 微批次成熟的 DAG 引擎 延迟较高   Kafka Streams 轻量、内嵌、Exactly-Once 仅限 Kafka 生态   Kafka Streams 是一个内嵌式流处理库（不是集群框架），它直接集成到你的 Java 应用中，无需独立部署。核心优势有：  Exactly-Once 语义：端到端精确一次处理 状态存储：内置 RocksDB 持久化状态 一对多 Join：支持 Stream-Stream、Stream-Table、Table-Table JOIN 优雅降级：内嵌式，依赖少，运维简单  二、核心概念与架构2.1 拓扑结构Kafka S...</div></div></div></a><a class="pagination-related" href="/2026/06/17/kafka-architecture-deep-dive/" title="Apache Kafka 架构原理与存储机制深度剖析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">Apache Kafka 架构原理与存储机制深度剖析</div></div><div class="info-2"><div class="info-item-1">Apache Kafka 架构原理与存储机制深度剖析一、Kafka 的诞生与设计哲学Apache Kafka 由 LinkedIn 于 2011 年开源，最初的设计动机很简单：解决传统消息队列（ActiveMQ、RabbitMQ）在处理海量日志数据时的吞吐瓶颈。LinkedIn 团队发现，当时的消息队列产品在面对每天千亿条消息的规模时，性能急剧下降——IO 模型低效、消费剥离困难、数据持久化开销大。 Kafka 的设计团队做了几个关键决策，奠定了它今日在消息队列领域的统治地位：  磁盘顺序写入 —— 放弃随机 IO，拥抱顺序 IO（机械硬盘上顺序写入比随机快 6000 倍） 零拷贝（Zero Copy） —— 数据直接从磁盘到网卡，跳过用户态内存拷贝 Pull 模型 —— 消费者主动拉取，而非 Broker 推送，消费者有能力控制消费速度 日志即存储 —— 消息就是追加日志，没有索引、没有 B+ 树   “Don’t use your disk as a random-access device; use it as a sequential-access device.” ——...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">627</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">740</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">204</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Kafka-%E6%9E%B6%E6%9E%84%E3%80%91MirrorMaker-2-%E8%B7%A8%E9%9B%86%E7%BE%A4%E5%A4%8D%E5%88%B6%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9A%E5%BC%82%E5%9C%B0%E5%AE%B9%E7%81%BE%E3%80%81%E5%8F%8C%E5%90%91%E5%90%8C%E6%AD%A5%E4%B8%8E%E5%81%8F%E7%A7%BB%E9%87%8F%E5%B9%B3%E7%A7%BB"><span class="toc-number">1.</span> <span class="toc-text">【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%88%91%E4%BB%AC%E5%81%9A%E4%BA%86%E4%B8%A4%E5%9C%B0%E4%B8%89%E4%B8%AD%E5%BF%83%EF%BC%8CKafka-%E6%80%8E%E4%B9%88%E6%8A%8A%E6%95%B0%E6%8D%AE%E5%90%8C%E6%AD%A5%E8%BF%87%E5%8E%BB%EF%BC%9F%E5%A6%82%E6%9E%9C%E4%B8%BB%E9%9B%86%E7%BE%A4%E6%8C%82%E4%BA%86%EF%BC%8C%E4%B8%8B%E6%B8%B8%E6%B6%88%E8%B4%B9%E8%80%85%E8%83%BD%E6%97%A0%E7%BC%9D%E5%88%87%E5%88%B0%E5%A4%87%E7%94%A8%E9%9B%86%E7%BE%A4%E5%90%97%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：我们做了两地三中心，Kafka 怎么把数据同步过去？如果主集群挂了，下游消费者能无缝切到备用集群吗？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81MM1-%E7%9A%84%E7%97%9B%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E8%A6%81%E6%9C%89-MM2"><span class="toc-number">1.2.</span> <span class="toc-text">一、MM1 的痛：为什么要有 MM2</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81MM2-%E6%9E%B6%E6%9E%84%EF%BC%9A%E4%B8%89%E4%B8%AA-Connector-%E5%88%86%E5%B7%A5"><span class="toc-number">1.3.</span> <span class="toc-text">二、MM2 架构：三个 Connector 分工</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%89%E4%B8%AA%E5%86%85%E9%83%A8-Topic"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 三个内部 Topic</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%A4%8D%E5%88%B6%E7%AD%96%E7%95%A5%EF%BC%88ReplicationPolicy%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 复制策略（ReplicationPolicy）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E9%85%8D%E7%BD%AE%E5%AE%9E%E6%88%98%EF%BC%9A%E4%B8%80%E4%BB%BD%E5%8F%AF%E7%9B%B4%E6%8E%A5%E4%B8%8A%E7%94%9F%E4%BA%A7%E7%9A%84-MM2-%E9%85%8D%E7%BD%AE"><span class="toc-number">1.4.</span> <span class="toc-text">三、配置实战：一份可直接上生产的 MM2 配置</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%89%E4%B8%AA%E8%87%B4%E5%91%BD%E9%85%8D%E7%BD%AE%E9%A1%B9%EF%BC%8890-%E7%9A%84%E7%BA%BF%E4%B8%8A%E9%97%AE%E9%A2%98%E6%BA%90%E4%BA%8E%E6%AD%A4%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 三个致命配置项（90% 的线上问题源于此）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%81%8F%E7%A7%BB%E9%87%8F%E5%B9%B3%E7%A7%BB%EF%BC%9A%E8%AE%A9%E6%B6%88%E8%B4%B9%E8%80%85%E6%97%A0%E7%BC%9D%E5%88%87%E6%8D%A2"><span class="toc-number">1.5.</span> <span class="toc-text">四、偏移量平移：让消费者无缝切换</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%8E%9F%E7%90%86"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 原理</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E7%94%A8%E4%BB%A3%E7%A0%81%E5%81%9A%E5%B9%B3%E7%A7%BB%EF%BC%88RemoteClusterUtils%EF%BC%89"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 用代码做平移（RemoteClusterUtils）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E4%BD%8D%E7%82%B9%E5%90%8C%E6%AD%A5%EF%BC%88%E8%87%AA%E5%8A%A8%E7%89%88%EF%BC%89"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 位点同步（自动版）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E5%B9%B3%E7%A7%BB%E7%9A%84%E4%B8%89%E4%B8%AA%E9%99%90%E5%88%B6%EF%BC%88%E9%9D%A2%E8%AF%95%E5%8A%A0%E5%88%86%E7%82%B9%EF%BC%89"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 平移的三个限制（面试加分点）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%8F%8C%E5%90%91-Active-Active-%E6%96%B9%E6%A1%88"><span class="toc-number">1.6.</span> <span class="toc-text">五、双向 Active-Active 方案</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%8B%93%E6%89%91"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 拓扑</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%8F%8C%E5%90%91%E6%96%B9%E6%A1%88%E7%9A%84%E5%9B%9B%E4%B8%AA%E9%9A%BE%E7%82%B9"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 双向方案的四个难点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E7%9B%91%E6%8E%A7%E4%B8%8E%E8%BF%90%E7%BB%B4"><span class="toc-number">1.7.</span> <span class="toc-text">六、监控与运维</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%BF%85%E7%9C%8B%E6%8C%87%E6%A0%87"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 必看指标</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%B8%B8%E8%A7%81%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5%E8%A1%A8"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 常见故障排查表</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E4%B8%8A%E7%BA%BF%E4%B8%8E%E6%BC%94%E7%BB%83%E6%B8%85%E5%8D%95"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 上线与演练清单</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%92%8C%E6%9B%BF%E4%BB%A3%E6%96%B9%E6%A1%88%E6%AF%94%E4%B8%80%E6%AF%94"><span class="toc-number">1.8.</span> <span class="toc-text">七、和替代方案比一比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E5%B0%8F%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/async-profiler-flamegraph-deep-practice/" title="【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU/内存/锁全维度线上排障">【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU/内存/锁全维度线上排障</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/" title="【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档">【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/java-stream-gatherers-deep-dive/" title="【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现">【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/" title="【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移">【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/redis-acl-security-hardening-deep-practice/" title="【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地">【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

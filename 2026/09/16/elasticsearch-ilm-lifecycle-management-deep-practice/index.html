@@ -1,0 +1,563 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档面试官：日志平台每天写入 500GB，一年就是 180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？这个问题背后其实有三层追问：  写入侧：单个索引无限增长会怎样？——分片数不能动态改、段文件越来越多、查询越来越慢、forcemerge 越来越不可行。 存储侧：冷数据占着高性能 SSD 是不是浪费">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档面试官：日志平台每天写入 500GB，一年就是 180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？这个问题背后其实有三层追问：  写入侧：单个索引无限增长会怎样？——分片数不能动态改、段文件越来越多、查询越来越慢、forcemerge 越来越不可行。 存储侧：冷数据占着高性能 SSD 是不是浪费">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-16T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-16T00:03:50.521Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="ILM">
+<meta property="article:tag" content="索引管理">
+<meta property="article:tag" content="运维">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档",
+  "url": "https://jiweidong.github.io/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-16T00:00:00.000Z",
+  "dateModified": "2026-09-16T00:03:50.521Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">627</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">740</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">204</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-16T00:03:50.521Z" title="更新于 2026-09-16 08:03:50">2026-09-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/Elasticsearch/">Elasticsearch</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【ES-运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover-与自动归档"><a href="#【ES-运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover-与自动归档" class="headerlink" title="【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档"></a>【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档</h1><h2 id="面试官：日志平台每天写入-500GB，一年就是-180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？"><a href="#面试官：日志平台每天写入-500GB，一年就是-180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？" class="headerlink" title="面试官：日志平台每天写入 500GB，一年就是 180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？"></a>面试官：日志平台每天写入 500GB，一年就是 180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？</h2><p>这个问题背后其实有三层追问：</p>
+<ol>
+<li><strong>写入侧</strong>：单个索引无限增长会怎样？——分片数不能动态改、段文件越来越多、查询越来越慢、forcemerge 越来越不可行。</li>
+<li><strong>存储侧</strong>：冷数据占着高性能 SSD 是不是浪费？——数据”热度”随时间单调衰减，但硬件成本是常数。</li>
+<li><strong>运维侧</strong>：谁来每天手动 rollover、手动改副本、手动删过期索引？——靠人肉脚本，迟早出事故。</li>
+</ol>
+<p>Elasticsearch 给出的标准答案是 <strong>ILM（Index Lifecycle Management，索引生命周期管理）</strong>：用声明式的策略，把”索引从生到死”的全过程自动化。</p>
+<p>这篇文章从 Phase&#x2F;Action 模型讲到冷热分层架构，再到生产级 policy 实战与踩坑清单。</p>
+<hr>
+<h2 id="一、ILM-的核心模型：Phase-与-Action"><a href="#一、ILM-的核心模型：Phase-与-Action" class="headerlink" title="一、ILM 的核心模型：Phase 与 Action"></a>一、ILM 的核心模型：Phase 与 Action</h2><p>ILM 把索引的一生划分为 <strong>5 个阶段（Phase）</strong>，每个阶段可以挂 <strong>若干动作（Action）</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>语义</th>
+<th>典型动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>hot</code></td>
+<td>正在被高频写入&#x2F;查询</td>
+<td><code>rollover</code>、<code>set_priority</code></td>
+</tr>
+<tr>
+<td><code>warm</code></td>
+<td>不再写入，仍会被查询</td>
+<td><code>allocate</code>、<code>forcemerge</code>、<code>shrink</code>、<code>readonly</code>、<code>set_priority</code></td>
+</tr>
+<tr>
+<td><code>cold</code></td>
+<td>很少查询，允许更高延迟</td>
+<td><code>allocate</code>、<code>searchable_snapshot</code>、<code>set_priority</code></td>
+</tr>
+<tr>
+<td><code>frozen</code></td>
+<td>几乎不查，只做合规留存</td>
+<td><code>searchable_snapshot</code></td>
+</tr>
+<tr>
+<td><code>delete</code></td>
+<td>到期删除</td>
+<td><code>delete</code>、<code>wait_for_snapshot</code></td>
+</tr>
+</tbody></table>
+<p>**关键设计点：Phase 是”单向流动”的。**索引只会 hot → warm → cold → frozen → delete，不能回退（除非用 <code>_ilm/move</code> 手动干预）。这个约束保证了生命周期的确定性。</p>
+<h3 id="1-1-Action-清单"><a href="#1-1-Action-清单" class="headerlink" title="1.1 Action 清单"></a>1.1 Action 清单</h3><table>
+<thead>
+<tr>
+<th>Action</th>
+<th>作用</th>
+<th>主要参数</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>rollover</code></td>
+<td>达到阈值时切新建索引</td>
+<td><code>max_primary_shard_size</code>、<code>max_age</code>、<code>max_docs</code></td>
+<td>索引名必须以数字结尾，且要有 write alias</td>
+</tr>
+<tr>
+<td><code>set_priority</code></td>
+<td>设置恢复优先级</td>
+<td><code>priority</code>（默认 hot&#x3D;100、warm&#x3D;50、cold&#x3D;0）</td>
+<td>越高越先恢复</td>
+</tr>
+<tr>
+<td><code>allocate</code></td>
+<td>调整副本数 &#x2F; 迁移到指定节点</td>
+<td><code>number_of_replicas</code>、<code>require</code>&#x2F;<code>include</code>&#x2F;<code>exclude</code>、<code>total_shards_per_node</code></td>
+<td>8.x 的 <code>migrate</code> 动作已移除，迁移由它直接完成</td>
+</tr>
+<tr>
+<td><code>forcemerge</code></td>
+<td>合并段，减少段数</td>
+<td><code>max_num_segments</code></td>
+<td><strong>只在 warm 做一次</strong>，是 IO 密集型操作</td>
+</tr>
+<tr>
+<td><code>shrink</code></td>
+<td>减少主分片数</td>
+<td><code>number_of_shards</code></td>
+<td>需先只读；数据流底层索引不支持</td>
+</tr>
+<tr>
+<td><code>readonly</code></td>
+<td>置为只读</td>
+<td>—</td>
+<td>阻止写入，避免误改</td>
+</tr>
+<tr>
+<td><code>searchable_snapshot</code></td>
+<td>转成”可搜索快照”</td>
+<td><code>snapshot_repository</code>、<code>storage</code>（<code>shared_cache</code>&#x2F;<code>full_copy</code>）</td>
+<td>需先有快照仓库；frozen 必须用它</td>
+</tr>
+<tr>
+<td><code>delete</code></td>
+<td>删除索引</td>
+<td><code>delete_searchable_snapshot</code></td>
+<td>建议配合 <code>wait_for_snapshot</code></td>
+</tr>
+<tr>
+<td><code>wait_for_snapshot</code></td>
+<td>等待快照完成</td>
+<td><code>policy</code></td>
+<td>保证”先备份再删”</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>版本提示：<code>freeze</code> 动作（旧版冻结索引）和 <code>migrate</code> 动作在 8.x 已被移除。冻结索引的能力由”可搜索快照”取代，节点迁移由 <code>allocate</code> 完成。</p>
+</blockquote>
+<h3 id="1-2-min-age-到底从什么时候算？"><a href="#1-2-min-age-到底从什么时候算？" class="headerlink" title="1.2 min_age 到底从什么时候算？"></a>1.2 <code>min_age</code> 到底从什么时候算？</h3><p>这是<strong>最容易理解错的一个点</strong>。</p>
+<blockquote>
+<p><code>min_age</code> 的基准是<strong>索引自身的创建时间</strong>（不是”进入上一个阶段的时刻”，也不是”策略创建时间”）。</p>
+</blockquote>
+<p>举例：policy 里 warm 阶段 <code>min_age: 3d</code>，意思是”这个索引从被创建算起满 3 天后进入 warm”。</p>
+<p>在线环境里判断某个索引为什么还卡在某个阶段，<strong>不要靠猜，用 <code>_ilm/explain</code> 看真实状态</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">GET logs-app-000042/_ilm/explain</span><br></pre></td></tr></table></figure>
+
+<p>返回里的关键字段：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;indices&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;logs-app-000042&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">      <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;logs-app-000042&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;managed&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;policy&quot;</span><span class="punctuation">:</span> <span class="string">&quot;logs-policy&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;phase&quot;</span><span class="punctuation">:</span> <span class="string">&quot;warm&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;action&quot;</span><span class="punctuation">:</span> <span class="string">&quot;forcemerge&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;step&quot;</span><span class="punctuation">:</span> <span class="string">&quot;forcemerge&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;5.2d&quot;</span><span class="punctuation">,</span>                       <span class="comment">// 索引当前年龄</span></span><br><span class="line">      <span class="attr">&quot;phase_time&quot;</span><span class="punctuation">:</span> <span class="string">&quot;2026-09-11T02:00:00Z&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;step_info&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;max_num_segments&quot;</span><span class="punctuation">:</span> <span class="number">1</span> <span class="punctuation">&#125;</span></span><br><span class="line">    <span class="punctuation">&#125;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>还有一个补数据的场景：如果是<strong>回灌历史数据</strong>，索引创建时间是”现在”，会导致它立刻被判成”很新”。这时用：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;index.lifecycle.parse_origination_date&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>让 ILM 从索引名里的日期（如 <code>logs-app-2025.01.15-000001</code>）解析真实起点。</p>
+<hr>
+<h2 id="二、Rollover：ILM-的发动机"><a href="#二、Rollover：ILM-的发动机" class="headerlink" title="二、Rollover：ILM 的发动机"></a>二、Rollover：ILM 的发动机</h2><p>没有 rollover，生命周期根本无从谈起——因为”一个新索引”是阶段推进的载体。</p>
+<h3 id="2-1-Rollover-的触发条件"><a href="#2-1-Rollover-的触发条件" class="headerlink" title="2.1 Rollover 的触发条件"></a>2.1 Rollover 的触发条件</h3><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">&quot;rollover&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;max_primary_shard_size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;50gb&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;max_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;1d&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;max_docs&quot;</span><span class="punctuation">:</span> <span class="number">100000000</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>建议</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>max_primary_shard_size</code></td>
+<td>30~50GB</td>
+<td><strong>首选</strong>，直接控制单分片大小，避免”大分片难恢复”</td>
+</tr>
+<tr>
+<td><code>max_age</code></td>
+<td>1d</td>
+<td>保证时间边界清晰，便于按天排查&#x2F;归档</td>
+</tr>
+<tr>
+<td><code>max_docs</code></td>
+<td>1亿</td>
+<td>文档体积差异大时才用</td>
+</tr>
+</tbody></table>
+<p><strong>只要满足任意一个条件就触发</strong>（OR 语义）。</p>
+<blockquote>
+<p>注意：<code>max_size</code> 是按”所有主分片总量”还是”单分片”？现代最佳实践一律用 <strong><code>max_primary_shard_size</code>（单主分片）</strong>，因为分片数一旦确定就不能改，按总量控制会导致分片越切越大。</p>
+</blockquote>
+<h3 id="2-2-Rollover-的前置条件（经典索引）"><a href="#2-2-Rollover-的前置条件（经典索引）" class="headerlink" title="2.2 Rollover 的前置条件（经典索引）"></a>2.2 Rollover 的前置条件（经典索引）</h3><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1) 创建 bootstrap 索引 + write alias（别名指向唯一写索引）</span></span><br><span class="line">PUT logs-app<span class="number">-000001</span></span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;aliases&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;logs-app&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;is_write_index&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span> <span class="punctuation">&#125;</span></span><br><span class="line">  <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;index.lifecycle.name&quot;</span><span class="punctuation">:</span> <span class="string">&quot;logs-policy&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;index.lifecycle.rollover_alias&quot;</span><span class="punctuation">:</span> <span class="string">&quot;logs-app&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;number_of_shards&quot;</span><span class="punctuation">:</span> <span class="number">3</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;number_of_replicas&quot;</span><span class="punctuation">:</span> <span class="number">1</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>三个硬性要求：</p>
+<ol>
+<li>索引名必须<strong>以数字结尾</strong>（<code>-000001</code>），rollover 时递增；</li>
+<li>必须配置 <code>index.lifecycle.rollover_alias</code>；</li>
+<li>该别名必须<strong>指向这个索引</strong>，且只有它被标记为 <code>is_write_index: true</code>。</li>
+</ol>
+<p>最常见的报错就是：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">illegal_argument_exception: index.lifecycle.rollover_alias [logs-app] does not point to index [logs-app-000002]</span><br></pre></td></tr></table></figure>
+
+<p>含义：rollover 想切新索引，但别名还指向旧的那个。通常是<strong>手工改过别名</strong>或<strong>多个索引争抢同一个别名</strong>导致的。</p>
+<h3 id="2-3-Data-Stream：让-rollover-自动发生"><a href="#2-3-Data-Stream：让-rollover-自动发生" class="headerlink" title="2.3 Data Stream：让 rollover 自动发生"></a>2.3 Data Stream：让 rollover 自动发生</h3><p>新版最佳实践是<strong>用 Data Stream 替代手工 alias</strong>。Data Stream 天然是”只追加 + 自动 rollover”的：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">PUT _index_template/logs-template</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;index_patterns&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span><span class="string">&quot;logs-app-*&quot;</span><span class="punctuation">]</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;data_stream&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span><span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;template&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">      <span class="attr">&quot;index.lifecycle.name&quot;</span><span class="punctuation">:</span> <span class="string">&quot;logs-policy&quot;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;number_of_shards&quot;</span><span class="punctuation">:</span> <span class="number">3</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;number_of_replicas&quot;</span><span class="punctuation">:</span> <span class="number">1</span></span><br><span class="line">    <span class="punctuation">&#125;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>写入时直接用 <code>logs-app</code> 这个名字，ES 会自动创建第一个底层索引（<code>.ds-logs-app-2026.09.16-000001</code>），并在 rollover 时自动递增。<strong>使用者完全不用管别名与索引名。</strong></p>
+<p>对比一下：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>经典索引 + alias</th>
+<th>Data Stream</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>手动创建 bootstrap</td>
+<td>需要</td>
+<td>不需要</td>
+</tr>
+<tr>
+<td>rollover 后别名维护</td>
+<td>ILM 维护，易出错</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>能否删除单条文档</td>
+<td>可以</td>
+<td><strong>不可以</strong>（append-only）</td>
+</tr>
+<tr>
+<td>是否需要 <code>@timestamp</code></td>
+<td>否</td>
+<td><strong>必须</strong></td>
+</tr>
+<tr>
+<td>能否 update</td>
+<td>可以</td>
+<td>不能（只能 <code>_update_by_query</code> 也受限）</td>
+</tr>
+<tr>
+<td>推荐度</td>
+<td>兼容存量</td>
+<td><strong>新项目首选</strong></td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="三、冷热分层架构怎么落地"><a href="#三、冷热分层架构怎么落地" class="headerlink" title="三、冷热分层架构怎么落地"></a>三、冷热分层架构怎么落地</h2><p>ILM 只负责”什么时候做什么”，<strong>具体落到哪台机器上，靠节点属性 + <code>allocate</code> 动作</strong>。</p>
+<h3 id="3-1-两种节点划分方式"><a href="#3-1-两种节点划分方式" class="headerlink" title="3.1 两种节点划分方式"></a>3.1 两种节点划分方式</h3><p><strong>方式一：节点角色（ES 7.10+，推荐）</strong></p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># hot 节点</span></span><br><span class="line"><span class="attr">node.roles:</span> [ <span class="string">data_hot</span>, <span class="string">ingest</span> ]</span><br><span class="line"><span class="comment"># warm 节点</span></span><br><span class="line"><span class="attr">node.roles:</span> [ <span class="string">data_warm</span> ]</span><br><span class="line"><span class="comment"># cold 节点</span></span><br><span class="line"><span class="attr">node.roles:</span> [ <span class="string">data_cold</span> ]</span><br><span class="line"><span class="comment"># frozen 节点</span></span><br><span class="line"><span class="attr">node.roles:</span> [ <span class="string">data_frozen</span>, <span class="string">search</span> ]</span><br></pre></td></tr></table></figure>
+
+<p><code>data_hot</code>&#x2F;<code>data_warm</code>&#x2F;<code>data_cold</code>&#x2F;<code>data_frozen</code> 是<strong>内置角色</strong>，ILM 的 <code>allocate</code> 可以直接基于角色过滤，语义清晰。</p>
+<p><strong>方式二：自定义节点属性（经典做法，更灵活）</strong></p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">node.attr.box_type:</span> <span class="string">warm</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">&quot;allocate&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;number_of_replicas&quot;</span><span class="punctuation">:</span> <span class="number">1</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;require&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;box_type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;warm&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>优点是可以自定义维度（比如按机房 <code>node.attr.zone: b</code>、按磁盘类型 <code>node.attr.disk: ssd</code>），实现”同城双可用区”的精细编排。</p>
+<h3 id="3-2-完整生产级-Policy"><a href="#3-2-完整生产级-Policy" class="headerlink" title="3.2 完整生产级 Policy"></a>3.2 完整生产级 Policy</h3><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br></pre></td><td class="code"><pre><span class="line">PUT _ilm/policy/logs-policy</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;policy&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;phases&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">      <span class="attr">&quot;hot&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">        <span class="attr">&quot;min_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;0ms&quot;</span><span class="punctuation">,</span></span><br><span class="line">        <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">          <span class="attr">&quot;rollover&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">            <span class="attr">&quot;max_primary_shard_size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;50gb&quot;</span><span class="punctuation">,</span></span><br><span class="line">            <span class="attr">&quot;max_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;1d&quot;</span></span><br><span class="line">          <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">          <span class="attr">&quot;set_priority&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;priority&quot;</span><span class="punctuation">:</span> <span class="number">100</span> <span class="punctuation">&#125;</span></span><br><span class="line">        <span class="punctuation">&#125;</span></span><br><span class="line">      <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;warm&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">        <span class="attr">&quot;min_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;3d&quot;</span><span class="punctuation">,</span></span><br><span class="line">        <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">          <span class="attr">&quot;allocate&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">            <span class="attr">&quot;number_of_replicas&quot;</span><span class="punctuation">:</span> <span class="number">1</span><span class="punctuation">,</span></span><br><span class="line">            <span class="attr">&quot;require&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;data&quot;</span><span class="punctuation">:</span> <span class="string">&quot;warm&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line">          <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">          <span class="attr">&quot;forcemerge&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;max_num_segments&quot;</span><span class="punctuation">:</span> <span class="number">1</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">          <span class="attr">&quot;set_priority&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;priority&quot;</span><span class="punctuation">:</span> <span class="number">50</span> <span class="punctuation">&#125;</span></span><br><span class="line">        <span class="punctuation">&#125;</span></span><br><span class="line">      <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;cold&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">        <span class="attr">&quot;min_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;15d&quot;</span><span class="punctuation">,</span></span><br><span class="line">        <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">          <span class="attr">&quot;allocate&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">            <span class="attr">&quot;number_of_replicas&quot;</span><span class="punctuation">:</span> <span class="number">1</span><span class="punctuation">,</span></span><br><span class="line">            <span class="attr">&quot;require&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;data&quot;</span><span class="punctuation">:</span> <span class="string">&quot;cold&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line">          <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">          <span class="attr">&quot;set_priority&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;priority&quot;</span><span class="punctuation">:</span> <span class="number">0</span> <span class="punctuation">&#125;</span></span><br><span class="line">        <span class="punctuation">&#125;</span></span><br><span class="line">      <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;frozen&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">        <span class="attr">&quot;min_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;60d&quot;</span><span class="punctuation">,</span></span><br><span class="line">        <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">          <span class="attr">&quot;searchable_snapshot&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">            <span class="attr">&quot;snapshot_repository&quot;</span><span class="punctuation">:</span> <span class="string">&quot;backup-repo&quot;</span><span class="punctuation">,</span></span><br><span class="line">            <span class="attr">&quot;storage&quot;</span><span class="punctuation">:</span> <span class="string">&quot;shared_cache&quot;</span></span><br><span class="line">          <span class="punctuation">&#125;</span></span><br><span class="line">        <span class="punctuation">&#125;</span></span><br><span class="line">      <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="attr">&quot;delete&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">        <span class="attr">&quot;min_age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;180d&quot;</span><span class="punctuation">,</span></span><br><span class="line">        <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">          <span class="attr">&quot;wait_for_snapshot&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;policy&quot;</span><span class="punctuation">:</span> <span class="string">&quot;backup-policy&quot;</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">          <span class="attr">&quot;delete&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span><span class="punctuation">&#125;</span></span><br><span class="line">        <span class="punctuation">&#125;</span></span><br><span class="line">      <span class="punctuation">&#125;</span></span><br><span class="line">    <span class="punctuation">&#125;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>几个设计取舍值得说明：</p>
+<ul>
+<li><strong>hot 阶段 <code>min_age: 0ms</code> + rollover 按 <code>max_age: 1d</code></strong>：让”天级索引”成为基本单位，运维视角最直观。</li>
+<li><strong>warm 才 forcemerge</strong>：hot 阶段还在写，合并出来的段很快又会被写碎，纯属浪费 IO。</li>
+<li><strong>cold 不再 forcemerge</strong>：已经合并过，反复合并没有收益。</li>
+<li><strong>frozen 用 <code>shared_cache</code></strong>：只把”实际被查询命中的部分”从快照拉到本地缓存，磁盘占用接近 0，代价是首次查询慢。</li>
+<li><strong>delete 前 <code>wait_for_snapshot</code></strong>：确保删掉的索引在快照仓库里有副本，合规与误删兜底。</li>
+</ul>
+<h3 id="3-3-可搜索快照（Searchable-Snapshot）的前置条件"><a href="#3-3-可搜索快照（Searchable-Snapshot）的前置条件" class="headerlink" title="3.3 可搜索快照（Searchable Snapshot）的前置条件"></a>3.3 可搜索快照（Searchable Snapshot）的前置条件</h3><p><code>searchable_snapshot</code> 是 cold&#x2F;frozen 的杀手锏，但它<strong>不是开箱即用的</strong>：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1) 先注册快照仓库（S3/MinIO/GCS/共享文件系统均可）</span></span><br><span class="line">PUT _snapshot/backup-repo</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;s3&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;bucket&quot;</span><span class="punctuation">:</span> <span class="string">&quot;es-snapshots&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;region&quot;</span><span class="punctuation">:</span> <span class="string">&quot;cn-north-1&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;base_path&quot;</span><span class="punctuation">:</span> <span class="string">&quot;cluster-a&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 2) 配置 SLM（快照生命周期管理），保证有持续可用的快照</span></span><br><span class="line">PUT _slm/policy/backup-policy</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;schedule&quot;</span><span class="punctuation">:</span> <span class="string">&quot;0 30 1 * * ?&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;name&quot;</span><span class="punctuation">:</span> <span class="string">&quot;&lt;daily-snap-&#123;now/d&#125;&gt;&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;repository&quot;</span><span class="punctuation">:</span> <span class="string">&quot;backup-repo&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;config&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;indices&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span><span class="string">&quot;logs-app-*&quot;</span><span class="punctuation">]</span><span class="punctuation">,</span> <span class="attr">&quot;include_global_state&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">false</span></span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;retention&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;expire_after&quot;</span><span class="punctuation">:</span> <span class="string">&quot;30d&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;min_count&quot;</span><span class="punctuation">:</span> <span class="number">5</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;max_count&quot;</span><span class="punctuation">:</span> <span class="number">50</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>没有仓库、没有快照，frozen 阶段会一直卡在 <code>waiting</code>（<code>explain</code> 里能看到原因）。<strong>这是冷热分层上线时最常踩的第一个坑。</strong></p>
+<blockquote>
+<p>补充：快照应至少保留”比最长 ILM 留存期更长”的周期，否则”可搜索快照”一旦对应快照被 SLM 清理，索引就废了。</p>
+</blockquote>
+<hr>
+<h2 id="四、运维-API-与状态机操作"><a href="#四、运维-API-与状态机操作" class="headerlink" title="四、运维 API 与状态机操作"></a>四、运维 API 与状态机操作</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 查看所有策略 / 单个策略</span></span><br><span class="line">GET _ilm/policy</span><br><span class="line">GET _ilm/policy/logs-policy</span><br><span class="line"></span><br><span class="line"><span class="comment"># 查看索引的 ILM 执行详情（排障第一命令）</span></span><br><span class="line">GET logs-app-*/_ilm/explain</span><br><span class="line"></span><br><span class="line"><span class="comment"># ILM 服务整体状态</span></span><br><span class="line">GET _ilm/status</span><br><span class="line"></span><br><span class="line"><span class="comment"># 出错后修复完，重试该索引</span></span><br><span class="line">POST logs-app-000042/_ilm/retry</span><br><span class="line"></span><br><span class="line"><span class="comment"># 手动推进阶段（比如紧急把某索引直接推进 delete）</span></span><br><span class="line">POST _ilm/move/logs-app-000042</span><br><span class="line">&#123;</span><br><span class="line">  <span class="string">&quot;current_step&quot;</span>: &#123; <span class="string">&quot;phase&quot;</span>: <span class="string">&quot;hot&quot;</span>, <span class="string">&quot;action&quot;</span>: <span class="string">&quot;complete&quot;</span>, <span class="string">&quot;name&quot;</span>: <span class="string">&quot;complete&quot;</span> &#125;,</span><br><span class="line">  <span class="string">&quot;next_step&quot;</span>:    &#123; <span class="string">&quot;phase&quot;</span>: <span class="string">&quot;delete&quot;</span>, <span class="string">&quot;action&quot;</span>: <span class="string">&quot;delete&quot;</span>, <span class="string">&quot;name&quot;</span>: <span class="string">&quot;delete&quot;</span> &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 暂停/恢复 ILM 服务（大变更期间用，慎用）</span></span><br><span class="line">POST _ilm/stop</span><br><span class="line">POST _ilm/start</span><br></pre></td></tr></table></figure>
+
+<p><strong>ILM 的调度不是实时的</strong>：ES 有一个轮询间隔 <code>indices.lifecycle.poll_interval</code>（默认 <strong>10 分钟</strong>）。所以”到点后延迟十几分钟才动”是正常的。测试环境为了观察方便可以调小：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">PUT _cluster/settings</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;transient&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;indices.lifecycle.poll_interval&quot;</span><span class="punctuation">:</span> <span class="string">&quot;10s&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>生产环境不要随意调小：每次轮询都要遍历所有受管索引，索引数量上万时轮询本身就会成为负载。</p>
+</blockquote>
+<hr>
+<h2 id="五、监控与踩坑清单"><a href="#五、监控与踩坑清单" class="headerlink" title="五、监控与踩坑清单"></a>五、监控与踩坑清单</h2><h3 id="5-1-该监控什么"><a href="#5-1-该监控什么" class="headerlink" title="5.1 该监控什么"></a>5.1 该监控什么</h3><table>
+<thead>
+<tr>
+<th>指标</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ILM 错误索引数</td>
+<td><code>GET _ilm/status</code> + 遍历 explain，<code>step: ERROR</code> 的必须告警</td>
+</tr>
+<tr>
+<td>索引总数 &#x2F; 分片总数</td>
+<td>分片数暴涨会拖垮集群元数据</td>
+</tr>
+<tr>
+<td>各阶段索引数量与体积</td>
+<td>判断冷热分层是否按预期收敛</td>
+</tr>
+<tr>
+<td><code>frozen</code> 卡住数量</td>
+<td>通常是快照仓库或 SLM 出问题</td>
+</tr>
+<tr>
+<td>forcemerge 并发</td>
+<td>大量 warm 索引同时 forcemerge 会打满 IO</td>
+</tr>
+<tr>
+<td>ILM 历史记录</td>
+<td><code>ilm-history-*</code> 数据流可回溯每次阶段变化</td>
+</tr>
+</tbody></table>
+<h3 id="5-2-高频坑"><a href="#5-2-高频坑" class="headerlink" title="5.2 高频坑"></a>5.2 高频坑</h3><ol>
+<li><strong><code>rollover_alias</code> 报错</strong> —— 别名没指向索引，或 <code>is_write_index</code> 缺失 &#x2F; 多索引争抢别名。</li>
+<li><strong><code>min_age</code> 理解错</strong> —— 以为从”进入上一阶段”起算，结果发现索引该进 warm 了却没动。用 <code>explain</code> 的 <code>age</code> 字段对齐认知。</li>
+<li><strong>forcemerge 放在 hot 阶段</strong> —— 与写入打架，IO 飙升，得不偿失。</li>
+<li><strong>frozen 阶段没配快照仓库</strong> —— 永远停在 waiting。</li>
+<li><strong>delete 阶段没配 <code>wait_for_snapshot</code></strong> —— SLM 与 ILM 节奏不一致时，可能删掉还没备份的数据。</li>
+<li><strong><code>shrink</code> 用在 data stream 底层索引上</strong> —— 不支持。要减分片请在建模板时就规划好。</li>
+<li><strong>回灌历史数据不设 <code>parse_origination_date</code></strong> —— 老数据被当成新数据，全部堆在 hot。</li>
+<li><strong>索引模板匹配优先级</strong> —— 多个模板匹配同一 pattern 时，后者覆盖前者且<strong>组件模板（component template）顺序决定合并结果</strong>，容易出现”策略没挂上”。</li>
+<li><strong>副本数与节点角色冲突</strong> —— <code>require: {data: cold}</code> 但 cold 节点只有一个，副本数还配 2，就会一直 <code>unassigned</code>。</li>
+</ol>
+<hr>
+<h2 id="六、面试常见追问"><a href="#六、面试常见追问" class="headerlink" title="六、面试常见追问"></a>六、面试常见追问</h2><p><strong>Q1：ILM 和 SLM 什么关系？</strong></p>
+<p>ILM 管<strong>索引的生命周期</strong>（阶段、rollover、删除），SLM 管<strong>快照的生命周期</strong>（多久打一次、保留多久）。两者配合点在于：frozen 阶段的可搜索快照依赖仓库里的快照，delete 前用 <code>wait_for_snapshot</code> 保证备份。</p>
+<p><strong>Q2：为什么建议 <code>max_primary_shard_size</code> 而不是 <code>max_size</code>？</strong></p>
+<p>分片数在索引创建时固定，按总量 rollover 会导致分片随数据增长而变大（”大分片”恢复慢、查询慢、单分片故障影响大）。按单分片大小控制，才能让每个分片都保持在健康区间。</p>
+<p><strong>Q3：<code>searchable_snapshot</code> 之后还能改索引吗？</strong></p>
+<p>不能。它本质是把索引数据放进快照仓库、只在本地缓存查询命中的部分，索引变为只读。要改只能重新从快照恢复成普通索引。</p>
+<p><strong>Q4：Data Stream 和 ILM 谁管 rollover？</strong></p>
+<p>Data Stream 自己会在”满足 ILM rollover 条件”时创建新的底层索引，索引命名与别名维护全部自动。对比经典索引，你要少维护一个 bootstrap 索引和 write alias，也因此少一类故障。</p>
+<p><strong>Q5：如果业务希望”7 天内可查、30 天后删除”，怎么设计？</strong></p>
+<p>典型三段式：hot（0<del>1d，rollover 50GB&#x2F;1d）→ warm（1</del>7d，forcemerge + 降副本）→ delete（30d）。”可查”和”可写”是两件事，全部数据 7 天都在 warm&#x2F;cold 上可查，不需要一直占 hot 节点。</p>
+<hr>
+<h2 id="七、小结"><a href="#七、小结" class="headerlink" title="七、小结"></a>七、小结</h2><table>
+<thead>
+<tr>
+<th>要点</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型</td>
+<td>5 Phase（hot&#x2F;warm&#x2F;cold&#x2F;frozen&#x2F;delete）+ 声明式 Action</td>
+</tr>
+<tr>
+<td>发动机</td>
+<td>rollover（<code>max_primary_shard_size</code> 优先 + <code>max_age</code> 兜底）</td>
+</tr>
+<tr>
+<td><code>min_age</code> 基准</td>
+<td>索引自身创建时间；回灌历史数据用 <code>parse_origination_date</code></td>
+</tr>
+<tr>
+<td>分层手段</td>
+<td>节点角色（<code>data_hot/warm/cold/frozen</code>）或自定义节点属性 + <code>allocate</code></td>
+</tr>
+<tr>
+<td>省钱关键</td>
+<td>cold&#x2F;frozen 用 <code>searchable_snapshot</code>（<code>shared_cache</code>），依赖快照仓库 + SLM</td>
+</tr>
+<tr>
+<td>排障命令</td>
+<td><code>GET &lt;index&gt;/_ilm/explain</code>、<code>GET _ilm/status</code>、<code>POST &lt;index&gt;/_ilm/retry</code></td>
+</tr>
+<tr>
+<td>调度粒度</td>
+<td><code>indices.lifecycle.poll_interval</code> 默认 10m，非实时</td>
+</tr>
+<tr>
+<td>新项目选择</td>
+<td><strong>Data Stream + ILM</strong>，不要再手写 alias 与 rollover 脚本</td>
+</tr>
+</tbody></table>
+<p>ILM 的价值不只是”自动删除过期索引省磁盘”。它真正解决的是<strong>索引治理的可预测性</strong>：写入形态（分片大小）可控、查询成本（段数&#x2F;分层）可控、存储成本（冷热分层）可控、留存策略（合规删除）可控。对一个每天 500GB 的日志平台来说，这四项可控，才是从”能跑”到”能运营”的分水岭。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/">https://jiweidong.github.io/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/ILM/">ILM</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95%E7%AE%A1%E7%90%86/">索引管理</a><a class="post-meta__tags" href="/tags/%E8%BF%90%E7%BB%B4/">运维</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/16/java-stream-gatherers-deep-dive/" title="【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现</div></div><div class="info-2"><div class="info-item-1">【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现面试官：Stream 的中间操作只有 map&#x2F;filter&#x2F;flatMap，如果我要做”滑动窗口聚合”，你怎么办？这是一个非常经典的”能力边界”问题。 在 JDK 24 之前，标准答案通常有三种，而且都不体面：  用 collect 兜底：把整个流物化成一个 List，再用循环做窗口切分。问题是——流式语义没了，内存占用从 O(1) 变成 O(n)，遇到无限流直接卡死。 自己写 Spliterator：可行，但要同时处理串行、并行、tryAdvance&#x2F;forEachRemaining、characteristics 四个维度，代码量巨大且极易踩坑。 上第三方库（如 StreamEx、protonpack）：能用，但引入了额外依赖，团队里还得统一认知。  JDK 22 引入预览、JDK 24 正式转正的 Stream Gatherers（JEP 461 → JEP 473 → JEP 485） 就是为了填这个坑：它给 Stream...</div></div></div></a><a class="pagination-related" href="/2026/09/16/async-profiler-flamegraph-deep-practice/" title="【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU/内存/锁全维度线上排障"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU/内存/锁全维度线上排障</div></div><div class="info-2"><div class="info-item-1">【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU&#x2F;内存&#x2F;锁全维度线上排障面试官：线上一个接口 CPU 飙到 100%，我给你 5 分钟，你怎么定位到具体代码行？先排除错误答案：  jstack 打 5 次，看哪个栈出现得多 —— 这是穷人的采样器，只能看”线程正在干什么”，看不到 CPU 时间占比，也看不到内核栈，命中率完全靠手气。 top -Hp 找出最热的线程，再 jstack 比对 nid —— 能定位到线程，但接口一多、线程池一摊开，编号对到眼瞎。 上 JProfiler&#x2F;YourKit —— 靠 JVMTI 方法进出插桩实现，方法级全量统计看着很爽，但采样有 SafePoint Bias（安全点偏差），而且开销大，生产环境不敢开。  真正在生产环境里的标准动作是：async-profiler 打一张火焰图，30 秒出结论。 它是目前 Java 世界最主流的低开销采样剖析器。这篇文章把它的采样原理、参数体系、火焰图读法以及 CPU&#x2F;内存&#x2F;锁三类实战案例一次讲清。  一、为什么 async-pr...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/12/elasticsearch-shard-strategy-scaling-deep-dive/" title="【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-12</div><div class="info-item-2">【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战</div></div><div class="info-2"><div class="info-item-1">【ES 运维】Elasticsearch 分片策略深度解析：分片数量设计、路由、扩容与 reindex 实战面试官：一个索引建几个分片？分片是不是越多越好？这是 Elasticsearch 面试里出现频率最高、也最容易答错的问题。很多人第一反应是「分片越多，并行度越高，当然越快」—— 这个直觉在 ES 里是错的，分片数量配置不当是生产集群性能问题最常见的根源之一。 这篇从分片的本质讲起，把「分片数量怎么定 → 数据怎么路由 → 集群怎么扩容 → 主分片建错了怎么救」这条完整链路讲清楚。 一、分片到底是什么ES 的一个索引（index）在物理上被拆成若干 主分片（primary shard），每个主分片是一个独立的 Lucene 索引（拥有自己的倒排索引、段文件、translog）。副本分片（replica shard）是主分片的完整拷贝，负责高可用与分担读请求。 关键事实：  主分片数量在索引创建时就固定了，之后不能改（这是所有扩容问题的根源）； 副本数量可以随时调整； 一个分片只能分配到一个节点上，不能被进一步拆分并行（Lucene 索引内部可以并行搜索，但分片本身是最小分配单...</div></div></div></a><a class="pagination-related" href="/2026/06/19/elasticsearch-performance-tuning/" title="Elasticsearch 集群性能调优实战：索引、查询与集群管理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-19</div><div class="info-item-2">Elasticsearch 集群性能调优实战：索引、查询与集群管理</div></div><div class="info-2"><div class="info-item-1">一、引言Elasticsearch 作为一个分布式搜索和分析引擎，广泛应用于日志分析、全文搜索、APM 和安全分析等场景。然而，随着数据量的增长和查询复杂度提升，不经调优的 ES 集群往往会出现查询延迟升高、写入积压、GC 频繁、磁盘 IO 瓶颈等问题。本文将从索引优化、写入优化、查询优化、集群管理、硬件选型五个维度，结合生产实践案例，系统性地讲解 ES 集群的性能调优方法。 二、索引优化2.1 Mapping 设计黄金法则映射是 ES 使用的基础，一个好的 Mapping 设计可以避免后续 80% 的性能问题。 字段类型选择   需求场景 推荐字段类型 避免使用    精确匹配查询 keyword text（会产生分词，性能差）   全文搜索 text + 合适的 analyzer 对不需要分词的字段使用 text   数值范围查询 integer&#x2F;long&#x2F;float&#x2F;double keyword（范围查询性能差）   日期排序&#x2F;聚合 date text 或 keyword   IP 地址查询 ip keyword（但不如 ip 类型高...</div></div></div></a><a class="pagination-related" href="/2026/07/02/java-cpu-high-troubleshooting-guide/" title="【生产实战】Java 应用 CPU 100% 问题排查实战：从定位到根治"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【生产实战】Java 应用 CPU 100% 问题排查实战：从定位到根治</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 应用 CPU 100% 问题排查实战：从定位到根治概述CPU 100% 是 Java 生产环境最常见的高危告警之一。应用响应变慢、请求超时、服务雪崩……背后往往都是 CPU 被打满。本文系统梳理 CPU 100% 的排查流程、十种典型案例和根治方案。 一、排查工具箱一览   阶段 工具 用途 定位速度    快速定位 top &#x2F; htop 找到 CPU 最高的进程 ⚡ 秒级   线程定位 top -Hp 找到 CPU 最高的线程 ⚡ 秒级   线程栈 jstack 查看线程正在执行的代码 ⏱ 分钟级   火焰图 async-profiler 可视化热点方法 🔥 最直观   在线诊断 Arthas 动态追踪，无需重启 🚀 秒级   性能剖析 JMC &#x2F; JProfiler 完整性能分析 📊 全面   二、六步排查法（标准流程）Step 1：找到 CPU 最高的进程12345# top 命令，按 CPU 降序top -c# 或者只看一次，过滤 Javatop -b -n 1 | grep java  输出示例： 12  PID USER...</div></div></div></a><a class="pagination-related" href="/2026/08/21/elasticsearch-chinese-analyzer-ik-deep-practice/" title="【搜索引擎】Elasticsearch 中文分词深度实战：从分析器原理到 IK 分词器调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-21</div><div class="info-item-2">【搜索引擎】Elasticsearch 中文分词深度实战：从分析器原理到 IK 分词器调优</div></div><div class="info-2"><div class="info-item-1">【搜索引擎】Elasticsearch 中文分词深度实战：从分析器原理到 IK 分词器调优面试官：为什么 Elasticsearch 搜索”苹果手机”匹配不到”iPhone”？——先聊聊分析器ES 之所以能全文检索，靠的是倒排索引；而倒排索引的构建质量，完全取决于分析器（Analyzer）。很多搜索问题（搜不到、搜不准）根子都在分词上——尤其是中文分词，一直是 ES 落地中文搜索的第一道坎。 先看分析器的三段式流水线： 1文本 → Character Filter（字符过滤）→ Tokenizer（分词器）→ Token Filter（词项过滤）→ 索引   Character Filter：预处理字符，如去 HTML 标签、替换特殊符号 Tokenizer：把文本切成词项（Token），决定分词的粗细粒度 Token Filter：对词项做加工：转小写、去停用词、同义词替换、拼音转换、词干提取  ES 内置常用分析器：    分析器 行为 典型效果    standard 按 Unicode 分词，英文按空格&#x2F;标点 “I’m fine” → [i, m, fine] ...</div></div></div></a><a class="pagination-related" href="/2026/09/16/redis-acl-security-hardening-deep-practice/" title="【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-16</div><div class="info-item-2">【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地</div></div><div class="info-2"><div class="info-item-1">【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地面试官：一个只暴露了 6379 端口、没有密码的 Redis，攻击者能做什么？很多人第一反应是：”Redis 只是缓存，里面没敏感数据，最坏就是被清库。” 这是极其危险的误判。一个未授权访问的 Redis，在攻击者眼里不是”缓存”，而是一台可以被利用来写文件、加载代码的远程命令执行入口。 这篇文章我们把攻击链完整拆开（知道怎么被打，才知道怎么防），再落到 Redis 6+ 的 ACL 权限体系上，给出一套可以直接上生产的加固方案。  一、先看攻击链：未授权 Redis 是怎么被打穿的前提条件只有一个：6379 可访问 + 无认证（或弱密码）。 1.1 利用一：写 SSH 公钥（最经典）12345redis-cli -h 10.0.0.5127.0.0.1:6379&gt; CONFIG SET dir /root/.ssh127.0.0.1:6379&gt; CONFIG SET dbfilename authorized_keys127.0.0.1:6379&gt; SET x ...</div></div></div></a><a class="pagination-related" href="/2026/09/08/elasticsearch-aggregation-deep-practice/" title="【ES 实战】Elasticsearch 聚合分析深度实战：Metric&#x2F;Bucket&#x2F;Pipeline 聚合原理与性能优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">【ES 实战】Elasticsearch 聚合分析深度实战：Metric&#x2F;Bucket&#x2F;Pipeline 聚合原理与性能优化</div></div><div class="info-2"><div class="info-item-1">【ES 实战】Elasticsearch 聚合分析深度实战：Metric&#x2F;Bucket&#x2F;Pipeline 聚合原理与性能优化面试官：ES 的聚合查询和 MySQL 的 GROUP BY 有什么区别？很多人用 ES 只停留在「搜索」层面，一提聚合就只会写个 terms。但面试官真正想考察的，是你对聚合分类、底层数据结构（doc_values）、以及那些「反直觉」行为（比如 terms 聚合的 doc_count 不精确）的理解。 Elasticsearch 的聚合（Aggregation）是分析型查询的核心能力，可以把它理解成 内存&#x2F;磁盘中的分布式 GROUP BY + 统计函数，但它的表达能力和灵活性远超 SQL。本文从三类聚合（Metric、Bucket、Pipeline）出发，配合实战案例和性能优化，一次讲透。  一、聚合的三层结构：桶、指标、管道聚合查询统一放在 aggs 节点下，核心分类如下：    聚合类型 作用 典型例子 类比 SQL    Metric 指标聚合 对一组文档做数值统计 avg、sum、max、cardinality、pe...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">627</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">740</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">204</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90ES-%E8%BF%90%E7%BB%B4%E3%80%91%E7%B4%A2%E5%BC%95%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E7%AE%A1%E7%90%86%EF%BC%88ILM%EF%BC%89%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9A%E7%83%AD%E6%B8%A9%E5%86%B7%E5%88%86%E5%B1%82%E3%80%81rollover-%E4%B8%8E%E8%87%AA%E5%8A%A8%E5%BD%92%E6%A1%A3"><span class="toc-number">1.</span> <span class="toc-text">【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%97%A5%E5%BF%97%E5%B9%B3%E5%8F%B0%E6%AF%8F%E5%A4%A9%E5%86%99%E5%85%A5-500GB%EF%BC%8C%E4%B8%80%E5%B9%B4%E5%B0%B1%E6%98%AF-180TB%E3%80%82%E4%BD%A0%E4%BB%AC%E7%9A%84%E7%B4%A2%E5%BC%95%E6%98%AF%E6%80%8E%E4%B9%88%E7%AE%A1%E7%90%86%E7%9A%84%EF%BC%9F%E6%80%BB%E4%B8%8D%E8%83%BD%E4%B8%80%E7%9B%B4%E5%A0%86%E5%9C%A8%E4%B8%80%E4%B8%AA%E7%B4%A2%E5%BC%95%E9%87%8C%E5%90%A7%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：日志平台每天写入 500GB，一年就是 180TB。你们的索引是怎么管理的？总不能一直堆在一个索引里吧？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81ILM-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%A8%A1%E5%9E%8B%EF%BC%9APhase-%E4%B8%8E-Action"><span class="toc-number">1.2.</span> <span class="toc-text">一、ILM 的核心模型：Phase 与 Action</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-Action-%E6%B8%85%E5%8D%95"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 Action 清单</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-min-age-%E5%88%B0%E5%BA%95%E4%BB%8E%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E7%AE%97%EF%BC%9F"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 min_age 到底从什么时候算？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81Rollover%EF%BC%9AILM-%E7%9A%84%E5%8F%91%E5%8A%A8%E6%9C%BA"><span class="toc-number">1.3.</span> <span class="toc-text">二、Rollover：ILM 的发动机</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-Rollover-%E7%9A%84%E8%A7%A6%E5%8F%91%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 Rollover 的触发条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-Rollover-%E7%9A%84%E5%89%8D%E7%BD%AE%E6%9D%A1%E4%BB%B6%EF%BC%88%E7%BB%8F%E5%85%B8%E7%B4%A2%E5%BC%95%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 Rollover 的前置条件（经典索引）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-Data-Stream%EF%BC%9A%E8%AE%A9-rollover-%E8%87%AA%E5%8A%A8%E5%8F%91%E7%94%9F"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 Data Stream：让 rollover 自动发生</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%86%B7%E7%83%AD%E5%88%86%E5%B1%82%E6%9E%B6%E6%9E%84%E6%80%8E%E4%B9%88%E8%90%BD%E5%9C%B0"><span class="toc-number">1.4.</span> <span class="toc-text">三、冷热分层架构怎么落地</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%A4%E7%A7%8D%E8%8A%82%E7%82%B9%E5%88%92%E5%88%86%E6%96%B9%E5%BC%8F"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 两种节点划分方式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%AE%8C%E6%95%B4%E7%94%9F%E4%BA%A7%E7%BA%A7-Policy"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 完整生产级 Policy</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%8F%AF%E6%90%9C%E7%B4%A2%E5%BF%AB%E7%85%A7%EF%BC%88Searchable-Snapshot%EF%BC%89%E7%9A%84%E5%89%8D%E7%BD%AE%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 可搜索快照（Searchable Snapshot）的前置条件</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%BF%90%E7%BB%B4-API-%E4%B8%8E%E7%8A%B6%E6%80%81%E6%9C%BA%E6%93%8D%E4%BD%9C"><span class="toc-number">1.5.</span> <span class="toc-text">四、运维 API 与状态机操作</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%9B%91%E6%8E%A7%E4%B8%8E%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.6.</span> <span class="toc-text">五、监控与踩坑清单</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E8%AF%A5%E7%9B%91%E6%8E%A7%E4%BB%80%E4%B9%88"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 该监控什么</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E9%AB%98%E9%A2%91%E5%9D%91"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 高频坑</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%B0%8F%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/async-profiler-flamegraph-deep-practice/" title="【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU/内存/锁全维度线上排障">【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU/内存/锁全维度线上排障</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/elasticsearch-ilm-lifecycle-management-deep-practice/" title="【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档">【ES 运维】索引生命周期管理（ILM）深度实战：热温冷分层、rollover 与自动归档</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/java-stream-gatherers-deep-dive/" title="【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现">【Java 24 新特性】Stream Gatherers 深度解析：从内置 gatherer 到自定义中间操作的完整实现</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/kafka-mirrormaker2-cross-cluster-deep-practice/" title="【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移">【Kafka 架构】MirrorMaker 2 跨集群复制深度实战：异地容灾、双向同步与偏移量平移</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/16/redis-acl-security-hardening-deep-practice/" title="【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地">【Redis 安全】Redis 安全加固深度实战：ACL 权限体系、未授权访问攻击链与 TLS 落地</a><time datetime="2026-09-16T00:00:00.000Z" title="发表于 2026-09-16 08:00:00">2026-09-16</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
