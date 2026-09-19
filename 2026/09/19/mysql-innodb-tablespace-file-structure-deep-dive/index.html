@@ -1,0 +1,370 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？这是我被问过最多次的问题之一。候选人通常答”因为 InnoDB 是页管理的，删除只是打标记”。这个答案对了一半，但要真正说清楚，必须把 InnoDB 的表空间（Tablespace）体系讲透：数据到底存在哪个文件里、页怎么分">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？这是我被问过最多次的问题之一。候选人通常答”因为 InnoDB 是页管理的，删除只是打标记”。这个答案对了一半，但要真正说清楚，必须把 InnoDB 的表空间（Tablespace）体系讲透：数据到底存在哪个文件里、页怎么分">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-19T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-19T00:02:46.611Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="InnoDB">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="存储引擎">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局",
+  "url": "https://jiweidong.github.io/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-19T00:00:00.000Z",
+  "dateModified": "2026-09-19T00:02:46.611Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">642</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">748</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">208</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-19T00:00:00.000Z" title="发表于 2026-09-19 08:00:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-19T00:02:46.611Z" title="更新于 2026-09-19 08:02:46">2026-09-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%BA%95%E5%B1%82/">数据库底层</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-底层】InnoDB-表空间体系深度解析：系统表空间、独立表空间、undo-与临时表空间的完整物理布局"><a href="#【MySQL-底层】InnoDB-表空间体系深度解析：系统表空间、独立表空间、undo-与临时表空间的完整物理布局" class="headerlink" title="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局"></a>【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</h1><h2 id="面试官：删了-2000-万行数据，为什么磁盘文件一点都没变小？"><a href="#面试官：删了-2000-万行数据，为什么磁盘文件一点都没变小？" class="headerlink" title="面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？"></a>面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？</h2><p>这是我被问过最多次的问题之一。候选人通常答”因为 InnoDB 是页管理的，删除只是打标记”。这个答案对了一半，但要真正说清楚，必须把 InnoDB 的<strong>表空间（Tablespace）体系</strong>讲透：数据到底存在哪个文件里、页怎么分配、空闲空间为什么不还给操作系统、<code>ibdata1</code> 为什么越涨越大。</p>
+<p>表空间是 InnoDB 存储引擎的逻辑-物理映射层。它向上承接表、索引这些逻辑对象，向下管理文件、区、页这些物理单位。这篇文章从磁盘文件一路拆到页，把 InnoDB 的表空间体系完整梳理一遍。</p>
+<h2 id="一、先建立坐标系：从文件到行记录的六层结构"><a href="#一、先建立坐标系：从文件到行记录的六层结构" class="headerlink" title="一、先建立坐标系：从文件到行记录的六层结构"></a>一、先建立坐标系：从文件到行记录的六层结构</h2><p>InnoDB 的数据组织是一条自顶向下的链路，理解这条链路，后面所有概念都能挂上去：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>名称</th>
+<th>典型大小</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>表空间 Tablespace</td>
+<td>文件级别</td>
+<td>逻辑上可包含多张表，物理上对应一个或多个 <code>.ibd</code> 文件</td>
+</tr>
+<tr>
+<td>2</td>
+<td>段 Segment</td>
+<td>逻辑概念</td>
+<td>一个索引对应两个段：叶子节点段 + 非叶子节点段</td>
+</tr>
+<tr>
+<td>3</td>
+<td>区 Extent</td>
+<td>1MB（64 个页）</td>
+<td>连续分配的页，减少随机 IO</td>
+</tr>
+<tr>
+<td>4</td>
+<td>页 Page</td>
+<td>16KB（默认）</td>
+<td>InnoDB 的最小 IO 单位</td>
+</tr>
+<tr>
+<td>5</td>
+<td>记录行 Row</td>
+<td>变长</td>
+<td>按行格式（Compact&#x2F;Dynamic）组织</td>
+</tr>
+<tr>
+<td>6</td>
+<td>字段 Column</td>
+<td>变长</td>
+<td>大字段可能溢出到溢出页</td>
+</tr>
+</tbody></table>
+<p>关键点：<strong>“段”不是物理文件，而是按区分配的连续空间集合</strong>。所以一张表的 <code>orders.ibd</code> 文件里，数据页是”按区断续分布”的，不是全连续。</p>
+<h2 id="二、表空间家族的五个成员"><a href="#二、表空间家族的五个成员" class="headerlink" title="二、表空间家族的五个成员"></a>二、表空间家族的五个成员</h2><h3 id="1-系统表空间（ibdata1）"><a href="#1-系统表空间（ibdata1）" class="headerlink" title="1. 系统表空间（ibdata1）"></a>1. 系统表空间（ibdata1）</h3><p>由 <code>innodb_data_file_path</code> 控制，默认是 <code>ibdata1:12M:autoextend</code>。它承载：</p>
+<ul>
+<li><strong>数据字典</strong>（MySQL 8.0 之前）：<code>SYS_TABLES</code>、<code>SYS_COLUMNS</code>、<code>SYS_INDEXES</code> 等，以 InnoDB 内部表形式存放。这也是”8.0 之前删表后 ibdata1 不缩小”的罪魁祸首——数据字典里留下了大量空洞。</li>
+<li><strong>双写缓冲（Doublewrite Buffer）</strong>：默认仍在系统表空间（8.0.20+ 可独立为 <code>#ib_16384_N.dblwr</code> 文件）。页刷盘前先写到 doublewrite 区，防止页断裂（torn page）。</li>
+<li><strong>Change Buffer</strong>（持久化部分，旧称 Insert Buffer）。</li>
+<li><strong>回滚段（Rollback Segment）</strong>：当 <code>innodb_rollback_segments</code> 使用系统 undo 表空间时。</li>
+</ul>
+<p>MySQL 8.0 起数据字典改为独立的 <code>mysql.ibd</code>，这是 8.0 最重要的存储层改动之一：不再需要 <code>frm</code> 文件，DDL 变成原子操作，<code>ibdata1</code> 也就不再随表数量线性膨胀。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 查看系统表空间配置</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_data_file_path&#x27;</span>;</span><br><span class="line"><span class="comment">-- 查看双写文件位置（8.0.20+）</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_doublewrite_dir&#x27;</span>;</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> information_schema.innodb_tablespaces;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-独立表空间（file-per-table）"><a href="#2-独立表空间（file-per-table）" class="headerlink" title="2. 独立表空间（file-per-table）"></a>2. 独立表空间（file-per-table）</h3><p><code>innodb_file_per_table=ON</code>（5.6.6 之后默认开启）时，每张表一个 <code>表名.ibd</code>，它包含：<strong>该表的聚簇索引（即表数据）+ 所有二级索引 + 可选的溢出页</strong>。</p>
+<p>为什么强烈建议开启？三个理由：</p>
+<ol>
+<li><code>TRUNCATE TABLE</code> &#x2F; <code>DROP TABLE</code> 可以直接删除文件，空间立刻归还操作系统；独立表空间下”删数据文件不缩小”的困扰轻很多。</li>
+<li>单表损坏只影响单表，恢复粒度小。</li>
+<li>支持 <code>OPTIMIZE TABLE</code> 真正重建文件来整理碎片。</li>
+</ol>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 查表空间文件与占用</span></span><br><span class="line"><span class="keyword">SELECT</span> TABLE_NAME, ROUND((DATA_LENGTH <span class="operator">+</span> INDEX_LENGTH) <span class="operator">/</span> <span class="number">1024</span> <span class="operator">/</span> <span class="number">1024</span>, <span class="number">2</span>) <span class="keyword">AS</span> MB</span><br><span class="line"><span class="keyword">FROM</span> information_schema.TABLES</span><br><span class="line"><span class="keyword">WHERE</span> TABLE_SCHEMA <span class="operator">=</span> <span class="string">&#x27;shop&#x27;</span> <span class="keyword">ORDER</span> <span class="keyword">BY</span> MB <span class="keyword">DESC</span> LIMIT <span class="number">10</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 真实物理文件大小（独立表空间）</span></span><br><span class="line"><span class="comment">-- ls -lh /var/lib/mysql/shop/orders.ibd</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-通用表空间（General-Tablespace）"><a href="#3-通用表空间（General-Tablespace）" class="headerlink" title="3. 通用表空间（General Tablespace）"></a>3. 通用表空间（General Tablespace）</h3><p>8.0 引入的 <code>CREATE TABLESPACE</code>，一张表空间可以装多张表，且<strong>支持多表共享物理文件</strong>：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE</span> TABLESPACE ts_small <span class="keyword">ADD</span> DATAFILE <span class="string">&#x27;ts_small.ibd&#x27;</span> ENGINE<span class="operator">=</span>InnoDB;</span><br><span class="line"><span class="keyword">CREATE TABLE</span> t_small (id <span class="type">INT</span> <span class="keyword">PRIMARY KEY</span>, v <span class="type">VARCHAR</span>(<span class="number">32</span>)) TABLESPACE ts_small;</span><br></pre></td></tr></table></figure>
+
+<p>适用场景：小表特别多（几万个配置表），file-per-table 会产生大量 <code>.ibd</code> 文件，<code>open_files_limit</code>、备份工具元数据管理都会成为瓶颈。通用表空间把它们打包进少量文件。</p>
+<p>代价：<code>DROP TABLE</code> 只能回收表内空间给表空间复用，文件本身不缩小。另外通用表空间不支持 <code>ALTER TABLE ... DISCARD TABLESPACE</code>。</p>
+<h3 id="4-Undo-表空间"><a href="#4-Undo-表空间" class="headerlink" title="4. Undo 表空间"></a>4. Undo 表空间</h3><p>8.0 默认 <code>innodb_undo_tablespaces=2</code>，对应 <code>undo_001</code>、<code>undo_002</code> 两个文件。它存储 undo 日志，承担两个职责：</p>
+<ul>
+<li><strong>事务回滚</strong>：把记录恢复到修改前版本。</li>
+<li><strong>MVCC 快照读</strong>：为其他事务提供历史版本（配合 Read View）。</li>
+</ul>
+<p>Undo 空间的膨胀是线上最常见的问题。长事务（哪怕只读、只是 <code>SELECT</code>）会让 purge 线程无法回收 undo，导致 undo 文件持续增长。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 查看 undo 表空间</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> information_schema.innodb_tablespaces <span class="keyword">WHERE</span> name <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_undo%&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 定位长事务（8.0 的 performance_schema 更精确）</span></span><br><span class="line"><span class="keyword">SELECT</span> trx_id, trx_state, trx_started, TIMESTAMPDIFF(<span class="keyword">SECOND</span>, trx_started, NOW()) <span class="keyword">AS</span> secs,</span><br><span class="line">       trx_mysql_thread_id, trx_query</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_trx</span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> trx_started <span class="keyword">ASC</span>;</span><br></pre></td></tr></table></figure>
+
+<p>线上治理要点：设置 <code>innodb_max_undo_log_size</code>、<code>innodb_undo_log_truncate=ON</code>，并在业务侧严格控制事务边界，杜绝”事务里调 RPC”。</p>
+<h3 id="5-临时表空间"><a href="#5-临时表空间" class="headerlink" title="5. 临时表空间"></a>5. 临时表空间</h3><ul>
+<li><strong>会话临时表空间</strong> <code>ibtmp1</code>：<code>innodb_temp_data_file_path</code>，存用户临时表（<code>CREATE TEMPORARY TABLE</code>）。</li>
+<li><strong>共享临时表空间</strong>：8.0 引入 <code>innodb_temp_tablespaces_dir</code>，存内部临时表（排序、<code>GROUP BY</code>、<code>UNION</code>、派生表物化）。之前我写过内部临时表的文章，这里只强调：它<strong>只增不减</strong>，实例重启才会释放。</li>
+</ul>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> information_schema.INNODB_SESSION_TEMP_TABLESPACES;</span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_temp%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<h2 id="三、区、页与”碎片”的真相"><a href="#三、区、页与”碎片”的真相" class="headerlink" title="三、区、页与”碎片”的真相"></a>三、区、页与”碎片”的真相</h2><p>理解三件事，就能解释 90% 的”空间没释放”疑惑：</p>
+<p><strong>第一，页内删除不打标记回收。</strong> <code>DELETE</code> 只把记录置为删除并加入页内空闲链表（<code>PAGE_FREE</code>），页整体仍属于该索引。</p>
+<p><strong>第二，空页不归还。</strong> 当页全部删空，InnoDB 会把它从索引的段上”摘除”，放到表空间的 <strong>FREE 链表</strong>里，供本表空间后续插入复用。文件大小不变——因为文件是按需扩展的，InnoDB 不会自动收缩。</p>
+<p><strong>第三，碎片分三类。</strong></p>
+<table>
+<thead>
+<tr>
+<th>碎片类型</th>
+<th>成因</th>
+<th>观测手段</th>
+<th>治理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>页内碎片</td>
+<td>频繁删除导致的页内空洞</td>
+<td><code>DATA_FREE</code> 偏大</td>
+<td><code>OPTIMIZE TABLE</code> 重建</td>
+</tr>
+<tr>
+<td>页间碎片</td>
+<td>主键无序插入导致页分裂、页填充率低</td>
+<td><code>INNODB_INDEX_STATS</code></td>
+<td>改用有序主键</td>
+</tr>
+<tr>
+<td>文件碎片</td>
+<td>文件系统层面不连续</td>
+<td><code>filefrag -v xxx.ibd</code></td>
+<td>重建表 &#x2F; 迁移</td>
+</tr>
+</tbody></table>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- DATA_FREE 是表空间内空闲字节数，最能反映&quot;可回收空间&quot;</span></span><br><span class="line"><span class="keyword">SELECT</span> TABLE_NAME, DATA_FREE <span class="operator">/</span> <span class="number">1024</span> <span class="operator">/</span> <span class="number">1024</span> <span class="keyword">AS</span> free_mb,</span><br><span class="line">       ROUND(DATA_FREE <span class="operator">/</span> (DATA_LENGTH <span class="operator">+</span> INDEX_LENGTH <span class="operator">+</span> <span class="number">1</span>), <span class="number">2</span>) <span class="keyword">AS</span> free_ratio</span><br><span class="line"><span class="keyword">FROM</span> information_schema.TABLES</span><br><span class="line"><span class="keyword">WHERE</span> TABLE_SCHEMA <span class="operator">=</span> <span class="string">&#x27;shop&#x27;</span> <span class="keyword">AND</span> DATA_FREE <span class="operator">&gt;</span> <span class="number">100</span> <span class="operator">*</span> <span class="number">1024</span> <span class="operator">*</span> <span class="number">1024</span>;</span><br></pre></td></tr></table></figure>
+
+<p>当 <code>free_ratio &gt; 0.5</code> 且确认无长事务、无活跃查询时，可以低峰期执行：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 8.0 的 OPTIMIZE TABLE 走 Online DDL，支持并发 DML（占用额外空间）</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> orders ENGINE<span class="operator">=</span>InnoDB, ALGORITHM<span class="operator">=</span>INPLACE, LOCK<span class="operator">=</span><span class="keyword">NONE</span>;</span><br><span class="line"><span class="comment">-- 或使用 gh-ost / pt-osc 在线重建，避免元数据锁风险</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="四、元数据与监控：常用-SQL-清单"><a href="#四、元数据与监控：常用-SQL-清单" class="headerlink" title="四、元数据与监控：常用 SQL 清单"></a>四、元数据与监控：常用 SQL 清单</h2><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 1. 所有表空间及其大小</span></span><br><span class="line"><span class="keyword">SELECT</span> name, space_type, row_format, ROUND(file_size<span class="operator">/</span><span class="number">1024</span><span class="operator">/</span><span class="number">1024</span>,<span class="number">2</span>) <span class="keyword">AS</span> mb</span><br><span class="line"><span class="keyword">FROM</span> information_schema.INNODB_TABLESPACES <span class="keyword">ORDER</span> <span class="keyword">BY</span> file_size <span class="keyword">DESC</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 2. 表 ↔ 表空间 ↔ 文件映射</span></span><br><span class="line"><span class="keyword">SELECT</span> ts.name <span class="keyword">AS</span> tablespace, tf.file_name, tf.total_extents,</span><br><span class="line">       ROUND(tf.total_extents <span class="operator">*</span> <span class="number">1024</span> <span class="operator">*</span> <span class="number">1024</span> <span class="operator">/</span> <span class="number">1024</span> <span class="operator">/</span> <span class="number">1024</span>, <span class="number">2</span>) <span class="keyword">AS</span> size_mb</span><br><span class="line"><span class="keyword">FROM</span> information_schema.INNODB_TABLESPACES ts</span><br><span class="line"><span class="keyword">JOIN</span> information_schema.INNODB_DATAFILES tf <span class="keyword">ON</span> ts.space <span class="operator">=</span> tf.space;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 3. 索引段/区信息</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> information_schema.INNODB_INDEXES <span class="keyword">WHERE</span> name <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span>;</span><br><span class="line"><span class="comment">-- 4. 每张表的压缩与行格式</span></span><br><span class="line"><span class="keyword">SELECT</span> table_name, row_format, create_options <span class="keyword">FROM</span> information_schema.TABLES</span><br><span class="line"><span class="keyword">WHERE</span> table_schema<span class="operator">=</span><span class="string">&#x27;shop&#x27;</span> LIMIT <span class="number">10</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>磁盘水位告警</strong>建议再加一层 OS 侧监控：<code>ibdata1</code>、<code>ibtmp1</code>、<code>undo_*</code>、<code>mysql.ibd</code> 单独观测。<code>ibtmp1</code> 突然暴涨通常是某个大查询把内部临时表落盘了——这是典型的”SQL 惹的祸，DBA 背的锅”。</p>
+<h2 id="五、常见事故场景复盘"><a href="#五、常见事故场景复盘" class="headerlink" title="五、常见事故场景复盘"></a>五、常见事故场景复盘</h2><p><strong>场景一：ibdata1 涨到 200GB 且无法回收。</strong> 原因几乎总是：5.6&#x2F;5.7 时代的数据字典 + 未开启 file-per-table + 长事务堆积。处置：<code>mysqldump</code> 逻辑重建（<code>innodb_data_file_path</code> 无法在线收缩），别无他法。这也是升级到 8.0 最强的动力。</p>
+<p><strong>场景二：undo 表空间撑爆磁盘。</strong> 现象是 <code>undo_001</code> &gt; 100GB，根因是夜间跑批事务未提交或常驻 <code>SELECT</code> 未结束。处置：<code>innodb_undo_log_truncate</code> + 强杀长事务 + 事务边界重构。</p>
+<p><strong>场景三：<code>ibtmp1</code> 膨胀到 500GB。</strong> 某条 <code>GROUP BY</code> 大表查询无索引，内部临时表落盘。处置：重启释放（或 <code>RESET</code> 临时表空间），并从 SQL 层加索引&#x2F;改写。</p>
+<p><strong>场景四：磁盘满导致实例挂起。</strong> <code>innodb_fatal_semaphore_wait_timeout</code> 触发、写操作全部 <code>ER_DISK_FULL</code>。止血手段：挑大表 <code>TRUNCATE</code>&#x2F;删历史分区，把水位先降到 80% 以下。</p>
+<h2 id="六、面试常见追问"><a href="#六、面试常见追问" class="headerlink" title="六、面试常见追问"></a>六、面试常见追问</h2><p><strong>Q1：为什么 InnoDB 页大小是 16KB？</strong><br>折中结果：太小则 B+ 树层数多、IO 次数多；太大则页内修改的写放大严重、缓冲池管理粒度粗。16KB 配合一个区 64 页 &#x3D; 1MB，与文件系统预读策略配合良好。</p>
+<p><strong>Q2：一个区为什么是 64 个页？</strong><br>1MB 的连续空间在机械盘上读取消代价低，同时又能让 B+ 树叶子节点尽量连续。InnoDB 对小于 1MB 的表还有”碎片区”（fragment extent）优化，按页而非按区分配，避免小表浪费 1MB。</p>
+<p><strong>Q3：<code>innodb_file_per_table=ON</code> 后，<code>ibdata1</code> 还有用吗？</strong><br>有。双写缓冲、Change Buffer、回滚段（若未独立）仍在里面，只是不再随表数量增长。所以它应该稳定在一个合理区间（通常几 GB 以内）。</p>
+<p><strong>Q4：<code>DELETE</code> 全表和 <code>TRUNCATE</code> 的区别（存储层面）？</strong><br><code>DELETE</code> 逐行删、产生 undo&#x2F;binlog、留下空洞，文件不变小；<code>TRUNCATE</code> 是 DDL，直接重建空表空间文件，秒级完成且立刻释放磁盘，但不可回滚、不触发触发器。</p>
+<p><strong>Q5：主键为什么推荐自增&#x2F;有序？</strong><br>乱序主键（UUID）会让插入随机落在 B+ 树不同叶子页上，触发大量页分裂，页填充率降到 ~50%，表空间里全是”页间碎片”。有序主键永远追加在最右叶子，页分裂极少。这是<strong>存储层</strong>对主键设计最硬的约束。</p>
+<p><strong>Q6：通用表空间和独立表空间怎么选？</strong><br>默认独立表空间。小表数量 &gt; 1 万、备份工具被文件数拖累时，才把一批小表收进通用表空间统一管理。</p>
+<h2 id="七、生产环境的最佳实践清单"><a href="#七、生产环境的最佳实践清单" class="headerlink" title="七、生产环境的最佳实践清单"></a>七、生产环境的最佳实践清单</h2><ol>
+<li><strong>必须开启</strong> <code>innodb_file_per_table=ON</code>，这是空间可治理的前提。</li>
+<li>MySQL <strong>8.0 是底线</strong>，数据字典独立后，DDL 原子性与 <code>ibdata1</code> 膨胀问题从根上缓解。</li>
+<li><strong>独立 undo 表空间</strong> + <code>innodb_undo_log_truncate=ON</code>，并监控 <code>History list length</code>。</li>
+<li><strong>事务边界要短</strong>：禁止在事务中做远程调用、批量循环提交要改成分批。</li>
+<li>对 <code>DATA_FREE</code> 和四类表空间文件做<strong>容量水位告警</strong>，别等磁盘满。</li>
+<li>大表重建用 <code>gh-ost</code> &#x2F; <code>pt-osc</code>，避免 <code>ALTER</code> 引发的元数据锁雪崩。</li>
+<li>定期做<strong>表空间体检</strong>：单表超过 500GB 就要考虑冷热分离或归档（我之前写过冷热分离方案，可以配合使用）。</li>
+</ol>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>InnoDB 的表空间体系是”逻辑对象 → 段 → 区 → 页 → 行”这条链路的物理落点：</p>
+<ul>
+<li><strong>系统表空间</strong>承载双写、Change Buffer 与回滚段，8.0 后不再装数据字典；</li>
+<li><strong>独立表空间</strong>是默认形态，让 <code>DROP</code>&#x2F;<code>TRUNCATE</code> 能真正释放空间；</li>
+<li><strong>通用表空间</strong>解决小表文件数爆炸；</li>
+<li><strong>undo 表空间</strong>是 MVCC 与回滚的基石，也是长事务的”罪证记录仪”；</li>
+<li><strong>临时表空间</strong>只增不减，是最容易被忽视的磁盘黑洞。</li>
+</ul>
+<p>“删了数据磁盘不变小”的本质是：<strong>删除只回收页内空间到表空间内部的 FREE 链表，文件不会自动收缩</strong>。要走 “重建文件” 的路子才能把空间还给操作系统——而在动手之前，先确认没有长事务和活跃查询，否则只会把一次空间问题升级成一次锁事故。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/">https://jiweidong.github.io/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/InnoDB/">InnoDB</a><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8%E5%BC%95%E6%93%8E/">存储引擎</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/19/jvm-crash-hs-err-core-dump-jhsdb-deep-practice/" title="【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战面试官：服务进程突然没了，日志里什么都没有，你怎么查？这是线上最让人绝望的场景：没有任何业务异常日志，docker ps 里容器不见了，K8s 显示 OOMKilled 或者 Exit Code 137。大多数人第一反应是”重启一下试试”——然后同样的事故在一周后再次发生。 真正会排查的人，第一时间去找两样东西：hs_err_pid 日志 和 core dump 文件。前者是 JVM 自己写下的”临终遗言”，后者是整个进程内存的”遗体”。这篇文章把 JVM 崩溃分析的完整链路讲透，包括文件在哪、怎么读、怎么定位到代码。 一、JVM 崩溃的分类：先分清”谁杀了谁”排查第一步是判断死亡类型，不同类型证据链完全不同：    类型 现象 关键证据    JVM 内部致命错误（SIGSEGV&#x2F;SIGBUS） 进程消失，产生 hs_err_pid&lt;n&gt;.log hs_err 里的 Problematic frame   JVM 主动退出 日志有明确错误，退出码 ...</div></div></div></a><a class="pagination-related" href="/2026/09/18/mysql-generated-column-virtual-index-deep-dive/" title="【MySQL 8.0】生成列（Generated Column）深度解析：虚拟列、存储列与索引实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 8.0】生成列（Generated Column）深度解析：虚拟列、存储列与索引实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 8.0】生成列（Generated Column）深度解析：虚拟列、存储列与索引实战面试官：JSON 字段里的属性怎么建索引？如果你回答「MySQL 8 有函数索引」，面试官通常会追问：「函数索引底层是怎么实现的？它和生成列是什么关系？」 这时候能讲清楚「函数索引本质上就是隐藏的虚拟生成列」的人，就明显高出一档。 生成列（Generated Column）是 MySQL 5.7 引入、8.0 大幅增强的能力，但很多人只知道概念不会用。这篇从语法到执行计划、从存储差异到 DDL 成本，把它彻底讲清楚。  一、什么是生成列生成列的值 不由 INSERT &#x2F; UPDATE 显式指定，而是由列定义里的表达式计算得出。 1234567891011CREATE TABLE t_order (  id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,  order_no    VARCHAR(32) NOT NULL,  amount      DECIMAL(10,2) NOT NULL,  tax_rate  ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/08/mysql-innodb-redo-undo-binlog-deep-dive/" title="【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复面试官：一条 UPDATE 语句在 InnoDB 里是怎么执行的？宕机了数据怎么不丢？这是 MySQL 面试的”必考压轴题”。要答好它，必须吃透 InnoDB 的三大日志：redo log（重做日志）、undo log（回滚日志）和 binlog（归档日志）。它们分别解决了崩溃恢复、事务回滚、主从复制三个核心问题。 本文从一条 UPDATE 的执行链路讲起，深入源码与磁盘结构，最后用”两阶段提交”串起整个故事。   一、先看全局：一条 UPDATE 的执行链路1UPDATE user SET age = 30 WHERE id = 1;  这条语句在 InnoDB 中的完整执行流程： 1234567891011121. 连接器：校验权限2. 分析器：词法/语法解析3. 优化器：选择索引，生成执行计划4. 执行器：调用 InnoDB 引擎接口   │   ├─ ① 从 Buffer Pool 读取 id=1 的页（若不在则从磁盘加载）   ├─ ② 在 undo l...</div></div></div></a><a class="pagination-related" href="/2026/06/16/mysql-innodb-storage-engine/" title="MySQL InnoDB 存储引擎与 B+ 树原理全解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-16</div><div class="info-item-2">MySQL InnoDB 存储引擎与 B+ 树原理全解</div></div><div class="info-2"><div class="info-item-1">MySQL InnoDB 存储引擎与 B+ 树原理全解一、为什么 InnoDB 成了 MySQL 的默认引擎？MySQL 5.5 起，InnoDB 取代 MyISAM 成为默认存储引擎。核心原因：    特性 InnoDB MyISAM    事务 ✅ ACID 支持 ❌ 不支持   行锁 ✅ 行级锁 ❌ 表级锁   外键 ✅ ❌   崩溃恢复 ✅ Redo Log 自动恢复 ❌ 需手动修复   MVCC ✅ ❌   全文索引 ✅ (5.6+) ✅   聚簇索引 ✅ ❌   选型结论：  OLTP（在线事务处理）场景一律选 InnoDB。MyISAM 仅在只读、表量小、不需要事务的场合还能一战。  二、InnoDB 的核心存储结构2.1 表空间（Tablespace）1234567891011InnoDB 表空间 ├── 系统表空间 (ibdata1) │    ├── Double Write Buffer │    ├── Insert Buffer (Change Buffer) │    ├── Undo Log │    └── 数据字典 ├── 独立表空间 (xxx....</div></div></div></a><a class="pagination-related" href="/2026/09/12/mysql-index-merge-optimization-deep-dive/" title="【MySQL 优化】索引合并（Index Merge）深度解析：Intersection、Union 与 Sort-Union 的底层原理与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-12</div><div class="info-item-2">【MySQL 优化】索引合并（Index Merge）深度解析：Intersection、Union 与 Sort-Union 的底层原理与实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】索引合并（Index Merge）深度解析：Intersection、Union 与 Sort-Union 的底层原理与实战面试官：EXPLAIN 里出现 Using intersect(…) 和 Using union(…) 是什么？很多人看到 type 那一列是 index_merge 就懵了 —— 不是说「一个查询只能用一个索引」吗？为什么这里出现了两个索引？ 答案是：MySQL 的优化器有一个专门的能力，叫做 索引合并（Index Merge）。它允许在单表查询中，同时对多个索引进行扫描，然后把各自的结果集在内存里做合并（交集、并集），最终用一个索引扫描的顺序回表。 理解 Index Merge，既能让你在做 SQL 优化时看懂执行计划，也能帮你识别出「看似走了索引、实际上更慢」的陷阱。 一、先看一个例子1234567891011CREATE TABLE t_order (  id          BIGINT PRIMARY KEY AUTO_INCREMENT,  user_id     BIGINT NOT NULL,  status     ...</div></div></div></a><a class="pagination-related" href="/2026/09/03/mysql-implicit-conversion-type-coercion-deep-dive/" title="【面试必备】面试官：明明建了索引，为什么 SQL 还是慢？MySQL 隐式转换类型转换规则深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-03</div><div class="info-item-2">【面试必备】面试官：明明建了索引，为什么 SQL 还是慢？MySQL 隐式转换类型转换规则深度解析</div></div><div class="info-2"><div class="info-item-1">【面试必备】面试官：明明建了索引，为什么 SQL 还是慢？MySQL 隐式转换类型转换规则深度解析开胃菜：一条”该走索引却没走”的 SQL123-- user 表：id BIGINT 主键，phone VARCHAR(20) 上有普通索引 uk_phoneSELECT * FROM user WHERE phone = 13800138000;EXPLAIN SELECT * FROM user WHERE phone = 13800138000;  EXPLAIN 结果 type 是 ALL（全表扫描），key 为 NULL——索引失效了。而把条件改成字符串： 1SELECT * FROM user WHERE phone = &#x27;13800138000&#x27;;  -- type=ref，命中 uk_phone  就正常走索引了。差别只在字面量有没有加引号。这就是 MySQL 隐式转换（Implicit Type Conversion） 的经典陷阱，也是面试官百问不厌的考点。本文从转换规则、索引失效原理到实战排查，一次讲透。 一、MySQL 的类型转换规则：先看官...</div></div></div></a><a class="pagination-related" href="/2026/08/31/mysql-optimizer-statistics-deep-dive/" title="【MySQL 原理】MySQL 优化器深度解析：从统计信息、基数估算到执行计划选择的决策逻辑"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-31</div><div class="info-item-2">【MySQL 原理】MySQL 优化器深度解析：从统计信息、基数估算到执行计划选择的决策逻辑</div></div><div class="info-2"><div class="info-item-1">【MySQL 原理】MySQL 优化器深度解析：从统计信息、基数估算到执行计划选择的决策逻辑面试官：为什么同样的 SQL，有时候走索引有时候全表扫描？优化器是怎么做决定的？很多人会把 SQL 慢归咎于「没建索引」，但很多时候索引建了、SQL 却没走 —— 因为 MySQL 优化器基于成本模型做选择，而成本估算依赖统计信息。理解优化器，是理解 EXPLAIN 里 rows、type、key 这些字段背后逻辑的钥匙。 一、一条 SQL 的完整旅程12345SQL 语句  → 连接器（鉴权、建立连接）  → 分析器（词法/语法分析，生成语法树）  → 优化器（决定执行计划：走哪个索引、表连接顺序）  → 执行器（按计划调用存储引擎 API，返回结果）  优化器是「决策者」：它的输入是语法树 + 统计信息，输出是执行计划。它可能做出错误决策，理解它才能干预它。 二、优化器的工作内容 选择索引：多个候选索引（主键、普通索引、联合索引）选哪个？可能全表扫描更优； 决定表连接顺序：多表 JOIN 时，谁是驱动表、谁是被驱动表； 选择执行算法：嵌套循环（NLJ）、块嵌套循环（BNL）、Hash ...</div></div></div></a><a class="pagination-related" href="/2026/09/07/mysql-table-fragmentation-optimize-rebuild/" title="【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-07</div><div class="info-item-2">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化一个线上事故：删除一半数据，表反而更慢了？某订单归档系统上线半年后，运维定期把 3 个月前的订单从 order 表 DELETE 掉。某天 DBA 发现：这张表明明只剩 2000 万行（高峰期 6000 万），但查询却越来越慢，磁盘占用还有 30GB 不降。 问题出在哪？答案就是表碎片（fragmentation）。DELETE 掉的行并没有真正释放空间，InnoDB 只是把它们标记为”可复用”，数据页里留下大量空洞；而频繁的随机更新又让索引页不断分裂，物理存储的连续性被破坏——InnoDB 不得不扫描大量”半空”的页来找到数据。 一、碎片是怎么产生的？三种来源1. DELETE 留下的空洞InnoDB 以 页（Page，默认 16KB） 为单位管理数据。DELETE 一行并不会立即把页里的空间归还给文件系统，而是在行记录上打删除标记，页内留下空洞。这些空洞只能被后续插入的、大小相近的行复用： 12-- 大量删除后，页内空间分布变成这样（示意）-- | 行1 | 空...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">642</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">748</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">208</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%BA%95%E5%B1%82%E3%80%91InnoDB-%E8%A1%A8%E7%A9%BA%E9%97%B4%E4%BD%93%E7%B3%BB%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E7%B3%BB%E7%BB%9F%E8%A1%A8%E7%A9%BA%E9%97%B4%E3%80%81%E7%8B%AC%E7%AB%8B%E8%A1%A8%E7%A9%BA%E9%97%B4%E3%80%81undo-%E4%B8%8E%E4%B8%B4%E6%97%B6%E8%A1%A8%E7%A9%BA%E9%97%B4%E7%9A%84%E5%AE%8C%E6%95%B4%E7%89%A9%E7%90%86%E5%B8%83%E5%B1%80"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E5%88%A0%E4%BA%86-2000-%E4%B8%87%E8%A1%8C%E6%95%B0%E6%8D%AE%EF%BC%8C%E4%B8%BA%E4%BB%80%E4%B9%88%E7%A3%81%E7%9B%98%E6%96%87%E4%BB%B6%E4%B8%80%E7%82%B9%E9%83%BD%E6%B2%A1%E5%8F%98%E5%B0%8F%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%BB%BA%E7%AB%8B%E5%9D%90%E6%A0%87%E7%B3%BB%EF%BC%9A%E4%BB%8E%E6%96%87%E4%BB%B6%E5%88%B0%E8%A1%8C%E8%AE%B0%E5%BD%95%E7%9A%84%E5%85%AD%E5%B1%82%E7%BB%93%E6%9E%84"><span class="toc-number">1.2.</span> <span class="toc-text">一、先建立坐标系：从文件到行记录的六层结构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E8%A1%A8%E7%A9%BA%E9%97%B4%E5%AE%B6%E6%97%8F%E7%9A%84%E4%BA%94%E4%B8%AA%E6%88%90%E5%91%98"><span class="toc-number">1.3.</span> <span class="toc-text">二、表空间家族的五个成员</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E7%B3%BB%E7%BB%9F%E8%A1%A8%E7%A9%BA%E9%97%B4%EF%BC%88ibdata1%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">1. 系统表空间（ibdata1）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E7%8B%AC%E7%AB%8B%E8%A1%A8%E7%A9%BA%E9%97%B4%EF%BC%88file-per-table%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2. 独立表空间（file-per-table）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-%E9%80%9A%E7%94%A8%E8%A1%A8%E7%A9%BA%E9%97%B4%EF%BC%88General-Tablespace%EF%BC%89"><span class="toc-number">1.3.3.</span> <span class="toc-text">3. 通用表空间（General Tablespace）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-Undo-%E8%A1%A8%E7%A9%BA%E9%97%B4"><span class="toc-number">1.3.4.</span> <span class="toc-text">4. Undo 表空间</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-%E4%B8%B4%E6%97%B6%E8%A1%A8%E7%A9%BA%E9%97%B4"><span class="toc-number">1.3.5.</span> <span class="toc-text">5. 临时表空间</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%8C%BA%E3%80%81%E9%A1%B5%E4%B8%8E%E2%80%9D%E7%A2%8E%E7%89%87%E2%80%9D%E7%9A%84%E7%9C%9F%E7%9B%B8"><span class="toc-number">1.4.</span> <span class="toc-text">三、区、页与”碎片”的真相</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%85%83%E6%95%B0%E6%8D%AE%E4%B8%8E%E7%9B%91%E6%8E%A7%EF%BC%9A%E5%B8%B8%E7%94%A8-SQL-%E6%B8%85%E5%8D%95"><span class="toc-number">1.5.</span> <span class="toc-text">四、元数据与监控：常用 SQL 清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%B8%B8%E8%A7%81%E4%BA%8B%E6%95%85%E5%9C%BA%E6%99%AF%E5%A4%8D%E7%9B%98"><span class="toc-number">1.6.</span> <span class="toc-text">五、常见事故场景复盘</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%94%9F%E4%BA%A7%E7%8E%AF%E5%A2%83%E7%9A%84%E6%9C%80%E4%BD%B3%E5%AE%9E%E8%B7%B5%E6%B8%85%E5%8D%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、生产环境的最佳实践清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/" title="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</a><time datetime="2026-09-19T00:40:00.000Z" title="发表于 2026-09-19 08:40:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/elasticsearch-shard-allocation-rebalance-deep-practice/" title="【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析</a><time datetime="2026-09-19T00:30:00.000Z" title="发表于 2026-09-19 08:30:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/kafka-log-compaction-retention-deep-dive/" title="【Kafka 原理】日志清理与 Log Compaction 深度解析：retention、压实、墓碑消息与状态存储实战">【Kafka 原理】日志清理与 Log Compaction 深度解析：retention、压实、墓碑消息与状态存储实战</a><time datetime="2026-09-19T00:20:00.000Z" title="发表于 2026-09-19 08:20:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/jvm-crash-hs-err-core-dump-jhsdb-deep-practice/" title="【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战">【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战</a><time datetime="2026-09-19T00:10:00.000Z" title="发表于 2026-09-19 08:10:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/" title="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</a><time datetime="2026-09-19T00:00:00.000Z" title="发表于 2026-09-19 08:00:00">2026-09-19</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

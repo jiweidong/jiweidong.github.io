@@ -1,0 +1,374 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？如果候选人已经聊完 G1&#x2F;ZGC、堆大小、Region 大小，还答不出”页大小”这一层，说明他对 JVM 的认识停在了”Java 层面”，没下探到操作系统与 CPU 的交互。 大页（Huge Pages">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？如果候选人已经聊完 G1&#x2F;ZGC、堆大小、Region 大小，还答不出”页大小”这一层，说明他对 JVM 的认识停在了”Java 层面”，没下探到操作系统与 CPU 的交互。 大页（Huge Pages">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-19T00:40:00.000Z">
+<meta property="article:modified_time" content="2026-09-19T00:04:17.290Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="性能调优">
+<meta property="article:tag" content="操作系统">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录",
+  "url": "https://jiweidong.github.io/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-19T00:40:00.000Z",
+  "dateModified": "2026-09-19T00:04:17.290Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">642</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">748</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">208</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-19T00:40:00.000Z" title="发表于 2026-09-19 08:40:00">2026-09-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-19T00:04:17.290Z" title="更新于 2026-09-19 08:04:17">2026-09-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM-%E8%B0%83%E4%BC%98/">JVM 调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-调优】透明大页（THP）与-Huge-Pages-深度解析：TLB、-XX-UseLargePages-与线上踩坑实录"><a href="#【JVM-调优】透明大页（THP）与-Huge-Pages-深度解析：TLB、-XX-UseLargePages-与线上踩坑实录" class="headerlink" title="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录"></a>【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</h1><h2 id="面试官：JVM-参数都调过了，还有什么能优化-GC-停顿？"><a href="#面试官：JVM-参数都调过了，还有什么能优化-GC-停顿？" class="headerlink" title="面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？"></a>面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？</h2><p>如果候选人已经聊完 G1&#x2F;ZGC、堆大小、Region 大小，还答不出”页大小”这一层，说明他对 JVM 的认识停在了”Java 层面”，没下探到操作系统与 CPU 的交互。</p>
+<p>大页（Huge Pages）是一个典型的”不懂不影响跑，懂了能救命”的调优点：它在某些场景能显著减少 GC 停顿和 TLB miss，在另一些场景却会让 JVM 启动变慢、内存居高不下。这篇文章把 THP、HugeTLB、<code>-XX:+UseLargePages</code> 的原理、配置、收益边界与踩坑全讲一遍。</p>
+<h2 id="一、为什么要关心”页”：从-TLB-说起"><a href="#一、为什么要关心”页”：从-TLB-说起" class="headerlink" title="一、为什么要关心”页”：从 TLB 说起"></a>一、为什么要关心”页”：从 TLB 说起</h2><p>现代 CPU 的内存访问链路是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">虚拟地址 → [TLB 查表] → 页表遍历 → 物理地址 → [CPU Cache] → 内存</span><br></pre></td></tr></table></figure>
+
+<p>关键点：</p>
+<ul>
+<li>操作系统按”页”管理内存，<strong>传统页大小 4KB</strong>；</li>
+<li>TLB（Translation Lookaside Buffer）是<strong>页表项的硬件缓存</strong>，容量极小（典型 L1 dTLB 64-128 项，L2 TLB 约 1536-2048 项）；</li>
+<li>每次 TLB miss，都要走多级页表（x86-64 四级页表，缺页时更贵），开销几十到上百个时钟周期。</li>
+</ul>
+<p>算一笔账：JVM 堆 32GB，按 4KB 页需要 <strong>8,388,608 个页表项</strong>。TLB 只能缓存其中约 2000 个 → 堆越大，TLB 命中率越低，随机访问模式下 TLB miss 会变成可观的性能损耗。</p>
+<p>若使用 <strong>2MB 大页</strong>，32GB 只需 <strong>16,384 个页表项</strong>，TLB 覆盖率提升 512 倍。1GB 大页更夸张，只要 32 个。</p>
+<h2 id="二、两种”大页”：THP-与-HugeTLB，别搞混"><a href="#二、两种”大页”：THP-与-HugeTLB，别搞混" class="headerlink" title="二、两种”大页”：THP 与 HugeTLB，别搞混"></a>二、两种”大页”：THP 与 HugeTLB，别搞混</h2><p>很多人把两个概念混为一谈，实际它们从分配机制到行为完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>透明大页 THP</th>
+<th>显式大页 HugeTLB</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>英文名</td>
+<td>Transparent Huge Pages</td>
+<td>Explicit Huge Pages</td>
+</tr>
+<tr>
+<td>分配时机</td>
+<td>内核自动、按需、可延迟</td>
+<td>启动时预留，固定不变</td>
+</tr>
+<tr>
+<td>是否可换出 swap</td>
+<td>可（<code>madvise</code> 模式可控制）</td>
+<td>不可（除非配了对应的 swap 页）</td>
+</tr>
+<tr>
+<td>是否保证拿到</td>
+<td>不保证，可能回退 4KB</td>
+<td>保证（拿不到就失败）</td>
+</tr>
+<tr>
+<td>管理方式</td>
+<td><code>/sys/kernel/mm/transparent_hugepage/*</code></td>
+<td><code>vm.nr_hugepages</code>、HugeTLB 文件系统</td>
+</tr>
+<tr>
+<td>JVM 用法</td>
+<td><code>-XX:+UseTransparentHugePages</code></td>
+<td><code>-XX:+UseLargePages</code></td>
+</tr>
+<tr>
+<td>生产建议</td>
+<td><strong>建议关闭或改 madvise</strong></td>
+<td>数据库&#x2F;JVM 大堆可选启用</td>
+</tr>
+</tbody></table>
+<p><strong>结论先行</strong>：</p>
+<ul>
+<li>JVM 生产环境<strong>通常建议把 THP 设为 <code>madvise</code></strong>，只让显式声明需要大页的进程用；</li>
+<li>若要用大页，<strong>优先 HugeTLB + <code>-XX:+UseLargePages</code></strong>，因为它确定性更强、不会引发内存碎片与分配停顿。</li>
+</ul>
+<h2 id="三、THP：内核的”自作主张”"><a href="#三、THP：内核的”自作主张”" class="headerlink" title="三、THP：内核的”自作主张”"></a>三、THP：内核的”自作主张”</h2><p>THP 的初衷是让应用无需改造就享受大页收益，但它的自动分配（<code>khugepaged</code> 后台线程合并 4KB 页）带来了两个副作用：</p>
+<ol>
+<li><strong>分配延迟抖动</strong>：内核在缺页时尝试凑齐 2MB 连续物理内存（<code>/sys/kernel/mm/transparent_hugepage/defrag</code>），碎片化严重时触发<strong>直接内存回收（direct reclaim）</strong>，表现为<strong>不可预测的长停顿</strong>——这就是”THP 导致 Redis 延迟毛刺”的著名问题。</li>
+<li><strong>内存占用偏高</strong>：2MB 页在 COW（写时复制）场景放大内存消耗，fork 的子进程（如 RDB 持久化）内存翻倍。</li>
+</ol>
+<h3 id="查看与配置"><a href="#查看与配置" class="headerlink" title="查看与配置"></a>查看与配置</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 当前状态</span></span><br><span class="line"><span class="built_in">cat</span> /sys/kernel/mm/transparent_hugepage/enabled</span><br><span class="line"><span class="comment"># 输出：[always] madvise never  ← 方括号是当前值</span></span><br><span class="line"></span><br><span class="line"><span class="built_in">cat</span> /sys/kernel/mm/transparent_hugepage/defrag</span><br><span class="line"><span class="comment"># always 意味着任何分配都尝试整理碎片，最容易引发停顿</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 大页统计（成功/失败次数）</span></span><br><span class="line">grep -i huge /proc/vmstat</span><br><span class="line"><span class="comment"># nr_hugepages / nr_hugepages_madvise / thp_fault_alloc / thp_fault_fallback ...</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>推荐配置</strong>（尤其数据库、消息中间件所在机器）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 临时生效</span></span><br><span class="line"><span class="built_in">echo</span> madvise &gt; /sys/kernel/mm/transparent_hugepage/enabled</span><br><span class="line"><span class="built_in">echo</span> defer+madvise &gt; /sys/kernel/mm/transparent_hugepage/defrag</span><br><span class="line"></span><br><span class="line"><span class="comment"># 永久生效（GRUB）</span></span><br><span class="line"><span class="comment"># /etc/default/grub</span></span><br><span class="line">GRUB_CMDLINE_LINUX=<span class="string">&quot;... transparent_hugepage=madvise&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>或者用 tuned：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># RHEL 系：用虚拟化/数据库 profile 自动关闭 THP 激进模式</span></span><br><span class="line">tuned-adm profile throughput-performance</span><br><span class="line"><span class="comment"># 自定义：/etc/tuned/&lt;name&gt;/tuned.conf 里设置 [vm] transparent_hugepage=madvise</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>检验是否踩过 THP 的坑</strong>：看应用延迟毛刺与 <code>thp_fault_fallback</code> &#x2F; <code>pgmajfault</code> 的增长是否相关；看内核日志是否有 <code>khugepaged</code> 相关停顿；对比关闭 THP 前后的 p99 延迟。</p>
+<h2 id="四、HugeTLB：显式大页的正确用法"><a href="#四、HugeTLB：显式大页的正确用法" class="headerlink" title="四、HugeTLB：显式大页的正确用法"></a>四、HugeTLB：显式大页的正确用法</h2><h3 id="1-预留大页"><a href="#1-预留大页" class="headerlink" title="1. 预留大页"></a>1. 预留大页</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 方式一：内核参数（推荐，启动即预留，避免碎片）</span></span><br><span class="line"><span class="comment"># /etc/sysctl.d/99-hugepages.conf</span></span><br><span class="line">vm.nr_hugepages = 16384        <span class="comment"># 16384 * 2MB = 32GB</span></span><br><span class="line">vm.hugetlb_shm_group = 1000    <span class="comment"># 允许使用大页的组 GID</span></span><br><span class="line">vm.nr_overcommit_hugepages = 0 <span class="comment"># 不超额分配</span></span><br><span class="line"></span><br><span class="line">sysctl -p</span><br><span class="line"></span><br><span class="line"><span class="comment"># 方式二：运行时调整（碎片化时往往失败）</span></span><br><span class="line"><span class="built_in">echo</span> 16384 &gt; /proc/sys/vm/nr_hugepages</span><br><span class="line"></span><br><span class="line"><span class="comment"># 验证</span></span><br><span class="line"><span class="built_in">cat</span> /proc/meminfo | grep -i huge</span><br><span class="line"><span class="comment"># HugePages_Total:   16384</span></span><br><span class="line"><span class="comment"># HugePages_Free:    16384</span></span><br><span class="line"><span class="comment"># Hugepagesize:       2048 kB</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>1GB 大页</strong>（需要 CPU 支持 <code>pdpe1gb</code>）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">cat</span> /proc/cpuinfo | grep -o pdpe1gb | <span class="built_in">head</span> -1</span><br><span class="line"><span class="comment"># 预留 8 个 1GB 大页</span></span><br><span class="line"><span class="built_in">echo</span> 8 &gt; /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages</span><br></pre></td></tr></table></figure>
+
+<p>1GB 大页对超大堆（&gt;64GB）收益更明显，但<strong>一旦预留就无法还给系统</strong>，且很难在运行时凑齐连续 1GB 物理内存，必须走内核参数。</p>
+<h3 id="2-JVM-侧配置"><a href="#2-JVM-侧配置" class="headerlink" title="2. JVM 侧配置"></a>2. JVM 侧配置</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">java -Xms32g -Xmx32g \</span><br><span class="line">     -XX:+UseLargePages \</span><br><span class="line">     -XX:+UseLargePagesInMetaspace \</span><br><span class="line">     -XX:LargePageSizeInBytes=2m \</span><br><span class="line">     -XX:+AlwaysPreTouch \</span><br><span class="line">     -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>几个参数的语义与配合：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>-XX:+UseLargePages</code></td>
+<td>尝试使用 HugeTLB（Linux 上即 hugetlbfs）</td>
+</tr>
+<tr>
+<td><code>-XX:+UseTransparentHugePages</code></td>
+<td>使用 THP（与上面互斥，不能同开）</td>
+</tr>
+<tr>
+<td><code>-XX:LargePageSizeInBytes</code></td>
+<td>指定页大小（2m&#x2F;1g），需系统支持</td>
+</tr>
+<tr>
+<td><code>-XX:+AlwaysPreTouch</code></td>
+<td><strong>启动时把堆的所有页都真实触碰一遍</strong>，避免运行时缺页停顿</td>
+</tr>
+<tr>
+<td><code>-XX:+UseLargePagesInMetaspace</code></td>
+<td>元空间也用大页（通常收益一般）</td>
+</tr>
+</tbody></table>
+<p><strong><code>AlwaysPreTouch</code> 与 HugeTLB 是天作之合</strong>：大页预留好、启动时全部预触碰，运行期就几乎没有缺页与页表遍历开销。代价是启动变慢（32GB 堆可能多花 10-30 秒）、RSS 立刻顶满（在 K8s 里要留出足够 limit）。</p>
+<h3 id="3-验证是否真的用上了"><a href="#3-验证是否真的用上了" class="headerlink" title="3. 验证是否真的用上了"></a>3. 验证是否真的用上了</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 方法一：-Xlog:pagesize（JDK 11+ 统一日志）</span></span><br><span class="line">java -Xlog:pagesize -Xms4g -Xmx4g -XX:+UseLargePages -version 2&gt;&amp;1 | <span class="built_in">head</span> -20</span><br><span class="line"><span class="comment"># 输出：UseLargePages ... Large page size: 2M、是否成功预留</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 方法二：看进程的 VmFlags / 大页使用量</span></span><br><span class="line">grep -i huge /proc/$(pgrep -f app.jar)/smaps | <span class="built_in">head</span></span><br><span class="line"><span class="built_in">cat</span> /proc/$(pgrep -f app.jar)/status | grep -i -E <span class="string">&quot;VmHWM|Rss&quot;</span></span><br><span class="line"><span class="built_in">cat</span> /proc/meminfo | grep HugePages_Free   <span class="comment"># 应减少</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 方法三：-XX:+PrintFlagsFinal 确认参数生效</span></span><br><span class="line">java -XX:+PrintFlagsFinal -XX:+UseLargePages -version | grep -i large</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：<code>-XX:+UseLargePages</code> 若无法满足<strong>会静默回退到普通页</strong>（除非配 <code>-XX:+UseLargePagesInMetaspace</code> 之类的严格模式），所以”配了参数”不等于”用上了大页”，<strong>必须验证</strong>。</p>
+<h2 id="五、收益与代价：什么场景值得开"><a href="#五、收益与代价：什么场景值得开" class="headerlink" title="五、收益与代价：什么场景值得开"></a>五、收益与代价：什么场景值得开</h2><h3 id="值得开的场景"><a href="#值得开的场景" class="headerlink" title="值得开的场景"></a>值得开的场景</h3><ol>
+<li><strong>超大堆 + 随机访问密集</strong>：堆 &gt; 32GB、以对象图遍历&#x2F;缓存为主的场景（如大内存搜索、图计算、大缓存服务）。TLB miss 下降带来的吞吐提升可达 5%-15%。</li>
+<li><strong>对 GC 停顿 p99 极敏感</strong>：G1&#x2F;ZGC 的标记阶段会遍历大量对象，大页减少页表遍历开销，停顿分布更稳定。</li>
+<li><strong>数据库类（MySQL&#x2F;PostgreSQL&#x2F;Redis Exporter 同机）</strong>：官方文档普遍建议关闭 THP、可选启用 HugeTLB。</li>
+</ol>
+<h3 id="不值得开-有风险的场景"><a href="#不值得开-有风险的场景" class="headerlink" title="不值得开 &#x2F; 有风险的场景"></a>不值得开 &#x2F; 有风险的场景</h3><ol>
+<li><strong>小堆（&lt; 8GB）</strong>：收益微乎其微，配置复杂度与运维风险不划算。</li>
+<li><strong>容器化环境（K8s）</strong>：HugeTLB 需要节点级预留 + Pod 里 <code>resources.limits.hugepages-2Mi</code> 显式声明，<strong>否则 Pod 起不来或看不到大页</strong>。THP 在容器里受宿主控制，无法按 Pod 隔离，更容易引发跨租户干扰。</li>
+<li><strong>内存碎片化严重的节点</strong>：运行时预留会失败，必须重启节点才能生效。</li>
+<li><strong>弹性伸缩频繁的场景</strong>：预留给大页的内存无法被其他进程复用，会显著降低资源利用率。</li>
+</ol>
+<h3 id="K8s-里的正确姿势"><a href="#K8s-里的正确姿势" class="headerlink" title="K8s 里的正确姿势"></a>K8s 里的正确姿势</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">apiVersion:</span> <span class="string">v1</span></span><br><span class="line"><span class="attr">kind:</span> <span class="string">Pod</span></span><br><span class="line"><span class="attr">metadata:</span></span><br><span class="line">  <span class="attr">name:</span> <span class="string">java-largepages</span></span><br><span class="line"><span class="attr">spec:</span></span><br><span class="line">  <span class="attr">containers:</span></span><br><span class="line">    <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">app</span></span><br><span class="line">      <span class="attr">image:</span> <span class="string">app:1.0</span></span><br><span class="line">      <span class="attr">resources:</span></span><br><span class="line">        <span class="attr">requests:</span></span><br><span class="line">          <span class="attr">memory:</span> <span class="string">&quot;34Gi&quot;</span></span><br><span class="line">          <span class="attr">cpu:</span> <span class="string">&quot;4&quot;</span></span><br><span class="line">        <span class="attr">limits:</span></span><br><span class="line">          <span class="attr">memory:</span> <span class="string">&quot;36Gi&quot;</span></span><br><span class="line">          <span class="attr">cpu:</span> <span class="string">&quot;4&quot;</span></span><br><span class="line">          <span class="attr">hugepages-2Mi:</span> <span class="string">&quot;32Gi&quot;</span>     <span class="comment"># 关键：显式申请大页资源</span></span><br><span class="line">      <span class="attr">volumeMounts:</span></span><br><span class="line">        <span class="bullet">-</span> <span class="attr">mountPath:</span> <span class="string">/hugepages-2Mi</span></span><br><span class="line">          <span class="attr">name:</span> <span class="string">hugepage</span></span><br><span class="line">      <span class="attr">command:</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">java</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">-Xms32g</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">-Xmx32g</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">-XX:+UseLargePages</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">-XX:LargePageSizeInBytes=2m</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">-XX:+AlwaysPreTouch</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">-jar</span></span><br><span class="line">        <span class="bullet">-</span> <span class="string">/app/app.jar</span></span><br><span class="line">  <span class="attr">volumes:</span></span><br><span class="line">    <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">hugepage</span></span><br><span class="line">      <span class="attr">emptyDir:</span></span><br><span class="line">        <span class="attr">medium:</span> <span class="string">HugePages</span></span><br></pre></td></tr></table></figure>
+
+<p>节点上还需预留（kubelet 会识别 <code>vm.nr_hugepages</code>）：<code>sysctl -w vm.nr_hugepages=16384</code>。<strong>容器内存 limit 要覆盖”堆 + 堆外 + 大页预留”</strong>，否则会被 OOMKilled——这和上一篇文章讲的崩溃排查直接相关。</p>
+<h2 id="六、四个真实的踩坑案例"><a href="#六、四个真实的踩坑案例" class="headerlink" title="六、四个真实的踩坑案例"></a>六、四个真实的踩坑案例</h2><p><strong>案例 1：THP 导致 Redis&#x2F;JVM 双双出现秒级毛刺。</strong><br>现象是每秒 QPS 正常，但偶发 1-3 秒停顿。内核 <code>vmstat</code> 显示 <code>thp_fault_alloc</code> 飙升、<code>pgmajfault</code> 集中出现。处置：宿主机 THP 改 <code>madvise</code>，毛刺消失。<strong>结论：THP 的收益是”平均提升”，代价是”尾部抖动”——而 SLA 看的是尾部。</strong></p>
+<p><strong>案例 2：<code>-XX:+UseLargePages</code> 配了却没生效。</strong><br><code>/proc/meminfo</code> 的 <code>HugePages_Free</code> 毫无变化，性能没提升。原因：容器内没申请 <code>hugepages-2Mi</code> 资源，JVM 静默回退。处置：加上资源声明，用 <code>-Xlog:pagesize</code> 验证。</p>
+<p><strong>案例 3：预留大页后其他服务起不来。</strong><br>运维按”堆大小”预留了 32GB 大页，机器总内存 64GB，剩余内存被其他服务抢光。<strong>大页预留 &#x3D; 独占</strong>。处置：按”实际活跃服务”分配，并加容量看板。</p>
+<p><strong>案例 4：<code>AlwaysPreTouch</code> + 容器 limit 打架。</strong><br>开了 <code>AlwaysPreTouch</code> 后启动即占满 32GB，容器 limit 设 32Gi，JVM 堆外内存一分配就被 OOMKilled。处置：limit ≥ 堆 × 1.25 + 512MB，或关掉 <code>AlwaysPreTouch</code> 换成渐进触碰。</p>
+<h2 id="七、面试追问清单"><a href="#七、面试追问清单" class="headerlink" title="七、面试追问清单"></a>七、面试追问清单</h2><p><strong>Q1：THP 和 HugeTLB 的本质区别？</strong><br>THP 由内核自动管理、按需分配、可能回退；HugeTLB 由管理员显式预留、确定分配、不可换出。前者省事但有抖动风险，后者可控但需规划。</p>
+<p><strong>Q2：为什么大页能提升 JVM 性能？</strong><br>减少页表项数量 → TLB 命中率提高 → 虚拟地址翻译开销下降；同时减少缺页次数与内核页管理开销。对堆遍历密集的 GC 和大内存随机访问收益最明显。</p>
+<p><strong>Q3：<code>-XX:+AlwaysPreTouch</code> 有什么用？</strong><br>启动时把堆内存全部写零触碰一遍，让 OS 真正分配物理页并建立页表，避免运行期因缺页造成 GC 与业务停顿。代价是启动时间与瞬时内存占用上升。</p>
+<p><strong>Q4：大页会不会影响 GC 算法选择？</strong><br>不影响选型，但对 GC 停顿的<strong>分布</strong>有影响。G1 的 Region、ZGC 的堆多重映射与 1GB 大页组合时需要额外验证（ZGC 用 2MB×3 视图映射，超大页支持有限）。</p>
+<p><strong>Q5：怎么量化大页的收益？</strong><br>做 A&#x2F;B 压测：固定堆大小与业务负载，对比开&#x2F;关大页的吞吐与 p99；同时用 <code>perf stat -e dTLB-load-misses,ITLB-load-misses</code> 观测 TLB miss 率变化。</p>
+<p><strong>Q6：容器里为什么更推荐关 THP？</strong><br>THP 是宿主级全局开关，无法按容器隔离，一个租户触发 direct reclaim 会影响同机所有 Pod；K8s 对 THP 也没有资源计量与隔离语义。相比之下 HugeTLB 有 <code>hugepages-2Mi</code> 资源声明，可控性强得多。</p>
+<h2 id="八、生产检查清单"><a href="#八、生产检查清单" class="headerlink" title="八、生产检查清单"></a>八、生产检查清单</h2><ol>
+<li><strong>宿主机 THP 设为 <code>madvise</code></strong>，<code>defrag</code> 设为 <code>defer+madvise</code>（不要 <code>always</code>）。</li>
+<li><strong>评估是否真的需要大页</strong>：堆 &lt; 8GB 直接跳过；大堆且延迟敏感才考虑。</li>
+<li>决定启用就<strong>走 HugeTLB + 内核参数预留</strong>（<code>vm.nr_hugepages</code>），不要靠运行时临时调。</li>
+<li><strong>JVM 侧配 <code>-XX:+UseLargePages -XX:LargePageSizeInBytes=2m</code></strong>，可叠加 <code>-XX:+AlwaysPreTouch</code>（前提是 limit 足够）。</li>
+<li><strong>必须验证</strong>：<code>-Xlog:pagesize</code>、<code>/proc/meminfo</code> 的 <code>HugePages_Free</code>、进程 smaps。</li>
+<li><strong>容器要显式申请 <code>hugepages-2Mi</code></strong>，并让内存 limit 覆盖堆外开销。</li>
+<li><strong>监控</strong>：<code>thp_fault_fallback</code>、<code>pgmajfault</code>、<code>HugePages_Free</code>、应用 p99 延迟。</li>
+<li><strong>压测验证收益</strong>，没有数据支撑的”调优”都是玄学。</li>
+</ol>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>大页这一层的关键认知：</p>
+<ul>
+<li><strong>TLB 是大内存服务真正的隐形瓶颈</strong>，堆越大、随机访问越密，页大小的影响越明显；</li>
+<li><strong>THP 与 HugeTLB 是两回事</strong>：前者自动但可能抖动，后者确定但需规划；</li>
+<li><strong>JVM 生产环境默认应把 THP 设为 <code>madvise</code></strong>，避免不可控的分配停顿；</li>
+<li><strong>要用大页就走 HugeTLB</strong>，配合 <code>AlwaysPreTouch</code>、显式验证、容器资源声明；</li>
+<li><strong>收益是概率性的</strong>（5%-15% 吞吐或尾部延迟改善），必须用压测和 TLB miss 指标量化。</li>
+</ul>
+<p>从 GC 参数调到大页，是从”Java 层”下探到”操作系统 + CPU 层”的一步。真正的性能优化，永远发生在你比问题更深一层的地方。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/">https://jiweidong.github.io/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a><a class="post-meta__tags" href="/tags/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F/">操作系统</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/09/19/elasticsearch-shard-allocation-rebalance-deep-practice/" title="【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析</div></div><div class="info-2"><div class="info-item-1">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析面试官：集群是 yellow 状态，你怎么办？Yellow 是 Elasticsearch 生产环境最常见的”半故障”：主分片全部就绪，副本分片没能分配。它不阻塞读写，所以很多人选择无视——直到某天一个节点宕机，yellow 变成 red，业务直接不可用。 要真正解决 yellow 和 red，必须理解 ES 的**分片分配（Shard Allocation）**机制：谁在决策、依据什么决策、什么时候会拒绝分配。这篇文章从集群规划讲到故障处置，把分配链路完整拆开。 一、先搞清楚：分片分配的决策者是谁ES 7.x 之后，分配决策由 Master 节点的 AllocationService 负责，配合三个组件：    组件 职责    AllocationDeciders 一串”是否允许分配”的过滤器（过滤器模式），任何一个否决就跳过   ShardsAllocator 在通过决策器的节点中，选一个”最合适”的（均衡度、磁盘水位）   BalancedShardsAllocato...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/26/jdk-cli-tools-jvm-deep-practice/" title="【JVM 实战】JDK 命令行工具全家桶：jps、jstat、jmap、jstack、jcmd 实战详解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-26</div><div class="info-item-2">【JVM 实战】JDK 命令行工具全家桶：jps、jstat、jmap、jstack、jcmd 实战详解</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】JDK 命令行工具全家桶：jps、jstat、jmap、jstack、jcmd 实战详解面试官：线上 Java 服务 CPU 飙高、内存暴涨、接口卡死，你手上只有命令行工具，怎么排查？生产环境往往没有图形界面、没有 IDE，甚至没有 Arthas（很多公司不允许随便装 agent）。这时候 JDK 自带的命令行工具就是你最可靠的武器——它们是 JDK 的一部分，零依赖、随处可用。 本文把最核心的 6 个命令讲透：jps、jstat、jmap、jstack、jcmd、jinfo，每个都配合真实排查场景，最后一节给出一套”线上故障排查 SOP”。 一、工具总览   命令 全称&#x2F;作用 核心用途 常用场景    jps Java Process Status 查看 Java 进程 找到目标 PID   jstat JVM Statistics Monitoring JVM 统计信息 GC、类加载、编译监控   jmap JVM Memory Map 堆内存映像 堆信息、堆转储、OOM 定位   jstack Java Stack Trace 线程堆栈 死锁、CP...</div></div></div></a><a class="pagination-related" href="/2026/09/18/jvm-code-cache-jit-tuning-deep-dive/" title="【JVM 实战】Code Cache 代码缓存深度解析：分层编译、缓存耗尽与 ReservedCodeCacheSize 调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-18</div><div class="info-item-2">【JVM 实战】Code Cache 代码缓存深度解析：分层编译、缓存耗尽与 ReservedCodeCacheSize 调优</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】Code Cache 代码缓存深度解析：分层编译、缓存耗尽与 ReservedCodeCacheSize 调优面试官：你见过日志里出现 CodeCache is full. Compiler has been disabled 吗？这句话是 JIT 的求救信号。它出现在 stdout &#x2F; GC 日志里时，意味着 JVM 已经不再编译新代码，所有热点方法退化为解释执行。表面上看服务「没挂」，但 RT 会毫无征兆地翻倍甚至翻十倍。 很多同学对 Code Cache 的印象停留在「JIT 编译后的代码放哪」，真要问「它多大、怎么分区域、满了会怎样、怎么监控」，就答不上来了。这篇把它讲透。  一、Code Cache 是什么，为什么必须有它Java 是解释 + 编译混合执行的：  解释器（interpreter）：启动快、执行慢； JIT 编译器（C1&#x2F;C2）：执行快、编译有成本，编译产物必须存在某个可执行内存区。  这块可执行内存就是 Code Cache（代码缓存），属于 非堆内存（Non-Heap），位于 JVM 的 Native Memory ...</div></div></div></a><a class="pagination-related" href="/2026/07/29/java-memory-leak-troubleshooting-guide/" title="【生产实战】Java 应用内存泄漏排查全攻略：从堆内泄漏到 Native Memory 泄漏"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-29</div><div class="info-item-2">【生产实战】Java 应用内存泄漏排查全攻略：从堆内泄漏到 Native Memory 泄漏</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 应用内存泄漏排查全攻略：从堆内泄漏到 Native Memory 泄漏前言内存泄漏是 Java 应用最棘手的生产问题之一。与传统的 C&#x2F;C++ 不同，Java 有 GC 自动管理内存，但这并不意味着不会泄漏。实际上，Java 内存泄漏的形式更多样、更隐蔽。 典型的症状：内存占用缓慢上升 → Full GC 频繁 → 最终 OOM 或性能急剧下降。 本文系统梳理各种内存泄漏场景、排查工具链与实战案例。 一、内存泄漏的分类   类型 描述 典型场景    堆内泄漏 对象无法被 GC 回收 集合类无界增长、缓存未设上限   堆外泄漏 DirectBuffer&#x2F;Unsafe 未释放 Netty 缓冲区、NIO 操作   Native Memory 泄漏 JVM 本地内存膨胀 ClassLoader 泄漏、线程泄漏、JNI 泄漏   MetaSpace 泄漏 方法区持续增长 动态类加载、CGLIB 代理类累积   二、堆内泄漏排查2.1 典型案例：ThreadLocal 内存泄漏这是最常见的堆内泄漏场景。 12345678public class ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/jvm-crash-hs-err-core-dump-jhsdb-deep-practice/" title="【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战面试官：服务进程突然没了，日志里什么都没有，你怎么查？这是线上最让人绝望的场景：没有任何业务异常日志，docker ps 里容器不见了，K8s 显示 OOMKilled 或者 Exit Code 137。大多数人第一反应是”重启一下试试”——然后同样的事故在一周后再次发生。 真正会排查的人，第一时间去找两样东西：hs_err_pid 日志 和 core dump 文件。前者是 JVM 自己写下的”临终遗言”，后者是整个进程内存的”遗体”。这篇文章把 JVM 崩溃分析的完整链路讲透，包括文件在哪、怎么读、怎么定位到代码。 一、JVM 崩溃的分类：先分清”谁杀了谁”排查第一步是判断死亡类型，不同类型证据链完全不同：    类型 现象 关键证据    JVM 内部致命错误（SIGSEGV&#x2F;SIGBUS） 进程消失，产生 hs_err_pid&lt;n&gt;.log hs_err 里的 Problematic frame   JVM 主动退出 日志有明确错误，退出码 ...</div></div></div></a><a class="pagination-related" href="/2026/07/02/java-oom-troubleshooting-mat-practice/" title="【生产实战】Java OOM 排查实战：从堆转储到 MAT 分析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【生产实战】Java OOM 排查实战：从堆转储到 MAT 分析</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java OOM 排查实战：从堆转储到 MAT 分析概述OutOfMemoryError（OOM）是 Java 生产环境中最具破坏力的故障之一。一次 OOM 可能导致整个应用不可用，甚至引发雪崩效应。本文从实战角度出发，系统梳理 OOM 的排查思路、常用工具和典型案例。 一、OOM 的类型与触发场景1.1 Java heap space最常见的 OOM，堆内存不足。 12345// 典型触发场景：内存泄漏或堆太小List&lt;byte[]&gt; list = new ArrayList&lt;&gt;();while (true) &#123;    list.add(new byte[1024 * 1024]); // 每秒泄漏1MB&#125;  常见原因：  内存泄漏（对象无法被 GC 回收） 堆大小设置不足（-Xmx 过小） 大对象&#x2F;大数组直接进入老年代 流量突增导致对象创建远快于 GC 回收  1.2 Metaspace12345678// 使用 CGLIB 动态生成大量类while (true) &#123;    Enhancer enha...</div></div></div></a><a class="pagination-related" href="/2026/06/11/jvm-memory-gc/" title="JVM 内存模型与垃圾回收机制全面解读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">JVM 内存模型与垃圾回收机制全面解读</div></div><div class="info-2"><div class="info-item-1">前言JVM 是 Java 跨平台的基石，也是面试中的”必考题”。理解 JVM 内存模型和 GC 机制，不仅能帮你通过面试，更是解决线上 OOM、CPU 飙升、GC 频繁等问题的必备技能。  一、JVM 内存区域划分1.1 整体架构12345678910111213┌─────────────────────────────────────────────────┐│               JVM 内存结构                        ││  ┌───────────────────┐  ┌─────────────────────┐  ││  │    堆 (Heap)      │  │    元空间 (MetaSpace) │  ││  │  - 新生代          │  │  - 类元信息          │  ││  │    · Eden          │  │  - 运行时常量池      │  ││  │    · S0 / S1       │  │                     │  ││  │  - 老年代    ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">642</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">748</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">208</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E8%B0%83%E4%BC%98%E3%80%91%E9%80%8F%E6%98%8E%E5%A4%A7%E9%A1%B5%EF%BC%88THP%EF%BC%89%E4%B8%8E-Huge-Pages-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9ATLB%E3%80%81-XX-UseLargePages-%E4%B8%8E%E7%BA%BF%E4%B8%8A%E8%B8%A9%E5%9D%91%E5%AE%9E%E5%BD%95"><span class="toc-number">1.</span> <span class="toc-text">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9AJVM-%E5%8F%82%E6%95%B0%E9%83%BD%E8%B0%83%E8%BF%87%E4%BA%86%EF%BC%8C%E8%BF%98%E6%9C%89%E4%BB%80%E4%B9%88%E8%83%BD%E4%BC%98%E5%8C%96-GC-%E5%81%9C%E9%A1%BF%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E8%A6%81%E5%85%B3%E5%BF%83%E2%80%9D%E9%A1%B5%E2%80%9D%EF%BC%9A%E4%BB%8E-TLB-%E8%AF%B4%E8%B5%B7"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么要关心”页”：从 TLB 说起</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%A4%E7%A7%8D%E2%80%9D%E5%A4%A7%E9%A1%B5%E2%80%9D%EF%BC%9ATHP-%E4%B8%8E-HugeTLB%EF%BC%8C%E5%88%AB%E6%90%9E%E6%B7%B7"><span class="toc-number">1.3.</span> <span class="toc-text">二、两种”大页”：THP 与 HugeTLB，别搞混</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81THP%EF%BC%9A%E5%86%85%E6%A0%B8%E7%9A%84%E2%80%9D%E8%87%AA%E4%BD%9C%E4%B8%BB%E5%BC%A0%E2%80%9D"><span class="toc-number">1.4.</span> <span class="toc-text">三、THP：内核的”自作主张”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%9F%A5%E7%9C%8B%E4%B8%8E%E9%85%8D%E7%BD%AE"><span class="toc-number">1.4.1.</span> <span class="toc-text">查看与配置</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81HugeTLB%EF%BC%9A%E6%98%BE%E5%BC%8F%E5%A4%A7%E9%A1%B5%E7%9A%84%E6%AD%A3%E7%A1%AE%E7%94%A8%E6%B3%95"><span class="toc-number">1.5.</span> <span class="toc-text">四、HugeTLB：显式大页的正确用法</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E9%A2%84%E7%95%99%E5%A4%A7%E9%A1%B5"><span class="toc-number">1.5.1.</span> <span class="toc-text">1. 预留大页</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-JVM-%E4%BE%A7%E9%85%8D%E7%BD%AE"><span class="toc-number">1.5.2.</span> <span class="toc-text">2. JVM 侧配置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-%E9%AA%8C%E8%AF%81%E6%98%AF%E5%90%A6%E7%9C%9F%E7%9A%84%E7%94%A8%E4%B8%8A%E4%BA%86"><span class="toc-number">1.5.3.</span> <span class="toc-text">3. 验证是否真的用上了</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%94%B6%E7%9B%8A%E4%B8%8E%E4%BB%A3%E4%BB%B7%EF%BC%9A%E4%BB%80%E4%B9%88%E5%9C%BA%E6%99%AF%E5%80%BC%E5%BE%97%E5%BC%80"><span class="toc-number">1.6.</span> <span class="toc-text">五、收益与代价：什么场景值得开</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%80%BC%E5%BE%97%E5%BC%80%E7%9A%84%E5%9C%BA%E6%99%AF"><span class="toc-number">1.6.1.</span> <span class="toc-text">值得开的场景</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%8D%E5%80%BC%E5%BE%97%E5%BC%80-%E6%9C%89%E9%A3%8E%E9%99%A9%E7%9A%84%E5%9C%BA%E6%99%AF"><span class="toc-number">1.6.2.</span> <span class="toc-text">不值得开 &#x2F; 有风险的场景</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#K8s-%E9%87%8C%E7%9A%84%E6%AD%A3%E7%A1%AE%E5%A7%BF%E5%8A%BF"><span class="toc-number">1.6.3.</span> <span class="toc-text">K8s 里的正确姿势</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%9B%9B%E4%B8%AA%E7%9C%9F%E5%AE%9E%E7%9A%84%E8%B8%A9%E5%9D%91%E6%A1%88%E4%BE%8B"><span class="toc-number">1.7.</span> <span class="toc-text">六、四个真实的踩坑案例</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E6%B8%85%E5%8D%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E7%94%9F%E4%BA%A7%E6%A3%80%E6%9F%A5%E6%B8%85%E5%8D%95"><span class="toc-number">1.9.</span> <span class="toc-text">八、生产检查清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/" title="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</a><time datetime="2026-09-19T00:40:00.000Z" title="发表于 2026-09-19 08:40:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/elasticsearch-shard-allocation-rebalance-deep-practice/" title="【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析</a><time datetime="2026-09-19T00:30:00.000Z" title="发表于 2026-09-19 08:30:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/kafka-log-compaction-retention-deep-dive/" title="【Kafka 原理】日志清理与 Log Compaction 深度解析：retention、压实、墓碑消息与状态存储实战">【Kafka 原理】日志清理与 Log Compaction 深度解析：retention、压实、墓碑消息与状态存储实战</a><time datetime="2026-09-19T00:20:00.000Z" title="发表于 2026-09-19 08:20:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/jvm-crash-hs-err-core-dump-jhsdb-deep-practice/" title="【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战">【JVM 实战】JVM 崩溃现场分析：hs_err_pid 日志、core dump 与 jhsdb 深度实战</a><time datetime="2026-09-19T00:10:00.000Z" title="发表于 2026-09-19 08:10:00">2026-09-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/" title="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</a><time datetime="2026-09-19T00:00:00.000Z" title="发表于 2026-09-19 08:00:00">2026-09-19</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
