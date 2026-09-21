@@ -1,0 +1,416 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复面试官：虚拟线程你都上生产了，那遇到过 Pinning 吗？这个问题是虚拟线程面试的「分水岭」。能说出「虚拟线程 &#x3D; 用户态轻量线程、由 ForkJoinPool 调度、synchronized 会阻塞载体线程」的是及格线；能讲清楚为什么 synchronized">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/21/virtual-thread-pinning-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复面试官：虚拟线程你都上生产了，那遇到过 Pinning 吗？这个问题是虚拟线程面试的「分水岭」。能说出「虚拟线程 &#x3D; 用户态轻量线程、由 ForkJoinPool 调度、synchronized 会阻塞载体线程」的是及格线；能讲清楚为什么 synchronized">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-21T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-21T00:02:51.337Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="虚拟线程">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复",
+  "url": "https://jiweidong.github.io/2026/09/21/virtual-thread-pinning-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-21T00:00:00.000Z",
+  "dateModified": "2026-09-21T00:02:51.337Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/21/virtual-thread-pinning-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">652</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">756</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">210</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-21T00:02:51.337Z" title="更新于 2026-09-21 08:02:51">2026-09-21</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/">并发编程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-21-并发】虚拟线程-Pinning-深度解析：synchronized-陷阱、定位手段与-JDK-24-修复"><a href="#【Java-21-并发】虚拟线程-Pinning-深度解析：synchronized-陷阱、定位手段与-JDK-24-修复" class="headerlink" title="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复"></a>【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</h1><h2 id="面试官：虚拟线程你都上生产了，那遇到过-Pinning-吗？"><a href="#面试官：虚拟线程你都上生产了，那遇到过-Pinning-吗？" class="headerlink" title="面试官：虚拟线程你都上生产了，那遇到过 Pinning 吗？"></a>面试官：虚拟线程你都上生产了，那遇到过 Pinning 吗？</h2><p>这个问题是虚拟线程面试的「分水岭」。能说出「虚拟线程 &#x3D; 用户态轻量线程、由 ForkJoinPool 调度、<code>synchronized</code> 会阻塞载体线程」的是及格线；能讲清楚<strong>为什么 <code>synchronized</code> 会导致 pinning、怎么定位、JDK 24 怎么修的</strong>，才是真正在生产里趟过坑的人。</p>
+<p>先说结论：<strong>虚拟线程（Virtual Thread）的核心卖点是「遇到阻塞就卸载（unmount）载体线程」。而 Pinning 就是指——本该卸载的虚拟线程，因为某种原因无法卸载，只能傻等，把宝贵的载体线程（Carrier Thread）一起拖住。</strong></p>
+<p>Pinning 是虚拟线程最容易被低估的性能杀手。因为它的表现非常隐蔽：程序不报错，吞吐却上不去。</p>
+<hr>
+<h2 id="一、回顾：虚拟线程为什么不阻塞载体线程"><a href="#一、回顾：虚拟线程为什么不阻塞载体线程" class="headerlink" title="一、回顾：虚拟线程为什么不阻塞载体线程"></a>一、回顾：虚拟线程为什么不阻塞载体线程</h2><p>虚拟线程的执行模型是 <strong>M:N 调度</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"> N 个虚拟线程（百万级）          M 个载体线程（= CPU 核数）</span><br><span class="line">┌──────┐ ┌──────┐ ┌──────┐</span><br><span class="line">│ VT-1 │ │ VT-2 │ │ VT-3 │  ...</span><br><span class="line">└──┬───┘ └──┬───┘ └──┬───┘</span><br><span class="line">   │        │        │</span><br><span class="line">   └────────┼────────┘</span><br><span class="line">            ▼</span><br><span class="line">    ForkJoinPool（默认并行度 = CPU 核数）</span><br><span class="line">   ┌────────┐ ┌────────┐</span><br><span class="line">   │Carrier1│ │Carrier2│</span><br><span class="line">   └────────┘ └────────┘</span><br></pre></td></tr></table></figure>
+
+<p>当虚拟线程执行到一个<strong>可卸载的阻塞操作</strong>时：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">Thread.sleep(<span class="number">1000</span>);              <span class="comment">// 卸载</span></span><br><span class="line">socket.getInputStream().read();  <span class="comment">// 卸载（NIO 已适配）</span></span><br><span class="line">queue.take();                    <span class="comment">// 卸载（java.util.concurrent 已适配）</span></span><br><span class="line">park();                          <span class="comment">// 卸载</span></span><br></pre></td></tr></table></figure>
+
+<p>JVM 会把虚拟线程的<strong>栈帧从载体线程的栈上「搬运」到堆上</strong>（continuation 的 stack chunk），然后释放载体线程去跑别的虚拟线程。等到 I&#x2F;O 就绪、等待条件满足，再把栈搬回来继续执行。</p>
+<p><strong>关键前提：栈能搬。</strong> 只要栈上有「JVM 无法搬运或无法安全恢复」的东西，就不能卸载。</p>
+<hr>
+<h2 id="二、Pinning-的两个经典原因"><a href="#二、Pinning-的两个经典原因" class="headerlink" title="二、Pinning 的两个经典原因"></a>二、Pinning 的两个经典原因</h2><h3 id="2-1-原因一：synchronized-块（JDK-21-23）"><a href="#2-1-原因一：synchronized-块（JDK-21-23）" class="headerlink" title="2.1 原因一：synchronized 块（JDK 21~23）"></a>2.1 原因一：<code>synchronized</code> 块（JDK 21~23）</h3><p>这是最著名的坑。在 JDK 21 到 23 中：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 会 pinning</span></span><br><span class="line"><span class="keyword">synchronized</span> (lock) &#123;</span><br><span class="line">    Thread.sleep(<span class="number">1000</span>);      <span class="comment">// 无法卸载！载体线程被占用</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 不会 pinning</span></span><br><span class="line">lock.lock();                 <span class="comment">// ReentrantLock</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    Thread.sleep(<span class="number">1000</span>);      <span class="comment">// 正常卸载</span></span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    lock.unlock();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么 <code>synchronized</code> 会 pin？</strong></p>
+<p>因为 <code>synchronized</code> 在 HotSpot 里的实现是 <strong>monitor（对象头 Mark Word + ObjectMonitor）</strong>，而 ObjectMonitor 记录的是<strong>线程身份</strong>。虚拟线程在被卸载&#x2F;重新挂载时，可能会<strong>运行在不同的载体线程上</strong>。如果持有 monitor 的虚拟线程被卸载，monitor 的所有者信息就「悬空」了——从其他线程视角看，这个 monitor 被一个「当前没有任何载体运行」的线程持有，会导致：</p>
+<ul>
+<li>其他真实线程尝试获取该 monitor 时无法推进；</li>
+<li>死锁检测、所有权判断全部失效。</li>
+</ul>
+<p>所以 HotSpot 的选择是：<strong>只要虚拟线程持有 <code>synchronized</code> 监视器，就禁止卸载（pin 住）</strong>。这是正确性优先的保守策略。</p>
+<h3 id="2-2-原因二：Native-栈帧"><a href="#2-2-原因二：Native-栈帧" class="headerlink" title="2.2 原因二：Native 栈帧"></a>2.2 原因二：Native 栈帧</h3><p>当调用栈上存在 <strong>native 方法帧</strong>（JNI）时，同样无法卸载：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 典型场景</span></span><br><span class="line">FileInputStream.read()          <span class="comment">// JDK 21 里是 native read，会 pin</span></span><br><span class="line">Socket.getInputStream().read()  <span class="comment">// 早期实现也有此问题</span></span><br><span class="line">LoadLibrary / JNI 调用</span><br><span class="line">本地加密库、图像库、数据库驱动中的 <span class="keyword">native</span> 调用</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意区分</strong>：<code>FileInputStream</code> 在新版本里已经用 FFM&#x2F;NIO 重写；而第三方 native 库（比如某些加密 SDK、<code>libjpeg</code> 封装）短期无解。</p>
+<p>不过，native pinning 的影响通常可控，因为 <strong>native 调用大多很快返回</strong>，不会长时间占用载体线程。<strong>真正致命的是「在 synchronized 里做长时间阻塞 I&#x2F;O」</strong>。</p>
+<hr>
+<h2 id="三、Pinning-的危害：吞吐断崖"><a href="#三、Pinning-的危害：吞吐断崖" class="headerlink" title="三、Pinning 的危害：吞吐断崖"></a>三、Pinning 的危害：吞吐断崖</h2><p>假设你的服务有 <strong>8 个 CPU 核</strong>，ForkJoinPool 并行度 &#x3D; 8，即 8 个载体线程。</p>
+<p><strong>理想情况（无 pinning）</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">10,000 个虚拟线程，每个都在等数据库响应（耗时 50ms）</span><br><span class="line">→ 8 个载体线程轮流服务，实际并发度 = 10,000</span><br><span class="line">→ 吞吐 ≈ 10,000 / 0.05s = 200,000 QPS（理论）</span><br></pre></td></tr></table></figure>
+
+<p><strong>Pinning 情况（每个请求在 synchronized 里阻塞 50ms）</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">同一时刻最多只有 8 个虚拟线程真正在「等待」</span><br><span class="line">其余 9,992 个虚拟线程排队等不到载体线程！</span><br><span class="line">→ 实际并发度 = 8</span><br><span class="line">→ 吞吐 ≈ 8 / 0.05s = 160 QPS</span><br></pre></td></tr></table></figure>
+
+<p><strong>并发能力从一万掉到八。</strong> 这就是为什么线上表现是「CPU 不高、QPS 很低、线程 dump 看不出问题」。</p>
+<p>更隐蔽的是：</p>
+<ul>
+<li><strong>线程数看起来正常</strong>（虚拟线程数量统计会显示很多，但它们都在等载体）；</li>
+<li><strong>CPU 利用率不高</strong>（确实没算什么东西）；</li>
+<li><strong>GC 正常、内存正常</strong>；</li>
+<li><strong>只有在压力上来时才暴露</strong>，低峰期完全看不出。</li>
+</ul>
+<hr>
+<h2 id="四、怎么定位-Pinning"><a href="#四、怎么定位-Pinning" class="headerlink" title="四、怎么定位 Pinning"></a>四、怎么定位 Pinning</h2><h3 id="4-1-JFR-事件：jdk-VirtualThreadPinned"><a href="#4-1-JFR-事件：jdk-VirtualThreadPinned" class="headerlink" title="4.1 JFR 事件：jdk.VirtualThreadPinned"></a>4.1 JFR 事件：<code>jdk.VirtualThreadPinned</code></h3><p>这是官方推荐的定位手段。启动 JFR 录制：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">java -XX:StartFlightRecording=filename=vt.jfr,duration=60s,settings=profile -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>然后用 <code>jfr</code> 命令查看：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">jfr <span class="built_in">print</span> --events jdk.VirtualThreadPinned vt.jfr</span><br></pre></td></tr></table></figure>
+
+<p>输出会包含：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">jdk.VirtualThreadPinned &#123;</span><br><span class="line">  startTime = 08:12:33.421</span><br><span class="line">  duration = 1.05 s</span><br><span class="line">  eventThread = &quot;virtual-1234&quot; (virtual)</span><br><span class="line">  stackTrace = [</span><br><span class="line">    com.example.UserService.queryUser(String) line: 42</span><br><span class="line">    com.example.UserService$$Lambda$123/0x... run()</span><br><span class="line">    ...</span><br><span class="line">  ]</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键字段是 <code>stackTrace</code>——它会直接指到引发 pinning 的那一行。</strong></p>
+<h3 id="4-2-诊断阈值：jdk-tracePinnedThreads"><a href="#4-2-诊断阈值：jdk-tracePinnedThreads" class="headerlink" title="4.2 诊断阈值：jdk.tracePinnedThreads"></a>4.2 诊断阈值：<code>jdk.tracePinnedThreads</code></h3><p>老一些的 JDK 版本支持这个诊断开关，可以打印 pinning 栈：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">java -Djdk.tracePinnedThreads=full -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>或者只打印摘要：<code>-Djdk.tracePinnedThreads=short</code>。</p>
+<blockquote>
+<p><strong>注意</strong>：这个选项在 JDK 24 之后因为 <code>synchronized</code> 不再 pin 而基本失去意义。JDK 21~23 可用。</p>
+</blockquote>
+<h3 id="4-3-自定义监控：虚拟线程-API"><a href="#4-3-自定义监控：虚拟线程-API" class="headerlink" title="4.3 自定义监控：虚拟线程 API"></a>4.3 自定义监控：虚拟线程 API</h3><p>JDK 21+ 提供了 <code>Thread.currentThread().isVirtual()</code> 和 <code>Thread.ofVirtual()</code> 等 API，可以自己埋点：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">PinningMonitor</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">watch</span><span class="params">(String name, Runnable task)</span> &#123;</span><br><span class="line">        <span class="type">Thread</span> <span class="variable">t</span> <span class="operator">=</span> Thread.ofVirtual().name(name).start(() -&gt; &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">            task.run();</span><br><span class="line">            <span class="type">long</span> <span class="variable">cost</span> <span class="operator">=</span> System.nanoTime() - start;</span><br><span class="line">            <span class="comment">// 结合 JFR 事件做告警</span></span><br><span class="line">        &#125;);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>更实用的做法是<strong>订阅 JFR 流式事件</strong>（JDK 14+ 的 <code>jdk.jfr.consumer</code>）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">try</span> (<span class="type">RecordingStream</span> <span class="variable">rs</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">RecordingStream</span>()) &#123;</span><br><span class="line">    rs.enable(<span class="string">&quot;jdk.VirtualThreadPinned&quot;</span>).withThreshold(Duration.ofMillis(<span class="number">20</span>));</span><br><span class="line">    rs.onEvent(<span class="string">&quot;jdk.VirtualThreadPinned&quot;</span>, e -&gt; &#123;</span><br><span class="line">        log.warn(<span class="string">&quot;Pinned for &#123;&#125; ms, stack: &#123;&#125;&quot;</span>,</span><br><span class="line">                e.getDuration().toMillis(),</span><br><span class="line">                e.getStackTrace());</span><br><span class="line">    &#125;);</span><br><span class="line">    rs.start();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>推荐线上常驻一个低频告警</strong>：阈值设 20ms 以上，超过就上报。这是把「玄学性能问题」变成「可观测问题」的关键。</p>
+<hr>
+<h2 id="五、修复方案"><a href="#五、修复方案" class="headerlink" title="五、修复方案"></a>五、修复方案</h2><h3 id="5-1-方案一：用-ReentrantLock-替换-synchronized（万能解）"><a href="#5-1-方案一：用-ReentrantLock-替换-synchronized（万能解）" class="headerlink" title="5.1 方案一：用 ReentrantLock 替换 synchronized（万能解）"></a>5.1 方案一：用 <code>ReentrantLock</code> 替换 <code>synchronized</code>（万能解）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 坏味道</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">synchronized</span> <span class="keyword">void</span> <span class="title function_">doWork</span><span class="params">()</span> &#123;</span><br><span class="line">    httpClient.send(req);   <span class="comment">// 长时间阻塞</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 好味道</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">final</span> <span class="type">ReentrantLock</span> <span class="variable">lock</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ReentrantLock</span>();</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">doWork</span><span class="params">()</span> &#123;</span><br><span class="line">    lock.lock();</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        httpClient.send(req);</span><br><span class="line">    &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">        lock.unlock();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>java.util.concurrent.locks</code> 下的锁<strong>已经全面适配虚拟线程</strong>：等待锁时会卸载，被唤醒时重新挂载。</p>
+<p><strong>注意区分两类锁的语义：</strong></p>
+<table>
+<thead>
+<tr>
+<th>锁</th>
+<th>虚拟线程行为</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>synchronized</code></td>
+<td>JDK ≤23：pinning；JDK 24+：可卸载</td>
+<td>JDK 24+ 可放心用</td>
+</tr>
+<tr>
+<td><code>ReentrantLock</code></td>
+<td>一直支持卸载</td>
+<td>最稳妥</td>
+</tr>
+<tr>
+<td><code>ReentrantReadWriteLock</code></td>
+<td>支持卸载</td>
+<td>读多写少优选</td>
+</tr>
+<tr>
+<td><code>StampedLock</code></td>
+<td>支持（但有 <code>synchronized</code> 内部细节需注意）</td>
+<td>谨慎</td>
+</tr>
+<tr>
+<td><code>Semaphore</code> &#x2F; <code>CountDownLatch</code></td>
+<td>支持卸载</td>
+<td>放心用</td>
+</tr>
+</tbody></table>
+<h3 id="5-2-方案二：缩短-synchronized-临界区"><a href="#5-2-方案二：缩短-synchronized-临界区" class="headerlink" title="5.2 方案二：缩短 synchronized 临界区"></a>5.2 方案二：缩短 <code>synchronized</code> 临界区</h3><p>如果实在不想改锁，<strong>把阻塞操作移出同步块</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌</span></span><br><span class="line"><span class="keyword">synchronized</span> (<span class="built_in">this</span>) &#123;</span><br><span class="line">    <span class="type">Result</span> <span class="variable">r</span> <span class="operator">=</span> slowRemoteCall();   <span class="comment">// 50ms</span></span><br><span class="line">    cache.put(key, r);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅</span></span><br><span class="line"><span class="type">Result</span> <span class="variable">r</span> <span class="operator">=</span> slowRemoteCall();       <span class="comment">// 在锁外做 I/O</span></span><br><span class="line"><span class="keyword">synchronized</span> (<span class="built_in">this</span>) &#123;</span><br><span class="line">    cache.put(key, r);             <span class="comment">// 临界区变成几纳秒</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这个重构的本质是：<strong><code>synchronized</code> 只用来保护共享状态的读写，不要用来「串行化 I&#x2F;O」</strong>。很多老代码里 <code>synchronized</code> 是顺手加的「整块方法锁」，这是 pinning 的重灾区。</p>
+<h3 id="5-3-方案三：升级到-JDK-24"><a href="#5-3-方案三：升级到-JDK-24" class="headerlink" title="5.3 方案三：升级到 JDK 24+"></a>5.3 方案三：升级到 JDK 24+</h3><p><strong>JEP 491（JDK 24）彻底解决了 <code>synchronized</code> 的 pinning 问题。</strong></p>
+<p>核心思路是：<strong>让虚拟线程在持有 monitor 时也能卸载</strong>。实现上做了两件事：</p>
+<ol>
+<li><strong>为虚拟线程重新设计 monitor 的所有权模型</strong>——把 monitor 的所有者从「物理线程」改成「虚拟线程身份」，这样卸载后所有权依然有效；</li>
+<li><strong>处理 monitor 与载体线程的解耦</strong>——当虚拟线程被卸载时，如果它持有 monitor，JVM 需要保证其他线程在 <code>monitorenter</code> 时能看到正确的所有权状态，并能被正确唤醒。</li>
+</ol>
+<p>从 JDK 24 开始：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// JDK 24+：不再 pinning！</span></span><br><span class="line"><span class="keyword">synchronized</span> (lock) &#123;</span><br><span class="line">    Thread.sleep(<span class="number">1000</span>);   <span class="comment">// 正常卸载，载体线程去做别的</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>所以升级路线图很清晰：</strong></p>
+<ul>
+<li>JDK 21&#x2F;22&#x2F;23：能用虚拟线程，但要严格自查 <code>synchronized</code>；</li>
+<li><strong>JDK 24+：放心用 <code>synchronized</code></strong>，pinning 只剩 native 帧一种原因。</li>
+</ul>
+<h3 id="5-4-方案四：处理-native-pinning"><a href="#5-4-方案四：处理-native-pinning" class="headerlink" title="5.4 方案四：处理 native pinning"></a>5.4 方案四：处理 native pinning</h3><ul>
+<li><strong>优先替换实现</strong>：<code>FileInputStream</code> → <code>Files.newInputStream</code> 或 <code>FileChannel</code>；</li>
+<li><strong>能异步就异步</strong>：把 native 调用丢到平台线程池（<code>Executors.newFixedThreadPool</code>）里执行，虚拟线程只做编排；</li>
+<li><strong>实在不行就接受</strong>：评估 native 调用的耗时，只要不是长阻塞，影响可控。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 把 native 阻塞调用隔离到平台线程池</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">ExecutorService</span> <span class="variable">NATIVE_POOL</span> <span class="operator">=</span></span><br><span class="line">        Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * <span class="number">2</span>);</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> CompletableFuture&lt;<span class="type">byte</span>[]&gt; nativeCall(<span class="type">byte</span>[] in) &#123;</span><br><span class="line">    <span class="keyword">return</span> CompletableFuture.supplyAsync(() -&gt; nativeEncrypt(in), NATIVE_POOL);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、一个完整的排查案例"><a href="#六、一个完整的排查案例" class="headerlink" title="六、一个完整的排查案例"></a>六、一个完整的排查案例</h2><p><strong>现象</strong>：某订单查询接口改成虚拟线程后，压测 QPS 反而从 3,000 掉到 400，CPU 只有 15%。</p>
+<p><strong>排查步骤</strong>：</p>
+<ol>
+<li><code>jstack</code> 看载体线程栈——发现 8 个 ForkJoinPool worker 全部卡在同一个方法上：</li>
+</ol>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">&quot;ForkJoinPool-1-worker-1&quot; ...</span><br><span class="line">   at com.example.OrderCache.get(OrderCache.java:88)</span><br><span class="line">   - waiting to lock &lt;0x0000000712ab1234&gt; (a com.example.OrderCache)</span><br><span class="line">   at com.example.OrderService.query(OrderService.java:31)</span><br></pre></td></tr></table></figure>
+
+<ol start="2">
+<li>看第 88 行——<code>synchronized (this) { ... httpClient.get(...) ... }</code>；</li>
+<li>开 JFR，<code>jfr print --events jdk.VirtualThreadPinned</code> 确认 pinning，栈一致；</li>
+<li><strong>修复</strong>：把 HTTP 调用移到 <code>synchronized</code> 外，只把 <code>cache.put</code> 留在临界区；</li>
+<li><strong>结果</strong>：QPS 从 400 恢复到 4,200。</li>
+</ol>
+<p><strong>教训</strong>：虚拟线程不是「换成 <code>Thread.ofVirtual()</code> 就变快」。<strong>它是把「阻塞等待」的成本从「占一个线程」降到「占一段堆内存」，前提是等待真的能够卸载。</strong></p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：除了 <code>synchronized</code> 和 native，还有别的原因会 pin 吗？</strong></p>
+<p>有。理论上任何导致**「栈不可搬运」或「JVM 无法安全恢复」**的情况都会。已知的还有：<code>class</code> 初始化过程、<code>Object.wait()</code>（实际也会 pin，本质是 monitor）、某些 JDK 内部持有原始锁的操作。面试时答 <code>synchronized</code> + native 帧这两条主因即可，能补充「本质是 monitor &#x2F; 栈帧不可搬运」就更好。</p>
+<p><strong>Q2：<code>Thread.sleep()</code> 会 pin 吗？</strong></p>
+<p>单独调用不会。<code>Thread.sleep</code> 本身就是虚拟线程可卸载的阻塞点。<strong>但如果你在 <code>synchronized</code> 块里 <code>sleep</code>，就会 pin。</strong> 这就是最容易踩的组合。</p>
+<p><strong>Q3：<code>ReentrantLock</code> 为什么就能卸载？</strong></p>
+<p>因为 AQS 的等待队列是基于 <code>Node</code> 对象 + <code>LockSupport.park()</code> 实现的，<strong>所有者信息记录在 AQS 的 <code>exclusiveOwnerThread</code> 字段（对象引用），不依赖物理线程身份</strong>。虚拟线程 park 时挂起，unpark 时唤醒，JVM 能准确保存&#x2F;恢复虚拟线程状态。</p>
+<p><strong>Q4：虚拟线程数受什么限制？</strong></p>
+<p>不受线程栈大小限制（栈在堆上，按需分配并会收缩），但受<strong>内存</strong>和<strong>下游容量</strong>限制。常见误区：以为可以随便开 100 万个然后打数据库——结果把数据库连接池打爆。<strong>虚拟线程适合「大量、可等待」的 I&#x2F;O 密集场景，不是用来绕过下游容量瓶颈的。</strong></p>
+<p><strong>Q5：怎么决定该用虚拟线程还是响应式（WebFlux）？</strong></p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>虚拟线程</th>
+<th>响应式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>编程模型</td>
+<td>同步阻塞，直观</td>
+<td>异步回调&#x2F;链式，学习成本高</td>
+</tr>
+<tr>
+<td>调试</td>
+<td>栈完整，好排查</td>
+<td>栈被切碎，难跟踪</td>
+</tr>
+<tr>
+<td>存量代码</td>
+<td>几乎零改造</td>
+<td>需要全量重写</td>
+</tr>
+<tr>
+<td>背压</td>
+<td>无</td>
+<td>原生支持</td>
+</tr>
+<tr>
+<td>适用</td>
+<td>I&#x2F;O 密集、代码以阻塞风格为主</td>
+<td>高并发流式、需要背压</td>
+</tr>
+</tbody></table>
+<p><strong>我的建议</strong>：<strong>优先虚拟线程</strong>。它用最低的心智成本拿到大部分异步收益；只有在需要精细背压控制、或者已经在响应式栈上时，才选 WebFlux。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>把这篇的核心压缩成一张清单：</p>
+<ul>
+<li><strong>Pinning &#x3D; 虚拟线程无法卸载，载体线程被拖住</strong>；</li>
+<li><strong>两大原因</strong>：<code>synchronized</code> 监视器（JDK ≤23）、native 栈帧；</li>
+<li><strong>危害</strong>：并发度塌缩到载体线程数，CPU 不高但 QPS 暴跌；</li>
+<li><strong>定位</strong>：JFR 的 <code>jdk.VirtualThreadPinned</code> 事件 + 栈；<code>-Djdk.tracePinnedThreads</code>（≤23）；</li>
+<li><strong>修复</strong>：<code>ReentrantLock</code> 替换、缩短临界区、隔离 native 调用、<strong>升 JDK 24+（JEP 491 根治 <code>synchronized</code> 问题）</strong>；</li>
+<li><strong>原则</strong>：虚拟线程解决的是「等待的成本」，不是「下游的容量」。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/21/virtual-thread-pinning-deep-dive/">https://jiweidong.github.io/2026/09/21/virtual-thread-pinning-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E8%99%9A%E6%8B%9F%E7%BA%BF%E7%A8%8B/">虚拟线程</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/09/21/netty-fastthreadlocal-deep-dive/" title="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</div></div><div class="info-2"><div class="info-item-1">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？面试官：Netty 里为什么不用 JDK 的 ThreadLocal？这个问题一出来，多半是在考察你对 Netty 内存模型和线程模型的整体理解。短答案是：Netty 的 EventLoop 线程生命周期很长、每连接绑定固定线程，这种场景下 ThreadLocal 的哈希冲突和内存回收问题会被放大，于是 Netty 自己做了一套 FastThreadLocal。 但如果你只答到这儿，面试官一定会追问：「具体快在哪？数据结构是什么？为什么能避免冲突？」 这一篇我们把它彻底拆开。  一、先看 JDK ThreadLocal 的结构与瓶颈1.1 数据结构：Thread → ThreadLocalMap → Entry[]123456789101112// 简化版 JDK 源码public class Thread &#123;    ThreadLocal.ThreadLocalMap threadLocals = null;&#125;static class Thr...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/21/java-jmm-volatile-happens-before/" title="【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了</div></div><div class="info-2"><div class="info-item-1">【面试必备】JVM 内存模型（JMM）与 happens-before 规则，这一篇就够了面试官：说说什么是 JMM（Java 内存模型）？JMM（Java Memory Model） 是一个抽象的概念，它定义了一套规则和规范，用来屏蔽不同硬件和操作系统的内存访问差异，确保 Java 程序在各种平台上都能达到内存访问的一致性。  JMM 的核心围绕着三个特性展开：原子性（Atomicity）、可见性（Visibility）、有序性（Ordering）。  为什么需要 JMM？现代 CPU 采用多级缓存架构（L1&#x2F;L2&#x2F;L3 Cache）来加速数据访问，但这也带来了缓存一致性问题。每个 CPU 核心有自己私有的缓存，当多个线程在不同核心上运行时，它们看到的共享变量值可能不一致。 1234567891011121314151617┌─────────────────────────────────────────┐│               Java 线程                   ││   ┌──────────┐     ┌──────────┐...</div></div></div></a><a class="pagination-related" href="/2026/08/24/java-spin-lock-deep-dive/" title="【并发编程】自旋锁深度解析：从 CAS 手写自旋到 CLH&#x2F;MCS 队列锁与自适应自旋"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">【并发编程】自旋锁深度解析：从 CAS 手写自旋到 CLH&#x2F;MCS 队列锁与自适应自旋</div></div><div class="info-2"><div class="info-item-1">【并发编程】自旋锁深度解析：从 CAS 手写自旋到 CLH&#x2F;MCS 队列锁与自适应自旋面试官：为什么需要自旋锁？阻塞锁有什么问题？阻塞锁（synchronized 重量级锁、LockSupport.park()）在锁竞争时会让线程进入阻塞态，但阻塞和唤醒是有代价的：  线程状态切换需要上下文切换（内核态切换，约 1~10 微秒级开销）； 阻塞线程需要操作系统调度，唤醒还有排队延迟； 频繁的「竞争 → 阻塞 → 唤醒」在锁持有时间极短时，开销甚至超过临界区本身。  自旋锁的思路很简单：拿不到锁就不让出 CPU，原地空转（自旋）反复尝试，直到拿到锁。如果临界区代码很短（比如只是一个 count++），自旋等待的消耗远小于线程挂起&#x2F;唤醒的消耗。 123456// 自旋锁 vs 阻塞锁的核心区别// 阻塞：线程休眠，等唤醒（上下文切换）synchronized (lock) &#123; critical(); &#125;// 自旋：线程忙等，不停尝试while (!lock.tryAcquire()) &#123; /* 空转 */ &#125;  一句话总结：自...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-concurrent-hashmap-evolution/" title="【面试必备】ConcurrentHashMap 在 JDK 7 和 8 中的演变与对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】ConcurrentHashMap 在 JDK 7 和 8 中的演变与对比</div></div><div class="info-2"><div class="info-item-1">【面试必备】ConcurrentHashMap 在 JDK 7 和 8 中的演变与对比面试官：说说 ConcurrentHashMap 的实现原理？ConcurrentHashMap 是 Java 并发包的王牌成员，也是面试中出场率最高的集合类之一。它的设计经历了 JDK 7 的「分段锁」到 JDK 8 的「CAS + synchronized」的重大演变。 数据结构的直观对比先上结论，再讲细节：    对比维度 JDK 7（1.7及以前） JDK 8（1.8及以后）    数据结构 Segment + HashEntry（数组+链表） Node + 红黑树（数组+链表+红黑树）   锁粒度 Segment 级别（粗粒度分段锁） 单个桶的头节点（细粒度）   并发机制 ReentrantLock（继承自ReentrantLock） synchronized + CAS   定位元素 两次哈希（定位Segment → 定位桶） 一次哈希   扩容机制 每个Segment单独扩容 整体扩容，支持多线程协助   size() 统计 先乐观尝试，失败再锁所有Segment 使用 base...</div></div></div></a><a class="pagination-related" href="/2026/07/10/java-scoped-values-deep-dive/" title="【Java 21+】Scoped Values（作用域值）深度解析：虚拟线程时代的线程局部变量替代方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-10</div><div class="info-item-2">【Java 21+】Scoped Values（作用域值）深度解析：虚拟线程时代的线程局部变量替代方案</div></div><div class="info-2"><div class="info-item-1">【Java 21+】Scoped Values（作用域值）深度解析：虚拟线程时代的线程局部变量替代方案引言在 Java 并发编程中，ThreadLocal 一直是传递”隐式上下文”的标准方案——从 Web 请求的 traceId 到事务管理的 connection，ThreadLocal 无处不在。 然而，虚拟线程时代的到来暴露了 ThreadLocal 的几个严重缺陷：  内存泄漏风险：虚拟线程数量可达百万级，每个 ThreadLocal 值都会常驻内存 不可变性缺失：任何代码都能修改 ThreadLocal 中的值，导致上下文漂移 继承性混乱：InheritableThreadLocal 在线程池场景下行为不可预测  JDK 21 以预览特性引入了 Scoped Values（作用域值，JEP 429），并在 JDK 22+ 持续优化。这是 Java 为了解决上述问题给出的官方方案。  一、ThreadLocal 的困境1.1 ThreadLocal 的典型用法1234567891011121314151617181920212223242526272829303132333...</div></div></div></a><a class="pagination-related" href="/2026/08/19/synchronized-vs-reentrantlock-deep-comparison/" title="【面试必备】synchronized vs ReentrantLock 深度对比：8 大区别与源码级解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-19</div><div class="info-item-2">【面试必备】synchronized vs ReentrantLock 深度对比：8 大区别与源码级解析</div></div><div class="info-2"><div class="info-item-1">【面试必备】synchronized vs ReentrantLock 深度对比：8 大区别与源码级解析面试官：你平时用 synchronized 还是 ReentrantLock？它俩有什么区别？这是 Java 并发面试的”必考题”，但大部分候选人的回答停留在”一个是关键字一个是类、一个自动释放一个手动释放”这种表面层。今天我们从语法、功能、底层原理、性能四个维度，把这两个锁彻底掰开揉碎。  一、先看结论：8 大区别一览表   维度 synchronized ReentrantLock    1. 本质 JVM 关键字（语言级） JUC 类（API 级）   2. 锁的获取&#x2F;释放 自动（JVM 管理） 手动（lock&#x2F;unlock，必须 finally 释放）   3. 可中断性 不可中断（等待时无法响应 interrupt） 可中断（lockInterruptibly）   4. 超时获取 不支持 支持 tryLock(timeout, unit)   5. 公平性 非公平 默认非公平，可配公平   6. 多条件变量 只能 wait&#x2F;notify...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-threadlocal-source-memory-leak/" title="【面试必备】ThreadLocal 内存泄漏问题深度分析：从源码到最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】ThreadLocal 内存泄漏问题深度分析：从源码到最佳实践</div></div><div class="info-2"><div class="info-item-1">【面试必备】ThreadLocal 内存泄漏问题深度分析：从源码到最佳实践面试官：说说你对 ThreadLocal 的理解，它有什么内存泄漏问题？ThreadLocal 是 Java 并发编程中一个非常有用的工具，也是面试中绕不开的坑——尤其是它的内存泄漏问题。 ThreadLocal 是干什么的？一句话概括：ThreadLocal 提供了线程局部变量，每个线程拥有自己独立的变量副本，互不干扰。 123456789101112131415161718192021222324// 简单使用示例public class ThreadLocalDemo &#123;    private static final ThreadLocal&lt;UserContext&gt; USER_CONTEXT = new ThreadLocal&lt;&gt;();        public static void main(String[] args) &#123;        // 模拟两个不同线程处理用户请求        new Thread(() -&gt; &#123;     ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">652</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">756</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">210</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-21-%E5%B9%B6%E5%8F%91%E3%80%91%E8%99%9A%E6%8B%9F%E7%BA%BF%E7%A8%8B-Pinning-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9Asynchronized-%E9%99%B7%E9%98%B1%E3%80%81%E5%AE%9A%E4%BD%8D%E6%89%8B%E6%AE%B5%E4%B8%8E-JDK-24-%E4%BF%AE%E5%A4%8D"><span class="toc-number">1.</span> <span class="toc-text">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%99%9A%E6%8B%9F%E7%BA%BF%E7%A8%8B%E4%BD%A0%E9%83%BD%E4%B8%8A%E7%94%9F%E4%BA%A7%E4%BA%86%EF%BC%8C%E9%82%A3%E9%81%87%E5%88%B0%E8%BF%87-Pinning-%E5%90%97%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：虚拟线程你都上生产了，那遇到过 Pinning 吗？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%9B%9E%E9%A1%BE%EF%BC%9A%E8%99%9A%E6%8B%9F%E7%BA%BF%E7%A8%8B%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E9%98%BB%E5%A1%9E%E8%BD%BD%E4%BD%93%E7%BA%BF%E7%A8%8B"><span class="toc-number">1.2.</span> <span class="toc-text">一、回顾：虚拟线程为什么不阻塞载体线程</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81Pinning-%E7%9A%84%E4%B8%A4%E4%B8%AA%E7%BB%8F%E5%85%B8%E5%8E%9F%E5%9B%A0"><span class="toc-number">1.3.</span> <span class="toc-text">二、Pinning 的两个经典原因</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%8E%9F%E5%9B%A0%E4%B8%80%EF%BC%9Asynchronized-%E5%9D%97%EF%BC%88JDK-21-23%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 原因一：synchronized 块（JDK 21~23）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%8E%9F%E5%9B%A0%E4%BA%8C%EF%BC%9ANative-%E6%A0%88%E5%B8%A7"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 原因二：Native 栈帧</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Pinning-%E7%9A%84%E5%8D%B1%E5%AE%B3%EF%BC%9A%E5%90%9E%E5%90%90%E6%96%AD%E5%B4%96"><span class="toc-number">1.4.</span> <span class="toc-text">三、Pinning 的危害：吞吐断崖</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%80%8E%E4%B9%88%E5%AE%9A%E4%BD%8D-Pinning"><span class="toc-number">1.5.</span> <span class="toc-text">四、怎么定位 Pinning</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-JFR-%E4%BA%8B%E4%BB%B6%EF%BC%9Ajdk-VirtualThreadPinned"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 JFR 事件：jdk.VirtualThreadPinned</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%AF%8A%E6%96%AD%E9%98%88%E5%80%BC%EF%BC%9Ajdk-tracePinnedThreads"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 诊断阈值：jdk.tracePinnedThreads</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E8%87%AA%E5%AE%9A%E4%B9%89%E7%9B%91%E6%8E%A7%EF%BC%9A%E8%99%9A%E6%8B%9F%E7%BA%BF%E7%A8%8B-API"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 自定义监控：虚拟线程 API</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BF%AE%E5%A4%8D%E6%96%B9%E6%A1%88"><span class="toc-number">1.6.</span> <span class="toc-text">五、修复方案</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E7%94%A8-ReentrantLock-%E6%9B%BF%E6%8D%A2-synchronized%EF%BC%88%E4%B8%87%E8%83%BD%E8%A7%A3%EF%BC%89"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 方案一：用 ReentrantLock 替换 synchronized（万能解）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E7%BC%A9%E7%9F%AD-synchronized-%E4%B8%B4%E7%95%8C%E5%8C%BA"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 方案二：缩短 synchronized 临界区</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E5%8D%87%E7%BA%A7%E5%88%B0-JDK-24"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 方案三：升级到 JDK 24+</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E6%96%B9%E6%A1%88%E5%9B%9B%EF%BC%9A%E5%A4%84%E7%90%86-native-pinning"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 方案四：处理 native pinning</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%80%E4%B8%AA%E5%AE%8C%E6%95%B4%E7%9A%84%E6%8E%92%E6%9F%A5%E6%A1%88%E4%BE%8B"><span class="toc-number">1.7.</span> <span class="toc-text">六、一个完整的排查案例</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/distributed-2pc-3pc-consensus-deep-dive/" title="【分布式理论】两阶段提交与三阶段提交深度解析：从 2PC 阻塞困境到 3PC 的取舍与局限">【分布式理论】两阶段提交与三阶段提交深度解析：从 2PC 阻塞困境到 3PC 的取舍与局限</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/java-class-file-api-jep484-deep-dive/" title="【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践">【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/mysql-auto-increment-lock-exhaustion-deep-dive/" title="【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/netty-fastthreadlocal-deep-dive/" title="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/virtual-thread-pinning-deep-dive/" title="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

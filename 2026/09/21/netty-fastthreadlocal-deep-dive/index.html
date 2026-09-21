@@ -1,0 +1,373 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？ | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？面试官：Netty 里为什么不用 JDK 的 ThreadLocal？这个问题一出来，多半是在考察你对 Netty 内存模型和线程模型的整体理解。短答案是：Netty 的 EventLoop 线程生命周期很长、每连接绑定固定线程，这种场景下 ThreadLocal 的哈希冲突和内存">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/21/netty-fastthreadlocal-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？面试官：Netty 里为什么不用 JDK 的 ThreadLocal？这个问题一出来，多半是在考察你对 Netty 内存模型和线程模型的整体理解。短答案是：Netty 的 EventLoop 线程生命周期很长、每连接绑定固定线程，这种场景下 ThreadLocal 的哈希冲突和内存">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-21T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-21T00:02:29.551Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Netty">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="源码">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？",
+  "url": "https://jiweidong.github.io/2026/09/21/netty-fastthreadlocal-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-21T00:00:00.000Z",
+  "dateModified": "2026-09-21T00:02:29.551Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/21/netty-fastthreadlocal-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">652</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">756</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">210</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-21T00:02:29.551Z" title="更新于 2026-09-21 08:02:29">2026-09-21</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Netty-进阶】FastThreadLocal-深度解析：为什么它比-JDK-ThreadLocal-快-3-倍？"><a href="#【Netty-进阶】FastThreadLocal-深度解析：为什么它比-JDK-ThreadLocal-快-3-倍？" class="headerlink" title="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？"></a>【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</h1><h2 id="面试官：Netty-里为什么不用-JDK-的-ThreadLocal？"><a href="#面试官：Netty-里为什么不用-JDK-的-ThreadLocal？" class="headerlink" title="面试官：Netty 里为什么不用 JDK 的 ThreadLocal？"></a>面试官：Netty 里为什么不用 JDK 的 ThreadLocal？</h2><p>这个问题一出来，多半是在考察你对 Netty 内存模型和线程模型的整体理解。短答案是：<strong>Netty 的 EventLoop 线程生命周期很长、每连接绑定固定线程，这种场景下 ThreadLocal 的哈希冲突和内存回收问题会被放大，于是 Netty 自己做了一套 FastThreadLocal。</strong></p>
+<p>但如果你只答到这儿，面试官一定会追问：「具体快在哪？数据结构是什么？为什么能避免冲突？」</p>
+<p>这一篇我们把它彻底拆开。</p>
+<hr>
+<h2 id="一、先看-JDK-ThreadLocal-的结构与瓶颈"><a href="#一、先看-JDK-ThreadLocal-的结构与瓶颈" class="headerlink" title="一、先看 JDK ThreadLocal 的结构与瓶颈"></a>一、先看 JDK ThreadLocal 的结构与瓶颈</h2><h3 id="1-1-数据结构：Thread-→-ThreadLocalMap-→-Entry"><a href="#1-1-数据结构：Thread-→-ThreadLocalMap-→-Entry" class="headerlink" title="1.1 数据结构：Thread → ThreadLocalMap → Entry[]"></a>1.1 数据结构：Thread → ThreadLocalMap → Entry[]</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 简化版 JDK 源码</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">Thread</span> &#123;</span><br><span class="line">    ThreadLocal.<span class="type">ThreadLocalMap</span> <span class="variable">threadLocals</span> <span class="operator">=</span> <span class="literal">null</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">ThreadLocalMap</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> Entry[] table;   <span class="comment">// 长度必须是 2 的幂</span></span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">Entry</span> <span class="keyword">extends</span> <span class="title class_">WeakReference</span>&lt;ThreadLocal&lt;?&gt;&gt; &#123;</span><br><span class="line">        Object value;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>关键点：</p>
+<ul>
+<li><strong>Map 存在 Thread 上</strong>，不在 ThreadLocal 上（这解决了 <code>ThreadLocal</code> 作为 key 长期存活的问题，但 value 会泄漏）；</li>
+<li><code>Entry</code> 的 key 是<strong>弱引用</strong>，value 是强引用；</li>
+<li>定位方式：<code>threadLocalHashCode &amp; (table.length - 1)</code>。</li>
+</ul>
+<h3 id="1-2-瓶颈一：哈希冲突"><a href="#1-2-瓶颈一：哈希冲突" class="headerlink" title="1.2 瓶颈一：哈希冲突"></a>1.2 瓶颈一：哈希冲突</h3><p><code>threadLocalHashCode</code> 每次 <code>new ThreadLocal()</code> 时用 <code>HASH_INCREMENT = 0x61c88647</code>（黄金分割数）递增：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">HASH_INCREMENT</span> <span class="operator">=</span> <span class="number">0x61c88647</span>;</span><br><span class="line"><span class="keyword">private</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">threadLocalHashCode</span> <span class="operator">=</span> nextHashCode();</span><br></pre></td></tr></table></figure>
+
+<p>这个数选得很好，能让哈希分布尽量均匀。<strong>但只要你的 ThreadLocal 实例多到和 table 容量同量级，冲突就不可避免</strong>。冲突时的处理是<strong>开放寻址 + 线性探测</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="type">int</span> <span class="title function_">nextIndex</span><span class="params">(<span class="type">int</span> i, <span class="type">int</span> len)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> ((i + <span class="number">1</span> &lt; len) ? i + <span class="number">1</span> : <span class="number">0</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>线性探测最坏情况退化成 O(n)。JDK 的扩容阈值是 <code>len * 2 / 3</code>，扩容时重新 hash 全部 Entry。</p>
+<h3 id="1-3-瓶颈二：探测过程中的清理成本"><a href="#1-3-瓶颈二：探测过程中的清理成本" class="headerlink" title="1.3 瓶颈二：探测过程中的清理成本"></a>1.3 瓶颈二：探测过程中的清理成本</h3><p><code>get()</code> 时遇到 key 为 null 的 Entry 会调用 <code>expungeStaleEntry()</code> 做一轮清理——这本身是必要的防泄漏设计，但它在<strong>热路径</strong>上执行，属于额外的分支和遍历成本。</p>
+<h3 id="1-4-瓶颈三：无法批量清理"><a href="#1-4-瓶颈三：无法批量清理" class="headerlink" title="1.4 瓶颈三：无法批量清理"></a>1.4 瓶颈三：无法批量清理</h3><p>一个线程退出时，它的 ThreadLocalMap 才整体不可达。而 Netty 的线程是<strong>长期存活</strong>的，所以必须手工清理，否则就是经典的内存泄漏。</p>
+<hr>
+<h2 id="二、FastThreadLocal-的核心设计：索引直接定位"><a href="#二、FastThreadLocal-的核心设计：索引直接定位" class="headerlink" title="二、FastThreadLocal 的核心设计：索引直接定位"></a>二、FastThreadLocal 的核心设计：索引直接定位</h2><p>Netty 的思路极其暴力且优雅：<strong>既然 ThreadLocal 的问题是哈希冲突，那我干脆不做哈希，用「全局递增索引 + 数组直接下标」</strong>。</p>
+<h3 id="2-1-三个核心角色"><a href="#2-1-三个核心角色" class="headerlink" title="2.1 三个核心角色"></a>2.1 三个核心角色</h3><table>
+<thead>
+<tr>
+<th>角色</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>FastThreadLocal</code></td>
+<td>逻辑上的「ThreadLocal」，持有 <code>index</code></td>
+</tr>
+<tr>
+<td><code>InternalThreadLocalMap</code></td>
+<td>每个 FastThreadLocalThread 一个，内部是 <code>Object[] indexedVariables</code></td>
+</tr>
+<tr>
+<td><code>FastThreadLocalThread</code></td>
+<td>继承 Thread，持有 <code>InternalThreadLocalMap</code></td>
+</tr>
+</tbody></table>
+<h3 id="2-2-索引分配"><a href="#2-2-索引分配" class="headerlink" title="2.2 索引分配"></a>2.2 索引分配</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FastThreadLocal</span>&lt;V&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">int</span> index;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">FastThreadLocal</span><span class="params">()</span> &#123;</span><br><span class="line">        index = InternalThreadLocalMap.nextVariableIndex();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// InternalThreadLocalMap</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">AtomicInteger</span> <span class="variable">nextIndex</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">AtomicInteger</span>();</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="type">int</span> <span class="title function_">nextVariableIndex</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">index</span> <span class="operator">=</span> nextIndex.getAndIncrement();</span><br><span class="line">    <span class="keyword">if</span> (index &lt; <span class="number">0</span>) &#123;</span><br><span class="line">        nextIndex.decrementAndGet();</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;too many thread-local indexed variables&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> index;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>每个 FastThreadLocal 实例拿到一个全局唯一的、单调递增的 index。</strong> 存取时：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> V <span class="title function_">get</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">InternalThreadLocalMap</span> <span class="variable">map</span> <span class="operator">=</span> InternalThreadLocalMap.get();</span><br><span class="line">    <span class="type">Object</span> <span class="variable">v</span> <span class="operator">=</span> map.indexedVariable(index);</span><br><span class="line">    <span class="keyword">if</span> (v != InternalThreadLocalMap.UNSET) &#123;</span><br><span class="line">        <span class="keyword">return</span> (V) v;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> initialize(initialValue());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>indexedVariable(index)</code> 就是一次<strong>纯数组随机访问</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> Object <span class="title function_">indexedVariable</span><span class="params">(<span class="type">int</span> index)</span> &#123;</span><br><span class="line">    Object[] lookup = indexedVariables;</span><br><span class="line">    <span class="keyword">return</span> index &lt; lookup.length ? lookup[index] : UNSET;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>没有哈希、没有取模、没有冲突、没有探测。</strong> 这就是它快的根本原因。</p>
+<h3 id="2-3-为什么数组访问这么快"><a href="#2-3-为什么数组访问这么快" class="headerlink" title="2.3 为什么数组访问这么快"></a>2.3 为什么数组访问这么快</h3><ul>
+<li>数组下标定位是 <code>base + index * 4/8</code> 的地址计算，<strong>O(1) 且没有分支</strong>；</li>
+<li>索引是编译期后确定但运行期稳定的常量，JIT 容易做<strong>边界检查消除</strong>；</li>
+<li>没有引用链追踪（ThreadLocal → Map → Entry → value 的三层跳转变成了两层）。</li>
+</ul>
+<hr>
+<h2 id="三、内部数组的扩容与常量池优化"><a href="#三、内部数组的扩容与常量池优化" class="headerlink" title="三、内部数组的扩容与常量池优化"></a>三、内部数组的扩容与常量池优化</h2><h3 id="3-1-数组初始大小"><a href="#3-1-数组初始大小" class="headerlink" title="3.1 数组初始大小"></a>3.1 数组初始大小</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">INDEXED_VARIABLE_TABLE_INITIAL_SIZE</span> <span class="operator">=</span> <span class="number">32</span>;</span><br></pre></td></tr></table></figure>
+
+<p>初始 32 个槽位。注意 Netty 在这里做了个很聪明的设计——<strong>小索引走数组，大索引走 Map 兜底</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 当 index &gt;= ARRAY_LIST_CAPACITY（默认 1024）时，用 HashMap 存储</span></span><br><span class="line"><span class="keyword">private</span> HashMap&lt;Integer, Object&gt; indexedVariableMap;</span><br></pre></td></tr></table></figure>
+
+<p>这处理了「某个框架疯狂创建 FastThreadLocal 导致数组无限膨胀」的极端情况。<strong>注意 <code>get()</code> 热路径上 Netty 依然假设小索引命中数组</strong>，大索引是冷路径。</p>
+<h3 id="3-2-一个细节：UNSET-哨兵值"><a href="#3-2-一个细节：UNSET-哨兵值" class="headerlink" title="3.2 一个细节：UNSET 哨兵值"></a>3.2 一个细节：<code>UNSET</code> 哨兵值</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Object</span> <span class="variable">UNSET</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Object</span>();</span><br></pre></td></tr></table></figure>
+
+<p>用哨兵对象而不是 <code>null</code> 的好处是：<strong>可以区分「从未赋值」和「被显式设为 null」</strong>，从而正确触发 <code>initialValue()</code>。这和 JDK 里 <code>set(null)</code> 会真的清空的行为不同——Netty 里 <code>set(null)</code> 存的是 <code>null</code>，<code>get()</code> 返回 <code>null</code> 而不会重新初始化。</p>
+<hr>
+<h2 id="四、批量清理：FastThreadLocal-的王牌"><a href="#四、批量清理：FastThreadLocal-的王牌" class="headerlink" title="四、批量清理：FastThreadLocal 的王牌"></a>四、批量清理：FastThreadLocal 的王牌</h2><h3 id="4-1-removeAll"><a href="#4-1-removeAll" class="headerlink" title="4.1 removeAll()"></a>4.1 <code>removeAll()</code></h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">removeAll</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="comment">// 由 EventLoop 线程在合适时机调用</span></span><br><span class="line">    Object[] lookup = indexedVariables;</span><br><span class="line">    <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; lookup.length; i++) &#123;</span><br><span class="line">        <span class="type">Object</span> <span class="variable">v</span> <span class="operator">=</span> lookup[i];</span><br><span class="line">        <span class="keyword">if</span> (v != UNSET) &#123;</span><br><span class="line">            removeAt(i);   <span class="comment">// 会回调 FastThreadLocal.remove(this)</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>这是 JDK ThreadLocal 做不到的事。</strong> JDK 无法枚举「当前线程上有哪些 ThreadLocal」，而 Netty 因为索引是全局注册的，可以精确地遍历所有槽位并逐个触发清理回调。</p>
+<p>Netty 在 <code>FastThreadLocalRunnable</code> &#x2F; <code>FastThreadLocalThread</code> 的 <code>run()</code> 结束时调用：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">FastThreadLocalRunnable</span> <span class="keyword">implements</span> <span class="title class_">Runnable</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            runnable.run();</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            FastThreadLocal.removeAll();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>这就是 Netty 避免 ThreadLocal 内存泄漏的机制</strong>——不是靠弱引用，而是靠显式的、确定性的批量清理。</p>
+<h3 id="4-2-为什么-Netty-的-EventLoop-必须这么干"><a href="#4-2-为什么-Netty-的-EventLoop-必须这么干" class="headerlink" title="4.2 为什么 Netty 的 EventLoop 必须这么干"></a>4.2 为什么 Netty 的 EventLoop 必须这么干</h3><p>Netty 的 <code>NioEventLoop</code> 线程是<strong>长生命周期</strong>的（一个 EventLoop 服务多个 Channel，一直活着）。如果用 JDK ThreadLocal：</p>
+<ul>
+<li>Map 里的 value 会一直跟着线程活着；</li>
+<li>连接关闭后，如果忘记 <code>remove()</code>，value（比如 ByteBuf、ChannelHandlerContext 引用）就永久泄漏。</li>
+</ul>
+<p>而 FastThreadLocal 的 <code>removeAll()</code> 在任务批次执行完毕后统一清理，把「可能泄漏」变成了「确定回收」。</p>
+<hr>
+<h2 id="五、实战：什么时候该用-FastThreadLocal"><a href="#五、实战：什么时候该用-FastThreadLocal" class="headerlink" title="五、实战：什么时候该用 FastThreadLocal"></a>五、实战：什么时候该用 FastThreadLocal</h2><h3 id="5-1-前提条件：必须跑在-FastThreadLocalThread-上"><a href="#5-1-前提条件：必须跑在-FastThreadLocalThread-上" class="headerlink" title="5.1 前提条件：必须跑在 FastThreadLocalThread 上"></a>5.1 前提条件：必须跑在 FastThreadLocalThread 上</h3><p>这是个<strong>高频踩坑点</strong>。<code>InternalThreadLocalMap.get()</code> 的逻辑是：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> InternalThreadLocalMap <span class="title function_">get</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">Thread</span> <span class="variable">thread</span> <span class="operator">=</span> Thread.currentThread();</span><br><span class="line">    <span class="keyword">if</span> (thread <span class="keyword">instanceof</span> FastThreadLocalThread) &#123;</span><br><span class="line">        <span class="keyword">return</span> fastGet((FastThreadLocalThread) thread);</span><br><span class="line">    &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> slowGet();   <span class="comment">// 兜底：用普通 ThreadLocal 包一层</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>如果当前线程不是 FastThreadLocalThread，就会退化成 <code>slowGet()</code>——内部其实是一个普通的 ThreadLocal。</strong> 此时 FastThreadLocal <strong>不比 JDK ThreadLocal 快，甚至更慢</strong>（多了一层包装）。</p>
+<p>所以：</p>
+<ul>
+<li>Netty 自己的 <code>NioEventLoop</code> 是 <code>FastThreadLocalThread</code>，放心用；</li>
+<li><strong>业务代码里用 <code>Executors.newFixedThreadPool()</code> 提交任务，然后指望 FastThreadLocal 加速？无效。</strong></li>
+<li>要正确用法：<code>new DefaultThreadFactory().newThread(...)</code>，它创建的就是 <code>FastThreadLocalThread</code>。</li>
+</ul>
+<h3 id="5-2-用法示例"><a href="#5-2-用法示例" class="headerlink" title="5.2 用法示例"></a>5.2 用法示例</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RequestContext</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> FastThreadLocal&lt;RequestContext&gt; CTX =</span><br><span class="line">            <span class="keyword">new</span> <span class="title class_">FastThreadLocal</span>&lt;RequestContext&gt;() &#123;</span><br><span class="line">                <span class="meta">@Override</span></span><br><span class="line">                <span class="keyword">protected</span> RequestContext <span class="title function_">initialValue</span><span class="params">()</span> &#123;</span><br><span class="line">                    <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">RequestContext</span>();</span><br><span class="line">                &#125;</span><br><span class="line">            &#125;;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> RequestContext <span class="title function_">current</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> CTX.get();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">clear</span><span class="params">()</span> &#123;</span><br><span class="line">        CTX.remove();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-线上内存泄漏排查清单"><a href="#5-3-线上内存泄漏排查清单" class="headerlink" title="5.3 线上内存泄漏排查清单"></a>5.3 线上内存泄漏排查清单</h3><p>如果怀疑 FastThreadLocal 泄漏，按这个顺序查：</p>
+<ol>
+<li><strong>确认是否走了 <code>slowGet()</code></strong>：抓线程栈，看线程类是否 <code>FastThreadLocalThread</code>；</li>
+<li><strong>确认是否有 <code>removeAll</code> 调用</strong>：如果是自定义线程池，检查任务提交方式；</li>
+<li><strong>dump 堆看 <code>InternalThreadLocalMap</code> 数量</strong>：<code>jmap -histo:live &lt;pid&gt; | grep InternalThreadLocalMap</code>，正常应该和 EventLoop 数量同量级；</li>
+<li><strong>看 value 类型</strong>：如果堆积的是 <code>ByteBuf</code>&#x2F;<code>PooledByteBuf</code>，多半是业务 handler 里存了没释放的引用；</li>
+<li><strong>用 Netty 自带检测</strong>：<code>-Dio.netty.leakDetection.level=paranoid</code>（仅压测环境，开销大）。</li>
+</ol>
+<hr>
+<h2 id="六、性能对比实测结论"><a href="#六、性能对比实测结论" class="headerlink" title="六、性能对比实测结论"></a>六、性能对比实测结论</h2><p>在 Netty 官方和一些社区 benchmark 中，典型结论是：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>JDK ThreadLocal</th>
+<th>FastThreadLocal</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>少量 ThreadLocal（&lt;8）</td>
+<td>基准</td>
+<td>略快（~1.2x）</td>
+</tr>
+<tr>
+<td>中等数量（16~64）</td>
+<td>基准</td>
+<td>明显快（<del>2</del>4x）</td>
+</tr>
+<tr>
+<td>大量（&gt;128）</td>
+<td>冲突加剧，抖动明显</td>
+<td>基本恒定</td>
+</tr>
+<tr>
+<td>非 FastThreadLocalThread</td>
+<td>—</td>
+<td>略慢（有明显退化）</td>
+</tr>
+<tr>
+<td>批量清理</td>
+<td>不支持</td>
+<td>O(n) 精确清理</td>
+</tr>
+</tbody></table>
+<p><strong>结论：FastThreadLocal 的优势随变量数量增长而放大，代价是强依赖 Netty 的线程体系。</strong></p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：FastThreadLocal 会有内存泄漏吗？</strong></p>
+<p>机制上比 JDK 好：<code>removeAll()</code> 能精确清理。但如果线程不是 <code>FastThreadLocalThread</code>（走 <code>slowGet</code>），退化成普通 ThreadLocal，就又回到弱引用 + 手工 remove 的老路，仍可能泄漏。<strong>所以「有没有泄漏」取决于你的线程是不是 Netty 线程。</strong></p>
+<p><strong>Q2：index 会无限增长吗？</strong></p>
+<p>会。<code>nextIndex</code> 是全局 <code>AtomicInteger</code>，只增不减。但 FastThreadLocal 实例通常是 <code>static final</code>，数量稳定，所以实际不会爆。极端情况下 <code>index &lt; 0</code> 溢出会抛 <code>IllegalStateException</code>。超过 1024 会走 HashMap 兜底。</p>
+<p><strong>Q3：为什么不用 <code>ThreadLocal</code> + 数组 &#x3D; 自己实现一套？</strong></p>
+<p>可以，但要处理：线程类型判定、索引分配、批量清理回调注册、大索引兜底、<code>UNSET</code> 语义。Netty 这套东西的价值在于<strong>和它自己的 EventLoop 生命周期严格对齐</strong>，单独拎出来用意义不大。</p>
+<p><strong>Q4：<code>FastThreadLocal.removeAll()</code> 和 <code>ThreadLocal.remove()</code> 的语义差异？</strong></p>
+<p><code>removeAll()</code> 遍历所有槽位并对<strong>每个已注册变量</strong>调用其 <code>onRemoval(value)</code> 回调，然后置为 <code>UNSET</code>。JDK 的 <code>remove()</code> 只处理当前这一个 key。前者是「线程级清理」，后者是「变量级清理」。</p>
+<p><strong>Q5：FastThreadLocal 里持有 ByteBuf 要注意什么？</strong></p>
+<p><code>onRemoval</code> 里应该检查并释放未释放的 ByteBuf，否则清理的是引用，底层内存还是泄漏的。Netty 的 <code>PooledByteBufAllocator</code> 有内存泄漏检测器，但只覆盖池化分配且默认采样。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>FastThreadLocal 的设计哲学可以概括成三句话：</p>
+<ol>
+<li><strong>用全局注册的 index 替代哈希</strong>，把 O(1)+探测 变成纯 O(1) 数组访问；</li>
+<li><strong>用 <code>removeAll()</code> 批量清理替代弱引用兜底</strong>，把不确定性回收变成确定性回收；</li>
+<li><strong>和 <code>FastThreadLocalThread</code> 强绑定</strong>，用类型判断换取正确性与性能。</li>
+</ol>
+<p>它的价值不是「比 ThreadLocal 快」，而是「<strong>在一个长期存活的线程池里，能把线程私有状态管理得既快又干净</strong>」。理解了这一点，Netty 为什么处处用 <code>FastThreadLocal</code>（<code>PoolThreadCache</code>、<code>ChannelOutboundBuffer</code> 相关的上下文、编解码器的状态）就顺理成章了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/21/netty-fastthreadlocal-deep-dive/">https://jiweidong.github.io/2026/09/21/netty-fastthreadlocal-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a><a class="post-meta__tags" href="/tags/Netty/">Netty</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/21/virtual-thread-pinning-deep-dive/" title="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</div></div><div class="info-2"><div class="info-item-1">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复面试官：虚拟线程你都上生产了，那遇到过 Pinning 吗？这个问题是虚拟线程面试的「分水岭」。能说出「虚拟线程 &#x3D; 用户态轻量线程、由 ForkJoinPool 调度、synchronized 会阻塞载体线程」的是及格线；能讲清楚为什么 synchronized 会导致 pinning、怎么定位、JDK 24 怎么修的，才是真正在生产里趟过坑的人。 先说结论：虚拟线程（Virtual Thread）的核心卖点是「遇到阻塞就卸载（unmount）载体线程」。而 Pinning 就是指——本该卸载的虚拟线程，因为某种原因无法卸载，只能傻等，把宝贵的载体线程（Carrier Thread）一起拖住。 Pinning 是虚拟线程最容易被低估的性能杀手。因为它的表现非常隐蔽：程序不报错，吞吐却上不去。  一、回顾：虚拟线程为什么不阻塞载体线程虚拟线程的执行模型是 M:N 调度： 1234567891011 N 个虚拟线程（百万级）          M 个...</div></div></div></a><a class="pagination-related" href="/2026/09/21/mysql-auto-increment-lock-exhaustion-deep-dive/" title="【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理面试官：自增主键为什么会有空洞？这算不算问题？这是 MySQL 面试里一个「看起来简单，深挖很深」的问题。绝大多数人答「因为回滚了」，然后就没了。但面试官想听的是：  自增值是在什么时候分配的？ 分配之后回滚会不会还回去？ 并发插入时自增值怎么保证不重复？ innodb_autoinc_lock_mode 的三种模式到底差在哪？ 主键快用完了怎么办？  这四个问题串起来，才是完整的正确答案。这篇我们从源码行为讲到线上治理。  一、第一性原理：自增值的分配时机1.1 核心结论InnoDB 的自增值是在「插入尝试」阶段分配的，且分配后立即持久化到内存计数器，不参与事务回滚。 1234567-- 当前 AUTO_INCREMENT = 100BEGIN;INSERT INTO t (name) VALUES (&#x27;a&#x27;);   -- 分配 100，计数器变成 101ROLLBACK;                            -- 回滚了数据，但 100 不会...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/24/netty-reactor-thread-model-source-analysis/" title="【源码深度】Netty Reactor 线程模型全解析：从 NioEventLoop 到百万并发"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-24</div><div class="info-item-2">【源码深度】Netty Reactor 线程模型全解析：从 NioEventLoop 到百万并发</div></div><div class="info-2"><div class="info-item-1">【源码深度】Netty Reactor 线程模型全解析：从 NioEventLoop 到百万并发面试官：说说 Netty 的线程模型？跟传统 BIO 比有什么优势？Netty 作为业界最流行的异步事件驱动网络框架，支撑了 Dubbo、RocketMQ、Elasticsearch 等众多中间件的高性能网络通信。理解 Netty 的线程模型，是深入 Java 网络编程的必修课。 一、从传统 BIO 到 NIO 再到 Netty1.1 BIO 模型的问题传统 BIO（Blocking I&#x2F;O）采用”一个线程处理一个连接”的模式： 123456// 传统 BIO 服务端ServerSocket serverSocket = new ServerSocket(8080);while (true) &#123;    Socket socket = serverSocket.accept(); // 阻塞    new Thread(() -&gt; handle(socket)).start(); // 每个连接一个线程&#125;  问题：当并发连接数达到上千甚至上万时，会创建...</div></div></div></a><a class="pagination-related" href="/2026/08/06/futuretask-source-deep-dive/" title="【并发编程】FutureTask 源码深度解析：从 Callable 到异步任务状态机"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【并发编程】FutureTask 源码深度解析：从 Callable 到异步任务状态机</div></div><div class="info-2"><div class="info-item-1">【并发编程】FutureTask 源码深度解析：从 Callable 到异步任务状态机面试官：说说 FutureTask 是怎么实现异步获取结果的？很多同学对 Future 的印象停留在”线程池 submit 后返回一个 Future，调 get() 能拿到结果”，但一旦被追问：  get() 是怎么阻塞的？为什么调用后线程会停下来？ cancel(true) 之后任务真的被取消了吗？ 为什么同一个 FutureTask 的 run() 只能执行一次？ FutureTask 和 CompletableFuture 有什么本质区别？  就会卡壳。本文从 JDK 8 源码出发，把 FutureTask 的状态机、阻塞唤醒机制、取消语义彻底讲透。   一、FutureTask 的身世：接口与类体系先看类定义： 123456public class FutureTask&lt;V&gt; implements RunnableFuture&lt;V&gt; &#123;    // RunnableFuture 同时继承了 Runnable 和 Future    public inte...</div></div></div></a><a class="pagination-related" href="/2026/09/15/java-delayqueue-delayed-queue-deep-dive/" title="【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-15</div><div class="info-item-2">【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战</div></div><div class="info-2"><div class="info-item-1">【并发编程】Java DelayQueue 延迟队列深度解析：优先队列、Leader-Follower 模式与订单超时实战面试官：订单 30 分钟未支付要自动关闭，你会怎么实现？这道题几乎是「订单系统」面试的必考题。答案通常有三种：定时任务扫表、MQ 延迟消息、时间轮&#x2F;延迟队列。 但真正让面试官眼睛一亮的，是你能说清楚：DelayQueue 内部到底是怎么做到「到点才返回」的？它为什么用 Leader-Follower 模式？单个 DelayQueue 能不能支撑高并发？ 本文从源码出发，把 DelayQueue 拆到底层：PriorityQueue 二叉堆、Delayed 接口、ReentrantLock + Condition、以及最精妙的 Leader-Follower 唤醒机制。最后给出订单超时场景的生产级方案对比。  一、DelayQueue 的定位：无界阻塞优先队列先看类签名： 123456789public class DelayQueue&lt;E extends Delayed&gt; extends AbstractQueue&lt;E&gt;   ...</div></div></div></a><a class="pagination-related" href="/2026/08/21/java-synchronousqueue-transferqueue-deep-dive/" title="【并发编程】SynchronousQueue 与 TransferQueue 深度解析：无缓冲队列的源码级探索"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-21</div><div class="info-item-2">【并发编程】SynchronousQueue 与 TransferQueue 深度解析：无缓冲队列的源码级探索</div></div><div class="info-2"><div class="info-item-1">【并发编程】SynchronousQueue 与 TransferQueue 深度解析：无缓冲队列的源码级探索面试官：SynchronousQueue 容量是 0，那它凭什么还能叫队列？大多数人对队列的第一印象是”先进先出的容器”，而 SynchronousQueue 恰恰是 BlockingQueue 家族里最叛逆的一个：它的容量永远是 0，内部不存储任何元素。一个线程 put() 一个元素，必须等另一个线程 take() 把它接走，put 才能返回；反之亦然。它本质是一个”线程间交接”的通道，而不是缓冲容器。 正因为这个特性，Executors.newCachedThreadPool() 才敢用它当工作队列——因为任务不会被积压，来了就交给线程处理，没线程就现场新建，从而实现了”无线程上限的弹性线程池”。 123456// 经典用法：缓存线程池的工作队列public static ExecutorService newCachedThreadPool() &#123;    return new ThreadPoolExecutor(0, Integer.MAX_VALUE,...</div></div></div></a><a class="pagination-related" href="/2026/08/06/scheduledthreadpoolexecutor-deep-dive/" title="【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理</div></div><div class="info-2"><div class="info-item-1">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理面试官：说说 JDK 里的定时任务调度是怎么实现的？一提到定时任务，很多人的第一反应是 Timer 或者 Spring 的 @Scheduled。但面试官真正想听到的，是 ScheduledThreadPoolExecutor（以下简称 STPE）——JDK 定时调度的正统实现。 被追问下去就是灵魂三连：  Timer 有什么缺陷？为什么现在都用 STPE？ scheduleAtFixedRate 和 scheduleWithFixedDelay 到底差在哪？ STPE 底层用什么数据结构存任务？延迟任务是怎么”到点触发”的？ 为什么 STPE 的 execute() 永远只创建一个线程？核心线程数会被”清零”吗？  本文结合 JDK 8 源码，把 STPE 和它的秘密武器 DelayedWorkQueue 彻底拆开。   一、Timer 的四大缺陷（面试必答）   缺陷 说明    单线程串行 一个任务执行时间过长，会阻塞后续所有任务   异常中断 ...</div></div></div></a><a class="pagination-related" href="/2026/08/25/tri-color-marking-algorithm-deep-dive/" title="【JVM 底层】三色标记算法深度解析：从 CMS 到 G1 的并发标记、漏标与写屏障"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-25</div><div class="info-item-2">【JVM 底层】三色标记算法深度解析：从 CMS 到 G1 的并发标记、漏标与写屏障</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】三色标记算法深度解析：从 CMS 到 G1 的并发标记、漏标与写屏障面试官：CMS 和 G1 的并发标记阶段是怎么实现的？为什么需要写屏障？“三色标记”是 JVM 面试从 30K 到 50K 的分水岭。懂的人能讲清楚”为什么并发标记会漏标、SATB 和增量更新怎么解决、写屏障在干什么”。本文从可达性分析讲起，把并发标记的底层逻辑完整拆开。 一、为什么需要并发标记？1. 可达性分析：GC Roots 出发的图遍历JVM 判定对象存活靠可达性分析：从 GC Roots（栈帧局部变量、静态变量、JNI 引用、常量池引用等）出发，沿着引用链遍历，所有不可达的对象就是垃圾。 123Object a = new Object();   // a 是 GC RootObject b = a;              // b 通过 a 可达，存活Object c = new Object();   // 没有引用指向 c，垃圾  2. 标记期间不能乱动：STW 的由来如果标记过程中引用关系还在变化（应用线程在跑），标记结果可能失真。所以早期的标记（如 Serial&#x2F;...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">652</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">756</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">210</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Netty-%E8%BF%9B%E9%98%B6%E3%80%91FastThreadLocal-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E5%AE%83%E6%AF%94-JDK-ThreadLocal-%E5%BF%AB-3-%E5%80%8D%EF%BC%9F"><span class="toc-number">1.</span> <span class="toc-text">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9ANetty-%E9%87%8C%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E7%94%A8-JDK-%E7%9A%84-ThreadLocal%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：Netty 里为什么不用 JDK 的 ThreadLocal？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E7%9C%8B-JDK-ThreadLocal-%E7%9A%84%E7%BB%93%E6%9E%84%E4%B8%8E%E7%93%B6%E9%A2%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、先看 JDK ThreadLocal 的结构与瓶颈</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%EF%BC%9AThread-%E2%86%92-ThreadLocalMap-%E2%86%92-Entry"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 数据结构：Thread → ThreadLocalMap → Entry[]</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E7%93%B6%E9%A2%88%E4%B8%80%EF%BC%9A%E5%93%88%E5%B8%8C%E5%86%B2%E7%AA%81"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 瓶颈一：哈希冲突</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E7%93%B6%E9%A2%88%E4%BA%8C%EF%BC%9A%E6%8E%A2%E6%B5%8B%E8%BF%87%E7%A8%8B%E4%B8%AD%E7%9A%84%E6%B8%85%E7%90%86%E6%88%90%E6%9C%AC"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 瓶颈二：探测过程中的清理成本</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-4-%E7%93%B6%E9%A2%88%E4%B8%89%EF%BC%9A%E6%97%A0%E6%B3%95%E6%89%B9%E9%87%8F%E6%B8%85%E7%90%86"><span class="toc-number">1.2.4.</span> <span class="toc-text">1.4 瓶颈三：无法批量清理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81FastThreadLocal-%E7%9A%84%E6%A0%B8%E5%BF%83%E8%AE%BE%E8%AE%A1%EF%BC%9A%E7%B4%A2%E5%BC%95%E7%9B%B4%E6%8E%A5%E5%AE%9A%E4%BD%8D"><span class="toc-number">1.3.</span> <span class="toc-text">二、FastThreadLocal 的核心设计：索引直接定位</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%89%E4%B8%AA%E6%A0%B8%E5%BF%83%E8%A7%92%E8%89%B2"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 三个核心角色</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E7%B4%A2%E5%BC%95%E5%88%86%E9%85%8D"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 索引分配</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E4%B8%BA%E4%BB%80%E4%B9%88%E6%95%B0%E7%BB%84%E8%AE%BF%E9%97%AE%E8%BF%99%E4%B9%88%E5%BF%AB"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 为什么数组访问这么快</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%86%85%E9%83%A8%E6%95%B0%E7%BB%84%E7%9A%84%E6%89%A9%E5%AE%B9%E4%B8%8E%E5%B8%B8%E9%87%8F%E6%B1%A0%E4%BC%98%E5%8C%96"><span class="toc-number">1.4.</span> <span class="toc-text">三、内部数组的扩容与常量池优化</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E6%95%B0%E7%BB%84%E5%88%9D%E5%A7%8B%E5%A4%A7%E5%B0%8F"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 数组初始大小</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E4%B8%80%E4%B8%AA%E7%BB%86%E8%8A%82%EF%BC%9AUNSET-%E5%93%A8%E5%85%B5%E5%80%BC"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 一个细节：UNSET 哨兵值</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%89%B9%E9%87%8F%E6%B8%85%E7%90%86%EF%BC%9AFastThreadLocal-%E7%9A%84%E7%8E%8B%E7%89%8C"><span class="toc-number">1.5.</span> <span class="toc-text">四、批量清理：FastThreadLocal 的王牌</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-removeAll"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 removeAll()</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%BA%E4%BB%80%E4%B9%88-Netty-%E7%9A%84-EventLoop-%E5%BF%85%E9%A1%BB%E8%BF%99%E4%B9%88%E5%B9%B2"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 为什么 Netty 的 EventLoop 必须这么干</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%AE%9E%E6%88%98%EF%BC%9A%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E8%AF%A5%E7%94%A8-FastThreadLocal"><span class="toc-number">1.6.</span> <span class="toc-text">五、实战：什么时候该用 FastThreadLocal</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%89%8D%E6%8F%90%E6%9D%A1%E4%BB%B6%EF%BC%9A%E5%BF%85%E9%A1%BB%E8%B7%91%E5%9C%A8-FastThreadLocalThread-%E4%B8%8A"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 前提条件：必须跑在 FastThreadLocalThread 上</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%94%A8%E6%B3%95%E7%A4%BA%E4%BE%8B"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 用法示例</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%BA%BF%E4%B8%8A%E5%86%85%E5%AD%98%E6%B3%84%E6%BC%8F%E6%8E%92%E6%9F%A5%E6%B8%85%E5%8D%95"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 线上内存泄漏排查清单</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%80%A7%E8%83%BD%E5%AF%B9%E6%AF%94%E5%AE%9E%E6%B5%8B%E7%BB%93%E8%AE%BA"><span class="toc-number">1.7.</span> <span class="toc-text">六、性能对比实测结论</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/distributed-2pc-3pc-consensus-deep-dive/" title="【分布式理论】两阶段提交与三阶段提交深度解析：从 2PC 阻塞困境到 3PC 的取舍与局限">【分布式理论】两阶段提交与三阶段提交深度解析：从 2PC 阻塞困境到 3PC 的取舍与局限</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/java-class-file-api-jep484-deep-dive/" title="【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践">【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/mysql-auto-increment-lock-exhaustion-deep-dive/" title="【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/netty-fastthreadlocal-deep-dive/" title="【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？">【Netty 进阶】FastThreadLocal 深度解析：为什么它比 JDK ThreadLocal 快 3 倍？</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/21/virtual-thread-pinning-deep-dive/" title="【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复">【Java 21+ 并发】虚拟线程 Pinning 深度解析：synchronized 陷阱、定位手段与 JDK 24 修复</a><time datetime="2026-09-21T00:00:00.000Z" title="发表于 2026-09-21 08:00:00">2026-09-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
