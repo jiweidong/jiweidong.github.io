@@ -1,0 +1,503 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优面试官：InnoDB 的索引是 B+ 树，为什么点查还是接近 O(1)？这个问题乍一听有点”反常识”。B+ 树查找的复杂度是树高，一张千万级表通常是 34 层，也就是 34 次页访问。既然每次都要走这么多层，为什么线上很多等值查询能快到微秒级？ 官方答案里藏着一个很多人只知道名字、不清楚细节的机制：自适应哈希索引（A">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优面试官：InnoDB 的索引是 B+ 树，为什么点查还是接近 O(1)？这个问题乍一听有点”反常识”。B+ 树查找的复杂度是树高，一张千万级表通常是 34 层，也就是 34 次页访问。既然每次都要走这么多层，为什么线上很多等值查询能快到微秒级？ 官方答案里藏着一个很多人只知道名字、不清楚细节的机制：自适应哈希索引（A">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-22T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-22T00:04:23.399Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="InnoDB">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="索引">
+<meta property="article:tag" content="自适应哈希索引">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优",
+  "url": "https://jiweidong.github.io/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-22T00:00:00.000Z",
+  "dateModified": "2026-09-22T00:04:23.399Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">657</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">764</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">211</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-22T00:04:23.399Z" title="更新于 2026-09-22 08:04:23">2026-09-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%BA%95%E5%B1%82/">数据库底层</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优"><a href="#【MySQL-底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优" class="headerlink" title="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优"></a>【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</h1><h2 id="面试官：InnoDB-的索引是-B-树，为什么点查还是接近-O-1-？"><a href="#面试官：InnoDB-的索引是-B-树，为什么点查还是接近-O-1-？" class="headerlink" title="面试官：InnoDB 的索引是 B+ 树，为什么点查还是接近 O(1)？"></a>面试官：InnoDB 的索引是 B+ 树，为什么点查还是接近 O(1)？</h2><p>这个问题乍一听有点”反常识”。B+ 树查找的复杂度是树高，一张千万级表通常是 3<del>4 层，也就是 3</del>4 次页访问。既然每次都要走这么多层，为什么线上很多等值查询能快到微秒级？</p>
+<p>官方答案里藏着一个很多人只知道名字、不清楚细节的机制：<strong>自适应哈希索引（Adaptive Hash Index，AHI）</strong>。</p>
+<p><code>SHOW ENGINE INNODB STATUS</code> 里那几行 <code>Hash table size</code>、<code>hash searches/s</code>、<code>non-hash searches/s</code>，说的就是它。这篇文章把它讲透：它长什么样、什么时候建、什么时候失效、什么时候该关掉，以及为什么”凭感觉关掉它”可能是错的。</p>
+<hr>
+<h2 id="一、AHI-是什么"><a href="#一、AHI-是什么" class="headerlink" title="一、AHI 是什么"></a>一、AHI 是什么</h2><p>一句话定义：</p>
+<blockquote>
+<p><strong>AHI 是 InnoDB 在内存中为”被频繁访问的 B+ 树页”自动建立的一组哈希索引，用来把某些等值查询的直接定位加速到接近 O(1)。</strong></p>
+</blockquote>
+<p>几个关键定语：</p>
+<ul>
+<li><strong>内存中</strong>：只存在于 buffer pool 的内存结构里，不落盘，重启即消失；</li>
+<li><strong>自动 &#x2F; 自适应</strong>：不需要 DBA 声明，由 InnoDB 根据访问模式自己判断该给哪些页建；</li>
+<li><strong>为页建</strong>：哈希的目标是<strong>页（page）</strong>，而不是行。也就是说，AHI 帮你快速找到”包含目标记录的页”，页内再用 page directory 二分查找定位记录；</li>
+<li><strong>只适用于特定访问模式</strong>：不是所有查询都能用。</li>
+</ul>
+<p>所以准确地说，AHI 加速的是”<strong>在 B+ 树里定位到叶子页</strong>“这一步，而不是整个查询。</p>
+<hr>
+<h2 id="二、为什么需要它：一次点查的真实路径"><a href="#二、为什么需要它：一次点查的真实路径" class="headerlink" title="二、为什么需要它：一次点查的真实路径"></a>二、为什么需要它：一次点查的真实路径</h2><p>先看没有 AHI 时，一次主键点查 <code>SELECT * FROM t_order WHERE id = 10086</code> 走什么：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">1. 在聚簇索引的根页（root）中二分查找 → 定位到下一层的页号</span><br><span class="line">2. 读该页（若不在 buffer pool 则从磁盘读入）</span><br><span class="line">3. 在页内二分查找 → 再定位下一层</span><br><span class="line">4. 重复 2~3，直到叶子页（通常 3~4 层）</span><br><span class="line">5. 在叶子页的 page directory 中用 slot 二分查找，定位到具体记录</span><br></pre></td></tr></table></figure>
+
+<p>每一步都是一次（或几次）内存中的二分查找，看起来不慢，但在<strong>高并发的热点等值查询</strong>下，这个固定开销会被放大：</p>
+<ul>
+<li>每层都要加&#x2F;释放页的<strong>读写锁（latch）</strong>，锁竞争是并发热点的主要成本；</li>
+<li>层数越多，latch 次数越多；</li>
+<li>对于”同一个 id 被查询成千上万次”的场景，每次都重复走这 4 层，纯属浪费。</li>
+</ul>
+<p>AHI 的思路很直白：<strong>如果某个查询模式反复出现，就把”键 → 页”的映射直接缓存下来。</strong></p>
+<hr>
+<h2 id="三、AHI-的内部结构"><a href="#三、AHI-的内部结构" class="headerlink" title="三、AHI 的内部结构"></a>三、AHI 的内部结构</h2><h3 id="3-1-哈希表的组织"><a href="#3-1-哈希表的组织" class="headerlink" title="3.1 哈希表的组织"></a>3.1 哈希表的组织</h3><p>AHI 的哈希表是<strong>按 buffer pool 页划分的</strong>（8.0 之前是一个全局结构，按页号取模分片；8.0 之后支持 <code>innodb_adaptive_hash_index_parts</code> 分区）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">              AHI Hash Table</span><br><span class="line">┌──────────────────────────────────────────┐</span><br><span class="line">│  hash(key) ──► bucket ──► 链上的 hash node │</span><br><span class="line">└──────────────────────────────────────────┘</span><br><span class="line">                         │</span><br><span class="line">           ┌─────────────┴─────────────┐</span><br><span class="line">           ▼                           ▼</span><br><span class="line">   (搜索键前缀 → 页)              (搜索键前缀 → 页)</span><br></pre></td></tr></table></figure>
+
+<p>每个 hash node 记录的核心信息：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>搜索键（search key）</td>
+<td>由<strong>索引前缀</strong>构造，比如 <code>(index_id, 前缀列值)</code></td>
+</tr>
+<tr>
+<td>目标页号</td>
+<td>命中的叶子页</td>
+</tr>
+<tr>
+<td>当前记录</td>
+<td>该键对应的记录指针（用于判断是否需要更新映射）</td>
+</tr>
+<tr>
+<td>链表指针</td>
+<td>处理哈希冲突（链地址法）</td>
+</tr>
+</tbody></table>
+<h3 id="3-2-搜索键是什么"><a href="#3-2-搜索键是什么" class="headerlink" title="3.2 搜索键是什么"></a>3.2 搜索键是什么</h3><p>这是理解 AHI 适用范围的<strong>核心</strong>。AHI 的搜索键基于<strong>索引的前缀</strong>，构造规则大致是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">search key = (index_id, 前缀列1的值, 前缀列2的值, ...)  + 额外机制</span><br></pre></td></tr></table></figure>
+
+<p>由此推出两条重要结论：</p>
+<ol>
+<li><strong>等值查询才可能用 AHI</strong>：哈希只能精确匹配，<code>=</code> 可以，<code>&gt;</code>、<code>&lt;</code>、<code>BETWEEN</code>、<code>LIKE &#39;%x&#39;</code> 不行；</li>
+<li><strong>前缀唯一性有影响</strong>：<ul>
+<li>如果是<strong>唯一索引的完整等值条件</strong>，键直接唯一确定记录，很容易建 AHI；</li>
+<li>如果是<strong>非唯一索引</strong>，同一个键对应多行，InnoDB 需要额外处理（记录位置等）来区分；</li>
+<li>如果有<strong>范围条件混入</strong>，前缀后面的部分无法用于哈希定页，AHI 可能就不命中或者不建。</li>
+</ul>
+</li>
+</ol>
+<h3 id="3-3-覆盖哪些查询"><a href="#3-3-覆盖哪些查询" class="headerlink" title="3.3 覆盖哪些查询"></a>3.3 覆盖哪些查询</h3><table>
+<thead>
+<tr>
+<th>查询形态</th>
+<th>能用 AHI 吗</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>主键等值：<code>WHERE id = 1</code></td>
+<td>✅ 最典型</td>
+</tr>
+<tr>
+<td>唯一索引等值：<code>WHERE uk_col = &#39;x&#39;</code></td>
+<td>✅</td>
+</tr>
+<tr>
+<td>普通索引等值：<code>WHERE idx_col = &#39;x&#39;</code></td>
+<td>✅（可能有额外处理）</td>
+</tr>
+<tr>
+<td>联合索引最左前缀等值：<code>WHERE a = 1 AND b = 2</code></td>
+<td>✅</td>
+</tr>
+<tr>
+<td>范围查询：<code>WHERE a &gt; 1</code></td>
+<td>❌</td>
+</tr>
+<tr>
+<td>前缀模糊：<code>WHERE name LIKE &#39;abc%&#39;</code></td>
+<td>❌</td>
+</tr>
+<tr>
+<td>无索引条件</td>
+<td>❌（本来走全表扫描）</td>
+</tr>
+<tr>
+<td>全表扫描 &#x2F; 大范围扫描</td>
+<td>❌</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="四、什么时候会被自动建立"><a href="#四、什么时候会被自动建立" class="headerlink" title="四、什么时候会被自动建立"></a>四、什么时候会被自动建立</h2><p>AHI 是”自适应”的，触发条件在源码里表现为<strong>对同一页的同一模式访问达到阈值</strong>（大致是同一个搜索模式对同一个页被访问若干次后建立）。工程上可以这样理解：</p>
+<p><strong>必要条件</strong>：</p>
+<ol>
+<li>查询能构造出稳定的搜索键（等值 + 索引前缀）；</li>
+<li>该搜索键对应的<strong>页被反复访问</strong>（热点页）；</li>
+<li><code>innodb_adaptive_hash_index = ON</code>（默认开启）。</li>
+</ol>
+<p><strong>加分条件</strong>（更容易被建）：</p>
+<ul>
+<li>索引前缀的<strong>区分度高</strong>（哈希冲突少，收益明显）；</li>
+<li>访问<strong>集中在少数页</strong>（热点明显），比如热点商品、热门用户、订单号点查；</li>
+<li>系统以<strong>读为主</strong>。</li>
+</ul>
+<h3 id="4-1-一个直观的例子"><a href="#4-1-一个直观的例子" class="headerlink" title="4.1 一个直观的例子"></a>4.1 一个直观的例子</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 假设 t_user 有主键 id，且以下查询被高频执行</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> t_user <span class="keyword">WHERE</span> id <span class="operator">=</span> ?;   <span class="comment">-- 每次传不同 id</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 对于&quot;某些 id 被反复查询&quot;（比如登录用户），</span></span><br><span class="line"><span class="comment">-- 这些 id 对应的叶子页被反复访问 → InnoDB 自动为这些页建立 AHI 条目</span></span><br><span class="line"><span class="comment">-- 之后定位这些页就不再需要走完整 B+ 树</span></span><br><span class="line"></span><br><span class="line"><span class="keyword">SHOW</span> ENGINE INNODB STATUS\G</span><br><span class="line"><span class="comment">-- ...</span></span><br><span class="line"><span class="comment">-- Hash table size 34679, node heap has 12 buffer(s)</span></span><br><span class="line"><span class="comment">-- 0.00 hash searches/s, 12345.67 non-hash searches/s</span></span><br><span class="line"><span class="comment">-- ...</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、性能收益与代价"><a href="#五、性能收益与代价" class="headerlink" title="五、性能收益与代价"></a>五、性能收益与代价</h2><h3 id="5-1-收益"><a href="#5-1-收益" class="headerlink" title="5.1 收益"></a>5.1 收益</h3><ul>
+<li><strong>减少 B+ 树层数遍历</strong>：热点等值查询从”3~4 次页定位 + 多次 latch”降到”1 次哈希查找 + 1 次 latch”；</li>
+<li><strong>减少读锁竞争</strong>：定位路径变短，页 latch 的持有次数下降；</li>
+<li>对<strong>高并发点查</strong>场景（如用户中心、配置读取、订单详情）收益最明显，官方文档给出的经验数据是<strong>可提升几倍</strong>的查询效率。</li>
+</ul>
+<h3 id="5-2-代价"><a href="#5-2-代价" class="headerlink" title="5.2 代价"></a>5.2 代价</h3><p>AHI 不是免费的：</p>
+<table>
+<thead>
+<tr>
+<th>代价</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>内存占用</td>
+<td>哈希节点、桶结构都属于 buffer pool 之外的额外内存（不算在 buffer pool 统计里）</td>
+</tr>
+<tr>
+<td>维护成本</td>
+<td>对 AHI 覆盖的页做 DML&#x2F;LRU 淘汰时，需要同步删除&#x2F;更新哈希条目，读锁之外还要拿<strong>索引锁（btr_search_latch）</strong></td>
+</tr>
+<tr>
+<td><strong>全局 latch 竞争</strong></td>
+<td>8.0 之前 AHI 是一个受 <code>btr_search_latch</code> 保护的全局结构，高并发下这个 latch 本身会成为瓶颈</td>
+</tr>
+<tr>
+<td>不适用场景负收益</td>
+<td>写密集、范围查询为主、访问分散时，建了也没用，还白占内存</td>
+</tr>
+</tbody></table>
+<h3 id="5-3-8-0-的关键改进"><a href="#5-3-8-0-的关键改进" class="headerlink" title="5.3 8.0 的关键改进"></a>5.3 8.0 的关键改进</h3><p>MySQL 5.7 及之前，AHI 的 <code>btr_search_latch</code> 是<strong>全局读写锁</strong>，这是著名的可扩展性瓶颈之一。MySQL 8.0 引入了：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">innodb_adaptive_hash_index_parts</span> = <span class="number">8</span>   <span class="comment"># 默认 8，范围 1~512</span></span><br></pre></td></tr></table></figure>
+
+<p>把 AHI 拆成多个分区，每个分区一把锁，显著降低了高并发下的 latch 竞争。另外 8.0 对 AHI 的淘汰与内存管理也做了优化。</p>
+<p><strong>这带来一个重要结论</strong>：网上那些”高并发一定要关掉 AHI”的经验，很多是 5.6&#x2F;5.7 时代的产物；在 8.0 + 多分区下，该结论需要重新评估。</p>
+<hr>
+<h2 id="六、监控：怎么判断-AHI-是否有效"><a href="#六、监控：怎么判断-AHI-是否有效" class="headerlink" title="六、监控：怎么判断 AHI 是否有效"></a>六、监控：怎么判断 AHI 是否有效</h2><h3 id="6-1-SHOW-ENGINE-INNODB-STATUS"><a href="#6-1-SHOW-ENGINE-INNODB-STATUS" class="headerlink" title="6.1 SHOW ENGINE INNODB STATUS"></a>6.1 <code>SHOW ENGINE INNODB STATUS</code></h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line">-------------------------------------</span><br><span class="line">INSERT BUFFER AND ADAPTIVE HASH INDEX</span><br><span class="line">-------------------------------------</span><br><span class="line">Ibuf: size 1, free list len 0, seg size 2, 0 merges</span><br><span class="line">merged operations:</span><br><span class="line"> insert 0, delete mark 0, delete 0</span><br><span class="line">discarded operations:</span><br><span class="line"> insert 0, delete mark 0, delete 0</span><br><span class="line">Hash table size 34679, node heap has 0 buffer(s)</span><br><span class="line">Hash table size 34679, node heap has 1 buffer(s)</span><br><span class="line">Hash table size 34679, node heap has 2 buffer(s)</span><br><span class="line">...</span><br><span class="line">0.00 hash searches/s, 458.31 non-hash searches/s</span><br></pre></td></tr></table></figure>
+
+<p>解读要点：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>关注什么</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Hash table size</code></td>
+<td>哈希表桶数</td>
+<td>反映 AHI 规模</td>
+</tr>
+<tr>
+<td><code>node heap has N buffer(s)</code></td>
+<td>各分区占用的内存块数</td>
+<td>是否为 0（说明完全没建）</td>
+</tr>
+<tr>
+<td><code>hash searches/s</code></td>
+<td>每秒命中 AHI 的次数</td>
+<td><strong>越高越好</strong></td>
+</tr>
+<tr>
+<td><code>non-hash searches/s</code></td>
+<td>每秒未命中 AHI 的次数</td>
+<td><strong>越低越好</strong></td>
+</tr>
+</tbody></table>
+<p><strong>核心判断指标就是那个比值</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">AHI 命中率 ≈ hash searches/s / (hash searches/s + non-hash searches/s)</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>命中率高（比如 &gt; 80%）→ AHI 有效，保持开启；</li>
+<li><code>hash searches/s = 0</code> 且 <code>node heap has 0 buffer(s)</code> → AHI 根本没建起来（可能全是范围查询&#x2F;无热点），可考虑关闭省内存；</li>
+<li>命中率低但内存占用高 → 考虑关闭或调小分区。</li>
+</ul>
+<h3 id="6-2-5-7-8-0-的系统变量"><a href="#6-2-5-7-8-0-的系统变量" class="headerlink" title="6.2 5.7+ &#x2F; 8.0 的系统变量"></a>6.2 5.7+ &#x2F; 8.0 的系统变量</h3><p>MySQL 5.7 起，<code>SHOW ENGINE INNODB STATUS</code> 中的很多计数器在<strong>被读取后会被清零</strong>（因为是”每秒速率”的分子），不便于持续监控。8.0 提供了 <code>information_schema.innodb_metrics</code>：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 开启监控采集</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> innodb_monitor_enable <span class="operator">=</span> <span class="string">&#x27;adaptive_hash%&#x27;</span>;</span><br><span class="line"><span class="comment">-- 或</span></span><br><span class="line"><span class="keyword">UPDATE</span> information_schema.innodb_metrics</span><br><span class="line">   <span class="keyword">SET</span> STATUS <span class="operator">=</span> <span class="string">&#x27;enabled&#x27;</span></span><br><span class="line"> <span class="keyword">WHERE</span> NAME <span class="keyword">LIKE</span> <span class="string">&#x27;adaptive_hash%&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">SELECT</span> NAME, COUNT, STATUS</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_metrics</span><br><span class="line"><span class="keyword">WHERE</span> NAME <span class="keyword">LIKE</span> <span class="string">&#x27;adaptive_hash%&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 典型条目：</span></span><br><span class="line"><span class="comment">-- adaptive_hash_searches              命中次数</span></span><br><span class="line"><span class="comment">-- adaptive_hash_searches_btree        未命中（退化为 B+ 树搜索）次数</span></span><br><span class="line"><span class="comment">-- adaptive_hash_pages_added           新建的哈希条目</span></span><br><span class="line"><span class="comment">-- adaptive_hash_pages_removed         删除的哈希条目</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>监控建议</strong>：把 <code>adaptive_hash_searches</code> 与 <code>adaptive_hash_searches_btree</code> 做成长期监控，算命中率和趋势，比每次手动 <code>SHOW ENGINE INNODB STATUS</code> 可靠得多。</p>
+<h3 id="6-3-用-performance-schema-看-latch-等待"><a href="#6-3-用-performance-schema-看-latch-等待" class="headerlink" title="6.3 用 performance_schema 看 latch 等待"></a>6.3 用 performance_schema 看 latch 等待</h3><p>AHI 真正的隐藏成本在 latch 竞争上：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> EVENT_NAME, COUNT_STAR, SUM_TIMER_WAIT<span class="operator">/</span><span class="number">1e9</span> <span class="keyword">AS</span> total_ms</span><br><span class="line"><span class="keyword">FROM</span> performance_schema.events_waits_summary_global_by_event_name</span><br><span class="line"><span class="keyword">WHERE</span> EVENT_NAME <span class="keyword">LIKE</span> <span class="string">&#x27;%btr_search%&#x27;</span>          <span class="comment">-- 8.0 之前</span></span><br><span class="line">   <span class="keyword">OR</span> EVENT_NAME <span class="keyword">LIKE</span> <span class="string">&#x27;%latch%&#x27;</span></span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> SUM_TIMER_WAIT <span class="keyword">DESC</span></span><br><span class="line">LIMIT <span class="number">20</span>;</span><br></pre></td></tr></table></figure>
+
+<p>如果 AHI 相关 latch 的累计等待时间很高，说明它已经从”加速器”变成了”竞争点”——这才是关闭 AHI 的真正依据。</p>
+<hr>
+<h2 id="七、到底要不要开：分场景给结论"><a href="#七、到底要不要开：分场景给结论" class="headerlink" title="七、到底要不要开：分场景给结论"></a>七、到底要不要开：分场景给结论</h2><p>不要凭一句”听说高并发要关”就改配置。按下面的决策树走：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line">你的负载以什么为主？</span><br><span class="line">│</span><br><span class="line">├─ 高并发「等值点查」为主（用户中心/商品详情/订单详情）</span><br><span class="line">│   └─ 保持 innodb_adaptive_hash_index = ON</span><br><span class="line">│      原因：AHI 正是为这类场景设计的，</span><br><span class="line">│            8.0 多分区已大幅缓解 latch 竞争</span><br><span class="line">│</span><br><span class="line">├─ 「范围查询 / 全表扫描 / 大报表」为主</span><br><span class="line">│   └─ 可以考虑关闭，AHI 基本建不起来（看 hash searches/s ≈ 0）</span><br><span class="line">│      省下内存与维护开销</span><br><span class="line">│</span><br><span class="line">├─ 「写密集」（大量 INSERT/UPDATE/DELETE，如日志、埋点表）</span><br><span class="line">│   └─ 倾向关闭</span><br><span class="line">│      原因：写会让 AHI 条目频繁失效，维护成本 &gt; 收益</span><br><span class="line">│</span><br><span class="line">└─ 高并发 + 出现明显 latch 竞争（performance_schema 佐证）</span><br><span class="line">    └─ 优先调大 innodb_adaptive_hash_index_parts（8.0）</span><br><span class="line">       仍无改善再评估关闭</span><br></pre></td></tr></table></figure>
+
+<h3 id="7-1-动态开关与热关闭"><a href="#7-1-动态开关与热关闭" class="headerlink" title="7.1 动态开关与热关闭"></a>7.1 动态开关与热关闭</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- AHI 支持动态开关，无需重启</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> innodb_adaptive_hash_index <span class="operator">=</span> OFF;   <span class="comment">-- 关闭</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> innodb_adaptive_hash_index <span class="operator">=</span> <span class="keyword">ON</span>;    <span class="comment">-- 开启</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 关闭时 InnoDB 会清空整个哈希表并释放内存</span></span><br><span class="line"><span class="comment">-- 开启后会根据后续访问重新逐步建立</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>一个重要提醒</strong>：<code>SET GLOBAL innodb_adaptive_hash_index = OFF</code> 在 8.0 中，如果 AHI 正在被使用，这个过程可能需要等待一些时间（要清理已有条目）。线上操作建议在低峰期做，并观察是否出现短时抖动。</p>
+<h3 id="7-2-一个真实案例"><a href="#7-2-一个真实案例" class="headerlink" title="7.2 一个真实案例"></a>7.2 一个真实案例</h3><p>某用户中心实例，8 核 16G，QPS 约 1.2 万，几乎全是 <code>WHERE user_id = ?</code> 的点查。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line">调优前：</span><br><span class="line">  hash searches/s ≈ 0</span><br><span class="line">  non-hash searches/s ≈ 11000</span><br><span class="line">  node heap has 0 buffer(s)</span><br><span class="line"></span><br><span class="line">排查发现：应用连接使用了新版本的 8.0.x，且 buffer pool 较小（2G），</span><br><span class="line">热数据不断被换出，AHI 条目频繁失效，几乎建不起来。</span><br><span class="line"></span><br><span class="line">调整：</span><br><span class="line">  innodb_buffer_pool_size 从 2G 提到 8G（先让热页稳定常驻）</span><br><span class="line">  innodb_adaptive_hash_index_parts 保持默认 8</span><br><span class="line"></span><br><span class="line">调优后：</span><br><span class="line">  hash searches/s ≈ 9000+</span><br><span class="line">  non-hash searches/s ≈ 1500</span><br><span class="line">  P99 从 12ms 降到 5ms 左右</span><br></pre></td></tr></table></figure>
+
+<p><strong>教训</strong>：AHI 的前提是”热页稳定”。如果 buffer pool 太小导致页频繁换出，AHI 根本建不起来，这时候该调的是 <code>innodb_buffer_pool_size</code>，而不是去折腾 AHI 开关。</p>
+<hr>
+<h2 id="八、AHI-在-InnoDB-加速体系中的位置"><a href="#八、AHI-在-InnoDB-加速体系中的位置" class="headerlink" title="八、AHI 在 InnoDB 加速体系中的位置"></a>八、AHI 在 InnoDB 加速体系中的位置</h2><p>把 AHI 和其他几个常被混淆的机制放在一起看：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>加速对象</th>
+<th>适用查询</th>
+<th>是否持久化</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>自适应哈希索引 AHI</strong></td>
+<td>定位到<strong>页</strong>（等值）</td>
+<td>等值查询、热点页</td>
+<td>否（内存）</td>
+</tr>
+<tr>
+<td><strong>Change Buffer</strong></td>
+<td>非唯一二级索引的<strong>写</strong></td>
+<td>INSERT&#x2F;UPDATE&#x2F;DELETE</td>
+<td>否（内存，刷盘到表空间）</td>
+</tr>
+<tr>
+<td><strong>Buffer Pool</strong></td>
+<td><strong>页的读写</strong>（减少磁盘 IO）</td>
+<td>所有</td>
+<td>否（内存）</td>
+</tr>
+<tr>
+<td><strong>B+ 树本身</strong></td>
+<td>数据定位</td>
+<td>等值 + 范围</td>
+<td>是（磁盘）</td>
+</tr>
+<tr>
+<td><strong>索引下推 ICP</strong></td>
+<td>减少回表&#x2F;读取行数</td>
+<td>联合索引 + 条件过滤</td>
+<td>是（执行优化）</td>
+</tr>
+</tbody></table>
+<p>一个容易混的点：<strong>AHI 与 Change Buffer 都挂在 buffer pool 的页上，但前者服务于读，后者服务于写。</strong> 面试时能把这张表说清楚，说明你对 InnoDB 内存体系有整体认识。</p>
+<hr>
+<h2 id="九、面试常见追问"><a href="#九、面试常见追问" class="headerlink" title="九、面试常见追问"></a>九、面试常见追问</h2><p><strong>Q1：AHI 是索引吗？会落盘吗？</strong></p>
+<p>它是内存中的哈希结构，不落盘、重启即消失，也不算严格意义上的”索引”。它是 B+ 树索引的<strong>缓存&#x2F;加速层</strong>。</p>
+<p><strong>Q2：AHI 命中后还需要回表吗？</strong></p>
+<p>需要区分：AHI 只帮你快速定位到<strong>叶子页</strong>。如果是二级索引查询，仍然要拿主键回表（如果需要的列不在索引里）。AHI 省的是”在 B+ 树里找页”的过程，不改变索引本身的性质。</p>
+<p><strong>Q3：为什么范围查询用不了 AHI？</strong></p>
+<p>哈希的本质是精确映射，<code>&gt;</code>、<code>&lt;</code>、<code>BETWEEN</code> 这些条件无法构造出确定的哈希键。范围查询只能靠 B+ 树的有序性做区间扫描。</p>
+<p><strong>Q4：AHI 会不会和 buffer pool 抢内存？</strong></p>
+<p>AHI 的结构内存<strong>独立于 buffer pool</strong>（不计入 <code>innodb_buffer_pool_size</code>），由 InnoDB 额外分配。这也是为什么”建了很多 AHI 条目”会推高整体内存使用。8.0 里可通过 <code>node heap buffer(s)</code> 观察其规模。</p>
+<p><strong>Q5：为什么有时 <code>hash searches/s</code> 一直是 0？</strong></p>
+<p>常见原因：① 负载是范围查询&#x2F;全表扫描；② 热页不稳定（buffer pool 太小，页被频繁换出，条目频繁失效）；③ 查询条件的前缀无法构成有效搜索键（比如索引列上用了函数、隐式类型转换导致条件不是纯等值）；④ AHI 被关闭了。</p>
+<p><strong>Q6：<code>innodb_adaptive_hash_index_parts</code> 调大有什么代价？</strong></p>
+<p>分区越多，每个分区越小，锁竞争越小；但内存开销略增（每个分区有独立的桶和堆），且条目分布可能不均。默认 8 对多数场景够用，极端热点再考虑调大（如 16&#x2F;32），不建议盲目设到 512。</p>
+<p><strong>Q7：AHI 和”查询缓存（Query Cache）”是一回事吗？</strong></p>
+<p>完全不是。Query Cache 缓存的是 <strong>SQL 文本 → 结果集</strong>，对任何写操作都会导致相关表缓存全部失效，MySQL 8.0 已彻底移除。AHI 缓存的是 <strong>索引键 → 页位置</strong>，粒度更细、失效成本更低、也不依赖 SQL 文本。把这两个混为一谈是经典错误。</p>
+<hr>
+<h2 id="十、总结"><a href="#十、总结" class="headerlink" title="十、总结"></a>十、总结</h2><ul>
+<li><strong>AHI 是 InnoDB 自动维护的内存哈希结构</strong>，把”热点等值查询在 B+ 树中定位页”的过程加速到接近 O(1)，不落盘、重启即失效。</li>
+<li><strong>只适用于等值 + 索引前缀</strong> 的查询，范围查询、模糊查询、无索引扫描都用不上。</li>
+<li><strong>收益</strong>：热点点查更快、页 latch 更少；<strong>代价</strong>：额外内存 + 维护成本 + 潜在的 latch 竞争。</li>
+<li><strong>监控指标</strong>：<code>hash searches/s</code> vs <code>non-hash searches/s</code> 的命中率，配合 8.0 的 <code>information_schema.innodb_metrics</code> 里 <code>adaptive_hash_*</code> 做长期观察；latch 竞争用 <code>performance_schema</code> 佐证。</li>
+<li><strong>开不开</strong>：高并发等值点查 → 开（8.0 多分区已缓解瓶颈）；范围查询&#x2F;写密集&#x2F;访问分散 → 可关；热页不稳时，先调大 buffer pool 而不是关 AHI。</li>
+<li><strong>别和 Query Cache 混淆</strong>：前者缓存”键 → 页”，后者缓存”SQL → 结果”，后者已在 8.0 移除。</li>
+</ul>
+<p>一句话记住：<strong>AHI 是”读路径上的热页近路”，短路的是 B+ 树的下降过程，代价是内存和一把（曾经全局的）锁。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/">https://jiweidong.github.io/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/InnoDB/">InnoDB</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95/">索引</a><a class="post-meta__tags" href="/tags/%E8%87%AA%E9%80%82%E5%BA%94%E5%93%88%E5%B8%8C%E7%B4%A2%E5%BC%95/">自适应哈希索引</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍面试官：数据库机器突然断电，重启之后为什么数据不是坏的？大多数人第一反应是”因为有 redo log”。这个答案不算错，但它解释不了另一个更隐蔽的问题：redo log 本身也是一个文件，它靠什么保证不坏？ 再想深一层。InnoDB 写数据页的单位是 16KB，而操作系统写磁盘的最小单位是 512B（或 4KB）。一次 16KB 的写入不是原子的——如果在写到一半的时候断电，磁盘上就会留下一个写了一半的页。这种页既不是旧数据，也不是新数据，而是一堆新旧混杂的字节。等恢复流程拿起 redo log 去”重放”时，它无法判断这个页到底是完整的还是残缺的，于是就有了经典的 “页断裂”（torn page &#x2F; partial page write） 问题。 双写缓冲（Doublewrite Buffer）就是为了解决这个问题而存在的。它是 InnoDB 里非常小、但非常关键的一块逻辑。下面从它的物理结构、写入流程、恢复流程、性能开销一路讲到 8.0 的新变化。 ...</div></div></div></a><a class="pagination-related" href="/2026/09/22/java-producer-consumer-pattern-deep-dive/" title="【并发编程】生产者-消费者模型深度解析：wait/notify、条件变量与 BlockingQueue 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【并发编程】生产者-消费者模型深度解析：wait/notify、条件变量与 BlockingQueue 实战</div></div><div class="info-2"><div class="info-item-1">【并发编程】生产者-消费者模型深度解析：wait&#x2F;notify、条件变量与 BlockingQueue 实战面试官：手写一个生产者-消费者模型，要求不能用阻塞队列这道题看起来简单，但它是并发编程的照妖镜。我面过的人里，能一次写对的不到三成。常见的翻车点有：  用 if 判断条件，被虚假唤醒了直接往下执行； 只调 notify() 不调 notifyAll()，导致同类线程互相唤醒、程序卡死； 把 wait() 写在 synchronized 块外面，直接抛 IllegalMonitorStateException； 有界队列满了&#x2F;空了，不做背压（backpressure），直接 OOM。  这篇文章从零讲起：先讲清楚这个模型到底解决什么问题，再给四种实现（由浅入深），最后把 JDK 里 BlockingQueue 的源码和面试追问一起串起来。  一、为什么需要生产者-消费者模型先明确动机，面试时先讲动机比直接写代码分高。 12生产者 ──► [ 队列 / 缓冲区 ] ──► 消费者  快              有界              慢  三类典型...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/21/mysql-auto-increment-lock-exhaustion-deep-dive/" title="【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-21</div><div class="info-item-2">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理面试官：自增主键为什么会有空洞？这算不算问题？这是 MySQL 面试里一个「看起来简单，深挖很深」的问题。绝大多数人答「因为回滚了」，然后就没了。但面试官想听的是：  自增值是在什么时候分配的？ 分配之后回滚会不会还回去？ 并发插入时自增值怎么保证不重复？ innodb_autoinc_lock_mode 的三种模式到底差在哪？ 主键快用完了怎么办？  这四个问题串起来，才是完整的正确答案。这篇我们从源码行为讲到线上治理。  一、第一性原理：自增值的分配时机1.1 核心结论InnoDB 的自增值是在「插入尝试」阶段分配的，且分配后立即持久化到内存计数器，不参与事务回滚。 1234567-- 当前 AUTO_INCREMENT = 100BEGIN;INSERT INTO t (name) VALUES (&#x27;a&#x27;);   -- 分配 100，计数器变成 101ROLLBACK;                            -- 回滚了数据，但 100 不会...</div></div></div></a><a class="pagination-related" href="/2026/08/15/mysql-back-to-table-covering-index-deep-dive/" title="【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战面试官：什么是回表？什么是覆盖索引？为什么 select * 和 select 指定字段性能差这么多？“回表”和”覆盖索引”是 MySQL 索引面试中最核心的两个概念，也是 SQL 优化的基本功。很多同学知道”要建联合索引、不要 select *”，但说不清背后的原理——为什么覆盖索引能避免回表？为什么联合索引能覆盖更多查询？ 本文从 InnoDB 索引结构出发，把回表、覆盖索引、索引下推（ICP）的关系一次讲透，最后给出可直接落地的优化 checklist。 一、先从 InnoDB 索引结构说起1.1 聚簇索引（Clustered Index）InnoDB 的表本身就是一棵 B+ 树，主键索引就是聚簇索引：  叶子节点直接存放整行数据（包括所有字段）； 每张表只有一个聚簇索引（通常是主键，没有主键就用第一个非空唯一索引，再没有就隐藏的 rowid）； 数据行按照主键顺序物理排列（逻辑顺序）。  123456789聚簇索引 B+ 树（主键 id）┌─────────┐│  根节点   │  ...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mysql-composite-index-leftmost-prefix-deep-dive/" title="MySQL 联合索引与最左前缀原则深度解析：从 B+ 树结构到索引失效场景"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">MySQL 联合索引与最左前缀原则深度解析：从 B+ 树结构到索引失效场景</div></div><div class="info-2"><div class="info-item-1">MySQL 联合索引与最左前缀原则深度解析：从 B+ 树结构到索引失效场景面试官：联合索引 (a, b, c) 最左前缀原则，能命中哪些查询？这是 MySQL 索引方向出现频率最高的问题，也是线上 SQL 优化翻车率最高的知识点。很多人只会背”最左前缀”四个字，但不知道为什么、边界在哪、哪些场景会失效。本文从 B+ 树结构出发，把联合索引彻底讲透。 一、联合索引的 B+ 树到底长什么样？单列索引的 B+ 树，非叶子节点存索引值，叶子节点存主键（聚簇索引）或行指针。 联合索引 (a, b, c) 的 B+ 树： 123456                    [1, 100, &#x27;x&#x27;]                   /            \        [1, 200, &#x27;a&#x27;]          [2, 100, &#x27;b&#x27;]        /           \          /           \[1,100,&#x27;x&#x27;]  [1,200,&#x27;a&#x27;]  [2,...</div></div></div></a><a class="pagination-related" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍面试官：数据库机器突然断电，重启之后为什么数据不是坏的？大多数人第一反应是”因为有 redo log”。这个答案不算错，但它解释不了另一个更隐蔽的问题：redo log 本身也是一个文件，它靠什么保证不坏？ 再想深一层。InnoDB 写数据页的单位是 16KB，而操作系统写磁盘的最小单位是 512B（或 4KB）。一次 16KB 的写入不是原子的——如果在写到一半的时候断电，磁盘上就会留下一个写了一半的页。这种页既不是旧数据，也不是新数据，而是一堆新旧混杂的字节。等恢复流程拿起 redo log 去”重放”时，它无法判断这个页到底是完整的还是残缺的，于是就有了经典的 “页断裂”（torn page &#x2F; partial page write） 问题。 双写缓冲（Doublewrite Buffer）就是为了解决这个问题而存在的。它是 InnoDB 里非常小、但非常关键的一块逻辑。下面从它的物理结构、写入流程、恢复流程、性能开销一路讲到 8.0 的新变化。 ...</div></div></div></a><a class="pagination-related" href="/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/" title="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？这是我被问过最多次的问题之一。候选人通常答”因为 InnoDB 是页管理的，删除只是打标记”。这个答案对了一半，但要真正说清楚，必须把 InnoDB 的表空间（Tablespace）体系讲透：数据到底存在哪个文件里、页怎么分配、空闲空间为什么不还给操作系统、ibdata1 为什么越涨越大。 表空间是 InnoDB 存储引擎的逻辑-物理映射层。它向上承接表、索引这些逻辑对象，向下管理文件、区、页这些物理单位。这篇文章从磁盘文件一路拆到页，把 InnoDB 的表空间体系完整梳理一遍。 一、先建立坐标系：从文件到行记录的六层结构InnoDB 的数据组织是一条自顶向下的链路，理解这条链路，后面所有概念都能挂上去：    层级 名称 典型大小 说明    1 表空间 Tablespace 文件级别 逻辑上可包含多张表，物理上对应一个或多个 .ibd 文件   2 段 Segment 逻辑概念 一个索引对应两个段：叶子...</div></div></div></a><a class="pagination-related" href="/2026/08/24/mysql-b-plus-tree-index-deep-dive/" title="【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现</div></div><div class="info-2"><div class="info-item-1">【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现面试官：为什么 MySQL 的索引要用 B+ 树，而不是二叉树、红黑树或者哈希表？这是一道几乎必问的数据库面试题。要答好它，需要从”磁盘 IO 模型”这个底层约束出发，一层层推演。先给出结论：B+ 树是在”磁盘访问”场景下，读写性能、范围查询、稳定性三者综合最优的数据结构。 一、为什么不是这些结构？1. 为什么不选哈希索引？哈希索引查找单个 key 是 O(1)，无敌快，但有两个致命缺陷：  不支持范围查询：WHERE age &gt; 20 这种条件，哈希表只能全表扫描 不支持排序：哈希是无序的，ORDER BY 无从谈起  所以哈希索引只适合等值查询的特定场景（如 Memory 引擎、自适应哈希索引 AHI）。 2. 为什么不选二叉搜索树（BST）？最坏情况下 BST 会退化成链表（插入有序数据时），查找退化成 O(n)。就算平衡了（AVL&#x2F;红黑树），还有更大的问题——树太高。 假设数据量是 1000 万条，红黑树高度约 log₂(1000万) ≈ 24 层。每查一个节点就是一次磁盘 IO...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">657</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">764</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">211</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%BA%95%E5%B1%82%E3%80%91%E8%87%AA%E9%80%82%E5%BA%94%E5%93%88%E5%B8%8C%E7%B4%A2%E5%BC%95%EF%BC%88AHI%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%93%88%E5%B8%8C%E7%BB%93%E6%9E%84%E3%80%81%E5%91%BD%E4%B8%AD%E6%9D%A1%E4%BB%B6%E4%B8%8E%E5%AE%9E%E6%88%98%E8%B0%83%E4%BC%98"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9AInnoDB-%E7%9A%84%E7%B4%A2%E5%BC%95%E6%98%AF-B-%E6%A0%91%EF%BC%8C%E4%B8%BA%E4%BB%80%E4%B9%88%E7%82%B9%E6%9F%A5%E8%BF%98%E6%98%AF%E6%8E%A5%E8%BF%91-O-1-%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：InnoDB 的索引是 B+ 树，为什么点查还是接近 O(1)？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81AHI-%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、AHI 是什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E5%AE%83%EF%BC%9A%E4%B8%80%E6%AC%A1%E7%82%B9%E6%9F%A5%E7%9A%84%E7%9C%9F%E5%AE%9E%E8%B7%AF%E5%BE%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、为什么需要它：一次点查的真实路径</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81AHI-%E7%9A%84%E5%86%85%E9%83%A8%E7%BB%93%E6%9E%84"><span class="toc-number">1.4.</span> <span class="toc-text">三、AHI 的内部结构</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%93%88%E5%B8%8C%E8%A1%A8%E7%9A%84%E7%BB%84%E7%BB%87"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 哈希表的组织</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E6%90%9C%E7%B4%A2%E9%94%AE%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 搜索键是什么</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E8%A6%86%E7%9B%96%E5%93%AA%E4%BA%9B%E6%9F%A5%E8%AF%A2"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 覆盖哪些查询</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E4%BC%9A%E8%A2%AB%E8%87%AA%E5%8A%A8%E5%BB%BA%E7%AB%8B"><span class="toc-number">1.5.</span> <span class="toc-text">四、什么时候会被自动建立</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%B8%80%E4%B8%AA%E7%9B%B4%E8%A7%82%E7%9A%84%E4%BE%8B%E5%AD%90"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 一个直观的例子</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%80%A7%E8%83%BD%E6%94%B6%E7%9B%8A%E4%B8%8E%E4%BB%A3%E4%BB%B7"><span class="toc-number">1.6.</span> <span class="toc-text">五、性能收益与代价</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E6%94%B6%E7%9B%8A"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 收益</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E4%BB%A3%E4%BB%B7"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 代价</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-8-0-%E7%9A%84%E5%85%B3%E9%94%AE%E6%94%B9%E8%BF%9B"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 8.0 的关键改进</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E7%9B%91%E6%8E%A7%EF%BC%9A%E6%80%8E%E4%B9%88%E5%88%A4%E6%96%AD-AHI-%E6%98%AF%E5%90%A6%E6%9C%89%E6%95%88"><span class="toc-number">1.7.</span> <span class="toc-text">六、监控：怎么判断 AHI 是否有效</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-SHOW-ENGINE-INNODB-STATUS"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 SHOW ENGINE INNODB STATUS</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-5-7-8-0-%E7%9A%84%E7%B3%BB%E7%BB%9F%E5%8F%98%E9%87%8F"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 5.7+ &#x2F; 8.0 的系统变量</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E7%94%A8-performance-schema-%E7%9C%8B-latch-%E7%AD%89%E5%BE%85"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 用 performance_schema 看 latch 等待</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%88%B0%E5%BA%95%E8%A6%81%E4%B8%8D%E8%A6%81%E5%BC%80%EF%BC%9A%E5%88%86%E5%9C%BA%E6%99%AF%E7%BB%99%E7%BB%93%E8%AE%BA"><span class="toc-number">1.8.</span> <span class="toc-text">七、到底要不要开：分场景给结论</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-%E5%8A%A8%E6%80%81%E5%BC%80%E5%85%B3%E4%B8%8E%E7%83%AD%E5%85%B3%E9%97%AD"><span class="toc-number">1.8.1.</span> <span class="toc-text">7.1 动态开关与热关闭</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-2-%E4%B8%80%E4%B8%AA%E7%9C%9F%E5%AE%9E%E6%A1%88%E4%BE%8B"><span class="toc-number">1.8.2.</span> <span class="toc-text">7.2 一个真实案例</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81AHI-%E5%9C%A8-InnoDB-%E5%8A%A0%E9%80%9F%E4%BD%93%E7%B3%BB%E4%B8%AD%E7%9A%84%E4%BD%8D%E7%BD%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、AHI 在 InnoDB 加速体系中的位置</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/java-full-link-stress-testing-shadow-traffic-deep-practice/" title="【生产实战】全链路压测深度实战：流量染色、影子库表与数据隔离方案">【生产实战】全链路压测深度实战：流量染色、影子库表与数据隔离方案</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/java-producer-consumer-pattern-deep-dive/" title="【并发编程】生产者-消费者模型深度解析：wait/notify、条件变量与 BlockingQueue 实战">【并发编程】生产者-消费者模型深度解析：wait/notify、条件变量与 BlockingQueue 实战</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/" title="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/" title="【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍">【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

@@ -1,0 +1,372 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？这个问题几乎是我面试 MySQL 方向必问的一道。候选人一般能答出”有 WAL，先写日志再写数据”，但当我追问下面三个问题时，能答清楚的就不多了：  一次提交到底要落几次盘？分别落的是什么？">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？这个问题几乎是我面试 MySQL 方向必问的一道。候选人一般能答出”有 WAL，先写日志再写数据”，但当我追问下面三个问题时，能答清楚的就不多了：  一次提交到底要落几次盘？分别落的是什么？">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-22T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-22T00:03:03.452Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="InnoDB">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="事务">
+<meta property="article:tag" content="组提交">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍",
+  "url": "https://jiweidong.github.io/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-22T00:00:00.000Z",
+  "dateModified": "2026-09-22T00:03:03.452Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">657</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">764</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">211</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-22T00:03:03.452Z" title="更新于 2026-09-22 08:03:03">2026-09-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/%E6%95%B0%E6%8D%AE%E5%BA%93%E5%BA%95%E5%B1%82/">数据库底层</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-底层】组提交（Group-Commit）深度解析：redo-binlog-刷盘与两阶段提交的性能取舍"><a href="#【MySQL-底层】组提交（Group-Commit）深度解析：redo-binlog-刷盘与两阶段提交的性能取舍" class="headerlink" title="【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍"></a>【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍</h1><h2 id="面试官：每次事务提交都要-fsync-两次，MySQL-为什么还能跑到几万-TPS？"><a href="#面试官：每次事务提交都要-fsync-两次，MySQL-为什么还能跑到几万-TPS？" class="headerlink" title="面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？"></a>面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？</h2><p>这个问题几乎是我面试 MySQL 方向必问的一道。候选人一般能答出”有 WAL，先写日志再写数据”，但当我追问下面三个问题时，能答清楚的就不多了：</p>
+<ol>
+<li>一次提交到底要落几次盘？分别落的是什么？</li>
+<li>如果是”每提交一次就 fsync 一次”，那 QPS 上限就是磁盘 IOPS 上限，几千都到不了，为什么实际能到几万？</li>
+<li>redo log 和 binlog 是两份日志，怎么保证它们的一致性？</li>
+</ol>
+<p>答案的核心是 <strong>两阶段提交（2PC）</strong> 加 <strong>组提交（Group Commit）</strong>。前者解决”两份日志不能写一半”，后者解决”每次提交都 fsync 太慢”。这两件事经常被混在一起讲，其实它们解决的问题完全不同，下面拆开说。</p>
+<hr>
+<h2 id="一、先看清楚一次提交要落几次盘"><a href="#一、先看清楚一次提交要落几次盘" class="headerlink" title="一、先看清楚一次提交要落几次盘"></a>一、先看清楚一次提交要落几次盘</h2><p>假设 <code>innodb_flush_log_at_trx_commit=1</code>、<code>sync_binlog=1</code>（双 1 配置，最常用也最安全的配置），一次普通的事务提交，理想化流程如下：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">客户端 COMMIT</span><br><span class="line">   │</span><br><span class="line">   ├─ 1. InnoDB 写入 redo log（prepare 状态），并 fsync     ← 第一次落盘</span><br><span class="line">   │</span><br><span class="line">   ├─ 2. 写入 binlog，并 fsync                              ← 第二次落盘</span><br><span class="line">   │</span><br><span class="line">   └─ 3. InnoDB 写入 commit 标记，事务完成                   ← 不再强制 fsync</span><br></pre></td></tr></table></figure>
+
+<p>粗算一下：每次提交 2 次 fsync，如果磁盘单次 fsync 耗时 1ms（普通 SSD），那单连接下 TPS 上限只有 500 左右；就算是 NVMe，5 万 IOPS 也只能撑到 2.5 万 TPS，而且随并发上升会断崖式下降。</p>
+<p>可是现实中的 MySQL 跑到了几万 TPS。<strong>差距就来自”组提交”：把多个并发事务的 fsync 合并成一次。</strong></p>
+<hr>
+<h2 id="二、两阶段提交：为什么必须以-prepare-→-binlog-→-commit-的顺序"><a href="#二、两阶段提交：为什么必须以-prepare-→-binlog-→-commit-的顺序" class="headerlink" title="二、两阶段提交：为什么必须以 prepare → binlog → commit 的顺序"></a>二、两阶段提交：为什么必须以 prepare → binlog → commit 的顺序</h2><p>先说清楚”为什么需要两份日志”。</p>
+<ul>
+<li><strong>redo log</strong> 是 InnoDB 存储引擎层的，负责崩溃后的数据恢复；</li>
+<li><strong>binlog</strong> 是 MySQL Server 层的，负责主从复制与基于时间点的恢复。</li>
+</ul>
+<p>两份日志各自独立，如果没有任何协调，故障时会不一致：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>redo 已写</th>
+<th>binlog 已写</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A</td>
+<td>是</td>
+<td>否</td>
+<td>主库认为提交成功，从库却收不到 → 主从不一致</td>
+</tr>
+<tr>
+<td>B</td>
+<td>否</td>
+<td>是</td>
+<td>从库重放了变更，主库却没有 → 主从不一致</td>
+</tr>
+</tbody></table>
+<p>所以必须让”两份日志同时生效或同时不生效”，这就是 2PC：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">阶段一：Prepare</span><br><span class="line">   InnoDB 写 redo log，标记为 prepare 状态（含事务 XID）</span><br><span class="line"></span><br><span class="line">阶段二：提交</span><br><span class="line">   ① 写 binlog（含事务 XID），fsync</span><br><span class="line">   ② InnoDB 把 redo 里的 prepare 改成 commit，事务正式结束</span><br></pre></td></tr></table></figure>
+
+<p><strong>恢复时的一致性判断规则</strong>（这是 DBA 面试的高频点）：</p>
+<ul>
+<li>redo 中事务处于 <strong>prepare</strong> 状态：<ul>
+<li>binlog 里<strong>有</strong>对应 XID 的完整记录 → <strong>提交</strong>该事务；</li>
+<li>binlog 里<strong>没有</strong>该 XID → <strong>回滚</strong>该事务。</li>
+</ul>
+</li>
+<li>redo 中已经是 commit 状态 → 无所谓 binlog，直接确认提交。</li>
+</ul>
+<p>这个规则把”两份日志谁对谁错”的仲裁权交给了 binlog：<strong>binlog 是最终裁判</strong>。因为 binlog 在从库复制链路中是权威的，主库必须以 binlog 是否完整来决定归档。</p>
+<hr>
+<h2 id="三、组提交：三个阶段与合并-fsync"><a href="#三、组提交：三个阶段与合并-fsync" class="headerlink" title="三、组提交：三个阶段与合并 fsync"></a>三、组提交：三个阶段与合并 fsync</h2><p>组提交（Group Commit）的思路是：<strong>不要求每个事务都独立刷盘，而是让一批事务排队，把落盘动作合并成一次。</strong></p>
+<p>MySQL 5.6 之后，组提交被清晰地拆成三个阶段，每个阶段都有一个独立的队列：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">     事务提交队列</span><br><span class="line">          │</span><br><span class="line">┌─────────▼─────────┐</span><br><span class="line">│  Stage 1: Flush   │  把各个事务的 binlog 从 cache 写到文件（不 fsync）</span><br><span class="line">└─────────┬─────────┘</span><br><span class="line">┌─────────▼─────────┐</span><br><span class="line">│  Stage 2: Sync    │  对文件做一次 fsync（一次调用覆盖一批事务）★关键</span><br><span class="line">└─────────┬─────────┘</span><br><span class="line">┌─────────▼─────────┐</span><br><span class="line">│  Stage 3: Commit  │  InnoDB 引擎层提交（把 redo prepare 改成 commit）</span><br><span class="line">└───────────────────┘</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-1-为什么分三个阶段就能合并"><a href="#3-1-为什么分三个阶段就能合并" class="headerlink" title="3.1 为什么分三个阶段就能合并"></a>3.1 为什么分三个阶段就能合并</h3><p>关键在于<strong>让事务在队列里”等一等”</strong>。当一批事务进入 Flush 阶段时：</p>
+<ol>
+<li>领队线程（leader）负责把队列中所有事务的 binlog 一次性写出并 fsync；</li>
+<li>其余线程（follower）等到 leader 完成 sync 后一起进入 Commit 阶段；</li>
+<li>这样，<strong>N 个事务只用了 1 次 fsync</strong>，而不是 N 次。</li>
+</ol>
+<p>并发越高，排队积起来的事务越多，合并收益越大——这也是为什么组提交在<strong>高并发</strong>下效果特别明显，而单连接压测时几乎看不到收益。</p>
+<h3 id="3-2-redo-那一侧呢"><a href="#3-2-redo-那一侧呢" class="headerlink" title="3.2 redo 那一侧呢"></a>3.2 redo 那一侧呢</h3><p>InnoDB 的 redo 本身也有类似的组提交机制（<code>innodb_flush_log_at_trx_commit</code> 相关）。当设置为 1 时，I&#x2F;O 线程会把多个事务的 redo 刷新请求合并，用一次 fsync 覆盖；设置 2 时，事务提交只把 redo 写到 OS page cache，由 OS 决定何时真正落盘（性能好，但崩溃时可能丢最近 1 秒的提交）。</p>
+<p>两种日志的组提交是<strong>协同</strong>工作的：真正让整个过程变快的，是<strong>两边的 fsync 都被合批了</strong>。</p>
+<hr>
+<h2 id="四、可控的”等一等”：让组提交合并更多事务"><a href="#四、可控的”等一等”：让组提交合并更多事务" class="headerlink" title="四、可控的”等一等”：让组提交合并更多事务"></a>四、可控的”等一等”：让组提交合并更多事务</h2><p>既然组提交的本质是”让事务多等一会儿，攒成更大的批”，MySQL 就提供了参数让你主动控制这个”等”，用来在<strong>延迟</strong>和<strong>吞吐</strong>之间做权衡：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[mysqld]</span></span><br><span class="line"><span class="comment"># binlog 组提交延迟：leader 在 fsync 前主动等待的时间（微秒），默认 0</span></span><br><span class="line"><span class="attr">binlog_group_commit_sync_delay</span> = <span class="number">0</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 攒够多少个事务就立即 fsync，不再等满延迟时间，默认 0（不限制）</span></span><br><span class="line"><span class="attr">binlog_group_commit_sync_no_delay_count</span> = <span class="number">0</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 是否保证组内事务的 binlog 顺序与提交顺序一致（默认 ON）</span></span><br><span class="line"><span class="attr">binlog_order_commits</span> = <span class="literal">ON</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-1-怎么理解这两个参数"><a href="#4-1-怎么理解这两个参数" class="headerlink" title="4.1 怎么理解这两个参数"></a>4.1 怎么理解这两个参数</h3><ul>
+<li><code>binlog_group_commit_sync_delay = N</code>（单位 <strong>微秒</strong>）：leader 会最多等 N 微秒再 fsync。等的时间越长，能攒进同一批的事务越多，吞吐越高，但<strong>每个事务的提交延迟最多增加 N 微秒</strong>。</li>
+<li><code>binlog_group_commit_sync_no_delay_count = M</code>：即使延迟时间没到，只要已经攒够 M 个事务就立刻 fsync。这是给延迟设的”上限兜底”，避免低峰期少量事务白等。</li>
+</ul>
+<h3 id="4-2-一个实际调优的例子"><a href="#4-2-一个实际调优的例子" class="headerlink" title="4.2 一个实际调优的例子"></a>4.2 一个实际调优的例子</h3><p>某订单库写压力大，单实例峰值 TPS 3 万，<code>sync_binlog=1</code>，P99 提交延迟约 2ms。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 调优前</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_delay <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_no_delay_count <span class="operator">=</span> <span class="number">0</span>;</span><br></pre></td></tr></table></figure>
+
+<p>调整为：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_delay <span class="operator">=</span> <span class="number">1000</span>;        <span class="comment">-- 最多等 1ms</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_no_delay_count <span class="operator">=</span> <span class="number">100</span>; <span class="comment">-- 攒够 100 个立即刷</span></span><br></pre></td></tr></table></figure>
+
+<p>效果：fsync 次数大幅下降，TPS 上升约 30%~50%，P99 提交延迟从 2ms 提到约 3ms 左右。<strong>账要算清楚：用 1ms 的延迟换吞吐，业务能接受就做。</strong></p>
+<p>注意 <code>sync_binlog</code> 的值也直接影响这个策略：</p>
+<ul>
+<li><code>sync_binlog = 1</code>：每次（每组）提交都 fsync，安全性最高；</li>
+<li><code>sync_binlog = 0</code>：交给 OS 刷，最不安全（崩溃丢 binlog）；</li>
+<li><code>sync_binlog = N</code>：每 N 次提交 fsync 一次（实践中基本不用，除非明确知道可丢）。</li>
+</ul>
+<p><strong>组提交是在 <code>sync_binlog=1</code> 前提下提高吞吐的核心手段</strong>；而降低 <code>sync_binlog</code> 是牺牲安全换性能，两者的取舍哲学完全不同，面试时一定要区分开。</p>
+<hr>
+<h2 id="五、验证：怎么看到组提交在生效"><a href="#五、验证：怎么看到组提交在生效" class="headerlink" title="五、验证：怎么看到组提交在生效"></a>五、验证：怎么看到组提交在生效</h2><h3 id="5-1-观察-binlog-组提交统计"><a href="#5-1-观察-binlog-组提交统计" class="headerlink" title="5.1 观察 binlog 组提交统计"></a>5.1 观察 binlog 组提交统计</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- binlog 组提交相关状态（8.0 提供）</span></span><br><span class="line"><span class="keyword">SHOW</span> <span class="keyword">GLOBAL</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Binlog_%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>比较有用的几个：</p>
+<table>
+<thead>
+<tr>
+<th>状态变量</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Binlog_commits</code></td>
+<td>提交次数</td>
+</tr>
+<tr>
+<td><code>Binlog_group_commits</code></td>
+<td>组提交的批次数</td>
+</tr>
+<tr>
+<td><code>Binlog_group_commit_trigger_count</code></td>
+<td>因攒够 no_delay_count 触发</td>
+</tr>
+<tr>
+<td><code>Binlog_group_commit_trigger_timeout</code></td>
+<td>因延迟超时触发</td>
+</tr>
+<tr>
+<td><code>Binlog_group_commit_trigger_lock_wait</code></td>
+<td>因锁等待触发</td>
+</tr>
+</tbody></table>
+<p><strong>判断依据</strong>：如果 <code>Binlog_commits</code> 远大于 <code>Binlog_group_commits</code>，说明组提交合并效果明显（平均每批合并了多个事务）。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 计算平均每批合并的事务数</span></span><br><span class="line"><span class="keyword">SELECT</span></span><br><span class="line">  VARIABLE_VALUE <span class="keyword">AS</span> commits <span class="keyword">FROM</span> performance_schema.global_status</span><br><span class="line">   <span class="keyword">WHERE</span> VARIABLE_NAME<span class="operator">=</span><span class="string">&#x27;Binlog_commits&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-用-performance-schema-看落盘等待"><a href="#5-2-用-performance-schema-看落盘等待" class="headerlink" title="5.2 用 performance_schema 看落盘等待"></a>5.2 用 performance_schema 看落盘等待</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 看事务提交相关等待</span></span><br><span class="line"><span class="keyword">SELECT</span> EVENT_NAME, COUNT_STAR, AVG_TIMER_WAIT<span class="operator">/</span><span class="number">1e9</span> <span class="keyword">AS</span> avg_us</span><br><span class="line"><span class="keyword">FROM</span> performance_schema.events_waits_summary_global_by_event_name</span><br><span class="line"><span class="keyword">WHERE</span> EVENT_NAME <span class="keyword">LIKE</span> <span class="string">&#x27;%sync%&#x27;</span> <span class="keyword">OR</span> EVENT_NAME <span class="keyword">LIKE</span> <span class="string">&#x27;%binlog%&#x27;</span></span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> COUNT_STAR <span class="keyword">DESC</span> LIMIT <span class="number">10</span>;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-看-redo-的刷盘压力"><a href="#5-3-看-redo-的刷盘压力" class="headerlink" title="5.3 看 redo 的刷盘压力"></a>5.3 看 redo 的刷盘压力</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> <span class="keyword">GLOBAL</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Innodb_log_waits&#x27;</span>;        <span class="comment">-- 等待 redo 空间释放</span></span><br><span class="line"><span class="keyword">SHOW</span> <span class="keyword">GLOBAL</span> STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Innodb_os_log_%&#x27;</span>;         <span class="comment">-- redo 的物理 I/O 次数</span></span><br></pre></td></tr></table></figure>
+
+<p><code>Innodb_os_log_fsyncs</code> 的增长速度，能直接反映 redo 侧 fsync 的真实频率。</p>
+<hr>
+<h2 id="六、几个容易踩的坑"><a href="#六、几个容易踩的坑" class="headerlink" title="六、几个容易踩的坑"></a>六、几个容易踩的坑</h2><h3 id="6-1-组提交不保证-binlog-与提交顺序一致？其实默认是保证的"><a href="#6-1-组提交不保证-binlog-与提交顺序一致？其实默认是保证的" class="headerlink" title="6.1 组提交不保证 binlog 与提交顺序一致？其实默认是保证的"></a>6.1 组提交不保证 binlog 与提交顺序一致？其实默认是保证的</h3><p><code>binlog_order_commits=ON</code> 时，引擎层的提交顺序与 binlog 写入顺序一致，这让<strong>并行复制</strong>（从库按组并行回放）更容易判断事务依赖。关掉它可以减少锁竞争，但会破坏顺序性，通常不建议。</p>
+<h3 id="6-2-主从延迟与组提交的关系"><a href="#6-2-主从延迟与组提交的关系" class="headerlink" title="6.2 主从延迟与组提交的关系"></a>6.2 主从延迟与组提交的关系</h3><p>组提交让主库的 binlog 里可能出现”大批同组事务”。从库的并行复制（<code>slave_parallel_type=LOGICAL_CLOCK</code>）正是利用 binlog 中的 <code>last_committed</code> &#x2F; <code>sequence_number</code> 信息来判断哪些事务可以并行回放。<strong>主库组提交合得越好，从库并行度越高，主从延迟越低</strong>——这是面试里一个很漂亮的加分点。</p>
+<h3 id="6-3-组提交带来的延迟抖动"><a href="#6-3-组提交带来的延迟抖动" class="headerlink" title="6.3 组提交带来的延迟抖动"></a>6.3 组提交带来的延迟抖动</h3><p><code>binlog_group_commit_sync_delay</code> 会让低峰期的事务无谓多等。经验做法是配合 <code>no_delay_count</code>，或在高并发时段才动态调大：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 大促期间临时提高合并度</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_delay <span class="operator">=</span> <span class="number">2000</span>;</span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_no_delay_count <span class="operator">=</span> <span class="number">200</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 大促结束恢复</span></span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_delay <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line"><span class="keyword">SET</span> <span class="keyword">GLOBAL</span> binlog_group_commit_sync_no_delay_count <span class="operator">=</span> <span class="number">0</span>;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-4-只改-sync-binlog-是危险的"><a href="#6-4-只改-sync-binlog-是危险的" class="headerlink" title="6.4 只改 sync_binlog 是危险的"></a>6.4 只改 <code>sync_binlog</code> 是危险的</h3><p>有人为了提吞吐把 <code>sync_binlog=0</code>，结果崩溃后 binlog 缺失，主从直接不一致。<strong>优先用组提交来提性能，而不是降低持久化等级。</strong></p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：组提交会不会导致事务提交后还没落盘，别的事务就读到了？</strong></p>
+<p>不会。组提交只做”批量化 fsync”，事务的可见性由锁和 MVCC 控制，与落盘时机无关。提交后的可见性与其他事务读到的新旧版本，是两套机制。</p>
+<p><strong>Q2：<code>innodb_flush_log_at_trx_commit=1</code> 和 <code>sync_binlog=1</code>，能不能只靠组提交保证一致？</strong></p>
+<p>组提交是性能手段，不负责一致性。一致性由 2PC 的 prepare&#x2F;binlog&#x2F;commit 顺序保证。两者缺一不可：没有 2PC 会主从不一致，没有组提交会慢到不可用。</p>
+<p><strong>Q3：为什么 binlog group commit 的 leader 必须串行？</strong></p>
+<p>因为 fsync 本身是串行资源，leader 负责本组的 fsync，follower 只等待。如果让每个事务各自 fsync，那就退化成最初的方案了。串行化 leader 恰恰是合并的前提。</p>
+<p><strong>Q4：从库上的组提交？</strong></p>
+<p>从库回放时也涉及提交和刷盘，组提交机制同样生效。另外，如果从库开启了并行复制，多个 worker 线程的提交也可以被组提交合并。</p>
+<p><strong>Q5：如何判断当前实例是否”卡在 fsync”？</strong></p>
+<p>用 <code>performance_schema</code> 的等待事件看 <code>wait/io/file/innodb/innodb_log_file</code> 和 binlog 文件相关的等待；再用 <code>iostat -x 1</code> 看 <code>fdatasync</code>&#x2F;<code>fsync</code> 的 <code>await</code>。如果单次 fsync 耗时飙到毫秒级以上，说明存储已经是瓶颈。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><ul>
+<li><strong>2PC</strong> 解决 redo 与 binlog 的原子性：prepare → binlog → commit，恢复时以 binlog 是否含 XID 为准。</li>
+<li><strong>组提交</strong> 解决”每次提交都要 fsync”的性能问题：三个阶段 Flush &#x2F; Sync &#x2F; Commit，把一批事务的 fsync 合并成一次。</li>
+<li><strong>调优手段</strong>：<code>binlog_group_commit_sync_delay</code> + <code>binlog_group_commit_sync_no_delay_count</code>，用可控延迟换吞吐；<strong>不要</strong>通过降低 <code>sync_binlog</code> 来换性能。</li>
+<li><strong>验证手段</strong>：<code>Binlog_commits</code> vs <code>Binlog_group_commits</code> 的比值、<code>Innodb_os_log_fsyncs</code> 的增速、<code>performance_schema</code> 的等待事件。</li>
+<li><strong>连带收益</strong>：组提交生成的 binlog 顺序信息，是主库 → 从库并行复制的关键输入，直接影响主从延迟。</li>
+</ul>
+<p>一句话记住：<strong>2PC 保证”不写半截”，组提交保证”别写那么多次”。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/">https://jiweidong.github.io/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E4%BA%8B%E5%8A%A1/">事务</a><a class="post-meta__tags" href="/tags/InnoDB/">InnoDB</a><a class="post-meta__tags" href="/tags/%E7%BB%84%E6%8F%90%E4%BA%A4/">组提交</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍面试官：数据库机器突然断电，重启之后为什么数据不是坏的？大多数人第一反应是”因为有 redo log”。这个答案不算错，但它解释不了另一个更隐蔽的问题：redo log 本身也是一个文件，它靠什么保证不坏？ 再想深一层。InnoDB 写数据页的单位是 16KB，而操作系统写磁盘的最小单位是 512B（或 4KB）。一次 16KB 的写入不是原子的——如果在写到一半的时候断电，磁盘上就会留下一个写了一半的页。这种页既不是旧数据，也不是新数据，而是一堆新旧混杂的字节。等恢复流程拿起 redo log 去”重放”时，它无法判断这个页到底是完整的还是残缺的，于是就有了经典的 “页断裂”（torn page &#x2F; partial page write） 问题。 双写缓冲（Doublewrite Buffer）就是为了解决这个问题而存在的。它是 InnoDB 里非常小、但非常关键的一块逻辑。下面从它的物理结构、写入流程、恢复流程、性能开销一路讲到 8.0 的新变化。 ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/21/mysql-auto-increment-lock-exhaustion-deep-dive/" title="【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-21</div><div class="info-item-2">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理面试官：自增主键为什么会有空洞？这算不算问题？这是 MySQL 面试里一个「看起来简单，深挖很深」的问题。绝大多数人答「因为回滚了」，然后就没了。但面试官想听的是：  自增值是在什么时候分配的？ 分配之后回滚会不会还回去？ 并发插入时自增值怎么保证不重复？ innodb_autoinc_lock_mode 的三种模式到底差在哪？ 主键快用完了怎么办？  这四个问题串起来，才是完整的正确答案。这篇我们从源码行为讲到线上治理。  一、第一性原理：自增值的分配时机1.1 核心结论InnoDB 的自增值是在「插入尝试」阶段分配的，且分配后立即持久化到内存计数器，不参与事务回滚。 1234567-- 当前 AUTO_INCREMENT = 100BEGIN;INSERT INTO t (name) VALUES (&#x27;a&#x27;);   -- 分配 100，计数器变成 101ROLLBACK;                            -- 回滚了数据，但 100 不会...</div></div></div></a><a class="pagination-related" href="/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/" title="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优面试官：InnoDB 的索引是 B+ 树，为什么点查还是接近 O(1)？这个问题乍一听有点”反常识”。B+ 树查找的复杂度是树高，一张千万级表通常是 34 层，也就是 34 次页访问。既然每次都要走这么多层，为什么线上很多等值查询能快到微秒级？ 官方答案里藏着一个很多人只知道名字、不清楚细节的机制：自适应哈希索引（Adaptive Hash Index，AHI）。 SHOW ENGINE INNODB STATUS 里那几行 Hash table size、hash searches/s、non-hash searches/s，说的就是它。这篇文章把它讲透：它长什么样、什么时候建、什么时候失效、什么时候该关掉，以及为什么”凭感觉关掉它”可能是错的。  一、AHI 是什么一句话定义：  AHI 是 InnoDB 在内存中为”被频繁访问的 B+ 树页”自动建立的一组哈希索引，用来把某些等值查询的直接定位加速到接近 O(1)。  几个关键定语：  内存中：只存在于 buffer pool 的内存结构里，不...</div></div></div></a><a class="pagination-related" href="/2026/08/08/mysql-innodb-redo-undo-binlog-deep-dive/" title="【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复面试官：一条 UPDATE 语句在 InnoDB 里是怎么执行的？宕机了数据怎么不丢？这是 MySQL 面试的”必考压轴题”。要答好它，必须吃透 InnoDB 的三大日志：redo log（重做日志）、undo log（回滚日志）和 binlog（归档日志）。它们分别解决了崩溃恢复、事务回滚、主从复制三个核心问题。 本文从一条 UPDATE 的执行链路讲起，深入源码与磁盘结构，最后用”两阶段提交”串起整个故事。   一、先看全局：一条 UPDATE 的执行链路1UPDATE user SET age = 30 WHERE id = 1;  这条语句在 InnoDB 中的完整执行流程： 1234567891011121. 连接器：校验权限2. 分析器：词法/语法解析3. 优化器：选择索引，生成执行计划4. 执行器：调用 InnoDB 引擎接口   │   ├─ ① 从 Buffer Pool 读取 id=1 的页（若不在则从磁盘加载）   ├─ ② 在 undo l...</div></div></div></a><a class="pagination-related" href="/2026/08/08/mysql-transaction-isolation-levels-deep-dive/" title="【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】事务隔离级别深度解析：脏读、不可重复读、幻读与 MVCC 快照读面试官：MySQL 默认隔离级别是什么？为什么它能解决幻读？“MySQL 默认是 RR（可重复读）”——这句话几乎人人会背，但接下来的追问能刷掉 80% 的人：  脏读、不可重复读、幻读到底怎么演示？ READ COMMITTED 和 REPEATABLE READ 在 MVCC 下有什么区别？ MySQL 的 RR 为什么能解决幻读，而教科书说 RR 不能？ 什么时候应该把隔离级别改成 RC？  本文用 SQL 实验 + 原理分析，一次讲透。   一、三大并发问题：先建立直觉假设有一张表：user(id, name, balance)，初始数据 id=1, balance=100。 1.1 脏读（Dirty Read）：读到未提交的数据123事务 A：UPDATE user SET balance=200 WHERE id=1;   -- 未提交事务 B：SELECT balance FROM user WHERE id=1;      -- 读到 200 ❌事务 A：ROLLBACK;    ...</div></div></div></a><a class="pagination-related" href="/2026/09/01/mysql-long-transaction-deep-dive/" title="【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-01</div><div class="info-item-2">【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 进阶】大事务与长事务深度解析：从锁持有、undo 膨胀到主从延迟的危害与治理实战面试官：线上 MySQL 突然主从延迟 10 分钟，你怎么排查？很多人的第一反应是「从库机器不行」或「网络抖动」，但排查到最后，十有八九是主库跑了一个大事务——一次 UPDATE 扫了几百万行，或者一个业务事务里开了事务却迟迟不提交，把锁、undo log、binlog 全拖垮了。 本文把「大事务」和「长事务」这两个高频事故元凶拆开讲透：它们有什么危害、底层原理是什么、怎么发现、怎么治理。 一、先分清两个概念：大事务 vs 长事务   维度 大事务（Large Transaction） 长事务（Long Transaction）    定义 单次事务处理的数据量&#x2F;日志量巨大 单次事务持续时间很长   典型表现 一次 DML 影响百万行、binlog 几十 GB 事务开启后几小时不提交   主要危害 undo 膨胀、主从延迟、锁范围大 锁长期占用、连接耗尽、死锁概率升高   常见来源 批量 UPDATE&#x2F;DELETE 不带条件、批量导入 应用里事务内做 RPC 调用&#...</div></div></div></a><a class="pagination-related" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍面试官：数据库机器突然断电，重启之后为什么数据不是坏的？大多数人第一反应是”因为有 redo log”。这个答案不算错，但它解释不了另一个更隐蔽的问题：redo log 本身也是一个文件，它靠什么保证不坏？ 再想深一层。InnoDB 写数据页的单位是 16KB，而操作系统写磁盘的最小单位是 512B（或 4KB）。一次 16KB 的写入不是原子的——如果在写到一半的时候断电，磁盘上就会留下一个写了一半的页。这种页既不是旧数据，也不是新数据，而是一堆新旧混杂的字节。等恢复流程拿起 redo log 去”重放”时，它无法判断这个页到底是完整的还是残缺的，于是就有了经典的 “页断裂”（torn page &#x2F; partial page write） 问题。 双写缓冲（Doublewrite Buffer）就是为了解决这个问题而存在的。它是 InnoDB 里非常小、但非常关键的一块逻辑。下面从它的物理结构、写入流程、恢复流程、性能开销一路讲到 8.0 的新变化。 ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">657</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">764</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">211</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%BA%95%E5%B1%82%E3%80%91%E7%BB%84%E6%8F%90%E4%BA%A4%EF%BC%88Group-Commit%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9Aredo-binlog-%E5%88%B7%E7%9B%98%E4%B8%8E%E4%B8%A4%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4%E7%9A%84%E6%80%A7%E8%83%BD%E5%8F%96%E8%88%8D"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%AF%8F%E6%AC%A1%E4%BA%8B%E5%8A%A1%E6%8F%90%E4%BA%A4%E9%83%BD%E8%A6%81-fsync-%E4%B8%A4%E6%AC%A1%EF%BC%8CMySQL-%E4%B8%BA%E4%BB%80%E4%B9%88%E8%BF%98%E8%83%BD%E8%B7%91%E5%88%B0%E5%87%A0%E4%B8%87-TPS%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E7%9C%8B%E6%B8%85%E6%A5%9A%E4%B8%80%E6%AC%A1%E6%8F%90%E4%BA%A4%E8%A6%81%E8%90%BD%E5%87%A0%E6%AC%A1%E7%9B%98"><span class="toc-number">1.2.</span> <span class="toc-text">一、先看清楚一次提交要落几次盘</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%A4%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E5%BF%85%E9%A1%BB%E4%BB%A5-prepare-%E2%86%92-binlog-%E2%86%92-commit-%E7%9A%84%E9%A1%BA%E5%BA%8F"><span class="toc-number">1.3.</span> <span class="toc-text">二、两阶段提交：为什么必须以 prepare → binlog → commit 的顺序</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E7%BB%84%E6%8F%90%E4%BA%A4%EF%BC%9A%E4%B8%89%E4%B8%AA%E9%98%B6%E6%AE%B5%E4%B8%8E%E5%90%88%E5%B9%B6-fsync"><span class="toc-number">1.4.</span> <span class="toc-text">三、组提交：三个阶段与合并 fsync</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%88%86%E4%B8%89%E4%B8%AA%E9%98%B6%E6%AE%B5%E5%B0%B1%E8%83%BD%E5%90%88%E5%B9%B6"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 为什么分三个阶段就能合并</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-redo-%E9%82%A3%E4%B8%80%E4%BE%A7%E5%91%A2"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 redo 那一侧呢</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%8F%AF%E6%8E%A7%E7%9A%84%E2%80%9D%E7%AD%89%E4%B8%80%E7%AD%89%E2%80%9D%EF%BC%9A%E8%AE%A9%E7%BB%84%E6%8F%90%E4%BA%A4%E5%90%88%E5%B9%B6%E6%9B%B4%E5%A4%9A%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.5.</span> <span class="toc-text">四、可控的”等一等”：让组提交合并更多事务</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%80%8E%E4%B9%88%E7%90%86%E8%A7%A3%E8%BF%99%E4%B8%A4%E4%B8%AA%E5%8F%82%E6%95%B0"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 怎么理解这两个参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%80%E4%B8%AA%E5%AE%9E%E9%99%85%E8%B0%83%E4%BC%98%E7%9A%84%E4%BE%8B%E5%AD%90"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 一个实际调优的例子</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E9%AA%8C%E8%AF%81%EF%BC%9A%E6%80%8E%E4%B9%88%E7%9C%8B%E5%88%B0%E7%BB%84%E6%8F%90%E4%BA%A4%E5%9C%A8%E7%94%9F%E6%95%88"><span class="toc-number">1.6.</span> <span class="toc-text">五、验证：怎么看到组提交在生效</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E8%A7%82%E5%AF%9F-binlog-%E7%BB%84%E6%8F%90%E4%BA%A4%E7%BB%9F%E8%AE%A1"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 观察 binlog 组提交统计</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%94%A8-performance-schema-%E7%9C%8B%E8%90%BD%E7%9B%98%E7%AD%89%E5%BE%85"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 用 performance_schema 看落盘等待</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%9C%8B-redo-%E7%9A%84%E5%88%B7%E7%9B%98%E5%8E%8B%E5%8A%9B"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 看 redo 的刷盘压力</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%87%A0%E4%B8%AA%E5%AE%B9%E6%98%93%E8%B8%A9%E7%9A%84%E5%9D%91"><span class="toc-number">1.7.</span> <span class="toc-text">六、几个容易踩的坑</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E7%BB%84%E6%8F%90%E4%BA%A4%E4%B8%8D%E4%BF%9D%E8%AF%81-binlog-%E4%B8%8E%E6%8F%90%E4%BA%A4%E9%A1%BA%E5%BA%8F%E4%B8%80%E8%87%B4%EF%BC%9F%E5%85%B6%E5%AE%9E%E9%BB%98%E8%AE%A4%E6%98%AF%E4%BF%9D%E8%AF%81%E7%9A%84"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 组提交不保证 binlog 与提交顺序一致？其实默认是保证的</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E4%B8%BB%E4%BB%8E%E5%BB%B6%E8%BF%9F%E4%B8%8E%E7%BB%84%E6%8F%90%E4%BA%A4%E7%9A%84%E5%85%B3%E7%B3%BB"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 主从延迟与组提交的关系</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E7%BB%84%E6%8F%90%E4%BA%A4%E5%B8%A6%E6%9D%A5%E7%9A%84%E5%BB%B6%E8%BF%9F%E6%8A%96%E5%8A%A8"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 组提交带来的延迟抖动</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E5%8F%AA%E6%94%B9-sync-binlog-%E6%98%AF%E5%8D%B1%E9%99%A9%E7%9A%84"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 只改 sync_binlog 是危险的</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/java-full-link-stress-testing-shadow-traffic-deep-practice/" title="【生产实战】全链路压测深度实战：流量染色、影子库表与数据隔离方案">【生产实战】全链路压测深度实战：流量染色、影子库表与数据隔离方案</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/java-producer-consumer-pattern-deep-dive/" title="【并发编程】生产者-消费者模型深度解析：wait/notify、条件变量与 BlockingQueue 实战">【并发编程】生产者-消费者模型深度解析：wait/notify、条件变量与 BlockingQueue 实战</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/mysql-adaptive-hash-index-ahi-deep-dive/" title="【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优">【MySQL 底层】自适应哈希索引（AHI）深度解析：哈希结构、命中条件与实战调优</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/" title="【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍">【MySQL 底层】组提交（Group Commit）深度解析：redo/binlog 刷盘与两阶段提交的性能取舍</a><time datetime="2026-09-22T00:00:00.000Z" title="发表于 2026-09-22 08:00:00">2026-09-22</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
