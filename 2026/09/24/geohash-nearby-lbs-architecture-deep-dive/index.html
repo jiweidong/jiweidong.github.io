@@ -1,0 +1,409 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构面试官：微信「附近的人」怎么实现？这道题看似是产品题，实际考的是空间索引。面试官期待的追问链是这样的：  经纬度是两个 double，怎么建索引？（单列索引没用） 查”附近 5 公里”要不要全表扫？（显然不能） 网格边界上的点漏了怎么办？（这是最能拉开差距的一问） 千万级在线用户，单机存得下吗？怎么分片？">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/24/geohash-nearby-lbs-architecture-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构面试官：微信「附近的人」怎么实现？这道题看似是产品题，实际考的是空间索引。面试官期待的追问链是这样的：  经纬度是两个 double，怎么建索引？（单列索引没用） 查”附近 5 公里”要不要全表扫？（显然不能） 网格边界上的点漏了怎么办？（这是最能拉开差距的一问） 千万级在线用户，单机存得下吗？怎么分片？">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-24T00:30:00.000Z">
+<meta property="article:modified_time" content="2026-09-24T00:03:05.871Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="地理位置">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构",
+  "url": "https://jiweidong.github.io/2026/09/24/geohash-nearby-lbs-architecture-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-24T00:30:00.000Z",
+  "dateModified": "2026-09-24T00:03:05.871Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/24/geohash-nearby-lbs-architecture-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">667</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">768</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">214</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-24T00:30:00.000Z" title="发表于 2026-09-24 08:30:00">2026-09-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-24T00:03:05.871Z" title="更新于 2026-09-24 08:03:05">2026-09-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【实战】GeoHash-与「附近的人」深度解析：原理、边界问题与-Redis-GEO-架构"><a href="#【实战】GeoHash-与「附近的人」深度解析：原理、边界问题与-Redis-GEO-架构" class="headerlink" title="【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构"></a>【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构</h1><h2 id="面试官：微信「附近的人」怎么实现？"><a href="#面试官：微信「附近的人」怎么实现？" class="headerlink" title="面试官：微信「附近的人」怎么实现？"></a>面试官：微信「附近的人」怎么实现？</h2><p>这道题看似是产品题，实际考的是<strong>空间索引</strong>。面试官期待的追问链是这样的：</p>
+<ol>
+<li>经纬度是两个 double，怎么建索引？（单列索引没用）</li>
+<li>查”附近 5 公里”要不要全表扫？（显然不能）</li>
+<li>网格边界上的点漏了怎么办？（这是最能拉开差距的一问）</li>
+<li>千万级在线用户，单机存得下吗？怎么分片？</li>
+</ol>
+<p>能把这条链走完，说明你不只是”用过 Redis 的 GEORADIUS”，而是真正理解了空间索引的本质。今天我们从算法一路推到架构。</p>
+<h2 id="一、为什么不能直接用经纬度算距离？"><a href="#一、为什么不能直接用经纬度算距离？" class="headerlink" title="一、为什么不能直接用经纬度算距离？"></a>一、为什么不能直接用经纬度算距离？</h2><p>最朴素的方案：遍历所有用户，用 Haversine 公式算距离，过滤出 5 公里内的。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">double</span> <span class="variable">EARTH_RADIUS</span> <span class="operator">=</span> <span class="number">6371000</span>;   <span class="comment">// 米</span></span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="type">double</span> <span class="title function_">haversine</span><span class="params">(<span class="type">double</span> lat1, <span class="type">double</span> lon1, <span class="type">double</span> lat2, <span class="type">double</span> lon2)</span> &#123;</span><br><span class="line">    <span class="type">double</span> <span class="variable">dLat</span> <span class="operator">=</span> Math.toRadians(lat2 - lat1);</span><br><span class="line">    <span class="type">double</span> <span class="variable">dLon</span> <span class="operator">=</span> Math.toRadians(lon2 - lon1);</span><br><span class="line">    <span class="type">double</span> <span class="variable">a</span> <span class="operator">=</span> Math.sin(dLat / <span class="number">2</span>) * Math.sin(dLat / <span class="number">2</span>)</span><br><span class="line">             + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))</span><br><span class="line">             * Math.sin(dLon / <span class="number">2</span>) * Math.sin(dLon / <span class="number">2</span>);</span><br><span class="line">    <span class="keyword">return</span> <span class="number">2</span> * EARTH_RADIUS * Math.asin(Math.sqrt(a));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>复杂度 O(N)，1000 万用户一次查询就是 1000 万次三角函数运算，<strong>单次查询几百毫秒起步</strong>，根本扛不住。</p>
+<p>问题在于：<strong>经纬度是二维坐标，而 B+ 树&#x2F;哈希索引是一维的</strong>。你给 <code>longitude</code> 建索引，MySQL 只能按经度范围筛，纬度条件退化成”回表后过滤”，扫描行数依然巨大。</p>
+<p>所以核心诉求是：<strong>把二维坐标降维成一维，让一维索引能用上。</strong></p>
+<h2 id="二、GeoHash：把二维坐标压成一维字符串"><a href="#二、GeoHash：把二维坐标压成一维字符串" class="headerlink" title="二、GeoHash：把二维坐标压成一维字符串"></a>二、GeoHash：把二维坐标压成一维字符串</h2><p>GeoHash 的思想非常优雅：<strong>交替对经度和纬度做二分，把落在左半边记 0、右半边记 1，得到的二进制串再按 base32 编码成字符串。</strong></p>
+<p>编码过程（以北京天安门 116.397, 39.909 为例）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line">经纬度范围：经度 [-180, 180]，纬度 [-90, 90]</span><br><span class="line"></span><br><span class="line">第 1 bit（经度）: 116.397 &gt; 0     → 1    经度区间变为 [0, 180]</span><br><span class="line">第 2 bit（纬度）: 39.909 &gt; 0      → 1    纬度区间变为 [0, 90]</span><br><span class="line">第 3 bit（经度）: 116.397 &gt; 90    → 1    经度区间变为 [90, 180]</span><br><span class="line">第 4 bit（纬度）: 39.909 &lt; 45     → 0    纬度区间变为 [0, 45]</span><br><span class="line">第 5 bit（经度）: 116.397 &lt; 135   → 0    经度区间变为 [90, 135]</span><br><span class="line">...</span><br><span class="line">（交替进行，直到达到目标精度）</span><br><span class="line"></span><br><span class="line">最终二进制串按每 5 bit 一组映射到 base32 字母表：</span><br><span class="line">0123456789bcdefghjkmnpqrstuvwxyz</span><br><span class="line">（注意：没有 a、i、l、o，避免和数字 1、0 混淆）</span><br></pre></td></tr></table></figure>
+
+<p>就是这么简单，但有几个必须掌握的推论：</p>
+<p><strong>推论 1：字符串前缀相同 &#x3D; 空间位置相近。</strong></p>
+<p>这是 GeoHash 最有用的性质。前缀越长，共享的格子越小，两个点越近。所以”查询附近”变成了<strong>前缀匹配查询</strong>，可以用 B+ 树的 <code>LIKE &#39;prefix%&#39;</code> 或者有序集合的范围扫描！二维查询降维成了一次范围扫描。</p>
+<p><strong>推论 2：精度由前缀长度决定。</strong></p>
+<table>
+<thead>
+<tr>
+<th>GeoHash 长度</th>
+<th>单元格大小（约）</th>
+<th>常见用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>5000km × 5000km</td>
+<td>洲际</td>
+</tr>
+<tr>
+<td>2</td>
+<td>1250km × 625km</td>
+<td>国家</td>
+</tr>
+<tr>
+<td>3</td>
+<td>156km × 156km</td>
+<td>省级</td>
+</tr>
+<tr>
+<td>4</td>
+<td>39km × 19.5km</td>
+<td>城市</td>
+</tr>
+<tr>
+<td>5</td>
+<td>4.9km × 4.9km</td>
+<td>城区（”附近的人”常用）</td>
+</tr>
+<tr>
+<td>6</td>
+<td>1.2km × 0.61km</td>
+<td>街道</td>
+</tr>
+<tr>
+<td>7</td>
+<td>153m × 153m</td>
+<td>楼栋</td>
+</tr>
+<tr>
+<td>8</td>
+<td>38m × 19m</td>
+<td>门口</td>
+</tr>
+<tr>
+<td>9</td>
+<td>4.8m × 4.8m</td>
+<td>精确定位</td>
+</tr>
+</tbody></table>
+<p><strong>推论 3：这是”有损降维”，边界处会出错。</strong></p>
+<p>这就是那道关键追问——</p>
+<h2 id="三、边界问题：为什么必须查”九宫格”"><a href="#三、边界问题：为什么必须查”九宫格”" class="headerlink" title="三、边界问题：为什么必须查”九宫格”"></a>三、边界问题：为什么必须查”九宫格”</h2><p>考虑一个经典场景：你在格子 A 的最右边缘，目标点在格子 B 的最左边缘，两者实际只差 10 米，但 <strong>GeoHash 前缀完全不同</strong>。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">┌─────────┬─────────┐</span><br><span class="line">│    A    │    B    │</span><br><span class="line">│        ●│●        │   ● 与 ● 相距 10 米</span><br><span class="line">│         │         │   但 GeoHash 前缀完全不同</span><br><span class="line">└─────────┴─────────┘</span><br></pre></td></tr></table></figure>
+
+<p>如果只按 <code>prefix = A</code> 查询，就会漏掉 B 里的点。解决方案是<strong>取当前格子 + 周围 8 个邻居格子，一共 9 个格子一起查</strong>（九宫格）。</p>
+<p>用 Redis 的 <code>GEOSEARCH</code> 底层也是这样处理的——它内部会计算一个覆盖圆形区域所需的所有 GeoHash 块。</p>
+<p><strong>另一个坑是”赤道&#x2F;极地附近的格子变形”</strong>。经度 1 度对应的实际距离随纬度变化：赤道约 111km，纬度 60° 处只有约 55.5km。所以用固定长度的 GeoHash 前缀做距离过滤时，<strong>高纬度地区的误差会放大</strong>。工程上通常的做法是：</p>
+<ol>
+<li>先用 GeoHash 粗筛（拿到候选集）；</li>
+<li>再用 Haversine 精确算距离做二次过滤和排序。</li>
+</ol>
+<p><strong>粗筛 + 精筛</strong>这个模式，是所有地理检索系统的标准做法。</p>
+<h2 id="四、Redis-GEO：本质是-ZSet-GeoHash"><a href="#四、Redis-GEO：本质是-ZSet-GeoHash" class="headerlink" title="四、Redis GEO：本质是 ZSet + GeoHash"></a>四、Redis GEO：本质是 ZSet + GeoHash</h2><p>Redis 从 3.2 开始提供 GEO 命令，底层实现特别巧妙——<strong>它把 GeoHash 编码后的 52 位整数当作 ZSet 的 score</strong>，用一个 <code>zset</code> 存储。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 添加地理位置（经纬度 + 成员名）</span></span><br><span class="line">GEOADD drivers 116.397128 39.916527 <span class="string">&quot;driver:1001&quot;</span></span><br><span class="line">GEOADD drivers 116.407128 39.916527 <span class="string">&quot;driver:1002&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 查询：以某点为中心 5 公里内的成员（带距离）</span></span><br><span class="line">GEOSEARCH drivers FROMLONLAT 116.40 39.91 BYRADIUS 5 km ASC WITHDIST COUNT 10</span><br><span class="line"></span><br><span class="line"><span class="comment"># 老的写法（Redis 6.2 之前）</span></span><br><span class="line">GEORADIUS drivers 116.40 39.91 5 km WITHDIST ASC</span><br></pre></td></tr></table></figure>
+
+<p>底层数据结构：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">ZSet</span><br><span class="line">  score  = GeoHash 的 52 位整数（不是字符串！）</span><br><span class="line">  member = &quot;driver:1001&quot;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么是 52 位而不是完整的 base32 字符串？</strong></p>
+<p>Redis 把经纬度分别按 26 位交替编码，得到 52 位整数，范围正好落在 double 能<strong>精确表示</strong>的整数区间内（2^52 &lt; 2^53，double 的尾数有 52 位 + 隐含 1 位）。这样 score 存 double 不会有精度损失，同时这个 52 位整数<strong>保持了空间邻近性</strong>（相邻的 GeoHash 块在数值上也接近），可以被 ZSet 的跳表高效范围查询。</p>
+<p>查询流程（简化）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">1. 计算中心点的 GeoHash（52 位精度 26 级）</span><br><span class="line">2. 根据半径和精度，算出需要覆盖的 9 个（或更多）GeoHash 区间的 score 范围</span><br><span class="line">3. 对每个区间在 ZSet 上做 ZRANGEBYSCORE（跳表范围扫描）</span><br><span class="line">4. 归并结果，用 Haversine 精确计算距离过滤，按距离排序</span><br></pre></td></tr></table></figure>
+
+<p>关键结论：<strong>Redis GEO 的快，不是因为”存得聪明”，而是因为复用了 ZSet 跳表的范围查询能力</strong>。这也是为什么 GEO 的成员数受限于单机内存（ZSet 本身是内存结构）。</p>
+<h2 id="五、Java-实现：GeoHash-编码-距离计算"><a href="#五、Java-实现：GeoHash-编码-距离计算" class="headerlink" title="五、Java 实现：GeoHash 编码 + 距离计算"></a>五、Java 实现：GeoHash 编码 + 距离计算</h2><p>不完全依赖 Redis 时，也可以自己在 Java 里实现 GeoHash（比如做分库分表的路由键）。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">GeoHashKit</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">char</span>[] BASE32 =</span><br><span class="line">            <span class="string">&quot;0123456789bcdefghjkmnpqrstuvwxyz&quot;</span>.toCharArray();</span><br><span class="line">    <span class="comment">// 经纬度各用 26 位，共 52 位</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span>[] BITS = &#123;<span class="number">16</span>, <span class="number">8</span>, <span class="number">4</span>, <span class="number">2</span>, <span class="number">1</span>&#125;;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 将经纬度编码为 GeoHash 字符串，precision 为字符数（1~12） */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> String <span class="title function_">encode</span><span class="params">(<span class="type">double</span> lat, <span class="type">double</span> lon, <span class="type">int</span> precision)</span> &#123;</span><br><span class="line">        <span class="type">double</span>[] latRange = &#123;-<span class="number">90.0</span>, <span class="number">90.0</span>&#125;;</span><br><span class="line">        <span class="type">double</span>[] lonRange = &#123;-<span class="number">180.0</span>, <span class="number">180.0</span>&#125;;</span><br><span class="line">        <span class="type">StringBuilder</span> <span class="variable">sb</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">StringBuilder</span>();</span><br><span class="line">        <span class="type">boolean</span> <span class="variable">even</span> <span class="operator">=</span> <span class="literal">true</span>;   <span class="comment">// 偶数位编码经度，奇数位编码纬度</span></span><br><span class="line">        <span class="type">int</span> <span class="variable">bit</span> <span class="operator">=</span> <span class="number">0</span>, ch = <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">while</span> (sb.length() &lt; precision) &#123;</span><br><span class="line">            <span class="type">double</span>[] range = even ? lonRange : latRange;</span><br><span class="line">            <span class="type">double</span> <span class="variable">v</span> <span class="operator">=</span> even ? lon : lat;</span><br><span class="line">            <span class="type">double</span> <span class="variable">mid</span> <span class="operator">=</span> (range[<span class="number">0</span>] + range[<span class="number">1</span>]) / <span class="number">2</span>;</span><br><span class="line"></span><br><span class="line">            <span class="keyword">if</span> (v &gt;= mid) &#123;</span><br><span class="line">                ch |= BITS[bit];</span><br><span class="line">                range[<span class="number">0</span>] = mid;</span><br><span class="line">            &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">                range[<span class="number">1</span>] = mid;</span><br><span class="line">            &#125;</span><br><span class="line"></span><br><span class="line">            even = !even;</span><br><span class="line">            <span class="keyword">if</span> (bit &lt; <span class="number">4</span>) &#123;</span><br><span class="line">                bit++;</span><br><span class="line">            &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">                sb.append(BASE32[ch]);</span><br><span class="line">                bit = <span class="number">0</span>;</span><br><span class="line">                ch = <span class="number">0</span>;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> sb.toString();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>计算某格子的相邻格子（九宫格的核心）：对二进制串做”加一&#x2F;减一”再解码，得到相邻格子的中心点。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">/** 求某 GeoHash 的 8 个邻居（简化版：用解码后的中心点做偏移） */</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> List&lt;String&gt; <span class="title function_">neighbors</span><span class="params">(<span class="type">double</span> lat, <span class="type">double</span> lon, <span class="type">int</span> precision)</span> &#123;</span><br><span class="line">    <span class="type">double</span> <span class="variable">cellWidth</span> <span class="operator">=</span> <span class="number">360.0</span> / Math.pow(<span class="number">2</span>, Math.ceil(precision * <span class="number">5</span> / <span class="number">2.0</span>));   <span class="comment">// 精度对应的经度跨度</span></span><br><span class="line">    <span class="type">double</span> <span class="variable">cellHeight</span> <span class="operator">=</span> <span class="number">180.0</span> / Math.pow(<span class="number">2</span>, Math.floor(precision * <span class="number">5</span> / <span class="number">2.0</span>));</span><br><span class="line">    List&lt;String&gt; result = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;(<span class="number">8</span>);</span><br><span class="line">    <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">dLat</span> <span class="operator">=</span> -<span class="number">1</span>; dLat &lt;= <span class="number">1</span>; dLat++) &#123;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">dLon</span> <span class="operator">=</span> -<span class="number">1</span>; dLon &lt;= <span class="number">1</span>; dLon++) &#123;</span><br><span class="line">            <span class="keyword">if</span> (dLat == <span class="number">0</span> &amp;&amp; dLon == <span class="number">0</span>) <span class="keyword">continue</span>;</span><br><span class="line">            <span class="type">double</span> <span class="variable">nLat</span> <span class="operator">=</span> lat + dLat * cellHeight;</span><br><span class="line">            <span class="type">double</span> <span class="variable">nLon</span> <span class="operator">=</span> lon + dLon * cellWidth;</span><br><span class="line">            <span class="keyword">if</span> (nLat &gt; <span class="number">90</span> || nLat &lt; -<span class="number">90</span>) <span class="keyword">continue</span>;                 <span class="comment">// 跨极点丢弃</span></span><br><span class="line">            <span class="keyword">if</span> (nLon &gt; <span class="number">180</span>) nLon -= <span class="number">360</span>;</span><br><span class="line">            <span class="keyword">if</span> (nLon &lt; -<span class="number">180</span>) nLon += <span class="number">360</span>;</span><br><span class="line">            result.add(encode(nLat, nLon, precision));</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> result;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意精度和半径的匹配</strong>：查 5km 半径，用 4 位（39km 格子）覆盖足够但候选集偏大（要算更多 Haversine）；用 6 位（1.2km）候选集小但需要查询 9 个格子甚至更多层。经验做法是<strong>取比半径略大的格子边长</strong>，用九宫格覆盖。</p>
+<h2 id="六、千万级用户的架构设计"><a href="#六、千万级用户的架构设计" class="headerlink" title="六、千万级用户的架构设计"></a>六、千万级用户的架构设计</h2><p>Redis GEO 单机能存多少？假设一条记录（member + score）约 80 字节，1000 万条约 800MB，一台 16GB 的 Redis 能扛住，但<strong>热点和不均匀分布</strong>会出问题（比如所有骑手都挤在一个商业区）。</p>
+<h3 id="方案一：Redis-Cluster-按-GEO-分区"><a href="#方案一：Redis-Cluster-按-GEO-分区" class="headerlink" title="方案一：Redis Cluster + 按 GEO 分区"></a>方案一：Redis Cluster + 按 GEO 分区</h3><p>把用户按城市&#x2F;地理区域分到不同 Redis 实例，查询时先定位区域再查询。问题是跨区域的”边界用户”需要查多个实例。</p>
+<h3 id="方案二：自建”网格索引-倒排”（大厂常用）"><a href="#方案二：自建”网格索引-倒排”（大厂常用）" class="headerlink" title="方案二：自建”网格索引 + 倒排”（大厂常用）"></a>方案二：自建”网格索引 + 倒排”（大厂常用）</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">1. 把地球切成一二级网格（如 S2 / 四叉树 / GeoHash 5 位格）</span><br><span class="line">2. 维护 网格ID -&gt; 用户集合 的映射（Redis Set 或本地缓存）</span><br><span class="line">3. 查询：取中心格子 + 8 邻格 → 拿到候选用户 ID 集合 → 读用户位置 → Haversine 精筛</span><br><span class="line">4. 位置更新：只更新网格映射（O(1)），不需要全量重算</span><br></pre></td></tr></table></figure>
+
+<p>这个方案的好处是<strong>更新极其廉价</strong>（用户移动只改一个 Set 的成员），缺点是要自己维护网格和用户位置的二级存储。</p>
+<h3 id="方案三：分层-冷热分离"><a href="#方案三：分层-冷热分离" class="headerlink" title="方案三：分层 + 冷热分离"></a>方案三：分层 + 冷热分离</h3><ul>
+<li><strong>热数据</strong>（活跃骑手、在店商家）：放 Redis GEO，毫秒级；</li>
+<li><strong>温数据</strong>（离线用户、历史位置）：放 Elasticsearch 的 <code>geo_point</code> 或 PostGIS，支持复杂空间查询；</li>
+<li><strong>冷数据</strong>：落 HBase&#x2F;对象存储，只做离线分析。</li>
+</ul>
+<h3 id="工程细节清单"><a href="#工程细节清单" class="headerlink" title="工程细节清单"></a>工程细节清单</h3><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>方案</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>位置更新频繁（每 3~5 秒上报）</td>
+<td>合并写入（本地聚合 + 批量 GEOADD），或降频</td>
+</tr>
+<tr>
+<td>查询半径大（如 50km）</td>
+<td>退化成 ES&#x2F;离线索引，或分层返回</td>
+</tr>
+<tr>
+<td>网格边界漏点</td>
+<td>九宫格（或更大范围）</td>
+</tr>
+<tr>
+<td>返回结果要过滤（在线、接单中）</td>
+<td>位图&#x2F;布隆过滤器预筛，或把状态打进 member 命名</td>
+</tr>
+<tr>
+<td>排序要综合距离和评分</td>
+<td>先取 TOP N（按距离），再在应用层重排</td>
+</tr>
+<tr>
+<td>高并发</td>
+<td>Redis 读写分离 + 本地缓存 + 限流</td>
+</tr>
+</tbody></table>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：为什么 GeoHash 用 52 位而不是 64 位？</strong></p>
+<p>因为 Redis 用 ZSet 的 score（double）存，double 只有 53 位有效精度（1 位符号 + 52 位尾数）。用 52 位可以保证整数精确存储，同时在 0.6m 左右的分辨率已经远超 GPS 精度需求。再多位不仅无意义，还会破坏存储的精确性。</p>
+<p><strong>Q2：GeoHash 和四叉树&#x2F;S2&#x2F;Google H3 的区别？</strong></p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>特点</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>GeoHash</td>
+<td>实现最简单，字符串前缀可索引，<strong>格子有变形</strong>（面积不等）</td>
+<td>通用 LBS、Redis GEO</td>
+</tr>
+<tr>
+<td>四叉树</td>
+<td>自适应细分（密处更细）</td>
+<td>内存索引、碰撞检测</td>
+</tr>
+<tr>
+<td>Google S2</td>
+<td>基于球面，格子面积近似相等，支持层级和区域覆盖</td>
+<td>大厂 LBS、地图</td>
+</tr>
+<tr>
+<td>Uber H3</td>
+<td>六边形网格，邻接关系均匀（6 邻居），距离误差小</td>
+<td>网格聚合、派单</td>
+</tr>
+</tbody></table>
+<p>如果面试官问”为什么 Uber 用六边形”，答案是：<strong>六边形每个格子只有 6 个等距邻居，而方形网格有 4 等距 + 4 对角（距离更远）</strong>，做区域聚合和邻域查询时误差更小、扩展更均匀。</p>
+<p><strong>Q3：Haversine 和 Vincenty 公式怎么选？</strong></p>
+<p>Haversine 把地球当正球体，误差约 0.3%，计算快，<strong>够用于”附近的人”这种场景</strong>。Vincenty 考虑椭球体（WGS-84），精度高但迭代计算慢，适合测绘级应用。工程上绝大多数场景用 Haversine 就够，还可以用等距圆柱投影做近似加速。</p>
+<p><strong>Q4：为什么查询要先粗筛再精筛？</strong></p>
+<p>粗筛（GeoHash&#x2F;网格）把候选集从千万级降到几十个，但<strong>有边界误差和格子变形误差</strong>，可能包含超出半径的点。精筛（Haversine）保证结果准确并按距离排序。两级过滤把”高复杂度运算”限制在极小集合上，这是空间检索的通用优化范式。</p>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>核心链路一张图：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line">需求：附近 5 公里的人</span><br><span class="line">  ↓</span><br><span class="line">痛点：二维坐标无法用一维索引，全表扫描 O(N)</span><br><span class="line">  ↓</span><br><span class="line">方案：GeoHash 降维（交替二分 + base32）→ 前缀相同即空间相近</span><br><span class="line">  ↓</span><br><span class="line">坑 1：格子边界漏点 → 九宫格（中心 + 8 邻居）</span><br><span class="line">  ↓</span><br><span class="line">坑 2：格子变形（高纬度）+ 粗筛误差 → Haversine 精筛</span><br><span class="line">  ↓</span><br><span class="line">Redis GEO：52 位 GeoHash 整数做 ZSet score → 复用跳表范围查询</span><br><span class="line">  ↓</span><br><span class="line">规模化：Redis Cluster / 网格倒排索引 / 冷热分层 + 高频更新合并</span><br></pre></td></tr></table></figure>
+
+<p>记住三个数字和一个套路：</p>
+<ul>
+<li><strong>52 位</strong>（Redis GEO 的编码长度，受 double 精度约束）；</li>
+<li><strong>九宫格</strong>（解决边界漏点的最小代价方案）；</li>
+<li><strong>粗筛 → 精筛</strong>（空间检索永远的两级过滤）。</li>
+</ul>
+<p>「附近的人」看着简单，实则把<strong>降维、索引、边界处理、分层架构</strong>四件事串在一起。能把边界问题答清楚，这道题就赢了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/24/geohash-nearby-lbs-architecture-deep-dive/">https://jiweidong.github.io/2026/09/24/geohash-nearby-lbs-architecture-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E5%9C%B0%E7%90%86%E4%BD%8D%E7%BD%AE/">地理位置</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/24/mysql-user-privilege-security-hardening-deep-practice/" title="【MySQL 运维】用户权限体系与安全加固深度实战：最小权限、角色与审计落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 运维】用户权限体系与安全加固深度实战：最小权限、角色与审计落地</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】用户权限体系与安全加固深度实战：最小权限、角色与审计落地从一次”全权限账号被拖库”说起某次复盘会，事故链条是这样的：一个内部数据同步服务用了 root@&#39;%&#39; 连库，密码写死在 Git 仓库里（后来仓库被误设为公开），攻击者拿这个账号 SELECT ... INTO OUTFILE 导出了全量用户表，还用 LOAD_FILE() 读了服务器上的配置文件。 三处失误，每一处都能独立致命：  用了 root 而不是最小权限账号； host 写成 %，任意机器可连； 密码进代码仓库，且没有加密&#x2F;轮转机制。  MySQL 的权限体系平时没什么存在感，但它是数据库安全的第一道也是最后一道防线。这篇文章把权限模型、账号安全、审计和加固清单一次性讲透，并给出 Java 应用侧的配合姿势。 一、权限模型：认证与授权是两个阶段MySQL 处理一个连接请求分两步，很多人把它们混为一谈： 1234567阶段 1：认证（Authentication）—— 你是谁？  Client 发起连接 → MySQL 用 (user, host, password) 三...</div></div></div></a><a class="pagination-related" href="/2026/09/24/java-native-serialization-serialversionuid-deep-dive/" title="【Java 核心】JDK 原生序列化深度解析：serialVersionUID、writeObject 与兼容性陷阱"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 核心】JDK 原生序列化深度解析：serialVersionUID、writeObject 与兼容性陷阱</div></div><div class="info-2"><div class="info-item-1">【Java 核心】JDK 原生序列化深度解析：serialVersionUID、writeObject 与兼容性陷阱面试官：你的实体类为什么天天被 Sonar 警告 serialVersionUID 没定义？很多同学写 Java 好几年，serialVersionUID 这个字段一直是”IDEA 黄色波浪线 + 无脑 Alt+Enter 生成一个 1L”的存在。但面试官真正想问的是： “反序列化的时候，如果类结构变了会怎样？serialVersionUID 到底在校验什么？” 能答出这个，说明你理解序列化的协议层；答不出来，那 transient、readResolve、单例被破坏这些追问你也一定接不住。这篇文章从字节流格式开始，把 JDK 原生序列化彻底拆开。 一、序列化到底写进了什么？先看一段最简单的代码，然后看看它生成的字节： 123456class User implements Serializable &#123;    private static final long serialVersionUID = 1L;    private String name;  ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/30/distributed-split-brain-deep-dive/" title="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-30</div><div class="info-item-2">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</div></div><div class="info-2"><div class="info-item-1">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制面试官：什么是脑裂？为什么分布式系统里最怕脑裂？脑裂（Split Brain） 是指一个集群因为网络分区（Network Partition），被切成了两个或多个「互相联系不上、但各自存活」的小团体，每个小团体都认为自己是集群的唯一主人，各自继续对外提供服务、各自做出决策。  用大白话说：一个大脑裂成了两个，两个「大脑」都觉得自己才是本体，于是开始各写各的账。  脑裂的可怕之处不在于「集群分开了」，而在于分开之后双方都在写数据，等网络恢复、双方重新合并时，数据已经互相矛盾，无法无损合并。 脑裂的两个经典危害场景   场景 危害    数据库主主 两个主库都接受写入，各自生成不同的 binlog，恢复后数据冲突，主键&#x2F;唯一键直接爆掉   分布式锁 两个节点都认为自己持有锁，同时进入临界区，秒杀超卖、重复扣款随之而来   配置中心 两个「主」各自修改配置，客户端读到互相矛盾的结果   选主系统 出现两个 Le...</div></div></div></a><a class="pagination-related" href="/2026/08/22/feed-stream-system-design/" title="【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流</div></div><div class="info-2"><div class="info-item-1">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流面试官：微博的首页信息流是怎么做的？如果让你设计一个 Feed 流系统，你会怎么设计？Feed 流（信息流）是互联网最核心的业务形态之一：微博、朋友圈、抖音、小红书，全是 Feed 流。它和普通 CRUD 最大的区别在于——每个用户看到的首页内容都不一样，是”千人千面”的个性化时间线。设计 Feed 流，本质是解决三个问题：内容怎么分发、时间线怎么生成、读多写多怎么扛。 一、需求与指标先定义清楚规模，才有设计依据：  日活用户 1 亿，月活 3 亿； 平均每个用户关注 200 个账号； 每秒新增内容（发帖）1 万条，峰值 5 万条； 每秒读取时间线（刷首页）10 万次，峰值 50 万次； 要求：读延迟 &lt; 200ms，写后延迟 &lt; 1s 内可见。  读是写的 10 倍以上——这是所有 Feed 流设计的出发点：读多写少，必须为读优化。 二、三种核心模型：推、拉、推拉结合2.1 拉模式（Pull &#x2F; 读扩散）用户刷首页时，实时去拉取他关注的所有人的最新内容，再合并排序。 1用户刷首页 → 查关注列表...</div></div></div></a><a class="pagination-related" href="/2026/08/18/short-url-system-design/" title="【系统设计】短链接系统架构设计：从发号器到跳转的完整方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案</div></div><div class="info-2"><div class="info-item-1">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案面试官：设计一个短链接系统，说下你的思路？短链接是系统设计面试的”经典题库题”（和秒杀、支付、消息推送并列）。它麻雀虽小五脏俱全：发号算法、存储设计、缓存、高并发跳转、数据统计全都涉及。而且它真实存在于你身边的每个场景——微博分享、营销短信、二维码里那一串 t.cn/xxxxx。 本文给出一个可以直接”背”进面试的完整设计方案。  一、需求分析功能需求 生成：输入长链接，返回短链接（如 https://s.dg.com/Ab3xY9）； 跳转：访问短链接，302 重定向到长链接； 统计：每个短链接的访问次数、来源、时间分布（加分项）； 管理：可自定义短码、可设置过期时间（加分项）。  非功能需求（关键！） 高并发：跳转是读多写少，QPS 可能极高（营销活动时秒级上万）； 高可用：跳转失败 &#x3D; 用户进不了页面，可用性要求 99.99%； 低延迟：跳转链路要快，缓存命中率要足够高。  容量估算（背下来，面试很加分） 每天新增短链接 1000 万 → 每年约 36.5 亿条； 短码长度：用 62 进制（a-zA-Z0-9...</div></div></div></a><a class="pagination-related" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战前言Redis 作为内存数据库，其所有数据都存储在内存中。当写入速度超过内存容量时，Redis 必须决定应该删除哪些数据——这就是内存淘汰策略（Eviction Policy）。选错淘汰策略可能导致缓存命中率断崖式下跌、大量请求穿透到数据库，甚至引发雪崩。 很多开发者只知道 allkeys-lru 或 volatile-ttl 这些名字，但面试官一旦追问”Redis 的近似 LRU 和标准 LRU 有什么区别？””LFU 的 counter 是如何衰减的？”，就容易答不上来。 本文将对 Redis 的 8 种淘汰策略进行深度解析，从源码层面揭秘近 LRU&#x2F;LFU 的实现，并通过实战案例帮你做出最佳选择。  一、Redis 内存淘汰机制总览1.1 触发条件当以下条件满足时，Redis 会触发内存淘汰： 12345# 设置最大内存（默认不限制）maxmemory 4gb# 达到 maxmemory 后，Redis 会尝试淘汰数据# 如果无法释放足够内存，写入操作会返回 OOM 错...</div></div></div></a><a class="pagination-related" href="/2026/06/13/redis-core/" title="Redis 核心技术与实战（面试跳槽篇）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">Redis 核心技术与实战（面试跳槽篇）</div></div><div class="info-2"><div class="info-item-1">Redis 核心技术与实战（面试跳槽篇） Redis 是后端面试的”必考点”，本文从底层原理到生产实战，全面覆盖 Redis 核心知识点。  一、Redis 基础1.1 为什么这么快Redis 单机 QPS 可达 10 万+，主要归功于以下几点： 纯内存操作：数据全在内存中，读写速度远快于磁盘 IO。内存寻址是纳秒级，而磁盘寻址是毫秒级，差了三个数量级。 单线程模型：Redis 6.0 之前，核心命令执行是单线程的。单线程避免了线程切换和锁竞争的开销。值得注意的是，”单线程”指的是网络 IO 和命令执行在同一个线程中串行处理，但持久化、异步删除等操作由后台线程完成。 IO 多路复用（epoll）：Redis 使用基于 epoll 的 IO 多路复用技术，单线程可以监听多个套接字。当有事件就绪时，才会处理该事件，避免了阻塞等待。epoll 相比 select&#x2F;poll 的优势在于：没有最大连接数限制，使用红黑树管理 fd，通过事件回调避免轮询。 高效的数据结构：Redis 为每种数据类型设计了高效的底层编码，如压缩列表、跳表等。 1.2 五大核心数据结构   结构 底层编...</div></div></div></a><a class="pagination-related" href="/2026/08/21/load-balancing-algorithms-deep-dive/" title="【系统设计】负载均衡算法深度解析：轮询、加权、最少连接与一致性哈希全对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-21</div><div class="info-item-2">【系统设计】负载均衡算法深度解析：轮询、加权、最少连接与一致性哈希全对比</div></div><div class="info-2"><div class="info-item-1">【系统设计】负载均衡算法深度解析：轮询、加权、最少连接与一致性哈希全对比面试官：Nginx 的 upstream 里有十几种负载均衡算法，你怎么选？负载均衡是分布式系统的地基：把请求分散到多台服务器，解决单点瓶颈。但”分散”的策略千差万别——是平均分配，还是按机器性能分配？是按连接数动态调整，还是保证同一用户永远打到同一台机器？这就是负载均衡算法的学问。 先给一张全景图，把主流算法按”是否感知服务器实时状态”分成两类：    分类 算法 是否感知后端负载 典型场景    静态算法 轮询（Round Robin） 否 后端性能均匀   静态算法 加权轮询（WRR） 否 后端性能不均   静态算法 IP Hash &#x2F; 一致性哈希 否 会话保持、缓存路由   动态算法 最少连接（Least Connections） 是（连接数） 长连接、耗时波动大   动态算法 加权最少连接 是 性能 + 负载双重考虑   动态算法 最快响应（EWMA） 是（响应时间） 延迟敏感服务   一、轮询（Round Robin）：最简单，也最”理想化”轮流把请求分给每台服务器：1→2→3→1→2→...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">667</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">768</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">214</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E5%AE%9E%E6%88%98%E3%80%91GeoHash-%E4%B8%8E%E3%80%8C%E9%99%84%E8%BF%91%E7%9A%84%E4%BA%BA%E3%80%8D%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%8E%9F%E7%90%86%E3%80%81%E8%BE%B9%E7%95%8C%E9%97%AE%E9%A2%98%E4%B8%8E-Redis-GEO-%E6%9E%B6%E6%9E%84"><span class="toc-number">1.</span> <span class="toc-text">【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E5%BE%AE%E4%BF%A1%E3%80%8C%E9%99%84%E8%BF%91%E7%9A%84%E4%BA%BA%E3%80%8D%E6%80%8E%E4%B9%88%E5%AE%9E%E7%8E%B0%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：微信「附近的人」怎么实现？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E8%83%BD%E7%9B%B4%E6%8E%A5%E7%94%A8%E7%BB%8F%E7%BA%AC%E5%BA%A6%E7%AE%97%E8%B7%9D%E7%A6%BB%EF%BC%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么不能直接用经纬度算距离？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81GeoHash%EF%BC%9A%E6%8A%8A%E4%BA%8C%E7%BB%B4%E5%9D%90%E6%A0%87%E5%8E%8B%E6%88%90%E4%B8%80%E7%BB%B4%E5%AD%97%E7%AC%A6%E4%B8%B2"><span class="toc-number">1.3.</span> <span class="toc-text">二、GeoHash：把二维坐标压成一维字符串</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E8%BE%B9%E7%95%8C%E9%97%AE%E9%A2%98%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E5%BF%85%E9%A1%BB%E6%9F%A5%E2%80%9D%E4%B9%9D%E5%AE%AB%E6%A0%BC%E2%80%9D"><span class="toc-number">1.4.</span> <span class="toc-text">三、边界问题：为什么必须查”九宫格”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Redis-GEO%EF%BC%9A%E6%9C%AC%E8%B4%A8%E6%98%AF-ZSet-GeoHash"><span class="toc-number">1.5.</span> <span class="toc-text">四、Redis GEO：本质是 ZSet + GeoHash</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81Java-%E5%AE%9E%E7%8E%B0%EF%BC%9AGeoHash-%E7%BC%96%E7%A0%81-%E8%B7%9D%E7%A6%BB%E8%AE%A1%E7%AE%97"><span class="toc-number">1.6.</span> <span class="toc-text">五、Java 实现：GeoHash 编码 + 距离计算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%8D%83%E4%B8%87%E7%BA%A7%E7%94%A8%E6%88%B7%E7%9A%84%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.7.</span> <span class="toc-text">六、千万级用户的架构设计</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9ARedis-Cluster-%E6%8C%89-GEO-%E5%88%86%E5%8C%BA"><span class="toc-number">1.7.1.</span> <span class="toc-text">方案一：Redis Cluster + 按 GEO 分区</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E8%87%AA%E5%BB%BA%E2%80%9D%E7%BD%91%E6%A0%BC%E7%B4%A2%E5%BC%95-%E5%80%92%E6%8E%92%E2%80%9D%EF%BC%88%E5%A4%A7%E5%8E%82%E5%B8%B8%E7%94%A8%EF%BC%89"><span class="toc-number">1.7.2.</span> <span class="toc-text">方案二：自建”网格索引 + 倒排”（大厂常用）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E5%88%86%E5%B1%82-%E5%86%B7%E7%83%AD%E5%88%86%E7%A6%BB"><span class="toc-number">1.7.3.</span> <span class="toc-text">方案三：分层 + 冷热分离</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%B7%A5%E7%A8%8B%E7%BB%86%E8%8A%82%E6%B8%85%E5%8D%95"><span class="toc-number">1.7.4.</span> <span class="toc-text">工程细节清单</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/24/mysql-user-privilege-security-hardening-deep-practice/" title="【MySQL 运维】用户权限体系与安全加固深度实战：最小权限、角色与审计落地">【MySQL 运维】用户权限体系与安全加固深度实战：最小权限、角色与审计落地</a><time datetime="2026-09-24T00:40:00.000Z" title="发表于 2026-09-24 08:40:00">2026-09-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/24/geohash-nearby-lbs-architecture-deep-dive/" title="【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构">【实战】GeoHash 与「附近的人」深度解析：原理、边界问题与 Redis GEO 架构</a><time datetime="2026-09-24T00:30:00.000Z" title="发表于 2026-09-24 08:30:00">2026-09-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/24/java-native-serialization-serialversionuid-deep-dive/" title="【Java 核心】JDK 原生序列化深度解析：serialVersionUID、writeObject 与兼容性陷阱">【Java 核心】JDK 原生序列化深度解析：serialVersionUID、writeObject 与兼容性陷阱</a><time datetime="2026-09-24T00:20:00.000Z" title="发表于 2026-09-24 08:20:00">2026-09-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/24/java-script-engine-jsr223-graaljs-deep-practice/" title="【Java 进阶】JSR-223 脚本引擎深度实战：从 Nashorn、GraalJS 到动态规则引擎">【Java 进阶】JSR-223 脚本引擎深度实战：从 Nashorn、GraalJS 到动态规则引擎</a><time datetime="2026-09-24T00:10:00.000Z" title="发表于 2026-09-24 08:10:00">2026-09-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/24/hbase-rowkey-region-architecture-deep-dive/" title="【中间件】HBase 架构深度解析：RowKey 设计、Region 分裂与读写全流程实战">【中间件】HBase 架构深度解析：RowKey 设计、Region 分裂与读写全流程实战</a><time datetime="2026-09-24T00:00:00.000Z" title="发表于 2026-09-24 08:00:00">2026-09-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
