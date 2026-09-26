@@ -1,0 +1,461 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性面试官：数据分布倾斜导致选错索引，你有什么办法？这是 MySQL 优化里一个非常”内行”的问题。很多人第一反应是”加索引””强制索引””改写 SQL”，但真正切入本质的回答是：  问题可能不在索引本身，而在于优化器对基数的估算不准。 MySQL 8.0 引入的**直方图统计（Histogram Sta">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/26/mysql-histogram-statistics-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性面试官：数据分布倾斜导致选错索引，你有什么办法？这是 MySQL 优化里一个非常”内行”的问题。很多人第一反应是”加索引””强制索引””改写 SQL”，但真正切入本质的回答是：  问题可能不在索引本身，而在于优化器对基数的估算不准。 MySQL 8.0 引入的**直方图统计（Histogram Sta">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-26T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-26T00:01:23.658Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="数据库">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性",
+  "url": "https://jiweidong.github.io/2026/09/26/mysql-histogram-statistics-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-26T00:00:00.000Z",
+  "dateModified": "2026-09-26T00:01:23.658Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/26/mysql-histogram-statistics-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">677</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-26T00:00:00.000Z" title="发表于 2026-09-26 08:00:00">2026-09-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-26T00:01:23.658Z" title="更新于 2026-09-26 08:01:23">2026-09-26</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/%E6%95%B0%E6%8D%AE%E5%BA%93%E4%BC%98%E5%8C%96/">数据库优化</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性"><a href="#【MySQL-优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性" class="headerlink" title="【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性"></a>【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性</h1><h2 id="面试官：数据分布倾斜导致选错索引，你有什么办法？"><a href="#面试官：数据分布倾斜导致选错索引，你有什么办法？" class="headerlink" title="面试官：数据分布倾斜导致选错索引，你有什么办法？"></a>面试官：数据分布倾斜导致选错索引，你有什么办法？</h2><p>这是 MySQL 优化里一个非常”内行”的问题。很多人第一反应是”加索引””强制索引””改写 SQL”，但真正切入本质的回答是：</p>
+<blockquote>
+<p><strong>问题可能不在索引本身，而在于优化器对基数的估算不准。</strong> MySQL 8.0 引入的**直方图统计（Histogram Statistics）**就是专门用来解决”数据分布倾斜导致的估算失真”的。</p>
+</blockquote>
+<p>下面从优化器成本模型讲到直方图的实现细节、使用限制和线上实践。</p>
+<h2 id="一、先搞懂优化器”选错”的根源"><a href="#一、先搞懂优化器”选错”的根源" class="headerlink" title="一、先搞懂优化器”选错”的根源"></a>一、先搞懂优化器”选错”的根源</h2><p>MySQL 的 CBO（Cost-Based Optimizer）在选择执行计划时，核心输入是<strong>每个条件的过滤后行数估算（estimated rows）</strong>。它需要知道：</p>
+<ul>
+<li>这个表大概有多少行；</li>
+<li>某个条件能过滤掉多少（选择性 selectivity &#x3D; 匹配行数 &#x2F; 总行数）。</li>
+</ul>
+<p>而传统 InnoDB 统计信息只有一个 <strong>cardinality（基数，即不同值的数量）</strong>，估算选择性时用的是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">selectivity ≈ 1 / cardinality</span><br></pre></td></tr></table></figure>
+
+<p>问题来了：<strong>1 &#x2F; cardinality 是”平均选择性”，它假设所有值是均匀分布的。</strong></p>
+<p>看看真实世界：</p>
+<ul>
+<li>订单表 <code>status</code> 列：99.5% 是 <code>PAID</code>，0.4% 是 <code>PENDING</code>，0.1% 是 <code>CANCELLED</code>；</li>
+<li>用户表 <code>city</code> 列：一线城市占据绝大多数，长尾城市各有几千人；</li>
+<li>商品表 <code>category_id</code>：头部类目 50 万行，长尾类目 3 行。</li>
+</ul>
+<p><code>cardinality = 3</code> 的时候，优化器认为每个值各占 1&#x2F;3。于是：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 实际只匹配 0.4% 的行（约 4000 行，走索引 + 回表很划算）</span></span><br><span class="line"><span class="comment">-- 优化器却以为匹配 1/3（约 330 万行，全表扫描更划算）</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="string">&#x27;PENDING&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>计划选错，性能差几十倍。<strong>这就是直方图要解决的问题：把”平均值”换成”分布”。</strong></p>
+<h2 id="二、InnoDB-统计信息是怎么来的"><a href="#二、InnoDB-统计信息是怎么来的" class="headerlink" title="二、InnoDB 统计信息是怎么来的"></a>二、InnoDB 统计信息是怎么来的</h2><p>在讲直方图之前，必须先讲清楚传统统计信息的机制，因为它们是互补关系。</p>
+<h3 id="2-1-持久化统计信息"><a href="#2-1-持久化统计信息" class="headerlink" title="2.1 持久化统计信息"></a>2.1 持久化统计信息</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> mysql.innodb_table_stats <span class="keyword">WHERE</span> table_name <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span>\G</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> mysql.innodb_index_stats <span class="keyword">WHERE</span> table_name <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span>\G</span><br></pre></td></tr></table></figure>
+
+<p>关键参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>innodb_stats_persistent</code></td>
+<td>ON</td>
+<td>是否持久化统计信息（存到 mysql.innodb_*_stats）</td>
+</tr>
+<tr>
+<td><code>innodb_stats_persistent_sample_pages</code></td>
+<td>20</td>
+<td>更新统计信息时采样多少页</td>
+</tr>
+<tr>
+<td><code>innodb_stats_transient_sample_pages</code></td>
+<td>8</td>
+<td>非持久化模式下的采样页数</td>
+</tr>
+<tr>
+<td><code>innodb_stats_auto_recalc</code></td>
+<td>ON</td>
+<td>表变动超过 10% 时自动重算</td>
+</tr>
+<tr>
+<td><code>innodb_stats_include_delete_marked</code></td>
+<td>OFF</td>
+<td>是否统计标记删除的记录</td>
+</tr>
+</tbody></table>
+<h3 id="2-2-采样与”索引下潜”（index-dive）"><a href="#2-2-采样与”索引下潜”（index-dive）" class="headerlink" title="2.2 采样与”索引下潜”（index dive）"></a>2.2 采样与”索引下潜”（index dive）</h3><p>对于<strong>等值条件</strong>，如果索引基数不明确，优化器还可以做 <strong>index dive</strong>：直接在 B+ 树上”潜下去”数区间内的记录数。这种方式精确，但代价是每次都要访问索引页。</p>
+<p>参数 <code>eq_range_index_dive_limit</code>（默认 200）控制这个行为：</p>
+<ul>
+<li>条件里 <strong>等值区间数 &lt; 200</strong> → 使用 index dive，精确估算；</li>
+<li><strong>&gt;&#x3D; 200</strong>（例如 <code>IN (1000 个值)</code>）→ 退回用 <code>cardinality</code> 估算，精度下降。</li>
+</ul>
+<p>这也解释了那个经典现象：<strong><code>IN</code> 列表一长，执行计划突然就”崩”了</strong>——因为估算方式从”精确下潜”切换成了”平均基数”。</p>
+<h3 id="2-3-传统统计信息的致命空白"><a href="#2-3-传统统计信息的致命空白" class="headerlink" title="2.3 传统统计信息的致命空白"></a>2.3 传统统计信息的致命空白</h3><ul>
+<li>只记录<strong>不同值个数</strong>，不记录<strong>每个值的频率</strong>；</li>
+<li>采样的页数是固定的（20 页），大表采样比例极低；</li>
+<li>对<strong>非索引列</strong>完全没有统计信息（不参与 index dive），只能靠”表行数 × 常量选择性”猜；</li>
+<li>对倾斜数据无能为力。</li>
+</ul>
+<p><strong>直方图恰好补上”分布”这一块，尤其是非索引列。</strong></p>
+<h2 id="三、直方图是什么：两种桶类型"><a href="#三、直方图是什么：两种桶类型" class="headerlink" title="三、直方图是什么：两种桶类型"></a>三、直方图是什么：两种桶类型</h2><p>MySQL 8.0.2 引入列统计直方图。官方文档定义的两类直方图：</p>
+<h3 id="3-1-单值桶（Singleton）"><a href="#3-1-单值桶（Singleton）" class="headerlink" title="3.1 单值桶（Singleton）"></a>3.1 单值桶（Singleton）</h3><p>当<strong>不同值的数量 &lt;&#x3D; 桶数量</strong>时使用。每个桶精确对应一个值，并记录该值的累计占比。</p>
+<p>适合：枚举型、状态型、低基数列（status、type、gender、level）。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">value = &#x27;CANCELLED&#x27;  cumulative_frequency = 0.001</span><br><span class="line">value = &#x27;PENDING&#x27;    cumulative_frequency = 0.005</span><br><span class="line">value = &#x27;PAID&#x27;       cumulative_frequency = 1.0</span><br></pre></td></tr></table></figure>
+
+<p>优化器一看就知道 <code>status = &#39;PENDING&#39;</code> 只有约 0.5% 的行，果断走索引。</p>
+<h3 id="3-2-等高桶（Equi-height）"><a href="#3-2-等高桶（Equi-height）" class="headerlink" title="3.2 等高桶（Equi-height）"></a>3.2 等高桶（Equi-height）</h3><p>当<strong>不同值数量 &gt; 桶数量</strong>时使用。把数据按频率累积切成 N 等份（每份占比约 1&#x2F;N），每个桶记录一个上界值（不含）和累计频率。</p>
+<p>适合：高基数列、数值范围列、时间列。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">&#123;</span><br><span class="line">  &quot;buckets&quot;: [</span><br><span class="line">    [0.001, 100, 0.1],</span><br><span class="line">    [0.002, 500, 0.2],</span><br><span class="line">    ...</span><br><span class="line">  ]</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>每个 bucket 是三元组：<code>[累计频率(不含), 值(桶上界，不含), 累计频率(含)]</code>。优化器通过这些分位点来估算<strong>范围查询</strong>的选择性：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 优化器可以从直方图推断出 price BETWEEN 100 AND 500 大概覆盖多少行</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> products <span class="keyword">WHERE</span> price <span class="keyword">BETWEEN</span> <span class="number">100</span> <span class="keyword">AND</span> <span class="number">500</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>这是直方图最有价值的场景之一：无索引的数值区间查询。</strong></p>
+<h2 id="四、动手实践：创建、查看、删除"><a href="#四、动手实践：创建、查看、删除" class="headerlink" title="四、动手实践：创建、查看、删除"></a>四、动手实践：创建、查看、删除</h2><h3 id="4-1-创建直方图"><a href="#4-1-创建直方图" class="headerlink" title="4.1 创建直方图"></a>4.1 创建直方图</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 对单列创建，桶数量 1 ~ 1024</span></span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">UPDATE</span> HISTOGRAM <span class="keyword">ON</span> status <span class="keyword">WITH</span> <span class="number">32</span> BUCKETS;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 多列（一次语句，多个列各自独立统计）</span></span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">UPDATE</span> HISTOGRAM <span class="keyword">ON</span> status, city <span class="keyword">WITH</span> <span class="number">64</span> BUCKETS;</span><br></pre></td></tr></table></figure>
+
+<p>输出：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">+---------------+---------+----------+---------------------------------------------------+</span><br><span class="line">| Table         | Op      | Msg_type | Msg_text                                          |</span><br><span class="line">+---------------+---------+----------+---------------------------------------------------+</span><br><span class="line">| test.orders   | histogram | status | Histogram statistics created for column &#x27;status&#x27;. |</span><br><span class="line">+---------------+---------+----------+---------------------------------------------------+</span><br></pre></td></tr></table></figure>
+
+<p>要点：</p>
+<ul>
+<li>桶数量范围 <strong>1 ~ 1024</strong>；</li>
+<li>语句会<strong>覆盖</strong>已有的直方图（先删后建）；</li>
+<li>列上已有直方图时不会报错，直接更新。</li>
+</ul>
+<h3 id="4-2-查看直方图"><a href="#4-2-查看直方图" class="headerlink" title="4.2 查看直方图"></a>4.2 查看直方图</h3><p>直方图存储在 <code>mysql.column_statistics</code> 表中（JSON 格式），通过信息模式查看：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span></span><br><span class="line">  SCHEMA_NAME, TABLE_NAME, COLUMN_NAME,</span><br><span class="line">  JSON_PRETTY(HISTOGRAM) <span class="keyword">AS</span> hist</span><br><span class="line"><span class="keyword">FROM</span> information_schema.COLUMN_STATISTICS</span><br><span class="line"><span class="keyword">WHERE</span> TABLE_NAME <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span> <span class="keyword">AND</span> COLUMN_NAME <span class="operator">=</span> <span class="string">&#x27;status&#x27;</span>\G</span><br></pre></td></tr></table></figure>
+
+<p>JSON 内容示例：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;buckets&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span></span><br><span class="line">    <span class="punctuation">[</span><span class="string">&quot;CANCELLED&quot;</span><span class="punctuation">,</span> <span class="number">0.001</span><span class="punctuation">]</span><span class="punctuation">,</span></span><br><span class="line">    <span class="punctuation">[</span><span class="string">&quot;PENDING&quot;</span><span class="punctuation">,</span> <span class="number">0.005</span><span class="punctuation">]</span><span class="punctuation">,</span></span><br><span class="line">    <span class="punctuation">[</span><span class="string">&quot;PAID&quot;</span><span class="punctuation">,</span> <span class="number">1.0</span><span class="punctuation">]</span></span><br><span class="line">  <span class="punctuation">]</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;data-type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;string&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;null-values&quot;</span><span class="punctuation">:</span> <span class="number">0.0</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;last-updated&quot;</span><span class="punctuation">:</span> <span class="string">&quot;2026-09-26 08:00:00.000000&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;sampling-rate&quot;</span><span class="punctuation">:</span> <span class="number">1.0</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;histogram-type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;singleton&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;number-of-buckets-specified&quot;</span><span class="punctuation">:</span> <span class="number">32</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>关键字段解读：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>histogram-type</code></td>
+<td><code>singleton</code>（单值桶）或 <code>equi-height</code>（等高桶）</td>
+</tr>
+<tr>
+<td><code>buckets</code></td>
+<td>桶数组，格式随类型变化</td>
+</tr>
+<tr>
+<td><code>null-values</code></td>
+<td>NULL 值占比</td>
+</tr>
+<tr>
+<td><code>sampling-rate</code></td>
+<td>实际采样比例，1.0 表示全量统计</td>
+</tr>
+<tr>
+<td><code>last-updated</code></td>
+<td>统计时间，用于判断是否过期</td>
+</tr>
+</tbody></table>
+<h3 id="4-3-删除直方图"><a href="#4-3-删除直方图" class="headerlink" title="4.3 删除直方图"></a>4.3 删除直方图</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">DROP</span> HISTOGRAM <span class="keyword">ON</span> status;</span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">DROP</span> HISTOGRAM <span class="keyword">ON</span> status, city;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意：<code>ANALYZE TABLE orders;</code>（不带 UPDATE HISTOGRAM）不会更新直方图。</strong> 直方图必须显式维护。</p>
+<h2 id="五、确认优化器到底有没有用直方图"><a href="#五、确认优化器到底有没有用直方图" class="headerlink" title="五、确认优化器到底有没有用直方图"></a>五、确认优化器到底有没有用直方图</h2><p>用 optimizer trace 是最直接的手段：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> SESSION optimizer_trace <span class="operator">=</span> <span class="string">&#x27;enabled=on&#x27;</span>;</span><br><span class="line"><span class="keyword">SET</span> SESSION optimizer_trace_max_mem_size <span class="operator">=</span> <span class="number">1048576</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="string">&#x27;PENDING&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">SELECT</span> TRACE <span class="keyword">FROM</span> information_schema.OPTIMIZER_TRACE\G</span><br></pre></td></tr></table></figure>
+
+<p>在 trace 里搜索 <code>histograms</code>，能看到类似结构：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">&quot;histograms&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span></span><br><span class="line">  <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;database&quot;</span><span class="punctuation">:</span> <span class="string">&quot;test&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;table&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;column&quot;</span><span class="punctuation">:</span> <span class="string">&quot;status&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;histogram_type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;singleton&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;buckets&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span> ... <span class="punctuation">]</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;selectivity&quot;</span><span class="punctuation">:</span> <span class="number">0.0045</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">]</span></span><br></pre></td></tr></table></figure>
+
+<p><code>selectivity: 0.0045</code> 就是优化器最终采用的过滤比例。对比创建直方图前后的 trace，可以量化收益。</p>
+<p>另外用 <code>EXPLAIN FORMAT=JSON</code> 看估算行数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN FORMAT<span class="operator">=</span>JSON</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="string">&#x27;PENDING&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>关注 <code>&quot;rows_examined_per_scan&quot;</code> 与 <code>&quot;filtered&quot;</code>。直方图生效后，<code>filtered</code> 会从”平均 33.33%”变成更贴近真实的数值。</p>
+<p>如果想看真实执行情况：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN ANALYZE <span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="string">&#x27;PENDING&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>它会给出 <code>actual rows</code> 与 <code>estimated rows</code> 的对比——<strong>估算误差大就是直方图&#x2F;统计信息的用武之地</strong>。</p>
+<h2 id="六、使用限制与坑（面试重点）"><a href="#六、使用限制与坑（面试重点）" class="headerlink" title="六、使用限制与坑（面试重点）"></a>六、使用限制与坑（面试重点）</h2><p>认真整理一下直方图的限制，这些都是面试官爱追问的点：</p>
+<table>
+<thead>
+<tr>
+<th>限制</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>必须显式维护</td>
+<td>不会随 DML 自动更新，需要 <code>ANALYZE TABLE ... UPDATE HISTOGRAM</code></td>
+</tr>
+<tr>
+<td>桶数量上限 1024</td>
+<td>高基数列精度有限</td>
+</tr>
+<tr>
+<td>只支持列级</td>
+<td>不能对表达式、函数结果建直方图</td>
+</tr>
+<tr>
+<td>采样受内存限制</td>
+<td><code>histogram_generation_max_mem_size</code> 控制采样规模</td>
+</tr>
+<tr>
+<td>对索引列收益有限</td>
+<td>索引列还能靠 index dive，直方图主要救”非索引列”和”长 IN 列表”</td>
+</tr>
+<tr>
+<td>统计存储为 JSON</td>
+<td>体积随列数与桶数增加，注意 mysql 库的元数据量</td>
+</tr>
+<tr>
+<td>不适用于视图&#x2F;临时表等对象</td>
+<td>只针对真实基表列</td>
+</tr>
+</tbody></table>
+<h3 id="6-1-histogram-generation-max-mem-size"><a href="#6-1-histogram-generation-max-mem-size" class="headerlink" title="6.1 histogram_generation_max_mem_size"></a>6.1 <code>histogram_generation_max_mem_size</code></h3><p>默认 <strong>20000000 字节（约 20MB）</strong>。如果待统计的列数据超过这个内存额度，MySQL 会改为<strong>采样</strong>，并在 JSON 里反映为 <code>sampling-rate &lt; 1.0</code>。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;histogram_generation_max_mem_size&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>大表上想拿到全量精度，可以临时调大（注意内存成本）：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> SESSION histogram_generation_max_mem_size <span class="operator">=</span> <span class="number">268435456</span>; <span class="comment">-- 256MB</span></span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> big_table <span class="keyword">UPDATE</span> HISTOGRAM <span class="keyword">ON</span> skewed_col <span class="keyword">WITH</span> <span class="number">256</span> BUCKETS;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-直方图-≠-索引"><a href="#6-2-直方图-≠-索引" class="headerlink" title="6.2 直方图 ≠ 索引"></a>6.2 直方图 ≠ 索引</h3><p>直方图只影响<strong>估算</strong>，不改变<strong>访问方式</strong>。它能让优化器知道”这个条件只过滤出 0.5% 的数据”，但如果那一列上根本没有索引，最终还是要全表扫描。</p>
+<blockquote>
+<p><strong>直方图 + 合适的索引 &#x3D; 1 + 1 &gt; 2；只有直方图没有索引 ≈ 只是让估算更诚实。</strong></p>
+</blockquote>
+<h2 id="七、真实案例：状态列倾斜导致的”错误-JOIN-顺序”"><a href="#七、真实案例：状态列倾斜导致的”错误-JOIN-顺序”" class="headerlink" title="七、真实案例：状态列倾斜导致的”错误 JOIN 顺序”"></a>七、真实案例：状态列倾斜导致的”错误 JOIN 顺序”</h2><p>场景：订单表 800 万行，<code>status</code> 有 5 个值，其中 <code>PENDING</code> 只有 3 万行（0.4%）。另一个 <code>order_item</code> 表 4000 万行。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> o.id, o.amount, i.product_id</span><br><span class="line"><span class="keyword">FROM</span> orders o</span><br><span class="line"><span class="keyword">JOIN</span> order_item i <span class="keyword">ON</span> i.order_id <span class="operator">=</span> o.id</span><br><span class="line"><span class="keyword">WHERE</span> o.status <span class="operator">=</span> <span class="string">&#x27;PENDING&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>没有直方图时</strong>：优化器认为 <code>status=&#39;PENDING&#39;</code> 过滤掉 4&#x2F;5（估算 160 万行），于是选择从 <code>orders</code> 先扫 160 万行驱动 <code>order_item</code>，或者干脆用 <code>order_item</code> 做驱动表。</p>
+<p><strong>有直方图后</strong>：优化器知道 <code>status=&#39;PENDING&#39;</code> 只有 0.4%，选择 <code>orders</code> 走 <code>idx_status</code> 取 3 万行再回 <code>order_item</code> 关联，成本模型彻底改变。</p>
+<p>验证方式：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN ANALYZE</span><br><span class="line"><span class="keyword">SELECT</span> ... ;</span><br><span class="line"><span class="comment">-- 对比 actual rows vs estimated rows 的差距</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="八、维护策略：什么时候该建直方图"><a href="#八、维护策略：什么时候该建直方图" class="headerlink" title="八、维护策略：什么时候该建直方图"></a>八、维护策略：什么时候该建直方图</h2><p>不是所有列都值得建。判断标准：</p>
+<p><strong>值得建：</strong></p>
+<ol>
+<li><strong>严重倾斜</strong>且经常出现在 <code>WHERE</code> 中的列（status、type、level、region、is_deleted）；</li>
+<li><strong>非索引列</strong>上的等值&#x2F;范围查询；</li>
+<li>参与 <code>JOIN</code> 的<strong>非索引连接列</strong>（影响驱动表选择）；</li>
+<li><code>IN</code> 列表很长（超过 <code>eq_range_index_dive_limit</code>）的场景；</li>
+<li>执行计划不稳定的历史”坏表”。</li>
+</ol>
+<p><strong>不值得建：</strong></p>
+<ol>
+<li>均匀分布、基数很高的列（如自增主键、UUID）——直方图帮不上忙；</li>
+<li>极度倾斜但<strong>从不查询</strong>的列——纯浪费元数据；</li>
+<li>已有完善索引且 index dive 足够精确的列。</li>
+</ol>
+<h3 id="自动化维护建议"><a href="#自动化维护建议" class="headerlink" title="自动化维护建议"></a>自动化维护建议</h3><p>直方图没有自动重算机制，所以需要纳管：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 每周低峰期重建关键列的直方图</span></span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">UPDATE</span> HISTOGRAM <span class="keyword">ON</span> status, city, channel <span class="keyword">WITH</span> <span class="number">128</span> BUCKETS;</span><br></pre></td></tr></table></figure>
+
+<p>工程上建议：</p>
+<ol>
+<li>把直方图维护写进<strong>发布流程&#x2F;定时任务</strong>（避免人工遗忘）；</li>
+<li>用 <code>information_schema.COLUMN_STATISTICS</code> 的 <code>last-updated</code> 做<strong>时效告警</strong>；</li>
+<li>结合 <code>performance_schema</code> 找出高代价 SQL，再定位相关列；</li>
+<li>在上线前用 <code>EXPLAIN ANALYZE</code> 做 <strong>估算偏差回归</strong>，把”估算误差 &gt; 10 倍”的 SQL 纳入治理清单。</li>
+</ol>
+<h2 id="九、面试高频追问速查"><a href="#九、面试高频追问速查" class="headerlink" title="九、面试高频追问速查"></a>九、面试高频追问速查</h2><p><strong>Q1：直方图和索引统计信息是什么关系？</strong><br>互补。索引统计信息记录基数（不同值数量），直方图记录<strong>分布</strong>（每个值&#x2F;区间的频率）。前者回答”有多少种值”，后者回答”每种值占多少”。</p>
+<p><strong>Q2：有索引还需要直方图吗？</strong><br>需要看情况。索引列的等值查询通常有 index dive 兜底，直方图收益有限；但<strong>非索引列</strong>、<strong>长 IN 列表</strong>（触发 dive 限制）、<strong>多列组合估算</strong>场景下直方图价值明显。</p>
+<p><strong>Q3：为什么我的直方图建了但执行计划没变？</strong><br>常见原因：① 直方图已过期（数据变了但没重建）；② 该列本来就能靠 index dive 精确估算，直方图不是瓶颈；③ 优化器在其他地方估算错误（JOIN 基数、临时表）；④ 直方图只改了估算，访问方式仍受限（没有可用索引）。</p>
+<p><strong>Q4：singleton 和 equi-height 怎么选？</strong><br>不是”选”，是优化器根据<strong>不同值数量与桶数量</strong>自动决定：不同值数 &lt;&#x3D; 桶数 → singleton；否则 equi-height。所以给低基数列设置足够桶数，才能拿到 singleton 的精确单值频率。</p>
+<p><strong>Q5：直方图会自动更新吗？</strong><br>不会。<code>ANALYZE TABLE</code>（不带 <code>UPDATE HISTOGRAM</code>）不更新直方图，必须显式执行 <code>ANALYZE TABLE ... UPDATE HISTOGRAM ...</code>。</p>
+<p><strong>Q6：直方图和 <code>innodb_stats_auto_recalc</code> 有关系吗？</strong><br>没有直接关系。后者只影响 InnoDB 持久化统计信息的自动重算，不触发直方图更新。</p>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><ul>
+<li>优化器选错计划的根本原因之一，是<strong>用平均选择性替代了真实分布</strong>；</li>
+<li>直方图（MySQL 8.0.2+）通过 <strong>singleton &#x2F; equi-height</strong> 两种桶把列的真实频率分布告诉优化器；</li>
+<li>建设方式：<code>ANALYZE TABLE ... UPDATE HISTOGRAM ON col WITH N BUCKETS</code>，查看用 <code>information_schema.COLUMN_STATISTICS</code>，验证用 optimizer trace 和 <code>EXPLAIN ANALYZE</code>；</li>
+<li>它<strong>只影响估算、不改变访问路径</strong>，要配合索引使用；</li>
+<li>最大坑是<strong>不会自动更新</strong>，必须纳入运维与发布流程；</li>
+<li>面试加分点：能讲清 “cardinality vs histogram””index dive vs eq_range_index_dive_limit””估算偏差回归”这三个关键词的内在联系。</li>
+</ul>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/26/mysql-histogram-statistics-deep-dive/">https://jiweidong.github.io/2026/09/26/mysql-histogram-statistics-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/26/redis-keyspace-notification-deep-dive/" title="【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践面试官：订单超时未支付要自动关闭，让你用 Redis 的 key 过期来做，怎么做？这个问题的标准开场是： 1redisTemplate.opsForValue().set(&quot;order:close:1001&quot;, &quot;1&quot;, 30, TimeUnit.MINUTES);  然后”监听 key 过期”就自动关单。听起来很美，但如果你只能答到这里，面试官下一句就会问：  那 Redis 的过期事件准不准？如果事件丢了怎么办？主从、集群下能收到吗？  答不上来，说明你只是”用过”，没”懂过”。这篇把键空间通知从原理到生产兜底一次讲透。 一、键空间通知是什么Redis 从 2.8.0 开始支持 Keyspace Notifications：当 key 被修改、过期、删除、淘汰时，Redis 会向特定的 Pub&#x2F;Sub 频道发布一条消息。 它不是独立的回调机制，本质就是基于现有的发布订阅（PUBLISH&#x2F;SUBSC...</div></div></div></a><a class="pagination-related" href="/2026/09/26/mysql-binlog-format-row-statement-mixed-deep-dive/" title="【MySQL 底层】binlog 三种格式深度解析：STATEMENT、ROW 与 MIXED 的选择、影响与复制实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 底层】binlog 三种格式深度解析：STATEMENT、ROW 与 MIXED 的选择、影响与复制实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】binlog 三种格式深度解析：STATEMENT、ROW 与 MIXED 的选择、影响与复制实战面试官：binlog 有几种格式？你们生产用哪种？这题看似基础，但真正拉开差距的是后面三问：  为什么 STATEMENT 会主从不一致？ ROW 模式下为什么一个 UPDATE 能写出几十万行日志？ MIXED 到底”聪明”在哪里，又有什么坑？  先说结论：binlog_format 有三种取值——STATEMENT（记录 SQL 原文）、ROW（记录行变更的前后镜像）、MIXED（默认 STATEMENT，遇到不确定函数自动升级为 ROW）。MySQL 5.7.7 之后默认 ROW，业界生产环境基本统一到 ROW（配合 binlog_row_image 控制体积）。 一、binlog 在整个体系里的位置MySQL 里有两类”日志”，职责完全不同，面试经常被混在一起问：    日志 层次 内容 用途 写入方式    redo log InnoDB 引擎层 物理逻辑页修改 崩溃恢复、保证持久性 循环写   undo log InnoDB 引擎层 反向操作&#x2F...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/11/mysql-json-type-functional-index-deep-practice/" title="【MySQL 实战】MySQL JSON 数据类型深度实战：二进制存储、JSON 函数、虚拟列与函数索引"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-11</div><div class="info-item-2">【MySQL 实战】MySQL JSON 数据类型深度实战：二进制存储、JSON 函数、虚拟列与函数索引</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】MySQL JSON 数据类型深度实战：二进制存储、JSON 函数、虚拟列与函数索引面试官：你们表里有 JSON 字段吗？为什么要用 JSON？很多人第一反应是”扩展字段用 TEXT 存一段 JSON 字符串不就行了”。这就是典型的把 JSON 当成字符串。MySQL 5.7 引入的 JSON 类型和 TEXT 存 JSON 完全是两种东西：    维度 TEXT 存 JSON JSON 类型    合法性校验 无，脏数据随便进 写入即校验，非法直接报 3130   存储格式 原样字符串 二进制格式（BINARY JSON）   读写效率 每次全量解析 解析一次，按路径定位   中文&#x2F;转义 需要处理转义字符 不需转义   路径查询 LIKE &#39;%xxx%&#39; 全表扫 -&gt; &#x2F; JSON_EXTRACT 走路径   索引 只能靠生成列 生成列 + 索引 &#x2F; 函数索引   部分更新 整行重写 满足条件可只改片段   所以 JSON 类型的价值在于：半结构化数据的动态扩展（比如商品的多变属性、风控事件的上下文、埋点参...</div></div></div></a><a class="pagination-related" href="/2026/07/26/mysql-table-partitioning-deep-practice/" title="【数据库实战】MySQL 表分区（Partitioning）深度解析：原理、类型与实战避坑指南"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-26</div><div class="info-item-2">【数据库实战】MySQL 表分区（Partitioning）深度解析：原理、类型与实战避坑指南</div></div><div class="info-2"><div class="info-item-1">MySQL 表分区（Partitioning）深度解析：原理、类型与实战避坑指南一、为什么需要表分区？当单表数据量达到千万级别甚至亿级别时，即使有合适的索引，查询性能也会出现明显下降。主要原因有三：  索引太大：B+Tree 索引深度增加，IO 次数增多 缓存压力：InnoDB Buffer Pool 无法容纳足够多的数据页 数据管理难：删除过期数据需要大量的 DELETE 操作，产生大量 binlog 和磁盘碎片  表分区（Partitioning） 将一张大表按规则拆分成多个物理分区，每个分区对应独立的 .ibd 文件，查询时通过分区裁剪只扫描相关分区，大幅提升性能。 1234-- 未分区：全表扫描SELECT * FROM orders WHERE created_at &gt;= &#x27;2026-01-01&#x27;;-- 分区后：只扫描相关分区，其余跳过  分区表的物理结构123456orders.ibd (未分区)       ↓orders#P#p2026Q1.ibdorders#P#p2026Q2.ibdorders#P#p2026Q3.ibdorders...</div></div></div></a><a class="pagination-related" href="/2026/09/21/mysql-auto-increment-lock-exhaustion-deep-dive/" title="【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-21</div><div class="info-item-2">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】AUTO_INCREMENT 深度解析：自增锁模式、批量插入空洞与主键耗尽治理面试官：自增主键为什么会有空洞？这算不算问题？这是 MySQL 面试里一个「看起来简单，深挖很深」的问题。绝大多数人答「因为回滚了」，然后就没了。但面试官想听的是：  自增值是在什么时候分配的？ 分配之后回滚会不会还回去？ 并发插入时自增值怎么保证不重复？ innodb_autoinc_lock_mode 的三种模式到底差在哪？ 主键快用完了怎么办？  这四个问题串起来，才是完整的正确答案。这篇我们从源码行为讲到线上治理。  一、第一性原理：自增值的分配时机1.1 核心结论InnoDB 的自增值是在「插入尝试」阶段分配的，且分配后立即持久化到内存计数器，不参与事务回滚。 1234567-- 当前 AUTO_INCREMENT = 100BEGIN;INSERT INTO t (name) VALUES (&#x27;a&#x27;);   -- 分配 100，计数器变成 101ROLLBACK;                            -- 回滚了数据，但 100 不会...</div></div></div></a><a class="pagination-related" href="/2026/09/15/mysql-internal-temporary-table-deep-dive/" title="【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-15</div><div class="info-item-2">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 原理】内部临时表深度解析：从内存临时表到磁盘落地的完整链路与优化实战面试官：我这条 SQL 只查了 3 万行，为什么磁盘 IO 打了 800MB？这是线上非常经典的一幕：一条看起来「不复杂」的 SQL，执行时间 4 秒，iostat 显示写盘量飙到几百 MB，而表本身只有几十万行，结果集也不大。 排查到最后，元凶往往是同一个东西：内部临时表（Internal Temporary Table）落盘。 这篇文章把内部临时表从「什么时候产生 → 放在哪 → 怎么一步步被逼到磁盘 → 怎么监控 → 怎么根治」整条链路讲透。这部分内容在面试里属于典型的「区分度考点」——能背 tmp_table_size 的人很多，能说清 TempTable 引擎、temptable_max_mmap 和派生表物化的人很少。  一、先搞清楚：什么是内部临时表MySQL 中「临时表」分两种，很多人混着说：    类型 创建方式 生命周期 典型用途    用户临时表 CREATE TEMPORARY TABLE 会话级，SESSION 断开即删 业务临时存中间结果、复杂报表   内部临时表 优化器...</div></div></div></a><a class="pagination-related" href="/2026/08/06/mysql-table-design-best-practice/" title="【MySQL 实战】MySQL 表设计最佳实践：字段类型选型、范式与反范式、索引设计规范"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【MySQL 实战】MySQL 表设计最佳实践：字段类型选型、范式与反范式、索引设计规范</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】MySQL 表设计最佳实践：字段类型选型、范式与反范式、索引设计规范面试官：你做过数据库表设计吗？说一下你的设计规范？「表设计」是后端开发的基本功，也是面试中最容易暴露水平的环节——很多人上来就聊索引优化，但一问字段类型为什么选 varchar(255)、为什么用 bigint 不用 int，就答不上来了。 表设计做得好，后续的查询优化、扩展、迁移都顺；设计得烂，上线就是灾难。本文从字段类型选型 → 范式与反范式 → 索引设计 → 命名规范 → 实战案例五层，系统梳理 MySQL 表设计的最佳实践。  一、字段类型选型：这是表设计的第一关1. 整数类型怎么选？   类型 字节数 取值范围（有符号） 适用场景    TINYINT 1 -128 ~ 127 状态码、开关（0&#x2F;1）、枚举小值   SMALLINT 2 -32768 ~ 32767 较小数值、端口号   MEDIUMINT 3 -838万 ~ 838万 中量数值   INT 4 -21亿 ~ 21亿 常规数值   BIGINT 8 ±922亿亿 主键 ID、雪花 ID、订单号   最佳实践...</div></div></div></a><a class="pagination-related" href="/2026/09/01/mysql-partition-table-deep-dive/" title="【MySQL 进阶】MySQL 分区表深度解析：从 Range&#x2F;List&#x2F;Hash&#x2F;Key 分区原理到落地实践与避坑指南"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-01</div><div class="info-item-2">【MySQL 进阶】MySQL 分区表深度解析：从 Range&#x2F;List&#x2F;Hash&#x2F;Key 分区原理到落地实践与避坑指南</div></div><div class="info-2"><div class="info-item-1">【MySQL 进阶】MySQL 分区表深度解析：从 Range&#x2F;List&#x2F;Hash&#x2F;Key 分区原理到落地实践与避坑指南面试官：你们公司几千万行的表是怎么优化的？你会考虑分区表吗？很多同学一上来就说「分库分表」，但分库分表带来的分布式事务、跨库 JOIN、全局主键等问题，对于大部分业务来说其实是过度设计。在数据量还没到亿级、但单表已经明显变慢的阶段，MySQL 分区表（Partitioning） 是一个成本极低、效果直接的方案。 本文从分区表的底层原理讲起，对比四种分区类型，最后给出生产环境的落地实践与避坑指南。 一、分区表是什么？它到底解决了什么问题？1.1 逻辑上一张表，物理上是多个文件分区表在 SQL 层面和普通表完全一样，你照样 SELECT、INSERT、UPDATE、JOIN，但在存储层面，数据被拆散到多个物理文件中： 1234567# 未分区：一个表一个文件（假设 MyISAM/独立表空间）order.ibd# 按年份 Range 分区：一个分区一个文件order#P#p2023.ibdorder#P#p2024.ibdorder#P#...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">677</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E4%BC%98%E5%8C%96%E3%80%91%E7%9B%B4%E6%96%B9%E5%9B%BE%EF%BC%88Histogram%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BC%98%E5%8C%96%E5%99%A8%E5%9F%BA%E6%95%B0%E4%BC%B0%E7%AE%97%E3%80%81%E7%BB%9F%E8%AE%A1%E4%BF%A1%E6%81%AF%E4%B8%8E%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92%E7%A8%B3%E5%AE%9A%E6%80%A7"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E6%95%B0%E6%8D%AE%E5%88%86%E5%B8%83%E5%80%BE%E6%96%9C%E5%AF%BC%E8%87%B4%E9%80%89%E9%94%99%E7%B4%A2%E5%BC%95%EF%BC%8C%E4%BD%A0%E6%9C%89%E4%BB%80%E4%B9%88%E5%8A%9E%E6%B3%95%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：数据分布倾斜导致选错索引，你有什么办法？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%9E%E6%87%82%E4%BC%98%E5%8C%96%E5%99%A8%E2%80%9D%E9%80%89%E9%94%99%E2%80%9D%E7%9A%84%E6%A0%B9%E6%BA%90"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搞懂优化器”选错”的根源</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81InnoDB-%E7%BB%9F%E8%AE%A1%E4%BF%A1%E6%81%AF%E6%98%AF%E6%80%8E%E4%B9%88%E6%9D%A5%E7%9A%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、InnoDB 统计信息是怎么来的</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E6%8C%81%E4%B9%85%E5%8C%96%E7%BB%9F%E8%AE%A1%E4%BF%A1%E6%81%AF"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 持久化统计信息</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E9%87%87%E6%A0%B7%E4%B8%8E%E2%80%9D%E7%B4%A2%E5%BC%95%E4%B8%8B%E6%BD%9C%E2%80%9D%EF%BC%88index-dive%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 采样与”索引下潜”（index dive）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E4%BC%A0%E7%BB%9F%E7%BB%9F%E8%AE%A1%E4%BF%A1%E6%81%AF%E7%9A%84%E8%87%B4%E5%91%BD%E7%A9%BA%E7%99%BD"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 传统统计信息的致命空白</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E7%9B%B4%E6%96%B9%E5%9B%BE%E6%98%AF%E4%BB%80%E4%B9%88%EF%BC%9A%E4%B8%A4%E7%A7%8D%E6%A1%B6%E7%B1%BB%E5%9E%8B"><span class="toc-number">1.4.</span> <span class="toc-text">三、直方图是什么：两种桶类型</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%8D%95%E5%80%BC%E6%A1%B6%EF%BC%88Singleton%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 单值桶（Singleton）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E7%AD%89%E9%AB%98%E6%A1%B6%EF%BC%88Equi-height%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 等高桶（Equi-height）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%8A%A8%E6%89%8B%E5%AE%9E%E8%B7%B5%EF%BC%9A%E5%88%9B%E5%BB%BA%E3%80%81%E6%9F%A5%E7%9C%8B%E3%80%81%E5%88%A0%E9%99%A4"><span class="toc-number">1.5.</span> <span class="toc-text">四、动手实践：创建、查看、删除</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%88%9B%E5%BB%BA%E7%9B%B4%E6%96%B9%E5%9B%BE"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 创建直方图</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%9F%A5%E7%9C%8B%E7%9B%B4%E6%96%B9%E5%9B%BE"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 查看直方图</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%88%A0%E9%99%A4%E7%9B%B4%E6%96%B9%E5%9B%BE"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 删除直方图</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%A1%AE%E8%AE%A4%E4%BC%98%E5%8C%96%E5%99%A8%E5%88%B0%E5%BA%95%E6%9C%89%E6%B2%A1%E6%9C%89%E7%94%A8%E7%9B%B4%E6%96%B9%E5%9B%BE"><span class="toc-number">1.6.</span> <span class="toc-text">五、确认优化器到底有没有用直方图</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BD%BF%E7%94%A8%E9%99%90%E5%88%B6%E4%B8%8E%E5%9D%91%EF%BC%88%E9%9D%A2%E8%AF%95%E9%87%8D%E7%82%B9%EF%BC%89"><span class="toc-number">1.7.</span> <span class="toc-text">六、使用限制与坑（面试重点）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-histogram-generation-max-mem-size"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 histogram_generation_max_mem_size</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E7%9B%B4%E6%96%B9%E5%9B%BE-%E2%89%A0-%E7%B4%A2%E5%BC%95"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 直方图 ≠ 索引</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%9C%9F%E5%AE%9E%E6%A1%88%E4%BE%8B%EF%BC%9A%E7%8A%B6%E6%80%81%E5%88%97%E5%80%BE%E6%96%9C%E5%AF%BC%E8%87%B4%E7%9A%84%E2%80%9D%E9%94%99%E8%AF%AF-JOIN-%E9%A1%BA%E5%BA%8F%E2%80%9D"><span class="toc-number">1.8.</span> <span class="toc-text">七、真实案例：状态列倾斜导致的”错误 JOIN 顺序”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E7%BB%B4%E6%8A%A4%E7%AD%96%E7%95%A5%EF%BC%9A%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E8%AF%A5%E5%BB%BA%E7%9B%B4%E6%96%B9%E5%9B%BE"><span class="toc-number">1.9.</span> <span class="toc-text">八、维护策略：什么时候该建直方图</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%87%AA%E5%8A%A8%E5%8C%96%E7%BB%B4%E6%8A%A4%E5%BB%BA%E8%AE%AE"><span class="toc-number">1.9.1.</span> <span class="toc-text">自动化维护建议</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE%E9%80%9F%E6%9F%A5"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试高频追问速查</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/26/dubbo3-application-level-service-discovery-deep-dive/" title="【微服务】Dubbo 3 应用级服务发现深度解析：从接口级注册到元数据中心与实例级寻址">【微服务】Dubbo 3 应用级服务发现深度解析：从接口级注册到元数据中心与实例级寻址</a><time datetime="2026-09-26T00:00:00.000Z" title="发表于 2026-09-26 08:00:00">2026-09-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/26/java-securitymanager-sandbox-deprecation-deep-dive/" title="【Java 安全】SecurityManager 深度解析：沙箱模型、权限检查原理与 JDK 17/24 的废弃之路">【Java 安全】SecurityManager 深度解析：沙箱模型、权限检查原理与 JDK 17/24 的废弃之路</a><time datetime="2026-09-26T00:00:00.000Z" title="发表于 2026-09-26 08:00:00">2026-09-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/26/mysql-binlog-format-row-statement-mixed-deep-dive/" title="【MySQL 底层】binlog 三种格式深度解析：STATEMENT、ROW 与 MIXED 的选择、影响与复制实战">【MySQL 底层】binlog 三种格式深度解析：STATEMENT、ROW 与 MIXED 的选择、影响与复制实战</a><time datetime="2026-09-26T00:00:00.000Z" title="发表于 2026-09-26 08:00:00">2026-09-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/26/mysql-histogram-statistics-deep-dive/" title="【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性">【MySQL 优化】直方图（Histogram）深度解析：优化器基数估算、统计信息与执行计划稳定性</a><time datetime="2026-09-26T00:00:00.000Z" title="发表于 2026-09-26 08:00:00">2026-09-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/26/redis-keyspace-notification-deep-dive/" title="【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践">【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践</a><time datetime="2026-09-26T00:00:00.000Z" title="发表于 2026-09-26 08:00:00">2026-09-26</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
