@@ -1,0 +1,747 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息面试官：订单 30 分钟未支付自动关闭，你怎么实现？这是最经典的延迟消息场景题。候选人的答案通常有三种：  「用定时任务扫描订单表」； 「用 RabbitMQ 的死信队列 + TTL」； 「用 RocketMQ 的延迟消息，delayLevel&#x3D;16」。  如果答第 3 种，我会继续追问：  「delayLeve">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/27/rocketmq-delay-timer-message-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息面试官：订单 30 分钟未支付自动关闭，你怎么实现？这是最经典的延迟消息场景题。候选人的答案通常有三种：  「用定时任务扫描订单表」； 「用 RabbitMQ 的死信队列 + TTL」； 「用 RocketMQ 的延迟消息，delayLevel&#x3D;16」。  如果答第 3 种，我会继续追问：  「delayLeve">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-27T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-09-27T00:03:13.695Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="RocketMQ">
+<meta property="article:tag" content="架构设计">
+<meta property="article:tag" content="消息队列">
+<meta property="article:tag" content="源码">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息",
+  "url": "https://jiweidong.github.io/2026/09/27/rocketmq-delay-timer-message-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-27T00:20:00.000Z",
+  "dateModified": "2026-09-27T00:03:13.695Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/27/rocketmq-delay-timer-message-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">682</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-27T00:20:00.000Z" title="发表于 2026-09-27 08:20:00">2026-09-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-27T00:03:13.695Z" title="更新于 2026-09-27 08:03:13">2026-09-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【消息队列】RocketMQ-延迟消息深度解析：从-18-个延迟级别到任意时间定时消息"><a href="#【消息队列】RocketMQ-延迟消息深度解析：从-18-个延迟级别到任意时间定时消息" class="headerlink" title="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息"></a>【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</h1><h2 id="面试官：订单-30-分钟未支付自动关闭，你怎么实现？"><a href="#面试官：订单-30-分钟未支付自动关闭，你怎么实现？" class="headerlink" title="面试官：订单 30 分钟未支付自动关闭，你怎么实现？"></a>面试官：订单 30 分钟未支付自动关闭，你怎么实现？</h2><p>这是最经典的延迟消息场景题。候选人的答案通常有三种：</p>
+<ol>
+<li>「用定时任务扫描订单表」；</li>
+<li>「用 RabbitMQ 的死信队列 + TTL」；</li>
+<li>「用 RocketMQ 的延迟消息，<code>delayLevel=16</code>」。</li>
+</ol>
+<p>如果答第 3 种，我会继续追问：</p>
+<ul>
+<li>「<code>delayLevel=16</code> 代表延迟多久？」</li>
+<li>「为什么 RocketMQ 4.x 只有 18 个固定级别，不能任意时间？」</li>
+<li>「延迟消息是存在哪里的？它和普通消息在存储上有什么区别？」</li>
+<li>「如果我要延迟 2 小时，你会怎么写？」</li>
+<li>「RocketMQ 5.x 的定时消息是怎么做到任意时间的？」</li>
+</ul>
+<p>这一串问题下去，能完整答上来的候选人非常少。而这篇文章，就是把这串问题从头到尾讲清楚。</p>
+<hr>
+<h2 id="一、为什么需要延迟消息"><a href="#一、为什么需要延迟消息" class="headerlink" title="一、为什么需要延迟消息"></a>一、为什么需要延迟消息</h2><p>延迟消息（也叫定时消息）指：<strong>消息发送到 Broker 后，不立即投递给消费者，而是等待指定时间后才可见。</strong></p>
+<p>典型场景：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>延迟需求</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>订单超时未支付自动关闭</td>
+<td>30 分钟</td>
+</tr>
+<tr>
+<td>优惠券到期提醒</td>
+<td>提前 1 天 &#x2F; 1 小时</td>
+</tr>
+<tr>
+<td>支付结果查询重试</td>
+<td>5s &#x2F; 10s &#x2F; 30s &#x2F; 1m &#x2F; 5m（阶梯重试）</td>
+</tr>
+<tr>
+<td>用户注册后 N 天未下单营销触达</td>
+<td>3 天</td>
+</tr>
+<tr>
+<td>外卖配送超时预警</td>
+<td>45 分钟</td>
+</tr>
+<tr>
+<td>分布式事务的本地消息表补偿</td>
+<td>秒级</td>
+</tr>
+</tbody></table>
+<p><strong>为什么不用定时任务扫表？</strong> 因为：</p>
+<ol>
+<li>扫表有精度和延迟的 trade-off：扫描间隔 1 分钟，就有最多 1 分钟的误差；间隔太短又会给 DB 造成压力；</li>
+<li>大表扫描（几十万待处理订单）性能堪忧，需要分库分表 + 索引设计；</li>
+<li>水平扩展困难，多个实例扫同一张表要做分布式锁；</li>
+<li><strong>本质上是「轮询模型」，消息队列的延迟投递是「事件模型」，后者更高效。</strong></li>
+</ol>
+<hr>
+<h2 id="二、RocketMQ-4-x-的延迟消息：18-个固定级别"><a href="#二、RocketMQ-4-x-的延迟消息：18-个固定级别" class="headerlink" title="二、RocketMQ 4.x 的延迟消息：18 个固定级别"></a>二、RocketMQ 4.x 的延迟消息：18 个固定级别</h2><h3 id="2-1-延迟级别定义"><a href="#2-1-延迟级别定义" class="headerlink" title="2.1 延迟级别定义"></a>2.1 延迟级别定义</h3><p>RocketMQ 4.x 内置 18 个延迟级别，定义在 <code>MessageDelayLevel</code> 中：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h</span><br></pre></td></tr></table></figure>
+
+<p>对应关系：</p>
+<table>
+<thead>
+<tr>
+<th>delayLevel</th>
+<th>延迟时间</th>
+<th>delayLevel</th>
+<th>延迟时间</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>1s</td>
+<td>10</td>
+<td>6m</td>
+</tr>
+<tr>
+<td>2</td>
+<td>5s</td>
+<td>11</td>
+<td>7m</td>
+</tr>
+<tr>
+<td>3</td>
+<td>10s</td>
+<td>12</td>
+<td>8m</td>
+</tr>
+<tr>
+<td>4</td>
+<td>30s</td>
+<td>13</td>
+<td>9m</td>
+</tr>
+<tr>
+<td>5</td>
+<td>1m</td>
+<td>14</td>
+<td>10m</td>
+</tr>
+<tr>
+<td>6</td>
+<td>2m</td>
+<td>15</td>
+<td>20m</td>
+</tr>
+<tr>
+<td>7</td>
+<td>3m</td>
+<td>16</td>
+<td><strong>30m</strong></td>
+</tr>
+<tr>
+<td>8</td>
+<td>4m</td>
+<td>17</td>
+<td>1h</td>
+</tr>
+<tr>
+<td>9</td>
+<td>5m</td>
+<td>18</td>
+<td>2h</td>
+</tr>
+</tbody></table>
+<p>所以「订单 30 分钟未支付关闭」用 <code>delayLevel = 16</code>。</p>
+<p><strong>注意 <code>delayLevel=0</code> 表示不延迟（立即投递）。</strong></p>
+<p>使用方式：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Message</span> <span class="variable">message</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Message</span>(</span><br><span class="line">        <span class="string">&quot;ORDER_TOPIC&quot;</span>,</span><br><span class="line">        <span class="string">&quot;ORDER_TIMEOUT&quot;</span>,</span><br><span class="line">        orderId.getBytes(StandardCharsets.UTF_8));</span><br><span class="line"></span><br><span class="line"><span class="comment">// 方式一：设置延迟级别</span></span><br><span class="line">message.setDelayTimeLevel(<span class="number">16</span>);   <span class="comment">// 30 分钟</span></span><br><span class="line"></span><br><span class="line">producer.send(message);</span><br></pre></td></tr></table></figure>
+
+<p>RocketMQ 5.x 之后提供了更友好的 API：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 方式二：直接设置延迟时间（5.x）</span></span><br><span class="line">message.setDelayTimeSec(<span class="number">1800</span>);                    <span class="comment">// 1800 秒后投递</span></span><br><span class="line"><span class="comment">// 或</span></span><br><span class="line">message.setDeliverTimeMs(System.currentTimeMillis() + <span class="number">1800_000L</span>);</span><br></pre></td></tr></table></figure>
+
+<p><strong>但 5.x 的 <code>setDelayTimeSec</code> 底层也是映射到延迟级别</strong>（如果 Broker 未开启定时消息功能），或者走新的 TimerWheel 机制（如果开启了 <code>timerWheel</code>）。这点后面详细说。</p>
+<h3 id="2-2-延迟消息的存储实现在哪？"><a href="#2-2-延迟消息的存储实现在哪？" class="headerlink" title="2.2 延迟消息的存储实现在哪？"></a>2.2 延迟消息的存储实现在哪？</h3><p>这是面试的重点，也是很多人答不出来的地方。</p>
+<p><strong>核心设计：延迟消息会被「改写」到一个内部 Topic 里。</strong></p>
+<p>流程如下：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">1. Producer 发送带 delayLevel 的消息到 Broker</span><br><span class="line">2. Broker 在 CommitLog 中正常存储（和普通消息一样），</span><br><span class="line">   但会把消息的 Topic 和 QueueId 替换为：</span><br><span class="line">      Topic   -&gt; SCHEDULE_TOPIC_XXXX</span><br><span class="line">      QueueId -&gt; delayLevel - 1</span><br><span class="line">   并在消息属性里保留原始 Topic/QueueId（PROPERTY_REAL_TOPIC / PROPERTY_REAL_QUEUE_ID）</span><br><span class="line">3. ConsumeQueue 中也记录为 SCHEDULE_TOPIC_XXXX 的对应队列</span><br><span class="line">4. Broker 启动一个定时任务 ScheduleMessageService，</span><br><span class="line">   为每个 delayLevel 创建一个 Timer，定时扫描对应 ConsumeQueue</span><br><span class="line">5. 到达延迟时间后，把消息的 Topic 还原为原始 Topic，</span><br><span class="line">   重新写入 CommitLog（这次是真的投递），消费者就能消费到了</span><br></pre></td></tr></table></figure>
+
+<p>源码关键点（<code>ScheduleMessageService</code>）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 每个延迟级别一个 TimerTask</span></span><br><span class="line"><span class="keyword">for</span> (Map.Entry&lt;Integer, Long&gt; entry : delayLevelTable.entrySet()) &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">level</span> <span class="operator">=</span> entry.getKey();</span><br><span class="line">    <span class="type">long</span> <span class="variable">delayTime</span> <span class="operator">=</span> entry.getValue();</span><br><span class="line"></span><br><span class="line">    <span class="type">Timer</span> <span class="variable">timer</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Timer</span>(<span class="string">&quot;ScheduleMessageTimerThread_&quot;</span> + level, <span class="literal">true</span>);</span><br><span class="line">    timer.scheduleAtFixedRate(<span class="keyword">new</span> <span class="title class_">DeliverDelayedMessageTimerTask</span>(level, offset), ...);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>DeliverDelayedMessageTimerTask</code> 的逻辑：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 从 SCHEDULE_TOPIC_XXXX 的 ConsumeQueue 中拉取消息</span></span><br><span class="line"><span class="type">MessageExt</span> <span class="variable">msg</span> <span class="operator">=</span> ...;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 2. 判断是否到期</span></span><br><span class="line"><span class="type">long</span> <span class="variable">deliverTimestamp</span> <span class="operator">=</span> msg.getStoreTimestamp() + delayLevelTable.get(level) * <span class="number">1000</span>;</span><br><span class="line"><span class="keyword">if</span> (System.currentTimeMillis() &gt;= deliverTimestamp) &#123;</span><br><span class="line">    <span class="comment">// 3. 还原原始 Topic 和 QueueId</span></span><br><span class="line">    <span class="type">MessageExtBrokerInner</span> <span class="variable">msgInner</span> <span class="operator">=</span> ...;</span><br><span class="line">    msgInner.setTopic(msg.getProperty(MessageConst.PROPERTY_REAL_TOPIC));</span><br><span class="line">    msgInner.setQueueId(Integer.parseInt(msg.getProperty(MessageConst.PROPERTY_REAL_QUEUE_ID)));</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 4. 重新写入 CommitLog（实际上是再次存储，消费者此时可见）</span></span><br><span class="line">    putMessage(msgInner);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>结论</strong>：延迟消息在磁盘上<strong>存了两份</strong>（一份 SCHEDULE_TOPIC 的原始消息，一份投递时的重写消息）。这也是为什么大量使用延迟消息会放大存储和 IO 压力。</p>
+<h3 id="2-3-关键配置：messageDelayLevel"><a href="#2-3-关键配置：messageDelayLevel" class="headerlink" title="2.3 关键配置：messageDelayLevel"></a>2.3 关键配置：<code>messageDelayLevel</code></h3><p>在 <code>broker.conf</code> 中可以自定义延迟级别：</p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 自定义延迟级别（必须是 18 个？不，可以任意个数，但要注意顺序以 s/m/h/d 结尾）</span></span><br><span class="line"><span class="attr">messageDelayLevel</span>=<span class="string">1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：修改 <code>messageDelayLevel</code> 后，<strong>已经投递的延迟消息不受影响</strong>（因为级别 -&gt; 时间的映射在投递时才读取），但<strong>队列数量会变化</strong>（<code>SCHEDULE_TOPIC_XXXX</code> 的队列数 &#x3D; 级别数），需要重启 Broker。</p>
+<h3 id="2-4-4-x-延迟消息的四大痛点"><a href="#2-4-4-x-延迟消息的四大痛点" class="headerlink" title="2.4 4.x 延迟消息的四大痛点"></a>2.4 4.x 延迟消息的四大痛点</h3><table>
+<thead>
+<tr>
+<th>痛点</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>只能是固定 18 个级别</strong></td>
+<td>要延迟 45 分钟？做不到，只能用 1h 或 30m</td>
+</tr>
+<tr>
+<td><strong>延迟精度差</strong></td>
+<td>定时器默认每 100ms 扫一次，但消费的是整级队列，实际延迟有抖动</td>
+</tr>
+<tr>
+<td><strong>存储翻倍</strong></td>
+<td>磁盘占两倍，IO 也翻倍</td>
+</tr>
+<tr>
+<td><strong>同一 level 的消息串行投递</strong></td>
+<td><code>SCHEDULE_TOPIC_XXXX</code> 的单个队列中，如果队头消息未到期，后面的消息即使到期也要等（<strong>队列是顺序扫描的！</strong>）</td>
+</tr>
+</tbody></table>
+<p>最后一条特别重要，很多人踩过坑：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">delayLevel=5 队列里：</span><br><span class="line">  msg1 (storeTimestamp=T, 需等 1m, 到期时间 T+60s)</span><br><span class="line">  msg2 (storeTimestamp=T+30s, 需等 1m, 到期时间 T+90s)</span><br><span class="line"></span><br><span class="line">在 T+60s 时：</span><br><span class="line">  扫到 msg1，投递，offset++；</span><br><span class="line">  扫到 msg2，未到期 -&gt; break（注意是 break 不是 continue）</span><br><span class="line">  -&gt; 定时器 reset offset，下次从 msg2 开始</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意：如果消息是「先存的消息延迟级别小、后存的消息延迟级别大」，不会阻塞；但如果是同一个队列里消息的到期时间乱序，就会导致后面到期的消息被前面的长延迟消息阻塞。</strong> 因为 RocketMQ 4.x 的扫描逻辑遇到未到期消息就 <code>break</code>（依赖同队列内 storeTimestamp 递增，从而到期时间递增）。</p>
+<p>由于 <code>SCHEDULE_TOPIC_XXXX</code> 的队列是按 delayLevel 划分的，<strong>同一队列内所有消息的延迟时长相同</strong>，storeTimestamp 递增 → 到期时间递增，所以不会乱序。这个设计是「用队列隔离级别」换来的正确性。</p>
+<h3 id="2-5-一个真实的踩坑：延迟级别满了怎么办？"><a href="#2-5-一个真实的踩坑：延迟级别满了怎么办？" class="headerlink" title="2.5 一个真实的踩坑：延迟级别满了怎么办？"></a>2.5 一个真实的踩坑：延迟级别满了怎么办？</h3><p><strong>问题</strong>：产品要求「延迟 45 分钟」，但只有 30m 和 1h 两个选项。</p>
+<p><strong>方案一：降级到 1h</strong>（业务能接受就最省事，但会晚 15 分钟）。</p>
+<p><strong>方案二：二次延迟</strong>（自己实现补偿）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 先用 30m 级别，消费时判断是否到期，未到期再发一次</span></span><br><span class="line">consumer.registerMessageListener((MessageListenerConcurrently) (msgs, ctx) -&gt; &#123;</span><br><span class="line">    <span class="keyword">for</span> (MessageExt msg : msgs) &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">targetTime</span> <span class="operator">=</span> Long.parseLong(msg.getUserProperty(<span class="string">&quot;targetTime&quot;</span>));</span><br><span class="line">        <span class="keyword">if</span> (System.currentTimeMillis() &gt;= targetTime) &#123;</span><br><span class="line">            processOrderTimeout(msg);</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            <span class="comment">// 还没到，再发一个延迟消息补差</span></span><br><span class="line">            <span class="type">long</span> <span class="variable">remain</span> <span class="operator">=</span> targetTime - System.currentTimeMillis();</span><br><span class="line">            <span class="type">Message</span> <span class="variable">again</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Message</span>(<span class="string">&quot;ORDER_TOPIC&quot;</span>, msg.getBody());</span><br><span class="line">            again.setDelayTimeLevel(levelFor(remain));   <span class="comment">// 只能选 &lt;= remain 的最大级别</span></span><br><span class="line">            again.putUserProperty(<span class="string">&quot;targetTime&quot;</span>, String.valueOf(targetTime));</span><br><span class="line">            producer.send(again);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> ConsumeConcurrentlyStatus.CONSUME_SUCCESS;</span><br><span class="line">&#125;);</span><br></pre></td></tr></table></figure>
+
+<p><strong>方案三：升级到 RocketMQ 5.x 用定时消息</strong>（下文详述）。</p>
+<p><strong>方案四：改用时间轮&#x2F;时间堆自行实现</strong>（引入复杂度，不推荐）。</p>
+<hr>
+<h2 id="三、RocketMQ-5-x-定时消息（Timer-Message）"><a href="#三、RocketMQ-5-x-定时消息（Timer-Message）" class="headerlink" title="三、RocketMQ 5.x 定时消息（Timer Message）"></a>三、RocketMQ 5.x 定时消息（Timer Message）</h2><p>RocketMQ 5.0 引入了<strong>任意时间精度</strong>的定时消息，原理基于<strong>时间轮（Timing Wheel）+ 两层日志文件</strong>。</p>
+<h3 id="3-1-整体架构"><a href="#3-1-整体架构" class="headerlink" title="3.1 整体架构"></a>3.1 整体架构</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line">                 ┌──────────────────────────────┐</span><br><span class="line">Producer ───────▶│  CommitLog + ConsumeQueue    │ (正常存储)</span><br><span class="line">(deliverTimeMs)  └──────────────────────────────┘</span><br><span class="line">                           │ 提取定时消息</span><br><span class="line">                           ▼</span><br><span class="line">                 ┌──────────────────────────────┐</span><br><span class="line">                 │  TimerWheel (时间轮, 内存)     │</span><br><span class="line">                 │  - 每个槽对应一个时间范围      │</span><br><span class="line">                 │  - 槽内是链表，指向 TimerLog   │</span><br><span class="line">                 └──────────────────────────────┘</span><br><span class="line">                           │ 到期槽</span><br><span class="line">                           ▼</span><br><span class="line">                 ┌──────────────────────────────┐</span><br><span class="line">                 │  TimerLog (磁盘文件)          │</span><br><span class="line">                 │  - TimerLogFile 按大小滚动     │</span><br><span class="line">                 │  - 记录真实消息的位置/位移     │</span><br><span class="line">                 └──────────────────────────────┘</span><br><span class="line">                           │ 拉取真实消息</span><br><span class="line">                           ▼</span><br><span class="line">                 ┌──────────────────────────────┐</span><br><span class="line">                 │  重新投递到原始 Topic          │</span><br><span class="line">                 └──────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-时间轮参数"><a href="#3-2-时间轮参数" class="headerlink" title="3.2 时间轮参数"></a>3.2 时间轮参数</h3><p>关键参数（<code>broker.conf</code>）：</p>
+<figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 时间轮基本单元：每个刻度 1000ms</span></span><br><span class="line"><span class="attr">timerPrecisionMs</span>=<span class="string">1000</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 时间轮槽位数：默认 604800000 / 1000 = 604800 个槽（7天）？不对，看下面</span></span><br><span class="line"><span class="comment"># 实际参数：</span></span><br><span class="line"><span class="comment">#   timerWheel 共 6048 个槽（按默认精度 1000ms，最远 3600 * 1000ms = 1小时水位）</span></span><br><span class="line"><span class="comment">#   超过 1 小时的定时消息会走「分段 + 链表」逐级传递</span></span><br></pre></td></tr></table></figure>
+
+<p>精确一点说，RocketMQ 的 TimerWheel 参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>默认值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>timerPrecisionMs</code></td>
+<td>1000</td>
+<td>时间轮刻度精度（ms）</td>
+</tr>
+<tr>
+<td><code>timerRollWindowSlot</code></td>
+<td>3600</td>
+<td>单圈槽数（精度 1000ms 时 &#x3D; 1 小时）</td>
+</tr>
+<tr>
+<td><code>timerInterceptDelayMs</code></td>
+<td>0</td>
+<td>若定时时间小于该值，走延迟消息（快速路径）</td>
+</tr>
+<tr>
+<td><code>enableTimerWheel</code></td>
+<td>true</td>
+<td>是否启用时间轮（5.x）</td>
+</tr>
+<tr>
+<td><code>timerStopTimeBoundary</code></td>
+<td>-</td>
+<td>定时时间上限（默认约 2 天）</td>
+</tr>
+</tbody></table>
+<p><strong>设计精髓</strong>：</p>
+<ol>
+<li><strong>轻量内存索引 + 磁盘日志</strong>：时间轮只在内存存「槽 -&gt; TimerLog 偏移量」的映射，真实消息仍在 CommitLog&#x2F;TimerLog 里，内存不会随消息量线性增长；</li>
+<li><strong>单圈 + 溢出轮</strong>：超过一圈时间的定时消息，放入更高层的轮（类似层级时间轮），逐级下沉；</li>
+<li><strong>只有到期的槽才会被扫描</strong>，避免了 4.x「扫整级队列」的低效。</li>
+</ol>
+<h3 id="3-3-与-4-x-的本质区别"><a href="#3-3-与-4-x-的本质区别" class="headerlink" title="3.3 与 4.x 的本质区别"></a>3.3 与 4.x 的本质区别</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>4.x 延迟消息</th>
+<th>5.x 定时消息</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>时间精度</td>
+<td>固定 18 级</td>
+<td>任意毫秒（受 <code>timerPrecisionMs</code> 限制）</td>
+</tr>
+<tr>
+<td>精度误差</td>
+<td>秒~分钟级</td>
+<td>通常 &lt; 1s</td>
+</tr>
+<tr>
+<td>时间范围</td>
+<td>最长 2h</td>
+<td>最长 2 天（可配）</td>
+</tr>
+<tr>
+<td>存储位置</td>
+<td>CommitLog（重写 Topic）</td>
+<td>CommitLog + TimerLog</td>
+</tr>
+<tr>
+<td>内存占用</td>
+<td>低</td>
+<td>时间轮索引，可控</td>
+</tr>
+<tr>
+<td>扫描方式</td>
+<td>每级独立定时任务</td>
+<td>时间轮到期槽驱动</td>
+</tr>
+<tr>
+<td>消息是否存两份</td>
+<td>是</td>
+<td>是（TimerLog + CommitLog）</td>
+</tr>
+<tr>
+<td>幂等要求</td>
+<td>需要</td>
+<td>需要（可能重复投递）</td>
+</tr>
+</tbody></table>
+<h3 id="3-4-使用方式"><a href="#3-4-使用方式" class="headerlink" title="3.4 使用方式"></a>3.4 使用方式</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 5.x 客户端</span></span><br><span class="line"><span class="type">Message</span> <span class="variable">message</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Message</span>(<span class="string">&quot;ORDER_TOPIC&quot;</span>, <span class="string">&quot;ORDER_TIMEOUT&quot;</span>, orderId.getBytes());</span><br><span class="line"></span><br><span class="line"><span class="comment">// 指定绝对投递时间（毫秒时间戳）</span></span><br><span class="line">message.setDeliverTimeMs(System.currentTimeMillis() + <span class="number">45</span> * <span class="number">60</span> * <span class="number">1000L</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 或指定相对延迟（秒）</span></span><br><span class="line">message.setDelayTimeSec(<span class="number">45</span> * <span class="number">60</span>);</span><br><span class="line"></span><br><span class="line">producer.send(message);</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ <strong>注意</strong>：<code>setDelayTimeSec</code> 在 5.x 里默认会<strong>优先尝试定时消息</strong>，如果 <code>enableTimerWheel=false</code> 或时间超出边界，则退化到延迟级别（会被对齐到最近级别，导致精度下降）。<strong>上线前一定要确认 Broker 的 <code>enableTimerWheel</code> 状态。</strong></p>
+<hr>
+<h2 id="四、延迟消息的可靠性设计"><a href="#四、延迟消息的可靠性设计" class="headerlink" title="四、延迟消息的可靠性设计"></a>四、延迟消息的可靠性设计</h2><p>这是生产落地最容易出问题的地方。</p>
+<h3 id="4-1-消息可能重复"><a href="#4-1-消息可能重复" class="headerlink" title="4.1 消息可能重复"></a>4.1 消息可能重复</h3><p>RocketMQ 保证 <strong>at-least-once</strong>，延迟消息在「投递阶段」如果 Broker 重启、时间轮重建失败，都可能重复。</p>
+<p>所以<strong>消费端必须幂等</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@RocketMQMessageListener(topic = &quot;ORDER_TOPIC&quot;, consumerGroup = &quot;order_timeout_group&quot;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderTimeoutConsumer</span> <span class="keyword">implements</span> <span class="title class_">RocketMQListener</span>&lt;MessageExt&gt; &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Autowired</span></span><br><span class="line">    <span class="keyword">private</span> OrderMapper orderMapper;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Autowired</span></span><br><span class="line">    <span class="keyword">private</span> IdempotentHelper idempotentHelper;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onMessage</span><span class="params">(MessageExt message)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">orderId</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">String</span>(message.getBody(), StandardCharsets.UTF_8);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 幂等：以「订单关闭」这个动作 + 订单号做唯一键去重</span></span><br><span class="line">        <span class="type">String</span> <span class="variable">idemKey</span> <span class="operator">=</span> <span class="string">&quot;close_order:&quot;</span> + orderId;</span><br><span class="line">        <span class="keyword">if</span> (!idempotentHelper.tryLock(idemKey, <span class="number">10</span>, TimeUnit.MINUTES)) &#123;</span><br><span class="line">            log.warn(<span class="string">&quot;重复消息，忽略: &#123;&#125;&quot;</span>, orderId);</span><br><span class="line">            <span class="keyword">return</span>;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="comment">// 条件更新：只有「待支付」状态才关闭，天然幂等</span></span><br><span class="line">            <span class="type">int</span> <span class="variable">affected</span> <span class="operator">=</span> orderMapper.closeIfUnpaid(orderId);</span><br><span class="line">            log.info(<span class="string">&quot;订单超时关闭: orderId=&#123;&#125;, affected=&#123;&#125;&quot;</span>, orderId, affected);</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            idempotentHelper.unlock(idemKey);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>对应 SQL（<strong>状态机 + 条件更新是天然幂等</strong>）：</p>
+<figure class="highlight xml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="tag">&lt;<span class="name">update</span> <span class="attr">id</span>=<span class="string">&quot;closeIfUnpaid&quot;</span>&gt;</span></span><br><span class="line">    UPDATE t_order</span><br><span class="line">    SET status = &#x27;CLOSED&#x27;, close_time = NOW()</span><br><span class="line">    WHERE order_id = #&#123;orderId&#125;</span><br><span class="line">      AND status = &#x27;UNPAID&#x27;</span><br><span class="line"><span class="tag">&lt;/<span class="name">update</span>&gt;</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-消息可能丢失"><a href="#4-2-消息可能丢失" class="headerlink" title="4.2 消息可能丢失"></a>4.2 消息可能丢失</h3><p>延迟消息丢失的场景：</p>
+<ol>
+<li>Broker 刷盘失败（异步刷盘 + 宕机）；</li>
+<li>时间轮重建时未正确恢复（5.x 已知问题，早期版本有 bug）；</li>
+<li>消费者处理异常但返回了 <code>CONSUME_SUCCESS</code>。</li>
+</ol>
+<p><strong>兜底手段</strong>：</p>
+<ul>
+<li><strong>本地消息表 + 定时补偿</strong>：延迟消息是快路径，兜底是扫表慢路径；</li>
+<li><strong>延迟消息 + 定时巡检</strong>：延迟消息负责「及时性」，兜底任务负责「不漏」；</li>
+<li>消费端返回 <code>RECONSUME_LATER</code>，配合重试队列。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Override</span></span><br><span class="line"><span class="keyword">public</span> ConsumeConcurrentlyStatus <span class="title function_">consumeMessage</span><span class="params">(List&lt;MessageExt&gt; msgs,</span></span><br><span class="line"><span class="params">                                               ConsumeConcurrentlyContext context)</span> &#123;</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        doProcess(msgs);</span><br><span class="line">        <span class="keyword">return</span> ConsumeConcurrentlyStatus.CONSUME_SUCCESS;</span><br><span class="line">    &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">        log.error(<span class="string">&quot;处理失败&quot;</span>, e);</span><br><span class="line">        <span class="keyword">return</span> ConsumeConcurrentlyStatus.RECONSUME_LATER;   <span class="comment">// 触发重试</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-延迟消息-vs-其他方案对比"><a href="#4-3-延迟消息-vs-其他方案对比" class="headerlink" title="4.3 延迟消息 vs 其他方案对比"></a>4.3 延迟消息 vs 其他方案对比</h3><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>精度</th>
+<th>可靠性</th>
+<th>复杂度</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>定时任务扫表</td>
+<td>分钟级</td>
+<td>高（DB 持久）</td>
+<td>低</td>
+<td>量小、精度要求低</td>
+</tr>
+<tr>
+<td>DB 定时任务 + 分片</td>
+<td>秒级</td>
+<td>高</td>
+<td>中</td>
+<td>量中等</td>
+</tr>
+<tr>
+<td>Redis ZSet 延迟队列</td>
+<td>秒级</td>
+<td>中（需持久化）</td>
+<td>中</td>
+<td>量小、可容忍丢失</td>
+</tr>
+<tr>
+<td>JDK <code>DelayQueue</code></td>
+<td>高</td>
+<td>低（单机内存）</td>
+<td>低</td>
+<td>单机、可丢</td>
+</tr>
+<tr>
+<td>时间轮（Netty&#x2F;Kafka 风格）</td>
+<td>高</td>
+<td>低（内存）</td>
+<td>中</td>
+<td>进程内</td>
+</tr>
+<tr>
+<td><strong>RocketMQ 4.x 延迟消息</strong></td>
+<td>固定级别</td>
+<td>高</td>
+<td>低</td>
+<td>匹配级别即可</td>
+</tr>
+<tr>
+<td><strong>RocketMQ 5.x 定时消息</strong></td>
+<td>秒级</td>
+<td>高</td>
+<td>低</td>
+<td>推荐</td>
+</tr>
+<tr>
+<td>RabbitMQ TTL + DLX</td>
+<td>秒级</td>
+<td>高</td>
+<td>中</td>
+<td>需注意队头阻塞</td>
+</tr>
+<tr>
+<td>RabbitMQ 延迟插件</td>
+<td>秒级</td>
+<td>高</td>
+<td>低</td>
+<td>推荐</td>
+</tr>
+</tbody></table>
+<p><strong>特别提醒 RabbitMQ 的坑</strong>：用「TTL + 死信队列」实现延迟消息时，如果<strong>同一个队列里消息的 TTL 不同</strong>，会有严重的<strong>队头阻塞</strong>——队头长 TTL 消息未过期，后面的短 TTL 消息即使过期也不会进入死信队列。解决办法是<strong>每个 TTL 一个队列</strong>（和 RocketMQ 4.x 按 level 分队列是同一个思路）。</p>
+<hr>
+<h2 id="五、源码级：4-x-延迟消息投递的完整链路"><a href="#五、源码级：4-x-延迟消息投递的完整链路" class="headerlink" title="五、源码级：4.x 延迟消息投递的完整链路"></a>五、源码级：4.x 延迟消息投递的完整链路</h2><p>把关键源码串一遍，面试时能讲出类名和文件名会加分很多。</p>
+<h3 id="5-1-发送阶段：CommitLog-putMessage"><a href="#5-1-发送阶段：CommitLog-putMessage" class="headerlink" title="5.1 发送阶段：CommitLog#putMessage"></a>5.1 发送阶段：<code>CommitLog#putMessage</code></h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// CommitLog.java</span></span><br><span class="line"><span class="keyword">private</span> PutMessageResult <span class="title function_">putMessage</span><span class="params">(DispatchRequest request)</span> &#123;</span><br><span class="line">    <span class="comment">// ...</span></span><br><span class="line">    <span class="type">String</span> <span class="variable">topic</span> <span class="operator">=</span> msg.getTopic();</span><br><span class="line">    <span class="type">int</span> <span class="variable">queueId</span> <span class="operator">=</span> request.getQueueId();</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 关键：如果 delayLevel &gt; 0，改写 topic</span></span><br><span class="line">    <span class="keyword">if</span> (msg.getDelayTimeLevel() &gt; <span class="number">0</span>) &#123;</span><br><span class="line">        <span class="keyword">if</span> (msg.getDelayTimeLevel() &gt; <span class="built_in">this</span>.defaultMessageStore.getMessageDelayLevel()) &#123;</span><br><span class="line">            msg.setDelayTimeLevel(<span class="built_in">this</span>.defaultMessageStore.getMessageDelayLevel());</span><br><span class="line">        &#125;</span><br><span class="line">        topic = TopicValidator.RMQ_SYS_SCHEDULE_TOPIC;   <span class="comment">// SCHEDULE_TOPIC_XXXX</span></span><br><span class="line">        queueId = msg.getDelayTimeLevel() - <span class="number">1</span>;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 保留原始信息，用于到期后还原</span></span><br><span class="line">        <span class="keyword">if</span> (msg.getPropertiesString() == <span class="literal">null</span>) &#123;</span><br><span class="line">            msg.putProperty(MessageConst.PROPERTY_REAL_TOPIC, msg.getTopic());</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            <span class="comment">// 追加 PARSE 属性（用空格分隔，追加替换）</span></span><br><span class="line">            msg.putProperty(MessageConst.PROPERTY_REAL_TOPIC, msg.getTopic());</span><br><span class="line">            msg.putProperty(MessageConst.PROPERTY_REAL_QUEUE_ID, String.valueOf(request.getQueueId()));</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        request.setTopic(topic);</span><br><span class="line">        request.setQueueId(queueId);</span><br><span class="line">        <span class="comment">// 设置 tags 为 null，避免 SCHEDULE_TOPIC 的 tag 过滤</span></span><br><span class="line">        msg.setTags(MessageConst.PROPERTY_SCHEDULE_TAGS);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 写入 CommitLog ...</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-投递阶段：DeliverDelayedMessageTimerTask-executeOnTimeup"><a href="#5-2-投递阶段：DeliverDelayedMessageTimerTask-executeOnTimeup" class="headerlink" title="5.2 投递阶段：DeliverDelayedMessageTimerTask#executeOnTimeup"></a>5.2 投递阶段：<code>DeliverDelayedMessageTimerTask#executeOnTimeup</code></h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ScheduleMessageService.java</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">executeOnTimeup</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 从 SCHEDULE_TOPIC_XXXX 对应 level-1 的队列读 ConsumeQueue</span></span><br><span class="line">    <span class="type">ConsumeQueue</span> <span class="variable">cq</span> <span class="operator">=</span> <span class="built_in">this</span>.defaultMessageStore.findConsumeQueue(</span><br><span class="line">            TopicValidator.RMQ_SYS_SCHEDULE_TOPIC, queueId);</span><br><span class="line">    <span class="type">SelectMappedBufferResult</span> <span class="variable">bufferCQ</span> <span class="operator">=</span> cq.getIndexBuffer(<span class="built_in">this</span>.offset);</span><br><span class="line">    <span class="comment">// ...</span></span><br><span class="line"></span><br><span class="line">    <span class="comment">// 2. 遍历，判断是否到期</span></span><br><span class="line">    <span class="keyword">for</span> (; i &lt; bufferCQ.getSize(); i += ConsumeQueue.CQ_STORE_UNIT_SIZE) &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">offsetPy</span> <span class="operator">=</span> bufferCQ.getByteBuffer().getLong();</span><br><span class="line">        <span class="type">int</span> <span class="variable">sizePy</span> <span class="operator">=</span> bufferCQ.getByteBuffer().getInt();</span><br><span class="line">        <span class="type">long</span> <span class="variable">tagsCode</span> <span class="operator">=</span> bufferCQ.getByteBuffer().getLong();   <span class="comment">// 这里存的是「投递时间戳」</span></span><br><span class="line"></span><br><span class="line">        <span class="type">long</span> <span class="variable">now</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">        <span class="type">long</span> <span class="variable">deliverTimestamp</span> <span class="operator">=</span> <span class="built_in">this</span>.correctDeliverTimestamp(now, tagsCode);</span><br><span class="line"></span><br><span class="line">        nextOffset = offset + i / ConsumeQueue.CQ_STORE_UNIT_SIZE;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (deliverTimestamp &lt;= now) &#123;</span><br><span class="line">            <span class="comment">// 3. 到期，回读 CommitLog 拿到真实消息体</span></span><br><span class="line">            <span class="type">MessageExt</span> <span class="variable">msgExt</span> <span class="operator">=</span> <span class="built_in">this</span>.defaultMessageStore.lookMessageByOffset(offsetPy, sizePy);</span><br><span class="line">            <span class="comment">// 4. 还原 Topic/QueueId 后重新投递</span></span><br><span class="line">            <span class="type">MessageExtBrokerInner</span> <span class="variable">msgInner</span> <span class="operator">=</span> messageTimeup(msgExt);</span><br><span class="line">            <span class="comment">// ...</span></span><br><span class="line">            <span class="type">PutMessageResult</span> <span class="variable">putMessageResult</span> <span class="operator">=</span> <span class="built_in">this</span>.scheduleMessageService</span><br><span class="line">                    .getDefaultMessageStore().putMessage(msgInner);</span><br><span class="line"></span><br><span class="line">            <span class="keyword">if</span> (putMessageResult.getPutMessageStatus() == PutMessageStatus.PUT_OK) &#123;</span><br><span class="line">                <span class="keyword">continue</span>;   <span class="comment">// 继续处理下一条</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            <span class="comment">// 5. 未到期：重置 offset，等下次定时触发</span></span><br><span class="line">            <span class="keyword">if</span> (i &gt; <span class="number">0</span>) &#123;</span><br><span class="line">                <span class="built_in">this</span>.scheduleMessageService.updateOffset(queueId, nextOffset, ...);</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="keyword">break</span>;   <span class="comment">// ⚠️ 关键：break，依赖队列内到期时间有序</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// ...</span></span><br><span class="line">    <span class="comment">// 6. 处理完换出，再调度自己</span></span><br><span class="line">    <span class="keyword">if</span> (bufferCQ != <span class="literal">null</span>) &#123; bufferCQ.release(); &#125;</span><br><span class="line">    <span class="built_in">this</span>.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);   <span class="comment">// 100ms 后再次触发</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键点</strong>：</p>
+<ul>
+<li><code>tagsCode</code> 在 <code>SCHEDULE_TOPIC</code> 里存的是<strong>投递时间戳</strong>（不是 tag 的 hash），这是为了扫描时无需回读 CommitLog 就能判断是否到期（性能优化）；</li>
+<li><code>correctDeliverTimestamp</code> 处理了「时间回拨」场景；</li>
+<li><code>break</code> 而非 <code>continue</code>，依赖「同队列内到期时间有序」这一不变量。</li>
+</ul>
+<h3 id="5-3-时间轮（5-x）：TimerMessageStore"><a href="#5-3-时间轮（5-x）：TimerMessageStore" class="headerlink" title="5.3 时间轮（5.x）：TimerMessageStore"></a>5.3 时间轮（5.x）：<code>TimerMessageStore</code></h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// TimerMessageStore.java</span></span><br><span class="line"><span class="comment">// 核心字段</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">volatile</span> TimerWheel timerWheel;          <span class="comment">// 内存时间轮</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">volatile</span> TimerLog timerLog;              <span class="comment">// 磁盘日志</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 1. 从 CommitLog 分发时，若消息是定时消息，加入时间轮</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">addTimerMessage</span><span class="params">(MessageExtBrokerInner msg, <span class="type">long</span> deliverTimeMs)</span> &#123;</span><br><span class="line">    <span class="comment">// 写入 TimerLog</span></span><br><span class="line">    <span class="type">TimerRequest</span> <span class="variable">timerRequest</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">TimerRequest</span>(msg, deliverTimeMs);</span><br><span class="line">    timerLog.append(timerRequest);</span><br><span class="line">    <span class="comment">// 加入时间轮对应槽</span></span><br><span class="line">    timerWheel.addSlot(timerRequest);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 2. 定时任务：每 timerPrecisionMs 推进一个槽</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">while</span> (!isStopped()) &#123;</span><br><span class="line">        <span class="comment">// 获取到期槽</span></span><br><span class="line">        LinkedList&lt;TimerRequest&gt; requests = timerWheel.getSlot(now);</span><br><span class="line">        <span class="comment">// 从 TimerLog 拉取真实消息并投递</span></span><br><span class="line">        <span class="keyword">for</span> (TimerRequest req : requests) &#123;</span><br><span class="line">            doEnqueue(req);   <span class="comment">// 重新写入 CommitLog，还原原 Topic</span></span><br><span class="line">        &#125;</span><br><span class="line">        Thread.sleep(timerPrecisionMs);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、生产实践清单"><a href="#六、生产实践清单" class="headerlink" title="六、生产实践清单"></a>六、生产实践清单</h2><h3 id="6-1-容量规划"><a href="#6-1-容量规划" class="headerlink" title="6.1 容量规划"></a>6.1 容量规划</h3><p>延迟消息<strong>存储会占用 2 倍空间</strong>（原始消息 + 重写消息），并且 <code>SCHEDULE_TOPIC_XXXX</code> 的 ConsumeQueue 也需要空间。如果延迟消息量很大（比如每单一条，日均 1000 万单），要提前评估磁盘。</p>
+<p>建议：<strong>延迟消息只用于「时间敏感 + 量可控」的场景</strong>，大规模通知类改用定时任务扫表（成本更低）。</p>
+<h3 id="6-2-监控指标"><a href="#6-2-监控指标" class="headerlink" title="6.2 监控指标"></a>6.2 监控指标</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 各延迟级别队列的积压量</span></span><br><span class="line">mqadmin consumerProgress -n 127.0.0.1:9876 -g SCHEDULE_TOPIC_XXXX</span><br><span class="line"></span><br><span class="line"><span class="comment"># 或者看 Broker 的定时消息统计</span></span><br><span class="line"><span class="comment"># 5.x: mqadmin statsMessageTimer / broker 指标</span></span><br></pre></td></tr></table></figure>
+
+<p>关键监控项：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>告警阈值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>延迟消息积压量</td>
+<td>各 level 队列未投递量</td>
+<td>持续增长即异常</td>
+</tr>
+<tr>
+<td>定时消息投递延迟</td>
+<td>实际投递时间 - 目标时间</td>
+<td>&gt; 10s</td>
+</tr>
+<tr>
+<td>TimerLog 磁盘占用</td>
+<td>定时日志文件大小</td>
+<td>超过预期增长</td>
+</tr>
+<tr>
+<td>投递失败率</td>
+<td><code>putMessage</code> 返回非 OK</td>
+<td>&gt; 0.1%</td>
+</tr>
+</tbody></table>
+<h3 id="6-3-常见故障"><a href="#6-3-常见故障" class="headerlink" title="6.3 常见故障"></a>6.3 常见故障</h3><table>
+<thead>
+<tr>
+<th>故障</th>
+<th>原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>延迟消息不投递</td>
+<td>定时器线程挂了 &#x2F; offset 异常</td>
+<td>重启 Broker，检查 <code>SCHEDULE_TOPIC_XXXX</code> ConsumeQueue</td>
+</tr>
+<tr>
+<td>延迟消息大量重复</td>
+<td>投递阶段重试 + 消费未幂等</td>
+<td>消费端补幂等</td>
+</tr>
+<tr>
+<td>延迟时间不准</td>
+<td>4.x 队列扫描 + 单级任务压力</td>
+<td>升级到 5.x 时间轮</td>
+</tr>
+<tr>
+<td>磁盘暴涨</td>
+<td>TimerLog 未清理</td>
+<td>检查 <code>timerLogFileSize</code> 与清理策略</td>
+</tr>
+<tr>
+<td>延迟消息乱序</td>
+<td>同一原始队列的消息被写入不同 level</td>
+<td>业务侧按 orderId 保证顺序</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="七、面试追问集"><a href="#七、面试追问集" class="headerlink" title="七、面试追问集"></a>七、面试追问集</h2><p><strong>Q1：<code>delayLevel=16</code> 是延迟多久？</strong></p>
+<blockquote>
+<p>30 分钟。4.x 的 18 个级别依次是 <code>1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h</code>，从 1 开始编号，所以 16 是 30 分钟。</p>
+</blockquote>
+<p><strong>Q2：延迟消息存在哪里？</strong></p>
+<blockquote>
+<p>存在 <strong>CommitLog</strong> 里，但 Topic 被改写为 <code>SCHEDULE_TOPIC_XXXX</code>，QueueId &#x3D; <code>delayLevel - 1</code>，原始 Topic&#x2F;QueueId 保存在消息属性 <code>PROPERTY_REAL_TOPIC</code>&#x2F;<code>PROPERTY_REAL_QUEUE_ID</code> 中。到期后由 <code>ScheduleMessageService</code> 的定时任务扫描对应 ConsumeQueue，还原 Topic 并再次写入 CommitLog 完成投递。</p>
+</blockquote>
+<p><strong>Q3：为什么延迟消息会占两倍存储？</strong></p>
+<blockquote>
+<p>因为投递时要「重写」：先按 <code>SCHEDULE_TOPIC_XXXX</code> 存一份，到期后再以原始 Topic 存一份。前者用于定时扫描，后者供消费者读取。所以磁盘和 IO 都是双份。</p>
+</blockquote>
+<p><strong>Q4：4.x 为什么只能固定级别？</strong></p>
+<blockquote>
+<p>设计上为了简化扫描：每个 level 一个独立队列 + 一个独立定时任务，队列内到期时间天然有序（因为延迟时长相同 + 存储时间递增），扫描时遇到未到期就 <code>break</code> 即可。如果要支持任意时间，就需要更复杂的数据结构（时间轮&#x2F;最小堆），所以 5.x 才引入 TimerWheel。</p>
+</blockquote>
+<p><strong>Q5：时间轮为什么比自己维护最小堆好？</strong></p>
+<blockquote>
+<p>时间轮的插入和删除都是 O(1)（按槽定位），且天然按时间分桶，到期只需要扫描当前槽；最小堆插入 O(logN)，且需要频繁比较。时间轮的代价是「槽数量 × 精度」决定的时间跨度，超出跨度要走层级轮。RocketMQ 用「内存时间轮索引 + 磁盘 TimerLog」组合，避免了内存随消息量增长。</p>
+</blockquote>
+<p><strong>Q6：延迟消息会丢吗？</strong></p>
+<blockquote>
+<p>会。可能丢的场景：异步刷盘时 Broker 宕机、时间轮重建失败、消费端处理异常却返回成功。所以生产上一般用**「延迟消息 + 兜底扫表」双保险**：延迟消息保证及时性，扫表任务保证不漏，消费端再保证幂等。</p>
+</blockquote>
+<p><strong>Q7：用 RocketMQ 实现「阶梯重试」（5s、10s、30s、1m、5m）怎么做？</strong></p>
+<blockquote>
+<p>消费失败时返回 <code>RECONSUME_LATER</code>，用 RocketMQ 自带的重试机制（<code>%RETRY%group</code> 的 18 个重试级别，默认 <code>10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h</code>）。如果要精确控制，就在消费端手动发一条带指定 <code>delayTimeLevel</code> 的消息，并用 <code>userProperty</code> 记录重试次数（<strong>消息自带的重试次数最多 16 次，超过进死信队列</strong>）。</p>
+</blockquote>
+<p><strong>Q8：延迟消息和分布式事务有什么配合？</strong></p>
+<blockquote>
+<p>典型用法是<strong>本地消息表 + 延迟消息做补偿</strong>：事务提交后写一条延迟消息，若在延迟时间内收到下游成功确认则取消（用一个状态表标记），否则到期消费时触发补偿&#x2F;回滚。RocketMQ 的事务消息（半消息 + 回查）解决的是「消息发送与本地事务的原子性」，延迟消息解决的是「超时补偿」，两者经常组合使用。</p>
+</blockquote>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><table>
+<thead>
+<tr>
+<th>版本</th>
+<th>机制</th>
+<th>精度</th>
+<th>范围</th>
+<th>关键类</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>4.x</td>
+<td>18 个固定延迟级别 + 队列扫描</td>
+<td>秒~分钟</td>
+<td>最长 2h</td>
+<td><code>ScheduleMessageService</code>、<code>DeliverDelayedMessageTimerTask</code></td>
+</tr>
+<tr>
+<td>5.x</td>
+<td>时间轮 + TimerLog</td>
+<td>毫秒~秒</td>
+<td>最长 2 天</td>
+<td><code>TimerMessageStore</code>、<code>TimerWheel</code>、<code>TimerLog</code></td>
+</tr>
+</tbody></table>
+<p>三句话记住核心：</p>
+<ol>
+<li><strong>4.x 是「用队列隔离延迟级别」换来的扫描正确性</strong>，代价是不支持任意时间；</li>
+<li><strong>5.x 是「时间轮 + 磁盘日志」</strong>，把内存索引和消息存储分离，支持任意时间；</li>
+<li><strong>不管用哪个版本，消费端都必须幂等</strong>，因为投递语义是 at-least-once。</li>
+</ol>
+<p>最后一个实战建议：<strong>延迟消息适合「时间点精确、量可控」的场景；如果是海量、精度要求不高的场景，定时任务扫表反而更省钱。</strong> 技术选型从来不是「哪个先进用哪个」，而是「哪个匹配当前业务成本模型用哪个」。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/27/rocketmq-delay-timer-message-deep-dive/">https://jiweidong.github.io/2026/09/27/rocketmq-delay-timer-message-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a><a class="post-meta__tags" href="/tags/RocketMQ/">RocketMQ</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/27/mysql-innodb-read-ahead-prefetch-deep-dive/" title="【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理面试官：全表扫描为什么比走索引还快？这个问题看起来是个悖论——索引不就是为了避免全表扫描吗？ 但如果你在线上跑过这两种 SQL： 12345-- 走二级索引 + 回表SELECT * FROM t_order WHERE user_id = 1001;   -- 命中 800 万行-- 直接全表扫描SELECT * FROM t_order;                          -- 3000 万行  你会发现有时候全表扫描反而更快。原因就是：顺序 IO 有预读，随机 IO 没有。 InnoDB 的预读（Read-Ahead）机制，是一个非常容易被忽略、但在 IO 密集型场景下影响巨大的设计。这篇文章把它从原理、参数、源码到调优完整讲一遍。  一、为什么需要预读1.1 磁盘的物理特性机械硬盘（HDD）的寻道时间是毫秒级（典型 8~10ms），而连续读取 1MB 数据可能只需要几毫秒。也就是说： 12随机读：1 次 IO ≈ 1 次寻道 ≈ 10ms顺序读：1 次...</div></div></div></a><a class="pagination-related" href="/2026/09/27/tcp-backlog-syn-accept-queue-deep-dive/" title="【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞</div></div><div class="info-2"><div class="info-item-1">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞面试官：服务端 accept 慢，客户端会怎样？这个问题看起来很基础，但能答透的人不多。常见的错误答案是「客户端会重试」。 正确的链条是这样的： 12345应用层 accept 不及时  -&gt; 全连接队列（accept queue）被填满  -&gt; 内核默认丢弃新完成握手的连接（或发 RST）  -&gt; 客户端认为自己已经 connect 成功，开始发数据  -&gt; 数据被丢弃，客户端重传，一段时间后才报 timeout  如果你是 Java 服务端开发者，ServerSocket 构造方法里的那个 backlog 参数，你已经写了无数遍，但未必真的知道它控制的是什么。 这篇文章把 TCP 三次握手过程中两个队列讲透：半连接队列、全连接队列，包括内核参数、溢出行为、观测手段、Java&#x2F;Netty&#x2F;Tomcat 的配置，以及一次真实线上事故的复盘。  一、三次握手与两个队列1.1 内核数据结构服务端在 listen() 之后，内核会为这...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-15</div><div class="info-item-2">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</div></div><div class="info-2"><div class="info-item-1">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？大部分人答「写一次」，然后就被追问到哑口无言。 真实答案是：一次写入调用，但数据落到了三份文件里——CommitLog、ConsumeQueue、IndexFile（可选）。更麻烦的是，这三份文件写入时机不同、刷盘策略不同、丢失后果也不同。 这套设计是 RocketMQ 高吞吐 + 高可靠的核心，也是面试里最能拉开差距的地方。本文按「文件布局 → 写入链路 → 读取链路 → 刷盘与复制 → 故障恢复 → 调优」六段讲透。  一、为什么不用「一条消息一个文件」先看反面教材。如果每条消息独立存一个文件，会立刻遇到三个问题：  文件数爆炸：每秒 10 万条消息 → 每天 86 亿个文件，inode 直接耗尽 写入变随机：文件创建本身是元数据随机写，无法利用磁盘顺序写特性 读取低效：按 Topic 拉取消息需要遍历大量文件  Kafka 的思路是「partition &#x3D; 一个目录，消息...</div></div></div></a><a class="pagination-related" href="/2026/06/15/rocketmq-deep-dive/" title="Apache RocketMQ 深度解析：原理、架构与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-15</div><div class="info-item-2">Apache RocketMQ 深度解析：原理、架构与最佳实践</div></div><div class="info-2"><div class="info-item-1">Apache RocketMQ 深度解析：原理、架构与最佳实践 RocketMQ 是阿里巴巴开源的分布式消息中间件，以高吞吐、低延迟、强一致性著称。本文从源码层面深入 RocketMQ 的架构设计、存储机制和最佳实践。  一、RocketMQ 架构总览1.1 核心组件12345678910111213141516171819202122┌─────────────────────────────────────────────────────┐│                     Producer                         │└──────────────────────┬──────────────────────────────┘                       │┌──────────────────────▼──────────────────────────────┐│                   Name Server                        ││              (路由注册中心，无状态)...</div></div></div></a><a class="pagination-related" href="/2026/06/18/event-driven-architecture-guide/" title="事件驱动架构设计实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-18</div><div class="info-item-2">事件驱动架构设计实战</div></div><div class="info-2"><div class="info-item-1">事件驱动架构设计实战一、事件驱动架构概述1.1 核心概念事件驱动架构（Event-Driven Architecture, EDA）是一种基于事件的产生、检测、消费和响应的软件架构模式。与传统的请求-响应模式不同，事件驱动架构中的组件通过事件进行松耦合通信。 1234567891011传统请求-响应:┌──────┐  请求   ┌──────┐│服务A  │───────→│服务B  ││      │←───────│      │└──────┘  响应   └──────┘事件驱动:┌──────┐  事件    ┌───────┐│服务A  │───────→│事件总线││(生产者)│        │(Broker)│──────→ 服务B, 服务C, 服务D...└──────┘          └───────┘        (消费者)  1.2 事件类型   事件类型 描述 示例 特点    领域事件 业务领域中发生的重大事 OrderCreated, PaymentReceived 不可变，有业务意义   事件通知 状态变更的简单通知 UserUpdate...</div></div></div></a><a class="pagination-related" href="/2026/06/13/message-queue-kafka-rocketmq/" title="消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇</div></div><div class="info-2"><div class="info-item-1">消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇一、消息队列基础1.1 四大核心作用消息队列（Message Queue，MQ）是分布式系统中不可或缺的中间件，它的核心价值体现在四个方面： 异步解耦：通过引入 MQ，上下游系统之间的直接依赖被打破。发送方只管发送消息，接收方自行消费，双方互不阻塞。例如订单系统创建订单后发送消息到 MQ，库存系统、积分系统各自订阅消费，即使某个系统临时不可用，也不会影响主流程。 流量削峰：秒杀、大促等场景下，瞬时流量可能达到正常值的几十倍。MQ 充当缓冲区，将海量请求暂存，下游系统按自身处理能力拉取消费，避免被流量冲垮。这就像水库在汛期蓄水、旱期放水一样平滑流量。 数据缓冲：当上下游处理能力不匹配时，MQ 作为缓冲层，允许生产者高速生产、消费者从容消费，实现最终一致性。 日志收集：Kafka 最初由 LinkedIn 开发时就是为了解决日志收集问题。大量日志通过 Kafka 聚合、分发，再交由 ELK 等系统处理。这是 MQ 在数据 pipeline 领域的经典应用。 1.2 消息模型点对点模型（P2P, Point-to-Poin...</div></div></div></a><a class="pagination-related" href="/2026/07/23/spring-boot-rocketmq-practice/" title="【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-23</div><div class="info-item-2">【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程一、RocketMQ 与 Spring Boot 集成概述RocketMQ 是阿里巴巴开源的分布式消息中间件，在阿里内部经历了多年双 11 的洗礼，具备高吞吐、低延迟、强一致性的特点。相比 Kafka，RocketMQ 在事务消息、延迟消息、消息重试、死信队列等企业级特性上更加完善。 Spring Boot 集成 RocketMQ 主要有两种方式：    集成方式 说明 适用场景    RocketMQ-Spring-Boot-Starter 官方 Starter，声明式注解 大多数 Spring Boot 项目   RocketMQ原生 Client 直接使用 producer&#x2F;consumer API 需要精细控制或特殊配置   本文默认使用官方 Starter 方式。 二、环境搭建与依赖配置2.1 Maven 依赖12345&lt;dependency&gt;    &lt;groupId&gt;org.apache.rocketmq&lt;/gro...</div></div></div></a><a class="pagination-related" href="/2026/08/25/mq-ordered-message-deep-dive/" title="【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-25</div><div class="info-item-2">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现</div></div><div class="info-2"><div class="info-item-1">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现面试官：你们的订单消息需要保证顺序吗？Kafka 怎么保证顺序？“消息顺序”是 MQ 面试的钉子户。很多人知道”Kafka 只能保证分区内有序”，但说不清为什么只能分区内有序、怎么做到分区内有序、哪些场景会悄悄破坏顺序。本文从存储模型讲到生产消费全链路，一次讲透。 一、什么是顺序消息？全局有序 vs 分区有序 全局有序：所有消息严格按照发送顺序被消费（要求单分区&#x2F;单队列 + 单消费者） 分区有序（局部有序）：同一业务维度（如同一订单、同一用户）的消息有序，不同维度之间不要求有序  现实业务几乎只用分区有序：订单的”创建→支付→发货”必须有序，但订单 A 和订单 B 之间无所谓。全局有序的代价是吞吐量断崖式下跌（退化成单队列单消费者），没人这么用。 二、Kafka 的顺序保证：分区内有序1. 存储模型决定了”分区 &#x3D; 顺序的天然边界”Kafka 的 Topic 被切成多个 Partition，每个 Partition 是追加写的日志（log segment）： 123Top...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">682</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E3%80%91RocketMQ-%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%BB%8E-18-%E4%B8%AA%E5%BB%B6%E8%BF%9F%E7%BA%A7%E5%88%AB%E5%88%B0%E4%BB%BB%E6%84%8F%E6%97%B6%E9%97%B4%E5%AE%9A%E6%97%B6%E6%B6%88%E6%81%AF"><span class="toc-number">1.</span> <span class="toc-text">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AE%A2%E5%8D%95-30-%E5%88%86%E9%92%9F%E6%9C%AA%E6%94%AF%E4%BB%98%E8%87%AA%E5%8A%A8%E5%85%B3%E9%97%AD%EF%BC%8C%E4%BD%A0%E6%80%8E%E4%B9%88%E5%AE%9E%E7%8E%B0%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：订单 30 分钟未支付自动关闭，你怎么实现？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么需要延迟消息</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81RocketMQ-4-x-%E7%9A%84%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%EF%BC%9A18-%E4%B8%AA%E5%9B%BA%E5%AE%9A%E7%BA%A7%E5%88%AB"><span class="toc-number">1.3.</span> <span class="toc-text">二、RocketMQ 4.x 的延迟消息：18 个固定级别</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%BB%B6%E8%BF%9F%E7%BA%A7%E5%88%AB%E5%AE%9A%E4%B9%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 延迟级别定义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%E7%9A%84%E5%AD%98%E5%82%A8%E5%AE%9E%E7%8E%B0%E5%9C%A8%E5%93%AA%EF%BC%9F"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 延迟消息的存储实现在哪？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%85%B3%E9%94%AE%E9%85%8D%E7%BD%AE%EF%BC%9AmessageDelayLevel"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 关键配置：messageDelayLevel</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-4-x-%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%E7%9A%84%E5%9B%9B%E5%A4%A7%E7%97%9B%E7%82%B9"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 4.x 延迟消息的四大痛点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-%E4%B8%80%E4%B8%AA%E7%9C%9F%E5%AE%9E%E7%9A%84%E8%B8%A9%E5%9D%91%EF%BC%9A%E5%BB%B6%E8%BF%9F%E7%BA%A7%E5%88%AB%E6%BB%A1%E4%BA%86%E6%80%8E%E4%B9%88%E5%8A%9E%EF%BC%9F"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 一个真实的踩坑：延迟级别满了怎么办？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81RocketMQ-5-x-%E5%AE%9A%E6%97%B6%E6%B6%88%E6%81%AF%EF%BC%88Timer-Message%EF%BC%89"><span class="toc-number">1.4.</span> <span class="toc-text">三、RocketMQ 5.x 定时消息（Timer Message）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E6%95%B4%E4%BD%93%E6%9E%B6%E6%9E%84"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 整体架构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E6%97%B6%E9%97%B4%E8%BD%AE%E5%8F%82%E6%95%B0"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 时间轮参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E4%B8%8E-4-x-%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 与 4.x 的本质区别</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E4%BD%BF%E7%94%A8%E6%96%B9%E5%BC%8F"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 使用方式</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%E7%9A%84%E5%8F%AF%E9%9D%A0%E6%80%A7%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.5.</span> <span class="toc-text">四、延迟消息的可靠性设计</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%B6%88%E6%81%AF%E5%8F%AF%E8%83%BD%E9%87%8D%E5%A4%8D"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 消息可能重复</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%B6%88%E6%81%AF%E5%8F%AF%E8%83%BD%E4%B8%A2%E5%A4%B1"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 消息可能丢失</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF-vs-%E5%85%B6%E4%BB%96%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 延迟消息 vs 其他方案对比</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%BA%90%E7%A0%81%E7%BA%A7%EF%BC%9A4-x-%E5%BB%B6%E8%BF%9F%E6%B6%88%E6%81%AF%E6%8A%95%E9%80%92%E7%9A%84%E5%AE%8C%E6%95%B4%E9%93%BE%E8%B7%AF"><span class="toc-number">1.6.</span> <span class="toc-text">五、源码级：4.x 延迟消息投递的完整链路</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%8F%91%E9%80%81%E9%98%B6%E6%AE%B5%EF%BC%9ACommitLog-putMessage"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 发送阶段：CommitLog#putMessage</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E6%8A%95%E9%80%92%E9%98%B6%E6%AE%B5%EF%BC%9ADeliverDelayedMessageTimerTask-executeOnTimeup"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 投递阶段：DeliverDelayedMessageTimerTask#executeOnTimeup</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E6%97%B6%E9%97%B4%E8%BD%AE%EF%BC%885-x%EF%BC%89%EF%BC%9ATimerMessageStore"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 时间轮（5.x）：TimerMessageStore</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5%E6%B8%85%E5%8D%95"><span class="toc-number">1.7.</span> <span class="toc-text">六、生产实践清单</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 容量规划</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E7%9B%91%E6%8E%A7%E6%8C%87%E6%A0%87"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 监控指标</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%B8%B8%E8%A7%81%E6%95%85%E9%9A%9C"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 常见故障</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E9%9B%86"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问集</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/" title="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</a><time datetime="2026-09-27T00:40:00.000Z" title="发表于 2026-09-27 08:40:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/mysql-innodb-read-ahead-prefetch-deep-dive/" title="【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理</a><time datetime="2026-09-27T00:30:00.000Z" title="发表于 2026-09-27 08:30:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/rocketmq-delay-timer-message-deep-dive/" title="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</a><time datetime="2026-09-27T00:20:00.000Z" title="发表于 2026-09-27 08:20:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/tcp-backlog-syn-accept-queue-deep-dive/" title="【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞</a><time datetime="2026-09-27T00:10:00.000Z" title="发表于 2026-09-27 08:10:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/" title="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜">【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</a><time datetime="2026-09-27T00:00:00.000Z" title="发表于 2026-09-27 08:00:00">2026-09-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

@@ -1,0 +1,689 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战面试官：Java 的类会被卸载吗？这是一个「听起来简单，答起来很难」的问题。 大多数人的回答是：「类加载后就一直存在，直到 JVM 结束。」 这个答案只对了一半。准确地说：  类是可以被卸载的，但条件非常苛刻。 类卸载的前提是它的 ClassLoader 被回收，而 ClassLoad">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战面试官：Java 的类会被卸载吗？这是一个「听起来简单，答起来很难」的问题。 大多数人的回答是：「类加载后就一直存在，直到 JVM 结束。」 这个答案只对了一半。准确地说：  类是可以被卸载的，但条件非常苛刻。 类卸载的前提是它的 ClassLoader 被回收，而 ClassLoad">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-27T00:40:00.000Z">
+<meta property="article:modified_time" content="2026-09-27T00:04:27.551Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="内存泄漏">
+<meta property="article:tag" content="生产实战">
+<meta property="article:tag" content="类加载">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战",
+  "url": "https://jiweidong.github.io/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-27T00:40:00.000Z",
+  "dateModified": "2026-09-27T00:04:27.551Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">682</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-27T00:40:00.000Z" title="发表于 2026-09-27 08:40:00">2026-09-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-27T00:04:27.551Z" title="更新于 2026-09-27 08:04:27">2026-09-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM/">JVM</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-底层】类卸载（Class-Unloading）与元空间回收深度解析：ClassLoader-泄漏排查实战"><a href="#【JVM-底层】类卸载（Class-Unloading）与元空间回收深度解析：ClassLoader-泄漏排查实战" class="headerlink" title="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战"></a>【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</h1><h2 id="面试官：Java-的类会被卸载吗？"><a href="#面试官：Java-的类会被卸载吗？" class="headerlink" title="面试官：Java 的类会被卸载吗？"></a>面试官：Java 的类会被卸载吗？</h2><p>这是一个「听起来简单，答起来很难」的问题。</p>
+<p>大多数人的回答是：「类加载后就一直存在，直到 JVM 结束。」</p>
+<p>这个答案<strong>只对了一半</strong>。准确地说：</p>
+<blockquote>
+<p><strong>类是可以被卸载的，但条件非常苛刻。</strong> 类卸载的前提是它的 <strong>ClassLoader 被回收</strong>，而 ClassLoader 被回收的前提是「它加载的所有类都不再被引用，且它自己也不被引用」。</p>
+</blockquote>
+<p>而现实中，<strong>ClassLoader 泄漏是 Java 应用中非常隐蔽、后果非常严重的一类内存问题</strong>，尤其在：</p>
+<ul>
+<li>Tomcat &#x2F; Jetty 热部署（reload&#x2F;undeploy）场景；</li>
+<li>OSGi、插件化框架；</li>
+<li>频繁使用脚本引擎（Nashorn&#x2F;GraalJS）、字节码生成（CGLIB&#x2F;ASM&#x2F;ByteBuddy）、动态代理；</li>
+<li>自定义 ClassLoader 做隔离（如 Dubbo 的 SPI 类隔离、Arthas）。</li>
+</ul>
+<p>这些场景下，<strong>元空间（Metaspace）会持续增长，最终 <code>java.lang.OutOfMemoryError: Metaspace</code></strong>，而且重启前无法自愈。</p>
+<p>这篇文章把类卸载的条件、Metaspace 回收机制、泄漏根因、排查手段和治理方案完整讲一遍。</p>
+<hr>
+<h2 id="一、类加载的生命周期回顾"><a href="#一、类加载的生命周期回顾" class="headerlink" title="一、类加载的生命周期回顾"></a>一、类加载的生命周期回顾</h2><p>类的完整生命周期：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">加载 → 验证 → 准备 → 解析 → 初始化 → 使用 → 卸载</span><br><span class="line"> ↓      ↓      ↓      ↓      ↓        ↓      ↓</span><br><span class="line"> 类加载器参与 ←───────────────────────────┤</span><br><span class="line">                                          └─ 类卸载（需 ClassLoader 被回收）</span><br></pre></td></tr></table></figure>
+
+<p>关键点：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>是否可卸载的决策点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>加载</td>
+<td>由某个 ClassLoader 加载，建立 ClassLoader ↔ Class 的引用关系</td>
+</tr>
+<tr>
+<td>使用</td>
+<td>实例、静态变量、反射引用都可能持有 Class</td>
+</tr>
+<tr>
+<td>卸载</td>
+<td><strong>必须等 ClassLoader 被 GC 回收</strong></td>
+</tr>
+</tbody></table>
+<p><strong>核心不变量：JVM 不会单独卸载一个类。</strong> 卸载的单位是「<strong>ClassLoader + 它加载的所有类</strong>」这个整体。</p>
+<p>为什么？因为：</p>
+<ol>
+<li><strong>Class 对象持有对 ClassLoader 的引用</strong>（<code>Class.getClassLoader()</code>）；</li>
+<li>ClassLoader 持有它加载的所有类的定义（<code>parallelLockMap</code>、<code>classes</code> 集合、<code>package2certs</code>）；</li>
+<li>类之间互相引用，无法单独卸载其中一个而不破坏一致性。</li>
+</ol>
+<p>所以：<strong>「类卸载」&#x3D; 「ClassLoader 被回收」</strong>。这就是问题的本质。</p>
+<hr>
+<h2 id="二、类被卸载的三个条件"><a href="#二、类被卸载的三个条件" class="headerlink" title="二、类被卸载的三个条件"></a>二、类被卸载的三个条件</h2><p>JVM 规范对类卸载的要求（可归纳为三条）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">1. 该类的所有实例都已被回收（堆中无该类的实例）</span><br><span class="line">2. 该类的 java.lang.Class 对象没有被任何地方引用</span><br><span class="line">   （没有通过反射、Class 对象、静态字段等被引用）</span><br><span class="line">3. 加载该类的 ClassLoader 实例已经被回收</span><br><span class="line">   （没有任何地方引用这个 ClassLoader）</span><br></pre></td></tr></table></figure>
+
+<p>三条必须<strong>同时满足</strong>，等价于「该类彻底不可达」。</p>
+<h3 id="2-1-详细拆解"><a href="#2-1-详细拆解" class="headerlink" title="2.1 详细拆解"></a>2.1 详细拆解</h3><p><strong>条件 1：实例全部被回收</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">MyClass</span> <span class="variable">obj</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">MyClass</span>();</span><br><span class="line"><span class="comment">// 只要 obj 可达，MyClass 就不能卸载</span></span><br><span class="line">obj = <span class="literal">null</span>;</span><br><span class="line"><span class="comment">// 现在实例可能被回收了</span></span><br></pre></td></tr></table></figure>
+
+<p>注意：<strong>局部变量表中的引用、线程栈中的引用、ThreadLocal 中的引用</strong>都算「可达」。</p>
+<p><strong>条件 2：Class 对象无引用</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">Class&lt;?&gt; clazz = Class.forName(<span class="string">&quot;com.example.MyClass&quot;</span>);</span><br><span class="line"><span class="comment">// 静态缓存了这个 clazz，就阻塞卸载</span></span><br><span class="line">staticCache.add(clazz);   <span class="comment">// ❌ 泄漏</span></span><br></pre></td></tr></table></figure>
+
+<p>常见坑：<strong>用 <code>Class</code> 对象或 <code>Method</code>&#x2F;<code>Field</code> 做缓存 key，会持有 ClassLoader 引用</strong>。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 典型泄漏：静态 Map 缓存 Method</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Map&lt;Class&lt;?&gt;, Method&gt; METHOD_CACHE = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line"><span class="comment">// 正确做法：用 WeakReference 或用 String 类型的类名做 key</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Map&lt;String, Method&gt; METHOD_CACHE = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br></pre></td></tr></table></figure>
+
+<p><strong>条件 3：ClassLoader 实例被回收</strong></p>
+<p>ClassLoader 本身也是对象，它也可能被：</p>
+<ul>
+<li>静态变量引用；</li>
+<li>线程（<code>Thread.contextClassLoader</code>）；</li>
+<li>ThreadLocal 引用；</li>
+<li>未关闭的资源引用；</li>
+<li>已加载类的静态字段引用（循环引用，但只要外部无引用，循环引用也能被 GC 回收）。</li>
+</ul>
+<h3 id="2-2-一个关键理解：循环引用不是问题"><a href="#2-2-一个关键理解：循环引用不是问题" class="headerlink" title="2.2 一个关键理解：循环引用不是问题"></a>2.2 一个关键理解：循环引用不是问题</h3><p>很多人以为「类引用 ClassLoader，ClassLoader 引用类，互相引用所以永远不能回收」。</p>
+<p>这是错的。<strong>JVM 用可达性分析（而不是引用计数）</strong>，只要这批对象整体对外不可达，就能被整体回收。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">GC Roots</span><br><span class="line">   │</span><br><span class="line">   ├─ Thread A ──▶ MyClassLoader ──▶ MyClass ──▶ MyClassLoader (循环)</span><br><span class="line">   │                    ▲</span><br><span class="line">   │                    └── 有 GC Root 引用，无法回收</span><br></pre></td></tr></table></figure>
+
+<p>只要切断 <code>Thread A → MyClassLoader</code> 这条边，整个闭环就能被回收。</p>
+<hr>
+<h2 id="三、Metaspace-的回收机制"><a href="#三、Metaspace-的回收机制" class="headerlink" title="三、Metaspace 的回收机制"></a>三、Metaspace 的回收机制</h2><h3 id="3-1-什么是-Metaspace"><a href="#3-1-什么是-Metaspace" class="headerlink" title="3.1 什么是 Metaspace"></a>3.1 什么是 Metaspace</h3><p>JDK 8 用 <strong>Metaspace</strong> 取代了 <strong>PermGen</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>PermGen（JDK 7 及以前）</th>
+<th>Metaspace（JDK 8+）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>位置</td>
+<td>堆内（连续）</td>
+<td><strong>本地内存（Native Memory）</strong></td>
+</tr>
+<tr>
+<td>大小控制</td>
+<td><code>-XX:MaxPermSize</code></td>
+<td><code>-XX:MaxMetaspaceSize</code>（默认无限）</td>
+</tr>
+<tr>
+<td>回收</td>
+<td>Full GC</td>
+<td>类卸载时才回收</td>
+</tr>
+<tr>
+<td>OOM 错误</td>
+<td><code>PermGen space</code></td>
+<td><code>Metaspace</code></td>
+</tr>
+<tr>
+<td>碎片化</td>
+<td>严重</td>
+<td>较好（Chunk 管理）</td>
+</tr>
+</tbody></table>
+<p>Metaspace 存放：<strong>类元数据、方法元数据、常量池、注解、字节码（部分）</strong>。</p>
+<h3 id="3-2-关键参数"><a href="#3-2-关键参数" class="headerlink" title="3.2 关键参数"></a>3.2 关键参数</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">-XX:MetaspaceSize=256m           <span class="comment"># 首次 GC 阈值（不是初始大小！触发 GC 后动态调整）</span></span><br><span class="line">-XX:MaxMetaspaceSize=512m        <span class="comment"># 上限，不设则无限（危险！）</span></span><br><span class="line">-XX:MinMetaspaceFreeRatio=40     <span class="comment"># GC 后最小空闲比例，低于则扩容</span></span><br><span class="line">-XX:MaxMetaspaceFreeRatio=70     <span class="comment"># GC 后最大空闲比例，高于则缩容</span></span><br><span class="line">-XX:+ClassUnloading              <span class="comment"># 允许类卸载（默认开启）</span></span><br><span class="line">-XX:+ClassUnloadingWithConcurrentMark  <span class="comment"># 并发标记阶段也卸载类（G1 默认开启）</span></span><br></pre></td></tr></table></figure>
+
+<p>⚠️ <strong><code>MetaspaceSize</code> 是「首次触发 GC 的阈值」，不是初始分配的容量。</strong> 这是个非常容易误解的点。</p>
+<p><strong>强烈建议设置 <code>MaxMetaspaceSize</code></strong>，否则元空间无限增长会耗尽整机内存，触发系统 OOM Killer（比 OOM 异常更难排查）。</p>
+<h3 id="3-3-什么时候会发生类卸载"><a href="#3-3-什么时候会发生类卸载" class="headerlink" title="3.3 什么时候会发生类卸载"></a>3.3 什么时候会发生类卸载</h3><p>关键：<strong>类卸载不是独立触发的，它依附于 GC。</strong></p>
+<table>
+<thead>
+<tr>
+<th>GC 类型</th>
+<th>是否卸载类</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Young GC（Minor GC）</td>
+<td>❌ 不卸载</td>
+</tr>
+<tr>
+<td>Full GC（Serial&#x2F;Parallel&#x2F;CMS）</td>
+<td>✅ 卸载</td>
+</tr>
+<tr>
+<td>CMS 并发周期</td>
+<td>✅（<code>-XX:+CMSClassUnloadingEnabled</code>，JDK 8 默认开）</td>
+</tr>
+<tr>
+<td>G1 并发标记周期</td>
+<td>✅（<code>-XX:+ClassUnloadingWithConcurrentMark</code>，默认开）</td>
+</tr>
+<tr>
+<td>ZGC &#x2F; Shenandoah 并发周期</td>
+<td>✅（并发类卸载）</td>
+</tr>
+</tbody></table>
+<p><strong>所以：如果你的应用长期没有 Full GC（比如用了 G1 + 大堆 + 低分配率），Metaspace 里的垃圾类就不会被回收！</strong></p>
+<p>这是一个隐蔽的坑：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">应用长期只做 Young GC</span><br><span class="line">  -&gt; 没有并发标记周期 / Full GC</span><br><span class="line">  -&gt; 类卸载不发生</span><br><span class="line">  -&gt; Metaspace 持续增长</span><br><span class="line">  -&gt; MetaspaceSize 触发的 &quot;Full GC&quot; 其实是 &quot;Metadata GC Threshold&quot;</span><br></pre></td></tr></table></figure>
+
+<p>实际上 JVM 会在 Metaspace 达到阈值时主动触发 GC（称为 <code>GCLocker</code> &#x2F; <code>Metadata GC Threshold</code>），日志里能看到：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">[Full GC (Metadata GC Threshold) ...]</span><br></pre></td></tr></table></figure>
+
+<p>但这类 GC 的<strong>类卸载效果依赖具体回收器</strong>。G1 上 <code>ClassUnloadingWithConcurrentMark</code> 默认开启，效果较好；CMS 需要显式开启 <code>CMSClassUnloadingEnabled</code>（JDK 8 默认开）。</p>
+<h3 id="3-4-观察类卸载"><a href="#3-4-观察类卸载" class="headerlink" title="3.4 观察类卸载"></a>3.4 观察类卸载</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 打印类加载/卸载统计（需要 -XX:+TraceClassLoading / -XX:+TraceClassUnloading）</span></span><br><span class="line">-XX:+TraceClassLoading</span><br><span class="line">-XX:+TraceClassUnloading</span><br><span class="line">-Xlog:class+load=info:file=classload.log        <span class="comment"># JDK 9+</span></span><br><span class="line">-Xlog:class+unload=info:file=classunload.log</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. 看累计加载/卸载数</span></span><br><span class="line">jstat -class &lt;pid&gt; 1000</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">Loaded  Bytes  Unloaded  Bytes     Time</span><br><span class="line"> 45231  89234.5     1234   2312.3    12.34</span><br></pre></td></tr></table></figure>
+
+<p><strong><code>Unloaded</code> 长期为 0 是一个危险信号</strong>：说明类从来没有被卸载过，Metaspace 只会涨不会落。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 3. 看 Metaspace 使用</span></span><br><span class="line">jstat -gc &lt;pid&gt;</span><br><span class="line"><span class="comment"># M（Metaspace 使用量）、CCS（压缩类空间）、MC（Metaspace 容量）、MU（Metaspace 已用）</span></span><br><span class="line"></span><br><span class="line">jcmd &lt;pid&gt; VM.metaspace</span><br></pre></td></tr></table></figure>
+
+<p>输出（JDK 11+）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">Metaspace Utilization (used, committed, reserved):</span><br><span class="line">  Non-class:     12.34 MB used,  14.00 MB committed,  1.03 GB reserved.</span><br><span class="line">      Class:     45.67 MB used,  48.00 MB committed,  1.03 GB reserved.</span><br><span class="line">       Both:     58.01 MB used,  62.00 MB committed,  1.03 GB reserved.</span><br><span class="line"></span><br><span class="line">Virtual space:</span><br><span class="line">  Chunk freelists: ...</span><br><span class="line">Non-class space:  15 chunks (of which 3 free)</span><br><span class="line">Class space:      30 chunks (of which 0 free)</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-5-深入：Metaspace-的内存管理"><a href="#3-5-深入：Metaspace-的内存管理" class="headerlink" title="3.5 深入：Metaspace 的内存管理"></a>3.5 深入：Metaspace 的内存管理</h3><p>JDK 8+ 的 Metaspace 用 <strong>Virtual Space List + Chunk</strong> 管理：</p>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Virtual Space</td>
+<td>向 OS 申请的内存区域（<code>mmap</code>），按 Chunk 切分</td>
+</tr>
+<tr>
+<td>Chunk</td>
+<td>基本分配单位，分 4 类：Class Space、Specialized、Small、Medium、Humongous</td>
+</tr>
+<tr>
+<td>Class Space</td>
+<td>存放 <code>Klass</code> 结构等，<strong>不会被复用</strong>（释放后整个 chunk 归还）</td>
+</tr>
+<tr>
+<td>Non-class Space</td>
+<td>方法元数据、常量池等，<strong>可以复用</strong>（通过 freelist）</td>
+</tr>
+</tbody></table>
+<p><strong>关键差异</strong>：</p>
+<ul>
+<li><strong>Class Space 不可复用</strong>：卸载一个类，只是标记 chunk 里的空间空闲，<strong>但 chunk 本身只有在整个 chunk 都空时才归还</strong>；如果 chunk 里有一个类泄漏，整个 chunk 无法释放；</li>
+<li><strong>Non-class Space 可复用</strong>：通过 freelist 复用，碎片化容忍度更高。</li>
+</ul>
+<p>这解释了为什么**「只泄漏少数几个类」也可能导致 Class Space 持续增长**——因为 chunk 粒度是 4KB~1MB（取决于类型）。</p>
+<hr>
+<h2 id="四、ClassLoader-泄漏的六大根因"><a href="#四、ClassLoader-泄漏的六大根因" class="headerlink" title="四、ClassLoader 泄漏的六大根因"></a>四、ClassLoader 泄漏的六大根因</h2><h3 id="4-1-ThreadLocal-未清理（最常见）"><a href="#4-1-ThreadLocal-未清理（最常见）" class="headerlink" title="4.1 ThreadLocal 未清理（最常见）"></a>4.1 ThreadLocal 未清理（最常见）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 泄漏</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">UserContext</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> ThreadLocal&lt;MyClassLoader&gt; HOLDER = <span class="keyword">new</span> <span class="title class_">ThreadLocal</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">set</span><span class="params">(MyClassLoader cl)</span> &#123;</span><br><span class="line">        HOLDER.set(cl);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 没有 remove() 方法！</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>为什么泄漏：<strong>线程池的线程会长期存活</strong>，<code>Thread.threadLocals</code> → <code>ThreadLocalMap.Entry</code> → <code>value</code>（ClassLoader）形成强引用链。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ✅ 正确：使用后清理</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    UserContext.set(cl);</span><br><span class="line">    doWork();</span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    UserContext.remove();   <span class="comment">// 必须！</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>更强的实践</strong>：ThreadLocal 存的值本身用 <strong>WeakReference</strong> 包一层，或者干脆不要在线程级上下文里存 ClassLoader。</p>
+<h3 id="4-2-线程的-contextClassLoader-未恢复"><a href="#4-2-线程的-contextClassLoader-未恢复" class="headerlink" title="4.2 线程的 contextClassLoader 未恢复"></a>4.2 线程的 contextClassLoader 未恢复</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 泄漏</span></span><br><span class="line"><span class="type">Thread</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">    Thread.currentThread().setContextClassLoader(myClassLoader);</span><br><span class="line">    <span class="comment">// 线程结束后没有恢复，如果线程来自线程池 -&gt; 泄漏</span></span><br><span class="line">&#125;);</span><br></pre></td></tr></table></figure>
+
+<p><strong>Tomcat 的经典泄漏就包含这一条</strong>。Tomcat 在 webapp 卸载时会检查：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">The web application [/app] created a ThreadLocal with key of type [...] </span><br><span class="line">and a value of type [...] but failed to remove it when the web application </span><br><span class="line">was stopped. This is very likely to create a memory leak.</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-静态字段持有-Class-ClassLoader"><a href="#4-3-静态字段持有-Class-ClassLoader" class="headerlink" title="4.3 静态字段持有 Class &#x2F; ClassLoader"></a>4.3 静态字段持有 Class &#x2F; ClassLoader</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 各种静态缓存</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> List&lt;Class&lt;?&gt;&gt; ALL_CLASSES = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Map&lt;String, Object&gt; BEAN_CACHE = <span class="keyword">new</span> <span class="title class_">HashMap</span>&lt;&gt;();</span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Set&lt;Method&gt; METHODS = <span class="keyword">new</span> <span class="title class_">HashSet</span>&lt;&gt;();</span><br></pre></td></tr></table></figure>
+
+<p><strong>排查思路</strong>：任何 <code>static</code> 的 <code>Map</code>&#x2F;<code>List</code>&#x2F;<code>Set</code>&#x2F;<code>Cache</code>，如果 key 或 value 是 <code>Class</code>&#x2F;<code>Method</code>&#x2F;<code>Field</code>&#x2F;<code>Constructor</code>&#x2F;<code>ClassLoader</code>，都是高危。</p>
+<p><strong>正确的替代</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ✅ 用弱引用</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Map&lt;Class&lt;?&gt;, Object&gt; CACHE = <span class="keyword">new</span> <span class="title class_">WeakHashMap</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 用 ClassLoader 的弱引用</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Map&lt;String, Method&gt; METHOD_CACHE = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 用 Caffeine 设置 weakKeys</span></span><br><span class="line">Cache&lt;Class&lt;?&gt;, Object&gt; cache = Caffeine.newBuilder()</span><br><span class="line">        .weakKeys()</span><br><span class="line">        .weakValues()</span><br><span class="line">        .build();</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-4-未关闭的资源"><a href="#4-4-未关闭的资源" class="headerlink" title="4.4 未关闭的资源"></a>4.4 未关闭的资源</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 注册了 Driver 但没注销</span></span><br><span class="line">DriverManager.registerDriver(<span class="keyword">new</span> <span class="title class_">MyDriver</span>());   <span class="comment">// DriverManager 是 bootstrap 加载的，</span></span><br><span class="line">                                                <span class="comment">// 它持有 MyDriver 实例 -&gt; 持有 ClassLoader</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ Tomcat 卸载 webapp 时会自动清理 DriverManager</span></span><br><span class="line"><span class="comment">// 手动清理：</span></span><br><span class="line">Enumeration&lt;Driver&gt; drivers = DriverManager.getDrivers();</span><br><span class="line"><span class="keyword">while</span> (drivers.hasMoreElements()) &#123;</span><br><span class="line">    <span class="type">Driver</span> <span class="variable">d</span> <span class="operator">=</span> drivers.nextElement();</span><br><span class="line">    <span class="keyword">if</span> (d.getClass().getClassLoader() == myClassLoader) &#123;</span><br><span class="line">        DriverManager.deregisterDriver(d);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>其他未关闭资源：<code>Timer</code>、<code>Thread</code>、<code>ScheduledExecutorService</code>、<code>Selector</code>、<code>JMX MBean</code>、<code>URLStreamHandlerFactory</code>、<code>Logger</code>（Logback 的 LoggerContext）。</p>
+<h3 id="4-5-动态生成的类（Lambda-代理-CGLIB）"><a href="#4-5-动态生成的类（Lambda-代理-CGLIB）" class="headerlink" title="4.5 动态生成的类（Lambda &#x2F; 代理 &#x2F; CGLIB）"></a>4.5 动态生成的类（Lambda &#x2F; 代理 &#x2F; CGLIB）</h3><p>这是<strong>现代 Java 应用最常见的隐性来源</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>是否可卸载</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CGLIB 代理类</td>
+<td>✅（需自己缓存）</td>
+<td>每次 <code>Enhancer.create()</code> 都可能生成新类</td>
+</tr>
+<tr>
+<td>JDK 动态代理</td>
+<td>✅（有内置缓存）</td>
+<td><code>Proxy.newProxyInstance</code> 有 <code>proxyClassCache</code>（弱引用）</td>
+</tr>
+<tr>
+<td>Lambda</td>
+<td>✅（JDK 15+ 隐藏类）</td>
+<td>隐藏类是弱引用，可被卸载</td>
+</tr>
+<tr>
+<td>ASM&#x2F;ByteBuddy 生成类</td>
+<td>✅（需自己管理）</td>
+<td>频繁生成会撑爆 Metaspace</td>
+</tr>
+<tr>
+<td>ScriptEngine 编译的类</td>
+<td>⚠️</td>
+<td>每次 <code>eval</code> 都可能生成新类</td>
+</tr>
+<tr>
+<td>JSP 编译的类</td>
+<td>⚠️</td>
+<td>JSP 改动后旧类需卸载</td>
+</tr>
+</tbody></table>
+<p><strong>CGLIB 的经典坑</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 每次调用都创建新的 Enhancer</span></span><br><span class="line"><span class="keyword">public</span> Object <span class="title function_">createProxy</span><span class="params">(Class&lt;?&gt; target)</span> &#123;</span><br><span class="line">    <span class="type">Enhancer</span> <span class="variable">enhancer</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Enhancer</span>();</span><br><span class="line">    enhancer.setSuperclass(target);</span><br><span class="line">    enhancer.setCallback(<span class="keyword">new</span> <span class="title class_">MyInterceptor</span>());</span><br><span class="line">    <span class="keyword">return</span> enhancer.create();   <span class="comment">// 每次都生成新类！Metaspace 爆炸</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 缓存 Enhancer（CGLIB 内部有 AbstractClassGenerator 的缓存，但要正确配置）</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">final</span> Map&lt;Class&lt;?&gt;, Enhancer&gt; enhancerCache = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br></pre></td></tr></table></figure>
+
+<p><strong>脚本引擎的坑</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 每次 eval 都新建引擎并编译</span></span><br><span class="line"><span class="type">ScriptEngine</span> <span class="variable">engine</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ScriptEngineManager</span>().getEngineByName(<span class="string">&quot;nashorn&quot;</span>);</span><br><span class="line">engine.eval(script);   <span class="comment">// 编译出的类无法释放（引擎持有）</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 复用引擎 + 显式清理</span></span><br><span class="line"><span class="comment">// 或改用 Invocable 缓存 CompiledScript</span></span><br><span class="line"><span class="type">CompiledScript</span> <span class="variable">compiled</span> <span class="operator">=</span> ((Compilable) engine).compile(script);</span><br></pre></td></tr></table></figure>
+
+<p>**JDK 15+ 的隐藏类（Hidden Class）**是重要改进：Lambda、方法引用生成的类通过 <code>Lookup.defineHiddenClass</code> 定义，<strong>不可被反射发现、天然可卸载</strong>，这解决了一大批 Lambda 泄漏问题。</p>
+<h3 id="4-6-缓存与框架"><a href="#4-6-缓存与框架" class="headerlink" title="4.6 缓存与框架"></a>4.6 缓存与框架</h3><table>
+<thead>
+<tr>
+<th>框架&#x2F;组件</th>
+<th>泄漏点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Spring</td>
+<td><code>defaultListableBeanFactory</code> 的 beanDefinitionNames（应用中持有一个就全泄漏）</td>
+</tr>
+<tr>
+<td>MyBatis</td>
+<td><code>Configuration.mappedStatements</code></td>
+</tr>
+<tr>
+<td>Logback</td>
+<td><code>LoggerContext</code> 里的 loggerCache</td>
+</tr>
+<tr>
+<td>注册中心客户端</td>
+<td>心跳线程持有 ClassLoader</td>
+</tr>
+<tr>
+<td>分布式追踪</td>
+<td>增强的类 + ThreadLocal 上下文</td>
+</tr>
+<tr>
+<td>Jackson</td>
+<td><code>TypeFactory</code> 的缓存（对 <code>Class</code> 有引用）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="五、排查方法论"><a href="#五、排查方法论" class="headerlink" title="五、排查方法论"></a>五、排查方法论</h2><h3 id="5-1-第一步：确认是-Metaspace-问题"><a href="#5-1-第一步：确认是-Metaspace-问题" class="headerlink" title="5.1 第一步：确认是 Metaspace 问题"></a>5.1 第一步：确认是 Metaspace 问题</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 看 Metaspace 使用趋势</span></span><br><span class="line">jstat -gc &lt;pid&gt; 5000</span><br><span class="line"><span class="comment"># MC / MU 持续增长且 Unloaded=0 -&gt; 确认</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 看 GC 日志里的 Metaspace 变化</span></span><br><span class="line">grep -i <span class="string">&quot;metaspace&quot;</span> gc.log | <span class="built_in">tail</span> -20</span><br></pre></td></tr></table></figure>
+
+<p>GC 日志（JDK 9+ 统一日志）示例：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">[2.345s][info][gc,heap,exit] Heap</span><br><span class="line">[2.345s][info][gc,metaspace] Metaspace: 45231K(46208K)-&gt;45120K(46208K)</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-第二步：看类加载统计"><a href="#5-2-第二步：看类加载统计" class="headerlink" title="5.2 第二步：看类加载统计"></a>5.2 第二步：看类加载统计</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">jcmd &lt;pid&gt; GC.class_stats</span><br><span class="line"><span class="comment"># 需要 -XX:+UnlockDiagnosticVMOptions</span></span><br></pre></td></tr></table></figure>
+
+<p>输出按 ClassLoader 分组的类数量：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">Index Super InstBytes KlassBytes annotations ... ClassName</span><br><span class="line">...</span><br><span class="line"># ClassLoader 级别的统计更直观</span><br></pre></td></tr></table></figure>
+
+<p>更实用的是 <code>jcmd &lt;pid&gt; VM.classloader_stats</code>（JDK 11+）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">ClassLoader         Parent              CLD*               Classes   ChunkSz   BlockSz  Type</span><br><span class="line">0x0000000000000000  0x0000000000000000  0x00007f...       1024      65536     57344    &lt;boot&gt;</span><br><span class="line">0x00007f1234abc000  0x0000000000000000  0x00007f...        312      32768     28672    MyClassLoader@0x...</span><br></pre></td></tr></table></figure>
+
+<p><strong>找到 Classes 数量多、且不断增长的 ClassLoader</strong>，就是嫌疑对象。</p>
+<h3 id="5-3-第三步：Heap-Dump-MAT-分析"><a href="#5-3-第三步：Heap-Dump-MAT-分析" class="headerlink" title="5.3 第三步：Heap Dump + MAT 分析"></a>5.3 第三步：Heap Dump + MAT 分析</h3><p>这是<strong>最有效</strong>的手段：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">jmap -dump:live,format=b,file=heap.hprof &lt;pid&gt;</span><br><span class="line"><span class="comment"># 或用 jcmd（更安全，不 STW 太久）</span></span><br><span class="line">jcmd &lt;pid&gt; GC.heap_dump /tmp/heap.hprof</span><br></pre></td></tr></table></figure>
+
+<p><strong>MAT 排查路径</strong>：</p>
+<ol>
+<li><strong>Histogram</strong> → 搜索 <code>ClassLoader</code> 子类，看实例数；</li>
+<li><strong>Dominator Tree</strong> → 找最大的对象，看是谁持有 ClassLoader；</li>
+<li><strong>Path to GC Roots</strong>（<strong>排除弱引用</strong>）→ 找到强引用链：<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">MyClassLoader</span><br><span class="line">  &lt;- value of ThreadLocalMap$Entry (thread: pool-1-thread-3)</span><br><span class="line">    &lt;- threadLocals of Thread</span><br><span class="line">      &lt;- worker of ThreadPoolExecutor</span><br><span class="line">        &lt;- static field of Executors  ❌ 泄漏根因</span><br></pre></td></tr></table></figure></li>
+</ol>
+<p><strong>核心技巧：一定要画 GC Roots 路径（Path to GC Roots → exclude weak&#x2F;soft references）</strong>，MAT 会直接告诉你谁在引用。</p>
+<h3 id="5-4-第四步：JFR-记录类卸载"><a href="#5-4-第四步：JFR-记录类卸载" class="headerlink" title="5.4 第四步：JFR 记录类卸载"></a>5.4 第四步：JFR 记录类卸载</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-XX:StartFlightRecording=duration=300s,filename=app.jfr,settings=profile</span><br></pre></td></tr></table></figure>
+
+<p>在 JMC 里看 <code>Class Loading</code> &#x2F; <code>Class Unloading</code> 事件，找出生成类最多的来源。</p>
+<h3 id="5-5-第五步：Arthas-快速定位"><a href="#5-5-第五步：Arthas-快速定位" class="headerlink" title="5.5 第五步：Arthas 快速定位"></a>5.5 第五步：Arthas 快速定位</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 类加载器统计</span></span><br><span class="line">classloader -t</span><br><span class="line"><span class="comment"># 输出 ClassLoader 树 + 每个加载了多少类</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 反查某个类由哪个 ClassLoader 加载</span></span><br><span class="line">sc -d com.example.MyClass | grep classLoaderHash</span><br><span class="line"></span><br><span class="line"><span class="comment"># 查看 ClassLoader 加载的所有类</span></span><br><span class="line">classloader -a -c &lt;classLoaderHash&gt;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 查看类的来源（哪个 jar）</span></span><br><span class="line">classloader -c &lt;<span class="built_in">hash</span>&gt; -r com/example/MyClass.class</span><br></pre></td></tr></table></figure>
+
+<p><strong>Arthas 的 <code>classloader -t</code> 是排查泄漏的快速入口</strong>，能一眼看出哪个 ClassLoader 加载了几万个类。</p>
+<h3 id="5-6-第六步：监控告警"><a href="#5-6-第六步：监控告警" class="headerlink" title="5.6 第六步：监控告警"></a>5.6 第六步：监控告警</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"># Prometheus + Micrometer</span><br><span class="line">jvm_classes_loaded_classes           # 已加载类数</span><br><span class="line">jvm_classes_unloaded_classes_total   # 累计卸载类数</span><br><span class="line">jvm_memory_used_bytes&#123;area=&quot;nonheap&quot;,id=&quot;Metaspace&quot;&#125;</span><br><span class="line"></span><br><span class="line"># 告警规则</span><br><span class="line">- alert: MetaspaceGrowing</span><br><span class="line">  expr: jvm_memory_used_bytes&#123;id=&quot;Metaspace&quot;&#125; &gt; 400e6</span><br><span class="line">        and delta(jvm_classes_loaded_classes[1h]) &gt; 1000</span><br></pre></td></tr></table></figure>
+
+<p><strong>指标设计要点</strong>：看**「类加载数增速」<strong>比看</strong>「Metaspace 绝对值」**更早发现问题。</p>
+<hr>
+<h2 id="六、实战：一次-Tomcat-频繁-reload-导致-Metaspace-OOM"><a href="#六、实战：一次-Tomcat-频繁-reload-导致-Metaspace-OOM" class="headerlink" title="六、实战：一次 Tomcat 频繁 reload 导致 Metaspace OOM"></a>六、实战：一次 Tomcat 频繁 reload 导致 Metaspace OOM</h2><h3 id="6-1-现象"><a href="#6-1-现象" class="headerlink" title="6.1 现象"></a>6.1 现象</h3><p>测试环境每次发布（Tomcat reload）后，Metaspace 增长 40MB 不回落；连续发布 12 次后，<code>java.lang.OutOfMemoryError: Metaspace</code>。</p>
+<h3 id="6-2-排查"><a href="#6-2-排查" class="headerlink" title="6.2 排查"></a>6.2 排查</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">$ jstat -class 12345</span><br><span class="line">Loaded  Bytes   Unloaded  Bytes   Time</span><br><span class="line">185432  372891  0        0.0     0.00</span><br></pre></td></tr></table></figure>
+
+<p><strong>Unloaded &#x3D; 0</strong>，12 次 reload 一个类都没卸载。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">$ jcmd 12345 VM.classloader_stats | <span class="built_in">head</span> -20</span><br><span class="line">ClassLoader             Classes   ChunkSz   BlockSz</span><br><span class="line">&lt;bootstrap&gt;             1024      65536     57344</span><br><span class="line">WebappClassLoader@1a2b   4213     262144    245760</span><br><span class="line">WebappClassLoader@3c4d   4198     262144    245760</span><br><span class="line">WebappClassLoader@5e6f   4189     262144    245760</span><br><span class="line">... (12 个 WebappClassLoader，每个都还活着)</span><br></pre></td></tr></table></figure>
+
+<p><strong>12 个 WebappClassLoader 全部存活</strong>，说明每次 reload 旧 ClassLoader 都没被回收。</p>
+<h3 id="6-3-定位引用链"><a href="#6-3-定位引用链" class="headerlink" title="6.3 定位引用链"></a>6.3 定位引用链</h3><p>Heap Dump + MAT “Path to GC Roots”：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">WebappClassLoader@1a2b</span><br><span class="line">  &lt;- contextClassLoader of Thread &quot;pool-2-thread-7&quot;</span><br><span class="line">    &lt;- (thread is alive, from a leaked ExecutorService)</span><br><span class="line">      &lt;- executor field of MyScheduledTask</span><br><span class="line">        &lt;- static field SCHEDULER of com.example.TaskManager  (WebappClassLoader 加载)</span><br><span class="line">          &lt;- (循环)</span><br></pre></td></tr></table></figure>
+
+<p>同时 MAT 发现：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">MyUserContext</span><br><span class="line">  &lt;- value of ThreadLocalMap$Entry</span><br><span class="line">    &lt;- threadLocals of Thread &quot;http-nio-8080-exec-5&quot;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-4-根因（三个叠加）"><a href="#6-4-根因（三个叠加）" class="headerlink" title="6.4 根因（三个叠加）"></a>6.4 根因（三个叠加）</h3><ol>
+<li><strong>静态 <code>ScheduledExecutorService</code> 未关闭</strong>：<code>TaskManager.SCHEDULER</code> 是静态字段，webapp 停止时没有 <code>shutdownNow()</code>，线程一直活着，线程的 <code>contextClassLoader</code> 指向旧 WebappClassLoader；</li>
+<li><strong>ThreadLocal 未 remove</strong>：<code>MyUserContext</code> 里的 ThreadLocal 在线程池线程上残留，value 持有业务类；</li>
+<li><strong>JDBC 驱动未注销</strong>：自定义 Driver 被注册到 <code>DriverManager</code>（Bootstrap 加载），持有 WebappClassLoader。</li>
+</ol>
+<h3 id="6-5-治理"><a href="#6-5-治理" class="headerlink" title="6.5 治理"></a>6.5 治理</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 修复 1：实现 ServletContextListener，在 contextDestroyed 中释放所有资源</span></span><br><span class="line"><span class="meta">@WebListener</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ResourceCleanupListener</span> <span class="keyword">implements</span> <span class="title class_">ServletContextListener</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">contextDestroyed</span><span class="params">(ServletContextEvent sce)</span> &#123;</span><br><span class="line">        <span class="comment">// ① 关闭线程池</span></span><br><span class="line">        TaskManager.shutdown();</span><br><span class="line"></span><br><span class="line">        <span class="comment">// ② 注销 JDBC 驱动</span></span><br><span class="line">        <span class="type">ClassLoader</span> <span class="variable">cl</span> <span class="operator">=</span> Thread.currentThread().getContextClassLoader();</span><br><span class="line">        Enumeration&lt;Driver&gt; drivers = DriverManager.getDrivers();</span><br><span class="line">        <span class="keyword">while</span> (drivers.hasMoreElements()) &#123;</span><br><span class="line">            <span class="type">Driver</span> <span class="variable">driver</span> <span class="operator">=</span> drivers.nextElement();</span><br><span class="line">            <span class="keyword">if</span> (driver.getClass().getClassLoader() == cl) &#123;</span><br><span class="line">                <span class="keyword">try</span> &#123;</span><br><span class="line">                    DriverManager.deregisterDriver(driver);</span><br><span class="line">                &#125; <span class="keyword">catch</span> (SQLException e) &#123;</span><br><span class="line">                    log.warn(<span class="string">&quot;deregister driver failed&quot;</span>, e);</span><br><span class="line">                &#125;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// ③ 清理 Logback LoggerContext</span></span><br><span class="line">        <span class="type">LoggerContext</span> <span class="variable">loggerContext</span> <span class="operator">=</span> (LoggerContext) LoggerFactory.getILoggerFactory();</span><br><span class="line">        loggerContext.stop();</span><br><span class="line"></span><br><span class="line">        <span class="comment">// ④ 关闭 Timer / 网络客户端</span></span><br><span class="line">        HttpClientHolder.close();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 修复 2：ThreadLocal 必须 remove</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">MyUserContext</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> ThreadLocal&lt;Context&gt; HOLDER = <span class="keyword">new</span> <span class="title class_">ThreadLocal</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">set</span><span class="params">(Context ctx)</span> &#123; HOLDER.set(ctx); &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> Context <span class="title function_">get</span><span class="params">()</span> &#123; <span class="keyword">return</span> HOLDER.get(); &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">clear</span><span class="params">()</span> &#123; HOLDER.remove(); &#125;   <span class="comment">// ✅ 关键</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 修复 3：filter 里保证清理</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ContextFilter</span> <span class="keyword">implements</span> <span class="title class_">Filter</span> &#123;</span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">doFilter</span><span class="params">(ServletRequest req, ServletResponse res, FilterChain chain)</span></span><br><span class="line">            <span class="keyword">throws</span> IOException, ServletException &#123;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            MyUserContext.set(buildContext(req));</span><br><span class="line">            chain.doFilter(req, res);</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            MyUserContext.clear();   <span class="comment">// ✅ 无论如何都清理</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-6-效果"><a href="#6-6-效果" class="headerlink" title="6.6 效果"></a>6.6 效果</h3><p>修复后：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">$ jstat -class 12345</span><br><span class="line">Loaded  Bytes   Unloaded  Bytes   Time</span><br><span class="line">185432  372891  41203     82311   45.67</span><br></pre></td></tr></table></figure>
+
+<p><strong>Unloaded 从 0 变成 4 万+</strong>，每次 reload 后 Metaspace 回落到基线，连续发布 30 次无异常。</p>
+<hr>
+<h2 id="七、预防清单"><a href="#七、预防清单" class="headerlink" title="七、预防清单"></a>七、预防清单</h2><table>
+<thead>
+<tr>
+<th>类别</th>
+<th>检查项</th>
+<th>做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>参数</td>
+<td>设置上限</td>
+<td><code>-XX:MaxMetaspaceSize=512m</code>（必须！）</td>
+</tr>
+<tr>
+<td>参数</td>
+<td>打点卸载日志</td>
+<td><code>-Xlog:class+unload=info:file=unload.log</code></td>
+</tr>
+<tr>
+<td>参数</td>
+<td>保证类卸载</td>
+<td>G1 默认开 <code>ClassUnloadingWithConcurrentMark</code>；CMS 显式开 <code>CMSClassUnloadingEnabled</code></td>
+</tr>
+<tr>
+<td>编码</td>
+<td>静态缓存</td>
+<td>禁止缓存 <code>Class</code>&#x2F;<code>Method</code>&#x2F;<code>ClassLoader</code>；必须缓存用 <code>WeakHashMap</code>&#x2F;<code>weakKeys</code></td>
+</tr>
+<tr>
+<td>编码</td>
+<td>ThreadLocal</td>
+<td>所有 <code>set</code> 必须有配对的 <code>remove</code>，用 try-finally 或 Filter&#x2F;AOP 保证</td>
+</tr>
+<tr>
+<td>编码</td>
+<td>线程池</td>
+<td>自建线程池必须有 <code>shutdown</code> 钩子（<code>contextDestroyed</code>&#x2F;<code>@PreDestroy</code>）</td>
+</tr>
+<tr>
+<td>编码</td>
+<td>资源注册</td>
+<td><code>DriverManager</code>、JMX、<code>URLStreamHandlerFactory</code> 注册后必须注销</td>
+</tr>
+<tr>
+<td>编码</td>
+<td>动态类</td>
+<td>CGLIB&#x2F;ASM 生成类必须缓存；脚本引擎复用</td>
+</tr>
+<tr>
+<td>监控</td>
+<td>指标</td>
+<td>监控 <code>jvm_classes_loaded_classes</code> 增速 + Metaspace 使用量</td>
+</tr>
+<tr>
+<td>监控</td>
+<td>告警</td>
+<td><code>Unloaded=0</code> 且 <code>Loaded</code> 持续增长 &gt; 1 小时即告警</td>
+</tr>
+<tr>
+<td>测试</td>
+<td>验证</td>
+<td>压测&#x2F;多次 reload 后检查 Metaspace 是否回落</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="八、面试追问集"><a href="#八、面试追问集" class="headerlink" title="八、面试追问集"></a>八、面试追问集</h2><p><strong>Q1：Java 的类什么时候会被卸载？</strong></p>
+<blockquote>
+<p>三个条件必须同时满足：① 该类的所有实例都已被回收；② 该类的 <code>Class</code> 对象没有被任何地方引用（反射、静态缓存等）；③ 加载该类的 <code>ClassLoader</code> 已被回收。因为 JVM 只能以「ClassLoader + 其加载的所有类」为单位卸载，所以本质是 <strong>ClassLoader 被回收</strong>。</p>
+</blockquote>
+<p><strong>Q2：类卸载和 GC 是什么关系？</strong></p>
+<blockquote>
+<p>类卸载<strong>依附于 GC</strong>，且只有在能进行<strong>并发标记&#x2F;Full GC</strong> 的回收阶段才会执行。Young GC 不卸载类。G1 通过 <code>-XX:+ClassUnloadingWithConcurrentMark</code>（默认开）在并发标记周期卸载；CMS 需要 <code>-XX:+CMSClassUnloadingEnabled</code>。<strong>如果应用长期没有并发标记周期，即使有垃圾类也不会被卸载。</strong></p>
+</blockquote>
+<p><strong>Q3：PermGen 和 Metaspace 有什么区别？</strong></p>
+<blockquote>
+<p>PermGen 在堆内，大小受限（<code>MaxPermSize</code>），Full GC 时回收，容易 <code>PermGen space</code> OOM；Metaspace 在<strong>本地内存</strong>，默认无上限（必须设 <code>MaxMetaspaceSize</code>！），用 Virtual Space + Chunk 管理，其中 Class Space 的 chunk 不可复用、Non-class Space 可复用。</p>
+</blockquote>
+<p><strong>Q4：类加载器和类互相引用，为什么还能被回收？</strong></p>
+<blockquote>
+<p>因为 JVM 用的是<strong>可达性分析</strong>而非引用计数。只要从 GC Roots 出发找不到这个对象环，整个环就能被一起回收。关键是切断「外部到环内的引用」（如线程的 <code>contextClassLoader</code>、静态字段）。</p>
+</blockquote>
+<p><strong>Q5：怎么排查 ClassLoader 泄漏？</strong></p>
+<blockquote>
+<p>五步：① <code>jstat -class</code> 看 <code>Unloaded</code> 是否为 0；② <code>jcmd VM.classloader_stats</code> 找出类数异常且持续增长的 ClassLoader；③ <code>jcmd GC.heap_dump</code> 导出堆；④ MAT 用 <strong>Path to GC Roots（排除弱引用）</strong> 找强引用链；⑤ Arthas 的 <code>classloader -t</code> 快速看 ClassLoader 树和类数量。<strong>MAT 的 GC Roots 路径是关键，它会直接指出谁持有 ClassLoader。</strong></p>
+</blockquote>
+<p><strong>Q6：ThreadLocal 为什么会造成 ClassLoader 泄漏？</strong></p>
+<blockquote>
+<p>线程池的线程长期存活 → <code>Thread.threadLocals</code>（<code>ThreadLocalMap</code>）→ Entry 的 <code>value</code> 强引用 → 如果是 ClassLoader 或它加载的对象，就阻止了回收。<strong>注意 Entry 的 key 是弱引用（ThreadLocal 本身），但 value 是强引用，所以 key 被回收后会留下 <code>key=null</code> 的 Entry，value 依然泄漏。</strong> 所以必须手动 <code>remove()</code>。</p>
+</blockquote>
+<p><strong>Q7：Lambda 会泄漏类吗？</strong></p>
+<blockquote>
+<p>在 JDK 15 之前，Lambda 通过 <code>invokedynamic</code> + <code>LambdaMetafactory</code> 生成匿名内部类，这些类<strong>会被 ClassLoader 持有</strong>，频繁动态生成 Lambda（比如每次请求都从字符串动态生成）会累积。JDK 15+ 引入<strong>隐藏类（Hidden Class）</strong>，Lambda 生成的类不可反射发现、天然可卸载，问题大幅缓解。</p>
+</blockquote>
+<p><strong>Q8：为什么必须设置 <code>MaxMetaspaceSize</code>？</strong></p>
+<blockquote>
+<p>因为 Metaspace 默认无上限，泄漏时会一直向 OS 申请内存，最终可能触发<strong>系统 OOM Killer</strong> 杀掉进程（甚至杀掉同机其他进程），这比 <code>OutOfMemoryError</code> 更难排查。设置上限后，问题会在应用层以明确异常暴露出来。</p>
+</blockquote>
+<p><strong>Q9：<code>-XX:MetaspaceSize</code> 是初始大小吗？</strong></p>
+<blockquote>
+<p>不是！它是<strong>首次触发 Metaspace GC 的阈值</strong>（默认约 21MB）。JVM 在 Metaspace 使用量达到该值时触发一次 GC（日志里是 <code>Full GC (Metadata GC Threshold)</code>），然后根据 <code>MinMetaspaceFreeRatio</code>&#x2F;<code>MaxMetaspaceFreeRatio</code> 动态调整阈值。所以常见建议是把它设大一点（如 256m），避免启动期频繁 GC。</p>
+</blockquote>
+<p><strong>Q10：G1 和 CMS 在类卸载上有什么区别？</strong></p>
+<blockquote>
+<p>G1 默认开启 <code>ClassUnloadingWithConcurrentMark</code>，在<strong>并发标记周期</strong>就能卸载类，不需要 Full GC，停顿更短；CMS 需要 <code>CMSClassUnloadingEnabled</code>（JDK 8 默认开），在<strong>并发周期</strong>中卸载，但 CMS 被移除后（JDK 14+）已不再是选项。ZGC&#x2F;Shenandoah 也支持并发类卸载，且停顿更低。</p>
+</blockquote>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>类卸载的核心逻辑，用一张图记住：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line">┌──────────────────────────────────┐</span><br><span class="line">│  条件 1：无实例引用                │</span><br><span class="line">│  条件 2：无 Class 对象引用          │──┐</span><br><span class="line">│  条件 3：ClassLoader 被回收         │  │</span><br><span class="line">└──────────────────────────────────┘  │</span><br><span class="line">                                       ▼</span><br><span class="line">                             ClassLoader 被 GC 回收</span><br><span class="line">                                       │</span><br><span class="line">                                       ▼</span><br><span class="line">                      该类及其加载的所有类被一起卸载</span><br><span class="line">                                       │</span><br><span class="line">                                       ▼</span><br><span class="line">                          Metaspace 中对应 Chunk 可释放</span><br></pre></td></tr></table></figure>
+
+<p>三句话总结：</p>
+<ol>
+<li><strong>类卸载的单位是 ClassLoader</strong>，不是单个类；条件是「实例、Class 对象、ClassLoader 三者都不可达」；</li>
+<li><strong>类卸载依附于 GC</strong>，长期没有并发标记周期的应用，垃圾类不会被回收；</li>
+<li><strong>ClassLoader 泄漏的元凶通常是 ThreadLocal、线程池线程、静态缓存和未注销的资源</strong>，排查的杀手锏是 <strong>MAT 的 Path to GC Roots</strong>。</li>
+</ol>
+<p>最后一条工程经验：<strong>任何涉及「热部署、插件化、动态字节码」的系统，上线前必须做一次「反复加载卸载」的压力测试，并用 <code>jstat -class</code> 验证 <code>Unloaded</code> 是否正常增长。</strong> 这个测试只要 10 分钟，能提前暴露 90% 的类加载器泄漏问题。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/">https://jiweidong.github.io/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/%E7%B1%BB%E5%8A%A0%E8%BD%BD/">类加载</a><a class="post-meta__tags" href="/tags/%E7%94%9F%E4%BA%A7%E5%AE%9E%E6%88%98/">生产实战</a><a class="post-meta__tags" href="/tags/%E5%86%85%E5%AD%98%E6%B3%84%E6%BC%8F/">内存泄漏</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/09/27/mysql-innodb-read-ahead-prefetch-deep-dive/" title="【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理面试官：全表扫描为什么比走索引还快？这个问题看起来是个悖论——索引不就是为了避免全表扫描吗？ 但如果你在线上跑过这两种 SQL： 12345-- 走二级索引 + 回表SELECT * FROM t_order WHERE user_id = 1001;   -- 命中 800 万行-- 直接全表扫描SELECT * FROM t_order;                          -- 3000 万行  你会发现有时候全表扫描反而更快。原因就是：顺序 IO 有预读，随机 IO 没有。 InnoDB 的预读（Read-Ahead）机制，是一个非常容易被忽略、但在 IO 密集型场景下影响巨大的设计。这篇文章把它从原理、参数、源码到调优完整讲一遍。  一、为什么需要预读1.1 磁盘的物理特性机械硬盘（HDD）的寻道时间是毫秒级（典型 8~10ms），而连续读取 1MB 数据可能只需要几毫秒。也就是说： 12随机读：1 次 IO ≈ 1 次寻道 ≈ 10ms顺序读：1 次...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/18/java-class-initialization-order-deep-dive/" title="【Java 核心】类初始化时机与执行顺序深度解析：从 clinit 到父子类初始化陷阱"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-18</div><div class="info-item-2">【Java 核心】类初始化时机与执行顺序深度解析：从 clinit 到父子类初始化陷阱</div></div><div class="info-2"><div class="info-item-1">【Java 核心】类初始化时机与执行顺序深度解析：从 clinit 到父子类初始化陷阱面试官：这道题输出什么？123456789101112131415161718class Parent &#123;    static &#123; System.out.println(&quot;1 Parent static block&quot;); &#125;    &#123; System.out.println(&quot;2 Parent instance block&quot;); &#125;    Parent() &#123; System.out.println(&quot;3 Parent constructor&quot;); &#125;&#125;class Child extends Parent &#123;    static &#123; System.out.println(&quot;4 Child static block&quot;); &#125;    &#123; System.out.println(&quot;5 Child in...</div></div></div></a><a class="pagination-related" href="/2026/09/17/jvm-bytecode-verifier-deep-dive/" title="【JVM 底层】字节码校验机制深度解析：类型推导、StackMapTable 与 VerifyError 排查"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-17</div><div class="info-item-2">【JVM 底层】字节码校验机制深度解析：类型推导、StackMapTable 与 VerifyError 排查</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】字节码校验机制深度解析：类型推导、StackMapTable 与 VerifyError 排查面试官：Class 文件被篡改过，JVM 怎么知道？“类加载过程”是面试高频题，大多数人的回答是五步走：加载、验证、准备、解析、初始化。但一旦追问”验证阶段具体验证了什么？“，回答往往就只剩一句”验证字节码是否合法”。 再往下问一层更致命：为什么用 ASM 改完字节码，有时候跑得好好的，有时候直接 VerifyError？ 这个问题直接指向 JVM 验证器的核心机制——类型推导与 StackMapTable。 本文按”验证阶段做了什么 → 为什么需要类型检查 → 栈映射帧如何工作 → 什么情况会 VerifyError → 怎么排查”，把这条链路打通。 一、验证（Verification）到底验证什么JVM 规范把验证分成四块：    阶段 验证内容 失败异常    文件格式验证 魔数 0xCAFEBABE、版本号、常量池结构、各表项长度 ClassFormatError   元数据验证 是否有父类、是否继承 final 类、抽象方法是否实现、字段&#x2F;方法签名合法...</div></div></div></a><a class="pagination-related" href="/2026/07/29/java-memory-leak-troubleshooting-guide/" title="【生产实战】Java 应用内存泄漏排查全攻略：从堆内泄漏到 Native Memory 泄漏"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-29</div><div class="info-item-2">【生产实战】Java 应用内存泄漏排查全攻略：从堆内泄漏到 Native Memory 泄漏</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 应用内存泄漏排查全攻略：从堆内泄漏到 Native Memory 泄漏前言内存泄漏是 Java 应用最棘手的生产问题之一。与传统的 C&#x2F;C++ 不同，Java 有 GC 自动管理内存，但这并不意味着不会泄漏。实际上，Java 内存泄漏的形式更多样、更隐蔽。 典型的症状：内存占用缓慢上升 → Full GC 频繁 → 最终 OOM 或性能急剧下降。 本文系统梳理各种内存泄漏场景、排查工具链与实战案例。 一、内存泄漏的分类   类型 描述 典型场景    堆内泄漏 对象无法被 GC 回收 集合类无界增长、缓存未设上限   堆外泄漏 DirectBuffer&#x2F;Unsafe 未释放 Netty 缓冲区、NIO 操作   Native Memory 泄漏 JVM 本地内存膨胀 ClassLoader 泄漏、线程泄漏、JNI 泄漏   MetaSpace 泄漏 方法区持续增长 动态类加载、CGLIB 代理类累积   二、堆内泄漏排查2.1 典型案例：ThreadLocal 内存泄漏这是最常见的堆内泄漏场景。 12345678public class ...</div></div></div></a><a class="pagination-related" href="/2026/06/13/jvm-classloader/" title="JVM 类加载机制详解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">JVM 类加载机制详解</div></div><div class="info-2"><div class="info-item-1">JVM 类加载机制详解一、引言Java 语言之所以能够实现”一次编写，到处运行”（Write Once, Run Anywhere），核心支柱之一就是 JVM 的类加载机制（Class Loading Mechanism）。类加载器（ClassLoader）负责将 .class 字节码文件加载到 JVM 内存中，并为之生成对应的 java.lang.Class 对象。理解类加载机制，不仅是深入 JVM 的必经之路，更是解决生产环境中各种类冲突、NoClassDefFoundError、ClassNotFoundException 等疑难杂症的关键。 本文将从类加载的生命周期、ClassLoader 层次结构、双亲委派模型、打破双亲委派、自定义 ClassLoader、类卸载等方面，全面深入地剖析 JVM 类加载机制。  二、类加载的生命周期一个类从被加载到 JVM 内存中，到最终被卸载，完整经历以下 七个阶段： 123加载 → 验证 → 准备 → 解析 → 初始化 → 使用 → 卸载├── 链接（Linking）───┤├────── 类加载过程 ──────┤  其中 验证、准...</div></div></div></a><a class="pagination-related" href="/2026/08/21/java-hot-deploy-classloader-isolation-deep-dive/" title="【JVM 实战】Java 热部署与类加载器隔离深度解析：从 Tomcat 到 JRebel 与 Arthas redefine"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-21</div><div class="info-item-2">【JVM 实战】Java 热部署与类加载器隔离深度解析：从 Tomcat 到 JRebel 与 Arthas redefine</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】Java 热部署与类加载器隔离深度解析：从 Tomcat 到 JRebel 与 Arthas redefine面试官：改了代码不重启，Java 是怎么做到的？“热部署”是每个 Java 开发都离不开的日常：改一行代码，保存，页面刷新就生效了。但你真的想过它背后的机制吗？要回答这个问题，先得明白一个 JVM 铁律：一个类只能被同一个类加载器加载一次，且 JVM 不会自动重新加载已加载的类。 所以热部署的本质只有两条路：  换类加载器：用一个新的 ClassLoader 重新加载修改后的类，让新对象用新版本 改字节码：通过 JVMTI 的 redefineClasses &#x2F; retransformClasses 直接在内存中替换已加载类的字节码  今天我们就从这两条路出发，把 Tomcat、Spring Boot DevTools、JRebel、Arthas 的热部署原理一次讲透。 一、先复习：类加载器与双亲委派JVM 内置三个类加载器：    类加载器 加载范围    Bootstrap（启动类加载器） rt.jar、JDK 核心类，C++ 实现   Ex...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-classloader-parent-delegation/" title="【面试必备】Java 类加载机制与双亲委派模型：从源码到打破双亲委派"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">【面试必备】Java 类加载机制与双亲委派模型：从源码到打破双亲委派</div></div><div class="info-2"><div class="info-item-1">【面试必备】Java 类加载机制与双亲委派模型：从源码到打破双亲委派面试官：说说 Java 类加载的过程？Java 类加载是在运行时将 .class 文件中的二进制字节流加载到 JVM 内存中，经过加载 → 验证 → 准备 → 解析 → 初始化五个阶段，最终成为 JVM 可以直接使用的 Java 类的过程。 类加载的 5 个阶段12345678910┌─────────────────────────────────────────────────┐│              类加载生命周期                        ││                                                    ││  加载 → 验证 → 准备 → 解析 → 初始化 → 使用 → 卸载   ││  └──────┬───────┬───────┬───────┘                  ││         │       │       │                          ││         │    链接阶段（L...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">682</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%BA%95%E5%B1%82%E3%80%91%E7%B1%BB%E5%8D%B8%E8%BD%BD%EF%BC%88Class-Unloading%EF%BC%89%E4%B8%8E%E5%85%83%E7%A9%BA%E9%97%B4%E5%9B%9E%E6%94%B6%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AClassLoader-%E6%B3%84%E6%BC%8F%E6%8E%92%E6%9F%A5%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9AJava-%E7%9A%84%E7%B1%BB%E4%BC%9A%E8%A2%AB%E5%8D%B8%E8%BD%BD%E5%90%97%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：Java 的类会被卸载吗？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E7%B1%BB%E5%8A%A0%E8%BD%BD%E7%9A%84%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E5%9B%9E%E9%A1%BE"><span class="toc-number">1.2.</span> <span class="toc-text">一、类加载的生命周期回顾</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%B1%BB%E8%A2%AB%E5%8D%B8%E8%BD%BD%E7%9A%84%E4%B8%89%E4%B8%AA%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.3.</span> <span class="toc-text">二、类被卸载的三个条件</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E8%AF%A6%E7%BB%86%E6%8B%86%E8%A7%A3"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 详细拆解</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%80%E4%B8%AA%E5%85%B3%E9%94%AE%E7%90%86%E8%A7%A3%EF%BC%9A%E5%BE%AA%E7%8E%AF%E5%BC%95%E7%94%A8%E4%B8%8D%E6%98%AF%E9%97%AE%E9%A2%98"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 一个关键理解：循环引用不是问题</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Metaspace-%E7%9A%84%E5%9B%9E%E6%94%B6%E6%9C%BA%E5%88%B6"><span class="toc-number">1.4.</span> <span class="toc-text">三、Metaspace 的回收机制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%BB%80%E4%B9%88%E6%98%AF-Metaspace"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 什么是 Metaspace</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%85%B3%E9%94%AE%E5%8F%82%E6%95%B0"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 关键参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E4%BC%9A%E5%8F%91%E7%94%9F%E7%B1%BB%E5%8D%B8%E8%BD%BD"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 什么时候会发生类卸载</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E8%A7%82%E5%AF%9F%E7%B1%BB%E5%8D%B8%E8%BD%BD"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 观察类卸载</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-5-%E6%B7%B1%E5%85%A5%EF%BC%9AMetaspace-%E7%9A%84%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86"><span class="toc-number">1.4.5.</span> <span class="toc-text">3.5 深入：Metaspace 的内存管理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81ClassLoader-%E6%B3%84%E6%BC%8F%E7%9A%84%E5%85%AD%E5%A4%A7%E6%A0%B9%E5%9B%A0"><span class="toc-number">1.5.</span> <span class="toc-text">四、ClassLoader 泄漏的六大根因</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-ThreadLocal-%E6%9C%AA%E6%B8%85%E7%90%86%EF%BC%88%E6%9C%80%E5%B8%B8%E8%A7%81%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 ThreadLocal 未清理（最常见）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E7%BA%BF%E7%A8%8B%E7%9A%84-contextClassLoader-%E6%9C%AA%E6%81%A2%E5%A4%8D"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 线程的 contextClassLoader 未恢复</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E9%9D%99%E6%80%81%E5%AD%97%E6%AE%B5%E6%8C%81%E6%9C%89-Class-ClassLoader"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 静态字段持有 Class &#x2F; ClassLoader</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E6%9C%AA%E5%85%B3%E9%97%AD%E7%9A%84%E8%B5%84%E6%BA%90"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 未关闭的资源</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-5-%E5%8A%A8%E6%80%81%E7%94%9F%E6%88%90%E7%9A%84%E7%B1%BB%EF%BC%88Lambda-%E4%BB%A3%E7%90%86-CGLIB%EF%BC%89"><span class="toc-number">1.5.5.</span> <span class="toc-text">4.5 动态生成的类（Lambda &#x2F; 代理 &#x2F; CGLIB）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-6-%E7%BC%93%E5%AD%98%E4%B8%8E%E6%A1%86%E6%9E%B6"><span class="toc-number">1.5.6.</span> <span class="toc-text">4.6 缓存与框架</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8E%92%E6%9F%A5%E6%96%B9%E6%B3%95%E8%AE%BA"><span class="toc-number">1.6.</span> <span class="toc-text">五、排查方法论</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E7%AC%AC%E4%B8%80%E6%AD%A5%EF%BC%9A%E7%A1%AE%E8%AE%A4%E6%98%AF-Metaspace-%E9%97%AE%E9%A2%98"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 第一步：确认是 Metaspace 问题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%AC%AC%E4%BA%8C%E6%AD%A5%EF%BC%9A%E7%9C%8B%E7%B1%BB%E5%8A%A0%E8%BD%BD%E7%BB%9F%E8%AE%A1"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 第二步：看类加载统计</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%AC%AC%E4%B8%89%E6%AD%A5%EF%BC%9AHeap-Dump-MAT-%E5%88%86%E6%9E%90"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 第三步：Heap Dump + MAT 分析</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E7%AC%AC%E5%9B%9B%E6%AD%A5%EF%BC%9AJFR-%E8%AE%B0%E5%BD%95%E7%B1%BB%E5%8D%B8%E8%BD%BD"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 第四步：JFR 记录类卸载</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-5-%E7%AC%AC%E4%BA%94%E6%AD%A5%EF%BC%9AArthas-%E5%BF%AB%E9%80%9F%E5%AE%9A%E4%BD%8D"><span class="toc-number">1.6.5.</span> <span class="toc-text">5.5 第五步：Arthas 快速定位</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-6-%E7%AC%AC%E5%85%AD%E6%AD%A5%EF%BC%9A%E7%9B%91%E6%8E%A7%E5%91%8A%E8%AD%A6"><span class="toc-number">1.6.6.</span> <span class="toc-text">5.6 第六步：监控告警</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%AE%9E%E6%88%98%EF%BC%9A%E4%B8%80%E6%AC%A1-Tomcat-%E9%A2%91%E7%B9%81-reload-%E5%AF%BC%E8%87%B4-Metaspace-OOM"><span class="toc-number">1.7.</span> <span class="toc-text">六、实战：一次 Tomcat 频繁 reload 导致 Metaspace OOM</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E7%8E%B0%E8%B1%A1"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 现象</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E6%8E%92%E6%9F%A5"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 排查</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%AE%9A%E4%BD%8D%E5%BC%95%E7%94%A8%E9%93%BE"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 定位引用链</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E6%A0%B9%E5%9B%A0%EF%BC%88%E4%B8%89%E4%B8%AA%E5%8F%A0%E5%8A%A0%EF%BC%89"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 根因（三个叠加）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-5-%E6%B2%BB%E7%90%86"><span class="toc-number">1.7.5.</span> <span class="toc-text">6.5 治理</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-6-%E6%95%88%E6%9E%9C"><span class="toc-number">1.7.6.</span> <span class="toc-text">6.6 效果</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%A2%84%E9%98%B2%E6%B8%85%E5%8D%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、预防清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E9%9B%86"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问集</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/" title="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</a><time datetime="2026-09-27T00:40:00.000Z" title="发表于 2026-09-27 08:40:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/mysql-innodb-read-ahead-prefetch-deep-dive/" title="【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理</a><time datetime="2026-09-27T00:30:00.000Z" title="发表于 2026-09-27 08:30:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/rocketmq-delay-timer-message-deep-dive/" title="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</a><time datetime="2026-09-27T00:20:00.000Z" title="发表于 2026-09-27 08:20:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/tcp-backlog-syn-accept-queue-deep-dive/" title="【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞</a><time datetime="2026-09-27T00:10:00.000Z" title="发表于 2026-09-27 08:10:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/" title="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜">【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</a><time datetime="2026-09-27T00:00:00.000Z" title="发表于 2026-09-27 08:00:00">2026-09-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

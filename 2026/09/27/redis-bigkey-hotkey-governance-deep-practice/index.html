@@ -1,0 +1,525 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜面试官：线上 Redis 突然一堆慢查询，你怎么定位？这是我在面试里特别喜欢问的一道题，因为它没有办法靠背八股蒙过去。 候选人一般会说：「看 SLOWLOG，看监控，可能是网络问题。」 我会继续问：  「如果 SLOWLOG 里出现的是 DEL、HGETALL、EXPIRE，你想到什么？」 「如果是 GET">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜面试官：线上 Redis 突然一堆慢查询，你怎么定位？这是我在面试里特别喜欢问的一道题，因为它没有办法靠背八股蒙过去。 候选人一般会说：「看 SLOWLOG，看监控，可能是网络问题。」 我会继续问：  「如果 SLOWLOG 里出现的是 DEL、HGETALL、EXPIRE，你想到什么？」 「如果是 GET">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-27T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-27T00:02:04.437Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="生产实战">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜",
+  "url": "https://jiweidong.github.io/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-27T00:00:00.000Z",
+  "dateModified": "2026-09-27T00:02:04.437Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">682</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-27T00:00:00.000Z" title="发表于 2026-09-27 08:00:00">2026-09-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-27T00:02:04.437Z" title="更新于 2026-09-27 08:02:04">2026-09-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Redis/">Redis</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Redis/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-实战】大-Key-与热-Key-治理深度实战：探测、拆分、多级缓存与集群倾斜"><a href="#【Redis-实战】大-Key-与热-Key-治理深度实战：探测、拆分、多级缓存与集群倾斜" class="headerlink" title="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜"></a>【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</h1><h2 id="面试官：线上-Redis-突然一堆慢查询，你怎么定位？"><a href="#面试官：线上-Redis-突然一堆慢查询，你怎么定位？" class="headerlink" title="面试官：线上 Redis 突然一堆慢查询，你怎么定位？"></a>面试官：线上 Redis 突然一堆慢查询，你怎么定位？</h2><p>这是我在面试里特别喜欢问的一道题，因为它没有办法靠背八股蒙过去。</p>
+<p>候选人一般会说：「看 SLOWLOG，看监控，可能是网络问题。」</p>
+<p>我会继续问：</p>
+<ul>
+<li>「如果 SLOWLOG 里出现的是 <code>DEL</code>、<code>HGETALL</code>、<code>EXPIRE</code>，你想到什么？」</li>
+<li>「如果是 <code>GET</code> 本身很慢，但 key 很小呢？」</li>
+<li>「集群模式下，为什么只有某一个分片的 CPU 打满，其他节点却很闲？」</li>
+<li>「大 Key 和热 Key，治理手段是一样的吗？」</li>
+</ul>
+<p>四个问题下去，能答得清楚的人不到三成。因为<strong>大 Key 是「数据倾斜」，热 Key 是「流量倾斜」，它们的探测手段和治理手段完全不是一个体系</strong>。</p>
+<p>这篇文章把这两类问题从量化标准、探测手段、根因分析到治理方案完整拆一遍，代码可以直接拿去用。</p>
+<hr>
+<h2 id="一、先给「大」和「热」下个可量化的定义"><a href="#一、先给「大」和「热」下个可量化的定义" class="headerlink" title="一、先给「大」和「热」下个可量化的定义"></a>一、先给「大」和「热」下个可量化的定义</h2><p>面试时最忌讳的就是「很大」「很高」这种模糊描述。工程上必须有阈值，否则你没法做监控告警。</p>
+<h3 id="1-1-大-Key-的量化标准"><a href="#1-1-大-Key-的量化标准" class="headerlink" title="1.1 大 Key 的量化标准"></a>1.1 大 Key 的量化标准</h3><table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>大 Key 经验阈值</th>
+<th>危险阈值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>String</td>
+<td>value &gt; 10 KB</td>
+<td>&gt; 1 MB</td>
+<td>单个 value 建议不超过 10KB</td>
+</tr>
+<tr>
+<td>Hash &#x2F; List &#x2F; Set &#x2F; ZSet</td>
+<td>元素数 &gt; 5000</td>
+<td>&gt; 10000</td>
+<td>同时看总字节数</td>
+</tr>
+<tr>
+<td>总字节数（任意类型）</td>
+<td>&gt; 1 MB</td>
+<td>&gt; 10 MB</td>
+<td>这个最关键</td>
+</tr>
+<tr>
+<td>集合类元素平均大小</td>
+<td>&gt; 1 KB</td>
+<td>&gt; 10 KB</td>
+<td>单元素过大 &#x3D; 隐性大 Key</td>
+</tr>
+</tbody></table>
+<p>一句话版本：<strong>元素数量过万，或者总大小过 1MB，就该上治理清单了。</strong></p>
+<h3 id="1-2-热-Key-的量化标准"><a href="#1-2-热-Key-的量化标准" class="headerlink" title="1.2 热 Key 的量化标准"></a>1.2 热 Key 的量化标准</h3><p>热 Key 没有绝对标准，要看集群规模。常用的判断方式是：</p>
+<ul>
+<li>单 key QPS 占该实例总 QPS 的 <strong>10% 以上</strong>；</li>
+<li>单 key QPS 超过 <strong>1000&#x2F;s</strong>（视实例规格）；</li>
+<li>集群中某一个分片的 QPS 显著高于其他分片（比如 5 倍以上）。</li>
+</ul>
+<p>热 Key 的可怕之处在于：Redis Cluster 是按 key 的 CRC16 取模分片的，<strong>同一个 key 永远落在同一个节点上</strong>。你有 100 个分片也没用，这个 key 的流量全部打在一个分片上，本质上是一个单机 Redis 在扛。</p>
+<hr>
+<h2 id="二、大-Key-到底会造成什么问题？"><a href="#二、大-Key-到底会造成什么问题？" class="headerlink" title="二、大 Key 到底会造成什么问题？"></a>二、大 Key 到底会造成什么问题？</h2><p>很多人只知道「大 Key 会慢」，但说不清为什么慢。我把它拆成 6 类危害：</p>
+<h3 id="2-1-命令阻塞（最直接）"><a href="#2-1-命令阻塞（最直接）" class="headerlink" title="2.1 命令阻塞（最直接）"></a>2.1 命令阻塞（最直接）</h3><p>Redis 命令执行是<strong>单线程</strong>的（指命令处理主线程）。对大 Key 执行 <code>HGETALL</code>、<code>SMEMBERS</code>、<code>ZRANGE 0 -1</code>、<code>LRANGE 0 -1</code> 这类<strong>全量返回</strong>命令时，主线程要遍历整个结构并序列化响应。</p>
+<ul>
+<li>遍历 100 万元素的 Hash，耗时可达几十毫秒；</li>
+<li>期间<strong>所有其他请求全部排队</strong>；</li>
+<li>这就是 SLOWLOG 里出现 <code>HGETALL</code> 的原因。</li>
+</ul>
+<h3 id="2-2-网络带宽打满"><a href="#2-2-网络带宽打满" class="headerlink" title="2.2 网络带宽打满"></a>2.2 网络带宽打满</h3><p><code>HGETALL</code> 返回 1MB 数据，QPS 100 就是 100MB&#x2F;s。千兆网卡直接打满，然后出现大量连接超时。</p>
+<h3 id="2-3-内存分布不均（集群雪崩的伏笔）"><a href="#2-3-内存分布不均（集群雪崩的伏笔）" class="headerlink" title="2.3 内存分布不均（集群雪崩的伏笔）"></a>2.3 内存分布不均（集群雪崩的伏笔）</h3><p>集群模式下，一个大 Key 可能占几 GB，导致某个节点内存远超其他节点。<strong>内存最高的那个节点先触发 eviction 或 OOM</strong>，然后它的槽对应的数据全部不可用。</p>
+<h3 id="2-4-持久化与主从同步受影响"><a href="#2-4-持久化与主从同步受影响" class="headerlink" title="2.4 持久化与主从同步受影响"></a>2.4 持久化与主从同步受影响</h3><ul>
+<li>RDB：fork 时如果大 Key 被写入，会触发大量 COW 页复制，内存翻倍；</li>
+<li>AOF rewrite &#x2F; 全量同步：要序列化整个大 Key，传输时间长，期间主从延迟飙升。</li>
+</ul>
+<h3 id="2-5-删除阻塞"><a href="#2-5-删除阻塞" class="headerlink" title="2.5 删除阻塞"></a>2.5 删除阻塞</h3><p>这是最容易被忽略的一点：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">DEL bigkey   # 同步删除，如果是 100万元素的 Hash，可能阻塞数百毫秒</span><br></pre></td></tr></table></figure>
+
+<p><strong>正确做法是 <code>UNLINK</code></strong>（异步删除，JDK 里叫延迟释放）。Redis 4.0+ 提供 <code>UNLINK</code>，把释放动作丢给后台线程（<code>lazyfree-lazy-user-del yes</code> 可以让 <code>DEL</code> 也走异步）。</p>
+<p>同时建议开启：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">lazyfree-lazy-eviction yes</span><br><span class="line">lazyfree-lazy-expire yes</span><br><span class="line">lazyfree-lazy-server-del yes</span><br><span class="line">replica-lazy-flush yes</span><br></pre></td></tr></table></figure>
+
+<p>这样过期删除、淘汰删除、<code>FLUSHDB</code> 都不会阻塞主线程。</p>
+<h3 id="2-6-过期时间设置失败"><a href="#2-6-过期时间设置失败" class="headerlink" title="2.6 过期时间设置失败"></a>2.6 过期时间设置失败</h3><p><code>EXPIRE bigkey 3600</code> 本身很快，但如果 key 已经有很多元素且是复合类型，<strong>惰性删除 + 定期删除</strong>时会反复阻塞。配合 <code>lazyfree-lazy-expire</code> 才安全。</p>
+<hr>
+<h2 id="三、大-Key-探测：五种手段，按场景选"><a href="#三、大-Key-探测：五种手段，按场景选" class="headerlink" title="三、大 Key 探测：五种手段，按场景选"></a>三、大 Key 探测：五种手段，按场景选</h2><h3 id="3-1-redis-cli-bigkeys（最快上手）"><a href="#3-1-redis-cli-bigkeys（最快上手）" class="headerlink" title="3.1 redis-cli --bigkeys（最快上手）"></a>3.1 <code>redis-cli --bigkeys</code>（最快上手）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">redis-cli -h 127.0.0.1 -p 6379 --bigkeys</span><br></pre></td></tr></table></figure>
+
+<p>原理：<strong>SCAN 遍历所有 key，对每种类型用对应的统计命令取元素个数</strong>（如 <code>STRLEN</code>、<code>HLEN</code>、<code>LLEN</code>、<code>SCARD</code>、<code>ZCARD</code>）。</p>
+<p>输出示例：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">[00.00%] Biggest string found so far &#x27;user:1001:profile&#x27; with 10240 bytes</span><br><span class="line">[12.34%] Biggest hash   found so far &#x27;order:detail:202609&#x27; with 120000 fields</span><br><span class="line">[45.67%] Biggest list   found so far &#x27;feed:timeline:1001&#x27; with 50000 items</span><br><span class="line">-------- summary -------</span><br><span class="line">Sampled 1000000 keys in the keyspace!</span><br><span class="line">Total key length in bytes is 25000000 (avg len 25.00)</span><br><span class="line">Biggest string found &#x27;user:1001:profile&#x27; has 10240 bytes</span><br></pre></td></tr></table></figure>
+
+<p><strong>局限</strong>：</p>
+<ul>
+<li>只统计<strong>元素数量或字符串长度</strong>，不统计真实内存占用；</li>
+<li>会全量 SCAN，对线上有压力（建议从<strong>从节点</strong>执行）；</li>
+<li>Hash 的「fields 多」不代表字节大，可能每个 field 都很大。</li>
+</ul>
+<h3 id="3-2-redis-cli-memkeys（按内存排序）"><a href="#3-2-redis-cli-memkeys（按内存排序）" class="headerlink" title="3.2 redis-cli --memkeys（按内存排序）"></a>3.2 <code>redis-cli --memkeys</code>（按内存排序）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">redis-cli --memkeys --memkeys-samples 0</span><br></pre></td></tr></table></figure>
+
+<p>用 <code>MEMORY USAGE</code> 采样统计真实内存占用，比 <code>--bigkeys</code> 更准。</p>
+<h3 id="3-3-MEMORY-USAGE-精确定位"><a href="#3-3-MEMORY-USAGE-精确定位" class="headerlink" title="3.3 MEMORY USAGE 精确定位"></a>3.3 <code>MEMORY USAGE</code> 精确定位</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">MEMORY USAGE order:detail:202609</span><br><span class="line"><span class="comment"># 返回 (integer) 10485760  单位字节</span></span><br></pre></td></tr></table></figure>
+
+<p>配合 <code>SCAN</code> 做批量扫描脚本：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">redis-cli --scan --pattern <span class="string">&#x27;order:*&#x27;</span> | <span class="keyword">while</span> <span class="built_in">read</span> k; <span class="keyword">do</span></span><br><span class="line">  size=$(redis-cli MEMORY USAGE <span class="string">&quot;<span class="variable">$k</span>&quot;</span> 2&gt;/dev/null | awk <span class="string">&#x27;&#123;print $2&#125;&#x27;</span>)</span><br><span class="line">  <span class="keyword">if</span> [ -n <span class="string">&quot;<span class="variable">$size</span>&quot;</span> ] &amp;&amp; [ <span class="string">&quot;<span class="variable">$size</span>&quot;</span> -gt 1048576 ]; <span class="keyword">then</span></span><br><span class="line">    <span class="built_in">echo</span> <span class="string">&quot;<span class="variable">$size</span> <span class="variable">$k</span>&quot;</span></span><br><span class="line">  <span class="keyword">fi</span></span><br><span class="line"><span class="keyword">done</span> | <span class="built_in">sort</span> -rn | <span class="built_in">head</span> -20</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-4-RDB-离线分析（生产推荐，零侵入）"><a href="#3-4-RDB-离线分析（生产推荐，零侵入）" class="headerlink" title="3.4 RDB 离线分析（生产推荐，零侵入）"></a>3.4 RDB 离线分析（生产推荐，零侵入）</h3><p>在从节点生成 RDB，然后离线分析，对线上<strong>完全无影响</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 从节点生成快照</span></span><br><span class="line">redis-cli -h replica bgsave</span><br><span class="line"></span><br><span class="line"><span class="comment"># 方式一：redis-rdb-tools</span></span><br><span class="line">pip install rdbtools</span><br><span class="line">rdb -c memory /data/dump.rdb --bytes 1024 --largest 20 &gt; bigkeys.csv</span><br><span class="line"></span><br><span class="line"><span class="comment"># 方式二：redis-rdb-cli（Java 生态，功能更强）</span></span><br><span class="line">rct -f mem -s /data/dump.rdb -o bigkeys.csv --<span class="built_in">sort</span> memory --order desc --<span class="built_in">limit</span> 50</span><br></pre></td></tr></table></figure>
+
+<p>输出包含 key、类型、元素数、序列化长度、内存占用等，<strong>这是最工程化的做法</strong>。</p>
+<h3 id="3-5-监控平台-内部系统"><a href="#3-5-监控平台-内部系统" class="headerlink" title="3.5 监控平台 &#x2F; 内部系统"></a>3.5 监控平台 &#x2F; 内部系统</h3><p>大型公司一般有自研的 key 分析平台（比如京东的 hotkey、美团的 Redis 巡检），原理就是周期性 RDB 解析 + 上报。中小团队用 <code>redis-rdb-cli</code> 定时跑就够了。</p>
+<h3 id="3-6-顺带一提：SLOWLOG-是「结果」不是「手段」"><a href="#3-6-顺带一提：SLOWLOG-是「结果」不是「手段」" class="headerlink" title="3.6 顺带一提：SLOWLOG 是「结果」不是「手段」"></a>3.6 顺带一提：SLOWLOG 是「结果」不是「手段」</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">SLOWLOG GET 10</span><br></pre></td></tr></table></figure>
+
+<p>只能告诉你「哪个命令慢了」，而 <code>HGETALL bigkey</code> 里的 key 名才是线索。所以 SLOWLOG 是<strong>发现入口</strong>，不是定位手段。</p>
+<hr>
+<h2 id="四、大-Key-治理：四种方案"><a href="#四、大-Key-治理：四种方案" class="headerlink" title="四、大 Key 治理：四种方案"></a>四、大 Key 治理：四种方案</h2><h3 id="4-1-方案一：拆分（最通用）"><a href="#4-1-方案一：拆分（最通用）" class="headerlink" title="4.1 方案一：拆分（最通用）"></a>4.1 方案一：拆分（最通用）</h3><p>核心思想：<strong>把一个大 Key 拆成 N 个小 Key，通过哈希分桶定位。</strong></p>
+<p>以「用户订单列表 Hash」为例，原始设计：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">order:detail:&#123;orderId&#125;  -&gt;  Hash&#123; orderId, userId, amount, items... &#125;</span><br></pre></td></tr></table></figure>
+
+<p>问题场景：一个 Hash 存了某商家全部订单（几十万 field）。拆分成桶：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">BigHashSharding</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">BUCKETS</span> <span class="operator">=</span> <span class="number">32</span>;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> StringRedisTemplate redis;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 分桶路由：根据 field 的 hash 决定落到哪个桶 */</span></span><br><span class="line">    <span class="keyword">private</span> String <span class="title function_">bucketKey</span><span class="params">(String bizKey, String field)</span> &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">idx</span> <span class="operator">=</span> Math.floorMod(field.hashCode(), BUCKETS);</span><br><span class="line">        <span class="keyword">return</span> bizKey + <span class="string">&quot;:&quot;</span> + idx;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">hset</span><span class="params">(String bizKey, String field, String value)</span> &#123;</span><br><span class="line">        redis.opsForHash().put(bucketKey(bizKey, field), field, value);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">hget</span><span class="params">(String bizKey, String field)</span> &#123;</span><br><span class="line">        <span class="type">Object</span> <span class="variable">v</span> <span class="operator">=</span> redis.opsForHash().get(bucketKey(bizKey, field), field);</span><br><span class="line">        <span class="keyword">return</span> v == <span class="literal">null</span> ? <span class="literal">null</span> : v.toString();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 全量查询：用 Pipeline 批量拉取，避免 32 次 RTT */</span></span><br><span class="line">    <span class="keyword">public</span> Map&lt;Object, Object&gt; <span class="title function_">hgetAll</span><span class="params">(String bizKey)</span> &#123;</span><br><span class="line">        List&lt;String&gt; keys = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; BUCKETS; i++) &#123;</span><br><span class="line">            keys.add(bizKey + <span class="string">&quot;:&quot;</span> + i);</span><br><span class="line">        &#125;</span><br><span class="line">        List&lt;Object&gt; results = redis.executePipelined((RedisCallback&lt;Object&gt;) conn -&gt; &#123;</span><br><span class="line">            keys.forEach(k -&gt; conn.hGetAll(k.getBytes(StandardCharsets.UTF_8)));</span><br><span class="line">            <span class="keyword">return</span> <span class="literal">null</span>;</span><br><span class="line">        &#125;);</span><br><span class="line"></span><br><span class="line">        Map&lt;Object, Object&gt; merged = <span class="keyword">new</span> <span class="title class_">HashMap</span>&lt;&gt;();</span><br><span class="line">        results.forEach(r -&gt; &#123;</span><br><span class="line">            <span class="keyword">if</span> (r <span class="keyword">instanceof</span> Map) &#123;</span><br><span class="line">                merged.putAll((Map&lt;?, ?&gt;) r);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;);</span><br><span class="line">        <span class="keyword">return</span> merged;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键点</strong>：</p>
+<ul>
+<li>分桶数选 <strong>2 的幂</strong>（16&#x2F;32&#x2F;64），方便扩展；</li>
+<li>全量查询必须用 <strong>Pipeline</strong>，否则 32 次 RTT 反而更慢；</li>
+<li><strong>不要用 <code>HGETALL</code></strong>，业务上应尽量改成按需 <code>HMGET</code>。</li>
+</ul>
+<p>其他类型的拆分套路：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>拆分方式</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>String</td>
+<td>拆成多段 + offset</td>
+<td><code>article:1:seg:0</code> ~ <code>seg:N</code></td>
+</tr>
+<tr>
+<td>List</td>
+<td>分片 + 元数据索引</td>
+<td><code>feed:u1:0</code> ~ <code>feed:u1:9</code></td>
+</tr>
+<tr>
+<td>Set</td>
+<td>按元素 hash 分桶</td>
+<td><code>tag:set:0</code> ~ <code>tag:set:31</code></td>
+</tr>
+<tr>
+<td>ZSet</td>
+<td>按 score 分段（时间分片）</td>
+<td><code>rank:2026-09-27:00</code> 每小时一个</td>
+</tr>
+<tr>
+<td>Hash</td>
+<td>按 field hash 分桶</td>
+<td>见上</td>
+</tr>
+</tbody></table>
+<h3 id="4-2-方案二：压缩-序列化优化"><a href="#4-2-方案二：压缩-序列化优化" class="headerlink" title="4.2 方案二：压缩 + 序列化优化"></a>4.2 方案二：压缩 + 序列化优化</h3><ul>
+<li><strong>业务侧压缩</strong>：大 JSON 用 Snappy&#x2F;LZ4&#x2F;GZIP 压缩后存 String，读取时解压。适合「写少读多」且数据本身重复度高的场景。</li>
+<li><strong>换序列化</strong>：JDK 原生序列化体积大，改用 Protobuf&#x2F;Kryo 可减小 30%~50%。</li>
+<li><strong>避免存冗余字段</strong>：只存必要字段，别把整行 DB 记录塞进去。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// LZ4 压缩示例</span></span><br><span class="line"><span class="keyword">public</span> String <span class="title function_">setCompressed</span><span class="params">(String key, Object obj)</span> &#123;</span><br><span class="line">    <span class="type">byte</span>[] raw = JSON.toJSONBytes(obj);</span><br><span class="line">    <span class="type">byte</span>[] compressed = LZ4Factory.fastestInstance().fastCompressor().compress(raw);</span><br><span class="line">    redis.opsForValue().set(key.getBytes(StandardCharsets.UTF_8), compressed);</span><br><span class="line">    <span class="keyword">return</span> key;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-方案三：业务重构（最优解）"><a href="#4-3-方案三：业务重构（最优解）" class="headerlink" title="4.3 方案三：业务重构（最优解）"></a>4.3 方案三：业务重构（最优解）</h3><p>很多大 Key 是<strong>设计缺陷</strong>导致的，最好的治理是改设计：</p>
+<ul>
+<li>用 Hash 存整张表 → 改成<strong>一个字段一个 String key</strong>（或用 Pipelining 批量取）；</li>
+<li>用 List 存全量消息 → 改成 <strong>Stream + XADD&#x2F;XTRIM 定长裁剪</strong>；</li>
+<li>用 Set 存全量用户 → 改成<strong>布隆过滤器&#x2F;位图</strong>（Bitmap&#x2F;HyperLogLog，内存降低几个数量级）；</li>
+<li>用 ZSet 存全量排行榜 → 改成<strong>只存 Top N</strong>，其余走 DB。</li>
+</ul>
+<p>位图做打卡统计的例子：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1000万用户每天1个位 -&gt; 每天仅需 1.25MB</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">signIn</span><span class="params">(String date, <span class="type">long</span> userId)</span> &#123;</span><br><span class="line">    redis.opsForValue().setBit(<span class="string">&quot;sign:&quot;</span> + date, userId, <span class="literal">true</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="type">long</span> <span class="title function_">countSignIn</span><span class="params">(String date)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> redis.execute((RedisCallback&lt;Long&gt;) c -&gt;</span><br><span class="line">            c.bitCount((<span class="string">&quot;sign:&quot;</span> + date).getBytes(StandardCharsets.UTF_8)));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-4-方案四：异步删除-生命周期管理"><a href="#4-4-方案四：异步删除-生命周期管理" class="headerlink" title="4.4 方案四：异步删除 + 生命周期管理"></a>4.4 方案四：异步删除 + 生命周期管理</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 异步删除，不阻塞主线程</span></span><br><span class="line">UNLINK bigkey</span><br><span class="line"></span><br><span class="line"><span class="comment"># 大 Key 批量清理脚本：分批删 field，避免一次阻塞</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">/** 分批清理大 Hash：每批 200 个 field，批间 sleep，避免阻塞 */</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">safeDeleteHash</span><span class="params">(String key, <span class="type">int</span> batch, <span class="type">long</span> sleepMs)</span> <span class="keyword">throws</span> InterruptedException &#123;</span><br><span class="line">    <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">        List&lt;Object&gt; fields = redis.execute((RedisCallback&lt;List&lt;Object&gt;&gt;) conn -&gt; &#123;</span><br><span class="line">            Cursor&lt;Map.Entry&lt;<span class="type">byte</span>[], <span class="type">byte</span>[]&gt;&gt; cursor = conn.hScan(key.getBytes(), ScanOptions.scanOptions().count(batch).build());</span><br><span class="line">            List&lt;Object&gt; batchFields = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line">            cursor.forEachRemaining(e -&gt; batchFields.add(e.getKey()));</span><br><span class="line">            <span class="keyword">return</span> batchFields;</span><br><span class="line">        &#125;);</span><br><span class="line">        <span class="keyword">if</span> (fields == <span class="literal">null</span> || fields.isEmpty()) &#123;</span><br><span class="line">            <span class="keyword">break</span>;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">byte</span>[][] fieldBytes = fields.stream()</span><br><span class="line">                .map(f -&gt; ((String) f).getBytes(StandardCharsets.UTF_8))</span><br><span class="line">                .toArray(<span class="type">byte</span>[][]::<span class="keyword">new</span>);</span><br><span class="line">        redis.execute((RedisCallback&lt;Long&gt;) conn -&gt; conn.hDel(key.getBytes(), fieldBytes));</span><br><span class="line">        TimeUnit.MILLISECONDS.sleep(sleepMs);</span><br><span class="line">    &#125;</span><br><span class="line">    redis.unlink(key);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：<code>HSCAN</code> 的 <code>CURSOR</code> 语义下删除元素是安全的（SCAN 系列保证「已存在元素一定被返回，新增元素可能不返回」）。</p>
+<hr>
+<h2 id="五、热-Key：另一个维度的问题"><a href="#五、热-Key：另一个维度的问题" class="headerlink" title="五、热 Key：另一个维度的问题"></a>五、热 Key：另一个维度的问题</h2><h3 id="5-1-热-Key-的危害"><a href="#5-1-热-Key-的危害" class="headerlink" title="5.1 热 Key 的危害"></a>5.1 热 Key 的危害</h3><table>
+<thead>
+<tr>
+<th>危害</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单分片 CPU 打满</td>
+<td>集群倾斜，其他节点闲</td>
+</tr>
+<tr>
+<td>连接被打满</td>
+<td>单节点连接数上限（默认 10000）</td>
+</tr>
+<tr>
+<td>慢查询雪崩</td>
+<td>热 key 上的操作变慢 → 大量超时 → 重试 → 更慢</td>
+</tr>
+<tr>
+<td>缓存击穿联动</td>
+<td>热 key 一旦过期，DB 瞬间被击穿</td>
+</tr>
+</tbody></table>
+<h3 id="5-2-热-Key-探测"><a href="#5-2-热-Key-探测" class="headerlink" title="5.2 热 Key 探测"></a>5.2 热 Key 探测</h3><p><strong>方式一：<code>redis-cli --hotkeys</code>（依赖 LFU）</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 需要 maxmemory-policy 为 allkeys-lfu 或 volatile-lfu</span></span><br><span class="line">redis-cli --hotkeys</span><br></pre></td></tr></table></figure>
+
+<p>输出：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">-------- summary -------</span><br><span class="line">Sampled 1000000 keys in the keyspace!</span><br><span class="line">hot key found with counter: 13842  keyname: seckill:item:10086</span><br><span class="line">hot key found with counter: 12001  keyname: config:global:switch</span><br></pre></td></tr></table></figure>
+
+<p><strong>局限</strong>：LFU 计数器有衰减，且必须开启 LFU 淘汰策略，很多线上用的是 <code>noeviction</code>，用不了。</p>
+<p><strong>方式二：客户端埋点统计</strong></p>
+<p>在 Redis 客户端 SDK 里包一层，统计每个 key 的访问次数，定期上报：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">HotKeyReporter</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> ConcurrentHashMap&lt;String, LongAdder&gt; counter = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">TOP_N</span> <span class="operator">=</span> <span class="number">50</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">get</span><span class="params">(String key)</span> &#123;</span><br><span class="line">        counter.computeIfAbsent(key, k -&gt; <span class="keyword">new</span> <span class="title class_">LongAdder</span>()).increment();</span><br><span class="line">        <span class="keyword">return</span> redis.opsForValue().get(key);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 定时任务：每 10 秒上报 Top N */</span></span><br><span class="line">    <span class="meta">@Scheduled(fixedRate = 10_000)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">report</span><span class="params">()</span> &#123;</span><br><span class="line">        counter.entrySet().stream()</span><br><span class="line">                .sorted((a, b) -&gt; Long.compare(b.getValue().sum(), a.getValue().sum()))</span><br><span class="line">                .limit(TOP_N)</span><br><span class="line">                .forEach(e -&gt; metricsCollector.report(e.getKey(), e.getValue().sum()));</span><br><span class="line">        counter.clear();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>方式三：Proxy &#x2F; 中间件层采集</strong></p>
+<p>如果有 Redis Proxy（如 Codis、twemproxy、自研 Proxy），在 Proxy 层做无侵入统计是最优方案。京东开源的 <strong>hotkey</strong> 就是通过 client 上报 + worker 聚合实现的毫秒级热 key 探测。</p>
+<p><strong>方式四：<code>MONITOR</code>（仅限短时间排查）</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">redis-cli MONITOR | <span class="built_in">head</span> -10000 | awk <span class="string">&#x27;&#123;print $4&#125;&#x27;</span> | <span class="built_in">sort</span> | <span class="built_in">uniq</span> -c | <span class="built_in">sort</span> -rn | <span class="built_in">head</span> -20</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ <code>MONITOR</code> 会把所有命令复制一份到客户端，<strong>生产环境严禁长时间开启</strong>，仅用于分钟级排查。</p>
+<h3 id="5-3-热-Key-治理：五种方案"><a href="#5-3-热-Key-治理：五种方案" class="headerlink" title="5.3 热 Key 治理：五种方案"></a>5.3 热 Key 治理：五种方案</h3><h4 id="方案一：本地缓存（第一选择）"><a href="#方案一：本地缓存（第一选择）" class="headerlink" title="方案一：本地缓存（第一选择）"></a>方案一：本地缓存（第一选择）</h4><p>热 Key 说明「读多写少、数据量小、变化不频繁」，最适合放本地内存。用 <strong>Caffeine</strong> 做一级缓存 + Redis 做二级缓存：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">MultiLevelCache</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Cache&lt;String, Object&gt; localCache = Caffeine.newBuilder()</span><br><span class="line">            .maximumSize(<span class="number">10_000</span>)</span><br><span class="line">            .expireAfterWrite(<span class="number">5</span>, TimeUnit.SECONDS)   <span class="comment">// 极短过期，容忍少量不一致</span></span><br><span class="line">            .recordStats()</span><br><span class="line">            .build();</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Autowired</span></span><br><span class="line">    <span class="keyword">private</span> StringRedisTemplate redis;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Autowired</span></span><br><span class="line">    <span class="keyword">private</span> HotKeyDetector hotKeyDetector;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> Object <span class="title function_">get</span><span class="params">(String key)</span> &#123;</span><br><span class="line">        <span class="comment">// 一级：本地缓存</span></span><br><span class="line">        <span class="type">Object</span> <span class="variable">local</span> <span class="operator">=</span> localCache.getIfPresent(key);</span><br><span class="line">        <span class="keyword">if</span> (local != <span class="literal">null</span>) &#123;</span><br><span class="line">            <span class="keyword">return</span> local;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 一级未命中：只有热 key 才回填本地缓存，避免污染</span></span><br><span class="line">        <span class="type">Object</span> <span class="variable">value</span> <span class="operator">=</span> redis.opsForValue().get(key);</span><br><span class="line">        <span class="keyword">if</span> (value != <span class="literal">null</span> &amp;&amp; hotKeyDetector.isHot(key)) &#123;</span><br><span class="line">            localCache.put(key, value);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> value;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 事件通知失效：其他节点收到广播后清本地缓存 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">evict</span><span class="params">(String key)</span> &#123;</span><br><span class="line">        localCache.invalidate(key);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>关键设计点：</p>
+<ol>
+<li><strong><code>expireAfterWrite</code> 设很短（1~5 秒）</strong>，牺牲一点实时性换吞吐；</li>
+<li><strong>只缓存热 key</strong>，否则本地缓存变成全量缓存，内存爆炸；</li>
+<li>变更时通过 <strong>Redis Pub&#x2F;Sub 广播</strong>，让所有节点失效本地缓存。</li>
+</ol>
+<h4 id="方案二：读写分离-多副本读"><a href="#方案二：读写分离-多副本读" class="headerlink" title="方案二：读写分离 &#x2F; 多副本读"></a>方案二：读写分离 &#x2F; 多副本读</h4><p>Redis Cluster 从节点默认只读，可以把热 key 的读流量打到从节点：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Lettuce 配置：开启从节点读 + 就近读</span></span><br><span class="line"><span class="type">ClientOptions</span> <span class="variable">options</span> <span class="operator">=</span> ClientOptions.builder()</span><br><span class="line">        .readFrom(ReadFrom.REPLICA_PREFERRED)   <span class="comment">// 优先从副本读</span></span><br><span class="line">        .build();</span><br></pre></td></tr></table></figure>
+
+<p>如果用的是「1 主 N 从」架构，一个热 key 的读流量可以分摊到 N 个从节点上。</p>
+<h4 id="方案三：Key-打散（读扩散）"><a href="#方案三：Key-打散（读扩散）" class="headerlink" title="方案三：Key 打散（读扩散）"></a>方案三：Key 打散（读扩散）</h4><p>把 1 个热 key 复制成 N 个副本，读的时候随机取：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">HotKeyScatter</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">COPIES</span> <span class="operator">=</span> <span class="number">16</span>;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">Random</span> <span class="variable">random</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Random</span>();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> String <span class="title function_">copyKey</span><span class="params">(String key)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> key + <span class="string">&quot;#&quot;</span> + random.nextInt(COPIES);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">get</span><span class="params">(String key)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">v</span> <span class="operator">=</span> redis.opsForValue().get(copyKey(key));</span><br><span class="line">        <span class="keyword">if</span> (v == <span class="literal">null</span>) &#123;</span><br><span class="line">            v = redis.opsForValue().get(key);   <span class="comment">// 兜底读原始 key</span></span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> v;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 写时广播到所有副本 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">set</span><span class="params">(String key, String value)</span> &#123;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; COPIES; i++) &#123;</span><br><span class="line">            redis.opsForValue().set(key + <span class="string">&quot;#&quot;</span> + i, value);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ <strong>注意</strong>：加 <code>#N</code> 后缀会改变 key 的 CRC16 结果，<strong>反而打散了原本在同一 slot 的副本</strong>——这正是我们要的效果（副本分散到不同节点）。</p>
+<p>但如果业务需要原 key 和副本必须在同一 slot，就要用 <strong>Hash Tag</strong>：<code>{key}#0</code>、<code>{key}#1</code>，此时 <code>{}</code> 内才是分片依据。<strong>打散场景要「反用」Hash Tag，即不加 <code>{}</code>。</strong></p>
+<h4 id="方案四：限流-降级"><a href="#方案四：限流-降级" class="headerlink" title="方案四：限流 + 降级"></a>方案四：限流 + 降级</h4><p>对热 key 的访问做限流，超过阈值直接返回兜底值：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">final</span> <span class="type">RateLimiter</span> <span class="variable">limiter</span> <span class="operator">=</span> RateLimiter.create(<span class="number">5000</span>); <span class="comment">// 5000 QPS</span></span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> String <span class="title function_">getWithRateLimit</span><span class="params">(String key)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (!limiter.tryAcquire()) &#123;</span><br><span class="line">        metrics.counter(<span class="string">&quot;redis.hotkey.rejected&quot;</span>).increment();</span><br><span class="line">        <span class="keyword">return</span> localFallback(key);   <span class="comment">// 返回旧值或默认值</span></span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> redis.opsForValue().get(key);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>秒杀场景尤其重要：<strong>宁可少卖，也不能把 Redis 打挂</strong>。</p>
+<h4 id="方案五：业务侧改造成「预计算-单飞」"><a href="#方案五：业务侧改造成「预计算-单飞」" class="headerlink" title="方案五：业务侧改造成「预计算 + 单飞」"></a>方案五：业务侧改造成「预计算 + 单飞」</h4><ul>
+<li>热点数据提前<strong>预热</strong>到本地缓存（比如活动开始前 5 分钟）；</li>
+<li>用 <strong>SingleFlight</strong> 模式合并并发请求，同一个 key 只放一个请求穿透到 Redis&#x2F;DB：</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">final</span> ConcurrentHashMap&lt;String, CompletableFuture&lt;Object&gt;&gt; inFlight = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> Object <span class="title function_">getWithSingleFlight</span><span class="params">(String key)</span> &#123;</span><br><span class="line">    CompletableFuture&lt;Object&gt; future = inFlight.computeIfAbsent(key, k -&gt;</span><br><span class="line">            CompletableFuture.supplyAsync(() -&gt; loadFromRedis(k))</span><br><span class="line">                    .whenComplete((r, e) -&gt; inFlight.remove(k)));</span><br><span class="line">    <span class="keyword">return</span> future.join();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、实战案例：一次秒杀事故的复盘"><a href="#六、实战案例：一次秒杀事故的复盘" class="headerlink" title="六、实战案例：一次秒杀事故的复盘"></a>六、实战案例：一次秒杀事故的复盘</h2><p><strong>现象</strong>：秒杀开始后 30 秒，Redis 集群某分片 CPU 100%，客户端大面积超时。</p>
+<p><strong>排查过程</strong>：</p>
+<ol>
+<li><code>INFO</code> 看各节点 CPU → 只有 shard-3 打满，确认是倾斜而非整体压力；</li>
+<li><code>SLOWLOG</code> 看到大量 <code>GET seckill:stock:10086</code>；</li>
+<li>确认：<strong>单个商品的库存 key 是热 key</strong>，几十万 QPS 全部落到同一个 slot；</li>
+<li>同时 <code>seckill:stock:10086</code> 是一个 String，不算大 key，所以 <code>--bigkeys</code> 没报。</li>
+</ol>
+<p><strong>治理</strong>：</p>
+<ol>
+<li><strong>库存预热到本地缓存</strong>（Caffeine，1 秒过期），扣减走 Redis；</li>
+<li>库存扣减改为 <strong>Lua 脚本</strong>（保证原子性），并把 QPS 限流到 3000；</li>
+<li>增加 <strong>异步下单</strong>：Redis 只做「预扣减」，真正下单走 MQ 削峰；</li>
+<li>库存 key 无副本需求，但<strong>商品详情</strong>这类纯读 key 做了 8 副本打散。</li>
+</ol>
+<p><strong>结果</strong>：Redis 峰值 QPS 从 30 万降到 3 万以内，分片 CPU 均衡在 30% 左右。</p>
+<hr>
+<h2 id="七、面试追问集"><a href="#七、面试追问集" class="headerlink" title="七、面试追问集"></a>七、面试追问集</h2><p><strong>Q1：大 Key 和热 Key，治理思路有什么本质区别？</strong></p>
+<blockquote>
+<p>大 Key 是<strong>空间维度</strong>的问题，本质是「单 key 数据量 vs 单线程处理能力」的矛盾，治理思路是<strong>拆分与压缩</strong>，让单个 key 变小、变可预测。<br>热 Key 是<strong>流量维度</strong>的问题，本质是「单 key 流量 vs 单分片处理能力」的矛盾，治理思路是<strong>分流与缓存</strong>，让流量分散或前置拦截。<br>一个 key 可以既大又热，那就两套手段一起上。</p>
+</blockquote>
+<p><strong>Q2：为什么 <code>UNLINK</code> 比 <code>DEL</code> 好？</strong></p>
+<blockquote>
+<p><code>DEL</code> 在主线程同步释放内存，大 Key 释放几十万对象会阻塞几百毫秒；<code>UNLINK</code> 只把 key 从 keyspace 摘除，内存释放交给后台 <code>lazyfree</code> 线程（默认 4 个）。配合 <code>lazyfree-lazy-expire</code>、<code>lazyfree-lazy-eviction</code> 可以让过期和淘汰也异步。</p>
+</blockquote>
+<p><strong>Q3：<code>redis-cli --bigkeys</code> 有什么坑？</strong></p>
+<blockquote>
+<p>三个坑：① 只统计元素个数&#x2F;字符串长度，不看真实内存，Hash 的 1 万个小 field 可能远小于 100 个 10KB 的 field；② 全量 SCAN 对线上有压力，应该打在从节点；③ 采样统计不能反映瞬时状态，还是要周期性 RDB 离线分析。</p>
+</blockquote>
+<p><strong>Q4：本地缓存和 Redis 的数据一致性怎么保证？</strong></p>
+<blockquote>
+<p>分三种策略：① <strong>短过期</strong>（1~5 秒），容忍短暂不一致，最简单；② <strong>Pub&#x2F;Sub 广播失效</strong>，变更时通知所有节点清缓存，但有消息丢失风险，需要配合短过期兜底；③ <strong>版本号&#x2F;时间戳</strong>，缓存的 value 带版本，读取时校验。生产上一般是 ①+② 组合。</p>
+</blockquote>
+<p><strong>Q5：集群模式下，怎么让同一个业务的多个 key 落在同一个节点？</strong></p>
+<blockquote>
+<p>用 <strong>Hash Tag</strong>：<code>{user:1001}:profile</code>、<code>{user:1001}:order</code>，只有 <code>{}</code> 内的内容参与 CRC16 计算。这样可以用 <strong>Lua 脚本&#x2F;MULTI</strong> 原子操作多个 key。反过来说，<strong>如果你想让 key 分散（打散热 key），就绝对不要加 <code>{}</code></strong>。</p>
+</blockquote>
+<p><strong>Q6：为什么 <code>EXPIRE</code> 大 Key 也可能慢？</strong></p>
+<blockquote>
+<p><code>EXPIRE</code> 本身是 O(1)，但 Redis 4.0 之前是<strong>同步过期删除</strong>，大 Key 过期时会阻塞。4.0+ 引入 <code>lazyfree-lazy-expire</code>，但<strong>主动过期（ACTIVE_EXPIRE）扫描到过期大 Key 时</strong>依然需要配合异步释放才安全。另外主从架构下从节点不主动过期，靠主节点 <code>DEL</code> 同步，所以从节点内存会先涨后降。</p>
+</blockquote>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>把整篇文章压缩成一张决策表：</p>
+<table>
+<thead>
+<tr>
+<th>问题类型</th>
+<th>探测手段</th>
+<th>治理手段（优先级排序）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>大 Key</td>
+<td><code>--bigkeys</code> &#x2F; <code>--memkeys</code> &#x2F; <code>MEMORY USAGE</code> &#x2F; RDB 离线分析</td>
+<td>① 业务重构 ② 拆分分桶 ③ 压缩 ④ <code>UNLINK</code> 异步删除</td>
+</tr>
+<tr>
+<td>热 Key</td>
+<td><code>--hotkeys</code>(LFU) &#x2F; 客户端埋点 &#x2F; Proxy 采集 &#x2F; <code>MONITOR</code></td>
+<td>① 本地缓存 ② 多副本读 ③ key 打散 ④ 限流降级 ⑤ SingleFlight</td>
+</tr>
+</tbody></table>
+<p>最后一句真心话：<strong>大 Key 和热 Key 的治理，80% 的收益来自设计阶段，而不是运维阶段。</strong> 上线前做一次 key 规范评审（命名、类型、预估元素数、预估 QPS、过期策略），比上线后半夜爬起来扩容划算得多。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/">https://jiweidong.github.io/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E7%94%9F%E4%BA%A7%E5%AE%9E%E6%88%98/">生产实战</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/27/tcp-backlog-syn-accept-queue-deep-dive/" title="【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞</div></div><div class="info-2"><div class="info-item-1">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞面试官：服务端 accept 慢，客户端会怎样？这个问题看起来很基础，但能答透的人不多。常见的错误答案是「客户端会重试」。 正确的链条是这样的： 12345应用层 accept 不及时  -&gt; 全连接队列（accept queue）被填满  -&gt; 内核默认丢弃新完成握手的连接（或发 RST）  -&gt; 客户端认为自己已经 connect 成功，开始发数据  -&gt; 数据被丢弃，客户端重传，一段时间后才报 timeout  如果你是 Java 服务端开发者，ServerSocket 构造方法里的那个 backlog 参数，你已经写了无数遍，但未必真的知道它控制的是什么。 这篇文章把 TCP 三次握手过程中两个队列讲透：半连接队列、全连接队列，包括内核参数、溢出行为、观测手段、Java&#x2F;Netty&#x2F;Tomcat 的配置，以及一次真实线上事故的复盘。  一、三次握手与两个队列1.1 内核数据结构服务端在 listen() 之后，内核会为这...</div></div></div></a><a class="pagination-related" href="/2026/09/26/redis-keyspace-notification-deep-dive/" title="【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】键空间通知（Keyspace Notifications）深度解析：事件订阅、过期回调与延迟任务实践面试官：订单超时未支付要自动关闭，让你用 Redis 的 key 过期来做，怎么做？这个问题的标准开场是： 1redisTemplate.opsForValue().set(&quot;order:close:1001&quot;, &quot;1&quot;, 30, TimeUnit.MINUTES);  然后”监听 key 过期”就自动关单。听起来很美，但如果你只能答到这里，面试官下一句就会问：  那 Redis 的过期事件准不准？如果事件丢了怎么办？主从、集群下能收到吗？  答不上来，说明你只是”用过”，没”懂过”。这篇把键空间通知从原理到生产兜底一次讲透。 一、键空间通知是什么Redis 从 2.8.0 开始支持 Keyspace Notifications：当 key 被修改、过期、删除、淘汰时，Redis 会向特定的 Pub&#x2F;Sub 频道发布一条消息。 它不是独立的回调机制，本质就是基于现有的发布订阅（PUBLISH&#x2F;SUBSC...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/01/redis-big-key-hot-key-governance/" title="Redis 大 Key 与热 Key 问题排查与治理实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-01</div><div class="info-item-2">Redis 大 Key 与热 Key 问题排查与治理实战</div></div><div class="info-2"><div class="info-item-1">Redis 大 Key 与热 Key 问题排查与治理实战线上 Redis 突然延迟飙升、CPU 打满、请求超时？十有八九是大 Key 或热 Key在作祟。这两个问题是 Redis 生产事故的头号元凶，也是面试必问的高频题。本文从判定标准、危害原理、排查手段到治理方案，给你一套完整的实战方法论。   一、什么是大 Key 和热 Key？大 Key（Big Key）指单个 Key 的 value 体积过大或元素数量过多：    类型 判定标准 典型案例    String value 超过 10KB（严格标准 100KB） 大 JSON、图片 Base64   Hash &#x2F; Set &#x2F; ZSet &#x2F; List 元素超过 5000 个，或总大小超 10MB 全量用户标签、日活名单   热 Key（Hot Key）指在极短时间内被极高频率访问的 Key，比如：  热点新闻、秒杀商品、爆款直播间数据 某个 Key 的 QPS 占实例总 QPS 的 30% 以上即为严重热 Key  危害对比   问题 大 Key 热 Key    主要危害 阻塞单线程、网络拥塞...</div></div></div></a><a class="pagination-related" href="/2026/09/15/redis-memory-fragmentation-defrag-deep-dive/" title="【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-15</div><div class="info-item-2">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战</div></div><div class="info-2"><div class="info-item-1">【Redis 运维】内存碎片深度解析与治理：mem_fragmentation_ratio 背后的真相与 activedefrag 实战面试官：Redis 实际占用 8G，但数据只有 4G，多出来的内存去哪了？这是 Redis 运维里最容易被误判的告警之一。 监控告警一响，多数人的第一反应是「内存泄漏了」或者「是不是大 Key」。但真实原因经常是另一回事：内存碎片（Memory Fragmentation）。 更微妙的是，碎片这件事在 Redis 里有一堆反直觉的细节：  mem_fragmentation_ratio &lt; 1 通常不报错，但它其实是交换分区正在被使用的严重信号； 内存碎片率超过 1.5 就该告警，但不是所有场景都该开 activedefrag； 有时候碎片率很高，activedefrag 却一动不动——因为它被主从复制、持久化、集群模式悄悄拦住了。  这篇文章把碎片的成因、观测、治理讲完整，并重点说清 activedefrag 为什么经常「失效」。  一、Redis 内存到底花在哪了在看碎片之前，先建立完整的内存全景。INFO memory 输出的关键字段...</div></div></div></a><a class="pagination-related" href="/2026/09/02/redis-big-key-hot-key-deep-dive/" title="【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-02</div><div class="info-item-2">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案面试官：线上 Redis 突然变慢、CPU 飙升、甚至发生阻塞，你会怎么排查？很多同学第一反应是”看慢日志、看 bigkeys”，但真正能系统讲清楚大 Key 和热 Key 的完整治理链路的人不多。今天我们从原理到实战，一次性把这两个”Redis 头号杀手”讲透。  一、什么是大 Key？什么是热 Key？1.1 大 Key（Big Key）大 Key 不是指某个 Key 的字符串值很长，而是指单个 Key 占用内存过大或元素数量过多。业界一般没有绝对标准，常用的判断线是：    类型 判定标准（参考） 举例    String value 超过 10KB 一个 JSON 序列化的大对象、一张 Base64 图片   Hash &#x2F; Set &#x2F; ZSet &#x2F; List 元素数量超过 5000 个，或总大小超过 10MB 一个存了几万条用户行为的 Hash   单个 value 过大 超过 1MB 就要警惕 缓存整张报表数据   1.2 热 Key（...</div></div></div></a><a class="pagination-related" href="/2026/08/22/feed-stream-system-design/" title="【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流</div></div><div class="info-2"><div class="info-item-1">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流面试官：微博的首页信息流是怎么做的？如果让你设计一个 Feed 流系统，你会怎么设计？Feed 流（信息流）是互联网最核心的业务形态之一：微博、朋友圈、抖音、小红书，全是 Feed 流。它和普通 CRUD 最大的区别在于——每个用户看到的首页内容都不一样，是”千人千面”的个性化时间线。设计 Feed 流，本质是解决三个问题：内容怎么分发、时间线怎么生成、读多写多怎么扛。 一、需求与指标先定义清楚规模，才有设计依据：  日活用户 1 亿，月活 3 亿； 平均每个用户关注 200 个账号； 每秒新增内容（发帖）1 万条，峰值 5 万条； 每秒读取时间线（刷首页）10 万次，峰值 50 万次； 要求：读延迟 &lt; 200ms，写后延迟 &lt; 1s 内可见。  读是写的 10 倍以上——这是所有 Feed 流设计的出发点：读多写少，必须为读优化。 二、三种核心模型：推、拉、推拉结合2.1 拉模式（Pull &#x2F; 读扩散）用户刷首页时，实时去拉取他关注的所有人的最新内容，再合并排序。 1用户刷首页 → 查关注列表...</div></div></div></a><a class="pagination-related" href="/2026/08/16/delay-queue-solutions-deep-dive/" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</div></div><div class="info-2"><div class="info-item-1">延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。 一、什么是延迟队列？普通队列：生产者放入消息，消费者立即消费。延迟队列：消息进入队列后，等待指定时间才被消费者消费。 核心能力：“到点了才执行”。 典型业务场景：    场景 延迟时间 到期动作    订单超时未支付 30 分钟 关闭订单、释放库存   用户下单未评价 7 天 发送提醒   定时发布文章 自定义 自动上架   支付成功通知 5 秒 通知下游   分布式锁续期 30 秒 续期&#x2F;释放   失败重试 递增 重新投递   二、方案一：数据库轮询（最朴素，先被否定）用定时任务（XXL-Job &#x2F; Quart...</div></div></div></a><a class="pagination-related" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战前言Redis 作为内存数据库，其所有数据都存储在内存中。当写入速度超过内存容量时，Redis 必须决定应该删除哪些数据——这就是内存淘汰策略（Eviction Policy）。选错淘汰策略可能导致缓存命中率断崖式下跌、大量请求穿透到数据库，甚至引发雪崩。 很多开发者只知道 allkeys-lru 或 volatile-ttl 这些名字，但面试官一旦追问”Redis 的近似 LRU 和标准 LRU 有什么区别？””LFU 的 counter 是如何衰减的？”，就容易答不上来。 本文将对 Redis 的 8 种淘汰策略进行深度解析，从源码层面揭秘近 LRU&#x2F;LFU 的实现，并通过实战案例帮你做出最佳选择。  一、Redis 内存淘汰机制总览1.1 触发条件当以下条件满足时，Redis 会触发内存淘汰： 12345# 设置最大内存（默认不限制）maxmemory 4gb# 达到 maxmemory 后，Redis 会尝试淘汰数据# 如果无法释放足够内存，写入操作会返回 OOM 错...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">682</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">777</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">217</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E5%AE%9E%E6%88%98%E3%80%91%E5%A4%A7-Key-%E4%B8%8E%E7%83%AD-Key-%E6%B2%BB%E7%90%86%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9A%E6%8E%A2%E6%B5%8B%E3%80%81%E6%8B%86%E5%88%86%E3%80%81%E5%A4%9A%E7%BA%A7%E7%BC%93%E5%AD%98%E4%B8%8E%E9%9B%86%E7%BE%A4%E5%80%BE%E6%96%9C"><span class="toc-number">1.</span> <span class="toc-text">【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E7%BA%BF%E4%B8%8A-Redis-%E7%AA%81%E7%84%B6%E4%B8%80%E5%A0%86%E6%85%A2%E6%9F%A5%E8%AF%A2%EF%BC%8C%E4%BD%A0%E6%80%8E%E4%B9%88%E5%AE%9A%E4%BD%8D%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：线上 Redis 突然一堆慢查询，你怎么定位？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E7%BB%99%E3%80%8C%E5%A4%A7%E3%80%8D%E5%92%8C%E3%80%8C%E7%83%AD%E3%80%8D%E4%B8%8B%E4%B8%AA%E5%8F%AF%E9%87%8F%E5%8C%96%E7%9A%84%E5%AE%9A%E4%B9%89"><span class="toc-number">1.2.</span> <span class="toc-text">一、先给「大」和「热」下个可量化的定义</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E5%A4%A7-Key-%E7%9A%84%E9%87%8F%E5%8C%96%E6%A0%87%E5%87%86"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 大 Key 的量化标准</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E7%83%AD-Key-%E7%9A%84%E9%87%8F%E5%8C%96%E6%A0%87%E5%87%86"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 热 Key 的量化标准</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%A4%A7-Key-%E5%88%B0%E5%BA%95%E4%BC%9A%E9%80%A0%E6%88%90%E4%BB%80%E4%B9%88%E9%97%AE%E9%A2%98%EF%BC%9F"><span class="toc-number">1.3.</span> <span class="toc-text">二、大 Key 到底会造成什么问题？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%91%BD%E4%BB%A4%E9%98%BB%E5%A1%9E%EF%BC%88%E6%9C%80%E7%9B%B4%E6%8E%A5%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 命令阻塞（最直接）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E7%BD%91%E7%BB%9C%E5%B8%A6%E5%AE%BD%E6%89%93%E6%BB%A1"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 网络带宽打满</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%86%85%E5%AD%98%E5%88%86%E5%B8%83%E4%B8%8D%E5%9D%87%EF%BC%88%E9%9B%86%E7%BE%A4%E9%9B%AA%E5%B4%A9%E7%9A%84%E4%BC%8F%E7%AC%94%EF%BC%89"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 内存分布不均（集群雪崩的伏笔）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E6%8C%81%E4%B9%85%E5%8C%96%E4%B8%8E%E4%B8%BB%E4%BB%8E%E5%90%8C%E6%AD%A5%E5%8F%97%E5%BD%B1%E5%93%8D"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 持久化与主从同步受影响</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-%E5%88%A0%E9%99%A4%E9%98%BB%E5%A1%9E"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 删除阻塞</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-6-%E8%BF%87%E6%9C%9F%E6%97%B6%E9%97%B4%E8%AE%BE%E7%BD%AE%E5%A4%B1%E8%B4%A5"><span class="toc-number">1.3.6.</span> <span class="toc-text">2.6 过期时间设置失败</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%A4%A7-Key-%E6%8E%A2%E6%B5%8B%EF%BC%9A%E4%BA%94%E7%A7%8D%E6%89%8B%E6%AE%B5%EF%BC%8C%E6%8C%89%E5%9C%BA%E6%99%AF%E9%80%89"><span class="toc-number">1.4.</span> <span class="toc-text">三、大 Key 探测：五种手段，按场景选</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-redis-cli-bigkeys%EF%BC%88%E6%9C%80%E5%BF%AB%E4%B8%8A%E6%89%8B%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 redis-cli --bigkeys（最快上手）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-redis-cli-memkeys%EF%BC%88%E6%8C%89%E5%86%85%E5%AD%98%E6%8E%92%E5%BA%8F%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 redis-cli --memkeys（按内存排序）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-MEMORY-USAGE-%E7%B2%BE%E7%A1%AE%E5%AE%9A%E4%BD%8D"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 MEMORY USAGE 精确定位</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-RDB-%E7%A6%BB%E7%BA%BF%E5%88%86%E6%9E%90%EF%BC%88%E7%94%9F%E4%BA%A7%E6%8E%A8%E8%8D%90%EF%BC%8C%E9%9B%B6%E4%BE%B5%E5%85%A5%EF%BC%89"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 RDB 离线分析（生产推荐，零侵入）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-5-%E7%9B%91%E6%8E%A7%E5%B9%B3%E5%8F%B0-%E5%86%85%E9%83%A8%E7%B3%BB%E7%BB%9F"><span class="toc-number">1.4.5.</span> <span class="toc-text">3.5 监控平台 &#x2F; 内部系统</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-6-%E9%A1%BA%E5%B8%A6%E4%B8%80%E6%8F%90%EF%BC%9ASLOWLOG-%E6%98%AF%E3%80%8C%E7%BB%93%E6%9E%9C%E3%80%8D%E4%B8%8D%E6%98%AF%E3%80%8C%E6%89%8B%E6%AE%B5%E3%80%8D"><span class="toc-number">1.4.6.</span> <span class="toc-text">3.6 顺带一提：SLOWLOG 是「结果」不是「手段」</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%A4%A7-Key-%E6%B2%BB%E7%90%86%EF%BC%9A%E5%9B%9B%E7%A7%8D%E6%96%B9%E6%A1%88"><span class="toc-number">1.5.</span> <span class="toc-text">四、大 Key 治理：四种方案</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E6%8B%86%E5%88%86%EF%BC%88%E6%9C%80%E9%80%9A%E7%94%A8%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 方案一：拆分（最通用）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E5%8E%8B%E7%BC%A9-%E5%BA%8F%E5%88%97%E5%8C%96%E4%BC%98%E5%8C%96"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 方案二：压缩 + 序列化优化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9A%E4%B8%9A%E5%8A%A1%E9%87%8D%E6%9E%84%EF%BC%88%E6%9C%80%E4%BC%98%E8%A7%A3%EF%BC%89"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 方案三：业务重构（最优解）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E6%96%B9%E6%A1%88%E5%9B%9B%EF%BC%9A%E5%BC%82%E6%AD%A5%E5%88%A0%E9%99%A4-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E7%AE%A1%E7%90%86"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 方案四：异步删除 + 生命周期管理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%83%AD-Key%EF%BC%9A%E5%8F%A6%E4%B8%80%E4%B8%AA%E7%BB%B4%E5%BA%A6%E7%9A%84%E9%97%AE%E9%A2%98"><span class="toc-number">1.6.</span> <span class="toc-text">五、热 Key：另一个维度的问题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E7%83%AD-Key-%E7%9A%84%E5%8D%B1%E5%AE%B3"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 热 Key 的危害</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%83%AD-Key-%E6%8E%A2%E6%B5%8B"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 热 Key 探测</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%83%AD-Key-%E6%B2%BB%E7%90%86%EF%BC%9A%E4%BA%94%E7%A7%8D%E6%96%B9%E6%A1%88"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 热 Key 治理：五种方案</span></a><ol class="toc-child"><li class="toc-item toc-level-4"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%B8%80%EF%BC%9A%E6%9C%AC%E5%9C%B0%E7%BC%93%E5%AD%98%EF%BC%88%E7%AC%AC%E4%B8%80%E9%80%89%E6%8B%A9%EF%BC%89"><span class="toc-number">1.6.3.1.</span> <span class="toc-text">方案一：本地缓存（第一选择）</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%BA%8C%EF%BC%9A%E8%AF%BB%E5%86%99%E5%88%86%E7%A6%BB-%E5%A4%9A%E5%89%AF%E6%9C%AC%E8%AF%BB"><span class="toc-number">1.6.3.2.</span> <span class="toc-text">方案二：读写分离 &#x2F; 多副本读</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%B8%89%EF%BC%9AKey-%E6%89%93%E6%95%A3%EF%BC%88%E8%AF%BB%E6%89%A9%E6%95%A3%EF%BC%89"><span class="toc-number">1.6.3.3.</span> <span class="toc-text">方案三：Key 打散（读扩散）</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E5%9B%9B%EF%BC%9A%E9%99%90%E6%B5%81-%E9%99%8D%E7%BA%A7"><span class="toc-number">1.6.3.4.</span> <span class="toc-text">方案四：限流 + 降级</span></a></li><li class="toc-item toc-level-4"><a class="toc-link" href="#%E6%96%B9%E6%A1%88%E4%BA%94%EF%BC%9A%E4%B8%9A%E5%8A%A1%E4%BE%A7%E6%94%B9%E9%80%A0%E6%88%90%E3%80%8C%E9%A2%84%E8%AE%A1%E7%AE%97-%E5%8D%95%E9%A3%9E%E3%80%8D"><span class="toc-number">1.6.3.5.</span> <span class="toc-text">方案五：业务侧改造成「预计算 + 单飞」</span></a></li></ol></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%AE%9E%E6%88%98%E6%A1%88%E4%BE%8B%EF%BC%9A%E4%B8%80%E6%AC%A1%E7%A7%92%E6%9D%80%E4%BA%8B%E6%95%85%E7%9A%84%E5%A4%8D%E7%9B%98"><span class="toc-number">1.7.</span> <span class="toc-text">六、实战案例：一次秒杀事故的复盘</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E9%9B%86"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问集</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/" title="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</a><time datetime="2026-09-27T00:40:00.000Z" title="发表于 2026-09-27 08:40:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/mysql-innodb-read-ahead-prefetch-deep-dive/" title="【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理">【MySQL 底层】InnoDB 预读（Read-Ahead）深度解析：线性预读、随机预读与缓冲池污染治理</a><time datetime="2026-09-27T00:30:00.000Z" title="发表于 2026-09-27 08:30:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/rocketmq-delay-timer-message-deep-dive/" title="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</a><time datetime="2026-09-27T00:20:00.000Z" title="发表于 2026-09-27 08:20:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/tcp-backlog-syn-accept-queue-deep-dive/" title="【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞">【网络编程】TCP 半连接队列与全连接队列深度解析：SYN Flood、backlog 与 accept 阻塞</a><time datetime="2026-09-27T00:10:00.000Z" title="发表于 2026-09-27 08:10:00">2026-09-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/27/redis-bigkey-hotkey-governance-deep-practice/" title="【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜">【Redis 实战】大 Key 与热 Key 治理深度实战：探测、拆分、多级缓存与集群倾斜</a><time datetime="2026-09-27T00:00:00.000Z" title="发表于 2026-09-27 08:00:00">2026-09-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
