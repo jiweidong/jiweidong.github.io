@@ -1,0 +1,476 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？这是分布式事务最经典的场景之一。候选人通常会给出三个答案：  先写订单库，再发 MQ——如果发消息失败，订单写了但积分不扣； 先发 MQ，再写订单——如果写库失败，积分扣了但订单不存在； 用本地消息表——可行，但要额外建表 + 定时任务兜底。  第 4">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地">
+<meta property="og:url" content="https://jiweidong.github.io/2026/09/30/rocketmq-transaction-message-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？这是分布式事务最经典的场景之一。候选人通常会给出三个答案：  先写订单库，再发 MQ——如果发消息失败，订单写了但积分不扣； 先发 MQ，再写订单——如果写库失败，积分扣了但订单不存在； 用本地消息表——可行，但要额外建表 + 定时任务兜底。  第 4">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-09-30T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-09-30T00:03:21.418Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="RocketMQ">
+<meta property="article:tag" content="分布式事务">
+<meta property="article:tag" content="消息队列">
+<meta property="article:tag" content="源码">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地",
+  "url": "https://jiweidong.github.io/2026/09/30/rocketmq-transaction-message-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-09-30T00:00:00.000Z",
+  "dateModified": "2026-09-30T00:03:21.418Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/09/30/rocketmq-transaction-message-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">697</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">786</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">222</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-09-30T00:00:00.000Z" title="发表于 2026-09-30 08:00:00">2026-09-30</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-09-30T00:03:21.418Z" title="更新于 2026-09-30 08:03:21">2026-09-30</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/%E5%BE%AE%E6%9C%8D%E5%8A%A1/">微服务</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【消息队列】RocketMQ-事务消息深度解析：半消息、回查机制与分布式事务落地"><a href="#【消息队列】RocketMQ-事务消息深度解析：半消息、回查机制与分布式事务落地" class="headerlink" title="【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地"></a>【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地</h1><h2 id="面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？"><a href="#面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？" class="headerlink" title="面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？"></a>面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？</h2><p>这是分布式事务最经典的场景之一。候选人通常会给出三个答案：</p>
+<ol>
+<li>先写订单库，再发 MQ——<strong>如果发消息失败，订单写了但积分不扣</strong>；</li>
+<li>先发 MQ，再写订单——<strong>如果写库失败，积分扣了但订单不存在</strong>；</li>
+<li>用本地消息表——<strong>可行，但要额外建表 + 定时任务兜底</strong>。</li>
+</ol>
+<p>第 4 个答案经常被忘掉：<strong>RocketMQ 的事务消息</strong>。它把”本地事务 + 消息发送”的原子性下沉到了 Broker 层，不需要业务方自己建兜底表。</p>
+<p>但很多人的理解停留在”发个消息、执行本地事务、提交或回滚”这个层面，往下追问就答不上来了：</p>
+<ul>
+<li>半消息（Half Message）存在哪里？能消费到吗？</li>
+<li>为什么 RocketMQ 4.x 事务消息<strong>不支持延迟消息</strong>、不支持批量？</li>
+<li>事务回查的触发条件是”超时”还是”没提交”？默认多久查一次？</li>
+<li>回查次数有上限吗？超过会怎样？</li>
+</ul>
+<p>本文从设计动机讲到源码实现，把这套机制彻底讲透。</p>
+<h2 id="一、要解决什么问题"><a href="#一、要解决什么问题" class="headerlink" title="一、要解决什么问题"></a>一、要解决什么问题</h2><h3 id="1-1-本地消息表方案的痛点"><a href="#1-1-本地消息表方案的痛点" class="headerlink" title="1.1 本地消息表方案的痛点"></a>1.1 本地消息表方案的痛点</h3><p>先看最朴素可靠的方案——本地消息表：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE TABLE</span> t_local_message (</span><br><span class="line">    id <span class="type">BIGINT</span> <span class="keyword">PRIMARY KEY</span> AUTO_INCREMENT,</span><br><span class="line">    biz_id <span class="type">VARCHAR</span>(<span class="number">64</span>) <span class="keyword">NOT NULL</span> <span class="keyword">UNIQUE</span>,</span><br><span class="line">    topic <span class="type">VARCHAR</span>(<span class="number">128</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">    payload TEXT <span class="keyword">NOT NULL</span>,</span><br><span class="line">    status TINYINT <span class="keyword">NOT NULL</span> <span class="keyword">DEFAULT</span> <span class="number">0</span>,  <span class="comment">-- 0待发送 1已发送 2已完成</span></span><br><span class="line">    retry_count <span class="type">INT</span> <span class="keyword">DEFAULT</span> <span class="number">0</span>,</span><br><span class="line">    next_retry_time DATETIME,</span><br><span class="line">    create_time DATETIME <span class="keyword">DEFAULT</span> <span class="built_in">CURRENT_TIMESTAMP</span></span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+
+<p>流程：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">1. 开启本地事务</span><br><span class="line">2. INSERT INTO t_order ...           ← 业务表</span><br><span class="line">3. INSERT INTO t_local_message ...   ← 消息表（同一个事务）</span><br><span class="line">4. COMMIT</span><br><span class="line">5. 异步线程扫描 status=0 的记录，发 MQ，成功后置为 1</span><br></pre></td></tr></table></figure>
+
+<p>它的问题：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>业务侵入</td>
+<td>每张需要发消息的表都要配套一张消息表</td>
+</tr>
+<tr>
+<td>额外扫描</td>
+<td>定时任务扫描 + 重试，有延迟（秒级）</td>
+</tr>
+<tr>
+<td>表膨胀</td>
+<td>消息表会随业务量线性增长，需要归档</td>
+</tr>
+<tr>
+<td>重复投递</td>
+<td>扫描线程并发时可能重复发送（要幂等）</td>
+</tr>
+</tbody></table>
+<p><strong>RocketMQ 事务消息的目标：把第 3 步和第 5 步的职责搬到 MQ 侧，让业务代码只写自己的表。</strong></p>
+<h3 id="1-2-核心思路：两阶段提交的变体"><a href="#1-2-核心思路：两阶段提交的变体" class="headerlink" title="1.2 核心思路：两阶段提交的变体"></a>1.2 核心思路：两阶段提交的变体</h3><p>RocketMQ 事务消息本质是<strong>两阶段提交（2PC）</strong>，但做了一次非常重要的改造——把”决定提交或回滚”的权力交给业务方，并且引入了**回查（Check Back）**机制来兜底”业务方没回应”的第三种状态：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">阶段一：发送半消息</span><br><span class="line">    Producer → Broker：我要发消息，但先别投递</span><br><span class="line">    Broker：收到，存起来，回复你&quot;我存好了&quot;（此时对 Consumer 不可见）</span><br><span class="line"></span><br><span class="line">阶段二：执行本地事务</span><br><span class="line">    Producer：执行数据库事务（写订单、扣库存...）</span><br><span class="line">    ├─ 成功 → 向 Broker 发送 COMMIT</span><br><span class="line">    ├─ 失败 → 向 Broker 发送 ROLLBACK</span><br><span class="line">    └─ 超时/进程挂了/网络断了 → 什么都没发（消息处于&quot;待确认&quot;状态）</span><br><span class="line">                                    ↓</span><br><span class="line">                            ★ Broker 定期回查 Producer</span><br><span class="line">                            Producer 回来查本地事务的最终状态，补发 COMMIT/ROLLBACK</span><br></pre></td></tr></table></figure>
+
+<p>这个”第三种状态”的处理，是 RocketMQ 事务消息与普通 2PC 最大的区别，也是它能在生产环境落地的关键。</p>
+<h2 id="二、半消息（Half-Message）机制"><a href="#二、半消息（Half-Message）机制" class="headerlink" title="二、半消息（Half Message）机制"></a>二、半消息（Half Message）机制</h2><h3 id="2-1-半消息存在哪"><a href="#2-1-半消息存在哪" class="headerlink" title="2.1 半消息存在哪"></a>2.1 半消息存在哪</h3><p>半消息（也叫预备消息、Prepared Message）的存储方式很有讲究：</p>
+<ul>
+<li><strong>存放在真实 Topic 的 CommitLog 中</strong>，但不是原 Topic，而是被替换成 <code>RMQ_SYS_TRANS_HALF_TOPIC</code>；</li>
+<li>原有的 Topic 和 QueueId 被<strong>备份到消息属性</strong>里：</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// org.apache.rocketmq.common.message.MessageConst</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">PROPERTY_TRANSACTION_PREPARED</span> <span class="operator">=</span> <span class="string">&quot;TRAN_MSG&quot;</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">PROPERTY_PRODUCER_GROUP</span> <span class="operator">=</span> <span class="string">&quot;PGROUP&quot;</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">PROPERTY_MIN_OFFSET</span> <span class="operator">=</span> <span class="string">&quot;MIN_OFFSET&quot;</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">PROPERTY_MAX_OFFSET</span> <span class="operator">=</span> <span class="string">&quot;MAX_OFFSET&quot;</span>;</span><br><span class="line"><span class="comment">// 原始 topic / queueId 存在属性中：</span></span><br><span class="line"><span class="comment">// REAL_TOPIC = &quot;REAL_TOPIC&quot;</span></span><br><span class="line"><span class="comment">// REAL_QUEUE_ID = &quot;REAL_QID&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>Producer 发送半消息时，请求里带 <code>TRAN_MSG=true</code>，Broker 端的 <code>SendMessageProcessor</code> 会做 topic 替换：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// SendMessageProcessor#sendMessage （简化）</span></span><br><span class="line"><span class="type">String</span> <span class="variable">tranMsg</span> <span class="operator">=</span> requestHeader.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);</span><br><span class="line"><span class="keyword">if</span> (tranMsg != <span class="literal">null</span> &amp;&amp; Boolean.parseBoolean(tranMsg)) &#123;</span><br><span class="line">    <span class="comment">// 关键：把 topic 换成半消息专用的系统 topic</span></span><br><span class="line">    requestHeader.setTopic(</span><br><span class="line">        MixAll.RMQ_SYS_TRANS_HALF_TOPIC);   <span class="comment">// &quot;RMQ_SYS_TRANS_HALF_TOPIC&quot;</span></span><br><span class="line">    <span class="comment">// 把真实 topic 和 queueId 存进属性</span></span><br><span class="line">    requestHeader.putProperty(MessageConst.PROPERTY_REAL_TOPIC, realTopic);</span><br><span class="line">    requestHeader.putProperty(MessageConst.PROPERTY_REAL_QUEUE_ID, String.valueOf(queueId));</span><br><span class="line">    <span class="comment">// 标记为事务消息</span></span><br><span class="line">    sysFlag |= MessageSysFlag.TRANSACTION_PREPARED_TYPE;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么要换 Topic？</strong> 因为 <code>RMQ_SYS_TRANS_HALF_TOPIC</code> <strong>没有 Consumer 订阅</strong>，所以消息虽然写进了 CommitLog，但<strong>永远不会被投递</strong>。这是一个非常巧妙的设计：</p>
+<ul>
+<li>复用 CommitLog 的写入路径（顺序写、零拷贝、可靠性都有保障）；</li>
+<li>靠”没有订阅者”实现”不可见”，比用单独的存储介质更简单高效。</li>
+</ul>
+<h3 id="2-2-从半消息到真实消息：Commit-做了什么"><a href="#2-2-从半消息到真实消息：Commit-做了什么" class="headerlink" title="2.2 从半消息到真实消息：Commit 做了什么"></a>2.2 从半消息到真实消息：Commit 做了什么</h3><p>Commit 时，Broker 的 <code>EndTransactionProcessor</code> 会：</p>
+<ol>
+<li>找到半消息在 <code>RMQ_SYS_TRANS_HALF_TOPIC</code> 里的 CommitLog offset；</li>
+<li><strong>把原消息重新写一遍</strong>，但这次 topic 用真实 Topic，并把 <code>TRAN_MSG</code> 属性去掉、打上 <code>TRANSACTION_COMMIT_TYPE</code> 标记；</li>
+<li>写一条”Op 消息”（操作记录）到 <code>RMQ_SYS_TRANS_OP_HALF_TOPIC</code>，内容记录”这个半消息已被 commit&#x2F;rollback”。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// EndTransactionProcessor#processRequest （简化）</span></span><br><span class="line"><span class="keyword">if</span> (requestHeader.getCommitOrRollback() ==</span><br><span class="line">        TransactionResolution.COMMIT_MESSAGE) &#123;</span><br><span class="line">    <span class="comment">// 1. 从半消息构建真实消息</span></span><br><span class="line">    <span class="type">MessageExtBrokerInner</span> <span class="variable">msgInner</span> <span class="operator">=</span> endMessageTransaction(requestHeader,</span><br><span class="line">            msgExt, tranStateTable.findOffset(...));</span><br><span class="line">    <span class="comment">// 2. 写回真实 topic</span></span><br><span class="line">    <span class="type">PutMessageResult</span> <span class="variable">putMessageResult</span> <span class="operator">=</span> <span class="built_in">this</span>.brokerController</span><br><span class="line">            .getMessageStore().putMessage(msgInner);</span><br><span class="line">    <span class="comment">// 3. 半消息本身被删掉（实际上是被标记为已完成）</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意这里有个”双写”</strong>：原始半消息 + 重新写入的真实消息。所以一条事务消息在 CommitLog 里<strong>占两份空间</strong>。这也是为什么 RocketMQ 不建议用事务消息承载超大 payload。</p>
+<h3 id="2-3-Rollback-做了什么"><a href="#2-3-Rollback-做了什么" class="headerlink" title="2.3 Rollback 做了什么"></a>2.3 Rollback 做了什么</h3><p>Rollback 比 Commit 更”轻”：</p>
+<ul>
+<li><strong>不写真实消息</strong>，只写一条 Op 记录到 <code>RMQ_SYS_TRANS_OP_HALF_TOPIC</code>；</li>
+<li>半消息本身仍然躺在 CommitLog 里（因为 CommitLog 只能追加，不能删除），但会被<strong>定期清理</strong>。</li>
+</ul>
+<p>这也解释了为什么”回滚”事务消息实际上已经消耗了磁盘——<strong>半消息已经写进去了，物理空间不会因为回滚而释放</strong>，直到 CommitLog 过期删除。</p>
+<h2 id="三、事务回查（Transaction-Check）机制"><a href="#三、事务回查（Transaction-Check）机制" class="headerlink" title="三、事务回查（Transaction Check）机制"></a>三、事务回查（Transaction Check）机制</h2><p>这是整套机制里最精妙、也最容易答不上来的部分。</p>
+<h3 id="3-1-回查的触发条件"><a href="#3-1-回查的触发条件" class="headerlink" title="3.1 回查的触发条件"></a>3.1 回查的触发条件</h3><p><strong>不是”超时”触发的，而是”没有被 Commit 或 Rollback”触发的。</strong></p>
+<p>具体来说，Broker 端有一个定时任务 <code>TransactionalMessageCheckService</code>，默认<strong>每 60 秒</strong>执行一次（<code>transactionCheckInterval</code>，可配置）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// TransactionalMessageCheckService</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TransactionalMessageCheckService</span> <span class="keyword">extends</span> <span class="title class_">ServiceThread</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> BrokerController brokerController;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">while</span> (!<span class="built_in">this</span>.isStopped()) &#123;</span><br><span class="line">            <span class="built_in">this</span>.waitForRunning(<span class="number">1000</span> * <span class="number">60</span>);   <span class="comment">// 每 60 秒一轮</span></span><br><span class="line"></span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                <span class="comment">// 核心：检查半消息</span></span><br><span class="line">                brokerController.getTransactionalMessageService()</span><br><span class="line">                        .check(<span class="built_in">this</span>.brokerController.getMessageStore());</span><br><span class="line">            &#125; <span class="keyword">catch</span> (Throwable e) &#123;</span><br><span class="line">                log.error(<span class="string">&quot;Failed to check transaction op message&quot;</span>, e);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>check()</code> 的详细逻辑（<code>TransactionalMessageServiceImpl#check</code>）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">check</span><span class="params">(MessageStore ms)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 从 RMQ_SYS_TRANS_OP_HALF_TOPIC 拉取&quot;已完成&quot;的 op 消息，</span></span><br><span class="line">    <span class="comment">//    建立一个 Set&lt;offset&gt; 作为&quot;已完成集合&quot;</span></span><br><span class="line">    <span class="comment">// 2. 从 RMQ_SYS_TRANS_HALF_TOPIC 按消费位点拉取半消息</span></span><br><span class="line">    <span class="comment">// 3. 对于每条半消息：</span></span><br><span class="line">    <span class="comment">//      if (opSet.contains(halfOffset))  → 已处理，跳过</span></span><br><span class="line">    <span class="comment">//      else → 需要回查</span></span><br><span class="line">    <span class="comment">//         如果需要回查：发送 CHECK_TRANSACTION_STATE 请求给 Producer</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键：回查是逐条”遍历半消息”然后对比 op 集合。</strong> 所以半消息的消费进度（<code>transactionCheckMax</code> 等）也是通过 <code>RMQ_SYS_TRANS_HALF_TOPIC</code> 的 ConsumerOffset 来维护的——<strong>Broker 自己是这个 topic 的”消费者”</strong>。</p>
+<h3 id="3-2-真的”超时”判断在哪"><a href="#3-2-真的”超时”判断在哪" class="headerlink" title="3.2 真的”超时”判断在哪"></a>3.2 真的”超时”判断在哪</h3><p>上面看到回查是”每 60 秒扫一遍所有未完成的半消息”。但实际实现里还有一个”过滤”：<strong>只看已经等待足够久的半消息。</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 关键常量（BrokerConfig）</span></span><br><span class="line"><span class="comment">/**</span></span><br><span class="line"><span class="comment"> * 最大检查次数，默认 15 次</span></span><br><span class="line"><span class="comment"> */</span></span><br><span class="line"><span class="keyword">private</span> <span class="type">int</span> <span class="variable">transactionCheckMax</span> <span class="operator">=</span> <span class="number">15</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">/**</span></span><br><span class="line"><span class="comment"> * 回查间隔，默认 60 秒（单位秒）</span></span><br><span class="line"><span class="comment"> */</span></span><br><span class="line"><span class="keyword">private</span> <span class="type">int</span> <span class="variable">transactionCheckInterval</span> <span class="operator">=</span> <span class="number">60</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">/**</span></span><br><span class="line"><span class="comment"> * 事务消息超时时间，默认 6 秒（在这个时间内不检查，因为可能事务还在执行）</span></span><br><span class="line"><span class="comment"> */</span></span><br><span class="line"><span class="keyword">private</span> <span class="type">long</span> <span class="variable">transactionTimeOut</span> <span class="operator">=</span> <span class="number">6_000</span>;</span><br></pre></td></tr></table></figure>
+
+<p>所以在 <code>check()</code> 内部会计算：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 距离半消息写入的时间</span></span><br><span class="line"><span class="type">long</span> <span class="variable">halfOffsetInMsg</span> <span class="operator">=</span> ...;</span><br><span class="line"><span class="type">long</span> <span class="variable">valueOfCurrentTime</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line"></span><br><span class="line"><span class="keyword">if</span> (valueOfCurrentTime - halfOffsetInMsg &lt; transactionTimeOut) &#123;</span><br><span class="line">    <span class="comment">// 还没超过 transactionTimeOut（默认 6s），认为事务可能还在执行，跳过</span></span><br><span class="line">    <span class="keyword">continue</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>所以完整的触发条件是：半消息写入后超过 <code>transactionTimeOut</code>（默认 6s），且没有被 Commit&#x2F;Rollback，且当前处在 60s 一轮的扫描中。</strong> 换算下来，生产环境里一次未确认事务通常在 <strong>6~66 秒</strong>内被回查。</p>
+<h3 id="3-3-回查请求怎么发"><a href="#3-3-回查请求怎么发" class="headerlink" title="3.3 回查请求怎么发"></a>3.3 回查请求怎么发</h3><p>Broker 通过 Netty 向 Producer 所在的那个 <strong>Producer Group 里的任意一个实例</strong>发请求：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 请求码</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">CHECK_TRANSACTION_STATE</span> <span class="operator">=</span> <span class="number">39</span>;</span><br></pre></td></tr></table></figure>
+
+<p>请求体里带上半消息的关键信息：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">CheckTransactionStateRequestHeader &#123;</span><br><span class="line">    <span class="type">long</span> commitLogOffset;     <span class="comment">// 半消息在 CommitLog 的位置</span></span><br><span class="line">    <span class="type">int</span> tranStateTableOffset; <span class="comment">// op 表里的位置</span></span><br><span class="line">    String transactionId;     <span class="comment">// 事务 ID（UNIQ_KEY）</span></span><br><span class="line">    MessageExt messageExt;    <span class="comment">// 原始消息内容</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意”任意一个实例”这个细节</strong>：Broker 是按 <strong>Producer Group</strong> 来找的，不是按发送方实例。这意味着：</p>
+<blockquote>
+<p>如果你的 Producer Group 有 3 个实例，Broker 可能把回查请求发给<strong>没执行过这个事务的那 2 个实例</strong>。</p>
+</blockquote>
+<p>所以 <code>TransactionListener</code> 的回查实现<strong>不能依赖本地内存状态</strong>，必须去查数据库或者共享存储！这是生产落地最常见的坑，后面会详细讲。</p>
+<h3 id="3-4-回查次数与最终归宿"><a href="#3-4-回查次数与最终归宿" class="headerlink" title="3.4 回查次数与最终归宿"></a>3.4 回查次数与最终归宿</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="type">int</span> <span class="variable">transactionCheckMax</span> <span class="operator">=</span> <span class="number">15</span>;</span><br></pre></td></tr></table></figure>
+
+<p>如果回查了 15 次（15 × 60s ≈ 15 分钟，实际还要加上 ~6s 的初始延迟）仍然没有结果，Broker 会<strong>直接丢弃这条半消息</strong>（并打日志、写 op 记录）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">if</span> (messageExt.getReconsumeTimes() &gt;= transactionCheckMax) &#123;</span><br><span class="line">    log.warn(<span class="string">&quot;Check transaction failed, discard the message: &#123;&#125;&quot;</span>, ...);</span><br><span class="line">    <span class="comment">// 记录到事务状态表，标记为&quot;丢弃&quot;</span></span><br><span class="line">    <span class="comment">// 最终半消息不再回查</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这里有个<strong>极其重要的生产隐患</strong>：<strong>丢弃意味着”这条消息永远不会被投递”</strong>，而且<strong>业务方不会收到任何通知</strong>。如果你的业务逻辑需要”100% 最终一致”，就必须：</p>
+<ol>
+<li>监控 Broker 日志里的 <code>Check transaction failed, discard the message</code>；</li>
+<li>在回查逻辑里保证一定能查到状态（而不是依赖内存）；</li>
+<li>或者干脆别用事务消息，回到本地消息表方案。</li>
+</ol>
+<h2 id="四、Producer-端-API-与代码实战"><a href="#四、Producer-端-API-与代码实战" class="headerlink" title="四、Producer 端 API 与代码实战"></a>四、Producer 端 API 与代码实战</h2><h3 id="4-1-核心接口：TransactionListener"><a href="#4-1-核心接口：TransactionListener" class="headerlink" title="4.1 核心接口：TransactionListener"></a>4.1 核心接口：TransactionListener</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">TransactionListener</span> &#123;</span><br><span class="line">    <span class="comment">/**</span></span><br><span class="line"><span class="comment">     * 执行本地事务（阶段二）</span></span><br><span class="line"><span class="comment">     * 返回 LOCAL_TRANSACTION_STATE，决定 COMMIT / ROLLBACK / UNKNOW</span></span><br><span class="line"><span class="comment">     */</span></span><br><span class="line">    LocalTransactionState <span class="title function_">executeLocalTransaction</span><span class="params">(Message msg, Object arg)</span>;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/**</span></span><br><span class="line"><span class="comment">     * 事务回查（Broker 主动调用）</span></span><br><span class="line"><span class="comment">     * 返回 UNKNOW 会让 Broker 继续回查</span></span><br><span class="line"><span class="comment">     */</span></span><br><span class="line">    LocalTransactionState <span class="title function_">checkLocalTransaction</span><span class="params">(MessageExt msg)</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>状态枚举：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">enum</span> <span class="title class_">LocalTransactionState</span> &#123;</span><br><span class="line">    COMMIT_MESSAGE,      <span class="comment">// 提交，消息对 Consumer 可见</span></span><br><span class="line">    ROLLBACK_MESSAGE,    <span class="comment">// 回滚，消息被丢弃</span></span><br><span class="line">    UNKNOW               <span class="comment">// 未知，触发 Broker 回查</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-完整发送示例"><a href="#4-2-完整发送示例" class="headerlink" title="4.2 完整发送示例"></a>4.2 完整发送示例</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderTransactionProducer</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> TransactionMQProducer producer;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> OrderDao orderDao;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">OrderTransactionProducer</span><span class="params">(OrderDao orderDao)</span> <span class="keyword">throws</span> MQClientException &#123;</span><br><span class="line">        <span class="built_in">this</span>.orderDao = orderDao;</span><br><span class="line"></span><br><span class="line">        producer = <span class="keyword">new</span> <span class="title class_">TransactionMQProducer</span>(<span class="string">&quot;order_tx_producer_group&quot;</span>);</span><br><span class="line">        producer.setNamesrvAddr(<span class="string">&quot;10.0.0.1:9876;10.0.0.2:9876&quot;</span>);</span><br><span class="line">        producer.setRetryTimesWhenSendAsyncFailed(<span class="number">3</span>);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 回查线程池（必须设置，否则回查请求会被拒绝！）</span></span><br><span class="line">        producer.setExecutorService(<span class="keyword">new</span> <span class="title class_">ThreadPoolExecutor</span>(</span><br><span class="line">            <span class="number">2</span>, <span class="number">5</span>, <span class="number">60</span>, TimeUnit.SECONDS,</span><br><span class="line">            <span class="keyword">new</span> <span class="title class_">ArrayBlockingQueue</span>&lt;&gt;(<span class="number">2000</span>),</span><br><span class="line">            <span class="keyword">new</span> <span class="title class_">ThreadFactoryImpl</span>(<span class="string">&quot;tx-check-thread-&quot;</span>)));</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 设置事务监听器</span></span><br><span class="line">        producer.setTransactionListener(<span class="keyword">new</span> <span class="title class_">OrderTransactionListener</span>(orderDao));</span><br><span class="line"></span><br><span class="line">        producer.start();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">createOrder</span><span class="params">(Order order)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">Message</span> <span class="variable">message</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Message</span>(</span><br><span class="line">                <span class="string">&quot;order_topic&quot;</span>,</span><br><span class="line">                <span class="string">&quot;CREATE_ORDER&quot;</span>,</span><br><span class="line">                order.getOrderId().toString(),</span><br><span class="line">                JSON.toJSONBytes(order));</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 关键：把业务参数通过 arg 传给 listener（不会发送到 Broker）</span></span><br><span class="line">        <span class="type">TransactionSendResult</span> <span class="variable">result</span> <span class="operator">=</span> producer.sendMessageInTransaction(</span><br><span class="line">                message, order);</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (result.getLocalTransactionState() != LocalTransactionState.COMMIT_MESSAGE) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;订单事务失败: &quot;</span> + result);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-关键点：本地事务与消息发送的分工"><a href="#4-3-关键点：本地事务与消息发送的分工" class="headerlink" title="4.3 关键点：本地事务与消息发送的分工"></a>4.3 关键点：本地事务与消息发送的分工</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderTransactionListener</span> <span class="keyword">implements</span> <span class="title class_">TransactionListener</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> OrderDao orderDao;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> LocalTransactionState <span class="title function_">executeLocalTransaction</span><span class="params">(Message msg, Object arg)</span> &#123;</span><br><span class="line">        <span class="type">Order</span> <span class="variable">order</span> <span class="operator">=</span> (Order) arg;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="comment">// ① 执行本地事务（写订单 + 写扣积分任务记录）</span></span><br><span class="line">            orderDao.createOrder(order);</span><br><span class="line">            orderDao.savePointDeductTask(order.getOrderId(), order.getPoints());</span><br><span class="line">            <span class="keyword">return</span> LocalTransactionState.COMMIT_MESSAGE;</span><br><span class="line">        &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">            log.error(<span class="string">&quot;本地事务执行失败, orderId=&#123;&#125;&quot;</span>, order.getOrderId(), e);</span><br><span class="line">            <span class="keyword">return</span> LocalTransactionState.ROLLBACK_MESSAGE;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> LocalTransactionState <span class="title function_">checkLocalTransaction</span><span class="params">(MessageExt msg)</span> &#123;</span><br><span class="line">        <span class="comment">// ★ 绝对不能依赖本地内存！必须查数据库</span></span><br><span class="line">        <span class="type">String</span> <span class="variable">orderId</span> <span class="operator">=</span> msg.getKeys();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="type">boolean</span> <span class="variable">exists</span> <span class="operator">=</span> orderDao.existsOrder(Long.valueOf(orderId));</span><br><span class="line">            <span class="type">boolean</span> <span class="variable">taskSaved</span> <span class="operator">=</span> orderDao.existsPointTask(Long.valueOf(orderId));</span><br><span class="line">            <span class="keyword">if</span> (exists &amp;&amp; taskSaved) &#123;</span><br><span class="line">                <span class="keyword">return</span> LocalTransactionState.COMMIT_MESSAGE;</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="comment">// 注意：订单不存在不代表&quot;回滚&quot;，可能是事务还在执行中</span></span><br><span class="line">            <span class="comment">// 返回 UNKNOW 让 Broker 稍后再查</span></span><br><span class="line">            <span class="keyword">return</span> LocalTransactionState.UNKNOW;</span><br><span class="line">        &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">            log.error(<span class="string">&quot;回查失败, orderId=&#123;&#125;&quot;</span>, orderId, e);</span><br><span class="line">            <span class="keyword">return</span> LocalTransactionState.UNKNOW;   <span class="comment">// 出错时也必须 UNKNOW，不能猜</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>三个铁律：</strong></p>
+<ol>
+<li><strong>回查逻辑必须查持久化状态</strong>，不能依赖内存&#x2F;ThreadLocal——因为回查请求可能发给同 Group 的其他实例；</li>
+<li><strong>查不到时返回 <code>UNKNOW</code>，不要返回 <code>ROLLBACK</code></strong>——不然会把”事务还没提交完”误判成”失败”，消息永久丢失（极难排查）；</li>
+<li><strong><code>arg</code> 参数只能本地传递</strong>，不会发给 Broker，也不会在回查时出现（回查拿到的是 <code>MessageExt</code>，<code>arg</code> 为 null），所以<strong>回查所需的信息必须能从消息体里解析出来</strong>——把 <code>orderId</code> 放进 <code>keys</code> 或消息体。</li>
+</ol>
+<h3 id="4-4-消费端幂等"><a href="#4-4-消费端幂等" class="headerlink" title="4.4 消费端幂等"></a>4.4 消费端幂等</h3><p>事务消息保证的是”消息最终会被投递且只 Commit 一次（如果本地事务成功）”，但<strong>不保证消费者只收到一次</strong>。因为：</p>
+<ul>
+<li>Broker 端 Commit 后，消息正常投递；</li>
+<li>如果消费者处理成功但 ACK 丢失，会重投（RocketMQ 至少一次语义）。</li>
+</ul>
+<p>所以消费端必须幂等：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@RocketMQMessageListener(</span></span><br><span class="line"><span class="meta">    topic = &quot;order_topic&quot;,</span></span><br><span class="line"><span class="meta">    consumerGroup = &quot;point_consumer_group&quot;,</span></span><br><span class="line"><span class="meta">    messageModel = MessageModel.CLUSTERING)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">PointDeductConsumer</span> <span class="keyword">implements</span> <span class="title class_">RocketMQListener</span>&lt;MessageExt&gt; &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onMessage</span><span class="params">(MessageExt message)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">orderId</span> <span class="operator">=</span> message.getKeys();</span><br><span class="line">        <span class="comment">// 幂等表 + 唯一索引，靠数据库约束防重</span></span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            pointService.deduct(orderId);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (DuplicateKeyException e) &#123;</span><br><span class="line">            log.info(<span class="string">&quot;重复消费，忽略, orderId=&#123;&#125;&quot;</span>, orderId);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h2 id="五、使用限制与生产陷阱"><a href="#五、使用限制与生产陷阱" class="headerlink" title="五、使用限制与生产陷阱"></a>五、使用限制与生产陷阱</h2><h3 id="5-1-事务消息的硬限制"><a href="#5-1-事务消息的硬限制" class="headerlink" title="5.1 事务消息的硬限制"></a>5.1 事务消息的硬限制</h3><table>
+<thead>
+<tr>
+<th>限制</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>不支持延迟消息</td>
+<td>半消息的延迟级别会被覆盖，RocketMQ 4.x 明确不支持</td>
+</tr>
+<tr>
+<td>不支持批量发送</td>
+<td>批量消息无法逐条确认事务状态</td>
+</tr>
+<tr>
+<td>不支持顺序消息</td>
+<td>事务消息在 Commit 前不可见，顺序无法保证</td>
+</tr>
+<tr>
+<td>存储成本翻倍</td>
+<td>半消息 + 真实消息各占一份 CommitLog</td>
+</tr>
+<tr>
+<td>回查有上限</td>
+<td><code>transactionCheckMax</code> 默认 15 次，超限直接丢弃</td>
+</tr>
+</tbody></table>
+<p><strong>为什么事务消息不支持延迟消息？</strong> 因为延迟消息在 Broker 端是通过 <code>SCHEDULE_TOPIC_XXXX</code> 转换 Topic 实现的，而事务消息也需要转换 Topic（转成 <code>RMQ_SYS_TRANS_HALF_TOPIC</code>），两个转换会互相覆盖，导致消息投递错乱。RocketMQ 5.x 的定时消息架构重构后支持了，但 4.x 不支持。</p>
+<h3 id="5-2-常见生产陷阱"><a href="#5-2-常见生产陷阱" class="headerlink" title="5.2 常见生产陷阱"></a>5.2 常见生产陷阱</h3><p><strong>陷阱一：忘了设置回查线程池</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">producer.setExecutorService(executorService);   <span class="comment">// 不设置会怎样？</span></span><br></pre></td></tr></table></figure>
+
+<p><code>TransactionMQProducer</code> 默认 <code>executorService = null</code>。当 Broker 发回查请求时，Producer 端的 <code>ClientRemotingProcessor#checkTransactionState</code> 会尝试用这个线程池处理，null 会导致请求被直接丢弃并打日志。<strong>表现为：事务一直不提交，最后被丢弃。</strong></p>
+<p><strong>陷阱二：Producer Group 混用</strong></p>
+<p>不同业务的事务消息<strong>必须用不同的 Producer Group</strong>。因为回查是按 Group 找 Producer 的，如果 Group 里有 A、B 两个业务的事务消息，Broker 的回查请求可能发给错误的实例，而该实例的 listener 未必认识这条消息。</p>
+<p><strong>陷阱三：回查返回 ROLLBACK 导致静默丢单</strong></p>
+<p>前面强调过。补充一个真实案例：</p>
+<blockquote>
+<p>某团队的回查逻辑是”查订单表，不存在就返回 ROLLBACK”。上线后偶发丢单：<strong>订单写入后数据库主从延迟</strong>（回查走从库），从库还没同步到，回查判为不存在 → 返回 ROLLBACK → 消息被丢弃 → 积分永远不扣。改成 <code>UNKNOW</code> 后问题消失。</p>
+</blockquote>
+<p><strong>陷阱四：Broker 磁盘满 &#x2F; 主从切换</strong></p>
+<ul>
+<li>CommitLog 写满（<code>diskMaxUsedPercentage</code>）时 Broker 拒绝写入，半消息写不进去，<code>sendMessageInTransaction</code> 抛异常，但<strong>本地事务可能已经执行</strong>——这时要靠业务侧的补偿或对账；</li>
+<li>主从切换时，如果半消息还没同步到新主，回查会查不到，可能导致重复 Commit（需消费端幂等兜底）。</li>
+</ul>
+<p><strong>陷阱五：<code>executeLocalTransaction</code> 里做长耗时操作</strong></p>
+<p>本地事务执行时间过长（超过 <code>transactionTimeOut</code>）会导致 Broker 在事务还在执行时就发起回查，此时回查必然返回 <code>UNKNOW</code>，白白消耗回查次数。</p>
+<p><strong>建议：<code>executeLocalTransaction</code> 里的操作控制在 2 秒以内；长流程拆成”写状态 + 异步处理”。</strong></p>
+<h2 id="六、与本地消息表、Seata-的对比"><a href="#六、与本地消息表、Seata-的对比" class="headerlink" title="六、与本地消息表、Seata 的对比"></a>六、与本地消息表、Seata 的对比</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>RocketMQ 事务消息</th>
+<th>本地消息表</th>
+<th>Seata AT</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>一致性</td>
+<td>最终一致</td>
+<td>最终一致</td>
+<td>最终一致（有全局锁，可做到接近强一致）</td>
+</tr>
+<tr>
+<td>业务侵入</td>
+<td>低（实现 listener）</td>
+<td>中（建表 + 扫描）</td>
+<td>低（<code>@GlobalTransactional</code>）</td>
+</tr>
+<tr>
+<td>中间件依赖</td>
+<td>RocketMQ（新版功能）</td>
+<td>无</td>
+<td>Seata Server</td>
+</tr>
+<tr>
+<td>数据可靠性</td>
+<td>依赖 Broker（回查上限 15 次后丢弃）</td>
+<td>依赖本地库（最可靠）</td>
+<td>依赖 undo_log</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>秒级</td>
+<td>秒级（扫描间隔）</td>
+<td>百毫秒级</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>已有 RocketMQ 的异步链路</td>
+<td>无 MQ 或要求最高可靠</td>
+<td>强一致要求 + 跨服务 RPC</td>
+</tr>
+</tbody></table>
+<p><strong>选型建议：</strong></p>
+<ul>
+<li>已经是 RocketMQ 用户，且业务是”本地事务 + 异步通知”→ <strong>事务消息</strong>，最省事；</li>
+<li>要求”绝不丢消息”（金融级）→ <strong>本地消息表</strong>，最可靠；</li>
+<li>需要跨服务强一致回滚 → <strong>Seata</strong>；</li>
+<li>业务量小、追求简单 → 干脆用”本地消息表 + 定时补偿”，代码几十行就够。</li>
+</ul>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：半消息为什么不会被消费？</strong></p>
+<p>因为 Broker 把它的 Topic 替换成了 <code>RMQ_SYS_TRANS_HALF_TOPIC</code>（通过 <code>TRAN_MSG=true</code> 触发），这个 Topic 没有任何 Consumer 订阅，所以永远不投递。CommitLog 里确实写了数据，但”可见性”由订阅关系决定。</p>
+<p><strong>Q2：为什么事务回查一定要查数据库？</strong></p>
+<p>因为 Broker 按 <strong>Producer Group</strong> 找实例发回查请求，可能发给 Group 内任何一个实例，而不一定是执行本地事务的那个。依赖内存状态会导致”回查找不到，误判回滚”。</p>
+<p><strong>Q3：回查 15 次后消息怎么办？</strong></p>
+<p>被 Broker 丢弃（写日志 <code>Check transaction failed, discard the message</code>），半消息永远不再投递。<strong>这是事务消息最危险的边界</strong>，必须监控告警 + 对账兜底。</p>
+<p><strong>Q4：事务消息能保证消息不重复吗？</strong></p>
+<p>不能。RocketMQ 的投递语义是<strong>至少一次（at least once）</strong>，消费端必须幂等。与事务消息本身无关，所有 MQ 都一样。</p>
+<p><strong>Q5：<code>arg</code> 参数在回查时能拿到吗？</strong></p>
+<p>不能。<code>arg</code> 只在 Producer 本地内存里传递给 <code>executeLocalTransaction</code>，不发送到 Broker，回查时是 null。需要回查的信息必须能从消息体或 <code>keys</code> 解析出来。</p>
+<p><strong>Q6：Commit 为什么要把消息重写一遍？不能直接改原位吗？</strong></p>
+<p>CommitLog 是<strong>只追加的顺序日志</strong>（append-only），不能原地修改（这正是它高性能的根源：顺序写 + 零拷贝）。所以 Commit 只能”重新写一条真实 Topic 的消息”，同时写 op 记录标记半消息已完成。</p>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>RocketMQ 事务消息的设计精髓可以浓缩成三句话：</p>
+<ol>
+<li><strong>用 Topic 替换实现”写入但不可见”</strong>——半消息落在 <code>RMQ_SYS_TRANS_HALF_TOPIC</code>，靠无订阅者实现隔离，复用了 CommitLog 的可靠性；</li>
+<li><strong>用回查兜住”第三种状态”</strong>——业务没回应不是失败，Broker 主动回查，把 2PC 的”阻塞等待”变成了”异步补偿”；</li>
+<li><strong>用 op 记录实现幂等标记</strong>——CommitLog 不可改，那就用另一份记录来表达”已完成”。</li>
+</ol>
+<p>但它不是免费的午餐：<strong>回查上限 15 次后会静默丢消息</strong>，这决定了它只适合”最终一致 + 有对账”的场景，不适合”绝对不能丢”的场景。</p>
+<p>落地时的三件必做事项：<strong>回查逻辑查数据库且返回 UNKNOW、独立 Producer Group、配套对账与告警</strong>。做到这三点，事务消息可以帮你省掉本地消息表和定时扫描任务；做不到，它可能会在某个大促的凌晨悄悄吞掉你的订单。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/09/30/rocketmq-transaction-message-deep-dive/">https://jiweidong.github.io/2026/09/30/rocketmq-transaction-message-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1/">分布式事务</a><a class="post-meta__tags" href="/tags/RocketMQ/">RocketMQ</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/09/30/spring-mvc-content-negotiation-deep-dive/" title="【Spring MVC 源码】内容协商（Content Negotiation）深度解析：Accept 解析、MediaType 匹配与消息转换"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Spring MVC 源码】内容协商（Content Negotiation）深度解析：Accept 解析、MediaType 匹配与消息转换</div></div><div class="info-2"><div class="info-item-1">【Spring MVC 源码】内容协商（Content Negotiation）深度解析：Accept 解析、MediaType 匹配与消息转换面试官：同一个接口，浏览器返回 HTML，Postman 返回 JSON，这是怎么做到的？这个问题看起来简单，但能往下追很深：  请求头里那个 Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8 是怎么解析的？ q=0.9 是什么意思？为什么 */* 排在最后？ 匹配到 MediaType 之后，@ResponseBody 的内容是怎么被序列化成对应格式的？ 如果匹配不上，Spring 返回 406，这个 406 是哪里抛的？  这一整套机制叫内容协商（Content Negotiation）。它在 Spring MVC 的 AbstractMessageConverterMethodProcessor 里实现，是 @ResponseBody、ResponseEntity、@RestController 的公共底座。本文从请求头一路追到 HttpM...</div></div></div></a><a class="pagination-related" href="/2026/09/30/mysql-multi-source-replication-deep-dive/" title="【MySQL 运维】多源复制（Multi-Source Replication）深度解析：多实例数据聚合与冲突治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 运维】多源复制（Multi-Source Replication）深度解析：多实例数据聚合与冲突治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】多源复制（Multi-Source Replication）深度解析：多实例数据聚合与冲突治理面试官：有 8 个分库，怎么做一张全局报表？这是一个非常典型的真实需求：业务按用户 ID 水平分成了 8 个库，现在要做运营报表、离线分析或者全局搜索，需要把这 8 个分库的数据汇总到一个地方。 候选人的答案通常有三种：  写个程序定时 SELECT 再 INSERT（数据同步服务）； 用 Canal&#x2F;Debezium 订阅 binlog 再写到汇总库； 用 MySQL 自带的多源复制。  前两种方案大家都熟，第三种却经常被忽略。MySQL 5.7 起正式支持多源复制（Multi-Source Replication），一个从库可以同时挂在多个主库下面，把多个实例的数据拉到一个实例里。本文就把这套机制讲透：怎么建、怎么防冲突、怎么监控、什么时候不该用。 一、多源复制解决什么问题1.1 场景对比   方案 优点 缺点    应用层定时同步 灵活、可做清洗 有延迟、要写代码、易漏数据、对主库有压力   Canal&#x2F;Debezium + MQ 事件驱动、...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/15/rocketmq-store-commitlog-consumequeue-deep-dive/" title="【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-15</div><div class="info-item-2">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制</div></div><div class="info-2"><div class="info-item-1">【消息队列】RocketMQ 存储引擎深度解析：CommitLog、ConsumeQueue、IndexFile 与 mmap 刷盘机制面试官：RocketMQ 一条消息写进去，到底写了几次磁盘？大部分人答「写一次」，然后就被追问到哑口无言。 真实答案是：一次写入调用，但数据落到了三份文件里——CommitLog、ConsumeQueue、IndexFile（可选）。更麻烦的是，这三份文件写入时机不同、刷盘策略不同、丢失后果也不同。 这套设计是 RocketMQ 高吞吐 + 高可靠的核心，也是面试里最能拉开差距的地方。本文按「文件布局 → 写入链路 → 读取链路 → 刷盘与复制 → 故障恢复 → 调优」六段讲透。  一、为什么不用「一条消息一个文件」先看反面教材。如果每条消息独立存一个文件，会立刻遇到三个问题：  文件数爆炸：每秒 10 万条消息 → 每天 86 亿个文件，inode 直接耗尽 写入变随机：文件创建本身是元数据随机写，无法利用磁盘顺序写特性 读取低效：按 Topic 拉取消息需要遍历大量文件  Kafka 的思路是「partition &#x3D; 一个目录，消息...</div></div></div></a><a class="pagination-related" href="/2026/09/27/rocketmq-delay-timer-message-deep-dive/" title="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-27</div><div class="info-item-2">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</div></div><div class="info-2"><div class="info-item-1">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息面试官：订单 30 分钟未支付自动关闭，你怎么实现？这是最经典的延迟消息场景题。候选人的答案通常有三种：  「用定时任务扫描订单表」； 「用 RabbitMQ 的死信队列 + TTL」； 「用 RocketMQ 的延迟消息，delayLevel=16」。  如果答第 3 种，我会继续追问：  「delayLevel=16 代表延迟多久？」 「为什么 RocketMQ 4.x 只有 18 个固定级别，不能任意时间？」 「延迟消息是存在哪里的？它和普通消息在存储上有什么区别？」 「如果我要延迟 2 小时，你会怎么写？」 「RocketMQ 5.x 的定时消息是怎么做到任意时间的？」  这一串问题下去，能完整答上来的候选人非常少。而这篇文章，就是把这串问题从头到尾讲清楚。  一、为什么需要延迟消息延迟消息（也叫定时消息）指：消息发送到 Broker 后，不立即投递给消费者，而是等待指定时间后才可见。 典型场景：    场景 延迟需求    订单超时未支付自动关闭 30 分钟   优惠券到期提醒 提前 ...</div></div></div></a><a class="pagination-related" href="/2026/07/23/spring-boot-rocketmq-practice/" title="【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-23</div><div class="info-item-2">【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Boot 集成 RocketMQ 实战：消息发送、消费与事务消息全流程一、RocketMQ 与 Spring Boot 集成概述RocketMQ 是阿里巴巴开源的分布式消息中间件，在阿里内部经历了多年双 11 的洗礼，具备高吞吐、低延迟、强一致性的特点。相比 Kafka，RocketMQ 在事务消息、延迟消息、消息重试、死信队列等企业级特性上更加完善。 Spring Boot 集成 RocketMQ 主要有两种方式：    集成方式 说明 适用场景    RocketMQ-Spring-Boot-Starter 官方 Starter，声明式注解 大多数 Spring Boot 项目   RocketMQ原生 Client 直接使用 producer&#x2F;consumer API 需要精细控制或特殊配置   本文默认使用官方 Starter 方式。 二、环境搭建与依赖配置2.1 Maven 依赖12345&lt;dependency&gt;    &lt;groupId&gt;org.apache.rocketmq&lt;/gro...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/08/25/mq-ordered-message-deep-dive/" title="【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-25</div><div class="info-item-2">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现</div></div><div class="info-2"><div class="info-item-1">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现面试官：你们的订单消息需要保证顺序吗？Kafka 怎么保证顺序？“消息顺序”是 MQ 面试的钉子户。很多人知道”Kafka 只能保证分区内有序”，但说不清为什么只能分区内有序、怎么做到分区内有序、哪些场景会悄悄破坏顺序。本文从存储模型讲到生产消费全链路，一次讲透。 一、什么是顺序消息？全局有序 vs 分区有序 全局有序：所有消息严格按照发送顺序被消费（要求单分区&#x2F;单队列 + 单消费者） 分区有序（局部有序）：同一业务维度（如同一订单、同一用户）的消息有序，不同维度之间不要求有序  现实业务几乎只用分区有序：订单的”创建→支付→发货”必须有序，但订单 A 和订单 B 之间无所谓。全局有序的代价是吞吐量断崖式下跌（退化成单队列单消费者），没人这么用。 二、Kafka 的顺序保证：分区内有序1. 存储模型决定了”分区 &#x3D; 顺序的天然边界”Kafka 的 Topic 被切成多个 Partition，每个 Partition 是追加写的日志（log segment）： 123Top...</div></div></div></a><a class="pagination-related" href="/2026/07/09/kafka-transaction-exactly-once-guide/" title="【消息队列】Kafka 事务与 Exactly-Once 语义深度实战：从原理到源码级解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-09</div><div class="info-item-2">【消息队列】Kafka 事务与 Exactly-Once 语义深度实战：从原理到源码级解析</div></div><div class="info-2"><div class="info-item-1">【消息队列】Kafka 事务与 Exactly-Once 语义深度实战一、消息投递语义：你了解几种？在分布式消息系统中，消息投递保证通常分为三个等级：    语义级别 含义 可能出现的问题    At Most Once（至多一次） 消息可能丢失，但不会重复 消费端处理完但提交前宕机，重启后消息丢失   At Least Once（至少一次） 消息不会丢失，但可能重复 消费端处理完且提交，但提交后重启，消息重复消费   Exactly Once（恰好一次） 消息既不丢失也不重复 需要事务机制保证    面试官：说说 Kafka 默认提供哪种语义？ 答：Kafka 默认是 At Least Once 语义。生产者重试可能导致消息重复，消费者在自动提交模式下也可能重复消费。Kafka 通过幂等生产者、事务 API 来实现 Exactly Once 语义。  二、Kafka Exactly Once 的三层保证2.1 幂等生产者（Idempotent Producer）从 Kafka 0.11 开始引入，通过 enable.idempotence=true 开启。 原理： 每个生产者会...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">697</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">786</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">222</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97%E3%80%91RocketMQ-%E4%BA%8B%E5%8A%A1%E6%B6%88%E6%81%AF%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%8D%8A%E6%B6%88%E6%81%AF%E3%80%81%E5%9B%9E%E6%9F%A5%E6%9C%BA%E5%88%B6%E4%B8%8E%E5%88%86%E5%B8%83%E5%BC%8F%E4%BA%8B%E5%8A%A1%E8%90%BD%E5%9C%B0"><span class="toc-number">1.</span> <span class="toc-text">【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E4%B8%8B%E5%8D%95%E6%88%90%E5%8A%9F%E5%90%8E%E8%A6%81%E5%8F%91%E6%B6%88%E6%81%AF%E6%89%A3%E7%A7%AF%E5%88%86%EF%BC%8C%E6%80%8E%E4%B9%88%E4%BF%9D%E8%AF%81%E2%80%9D%E8%AE%A2%E5%8D%95%E5%86%99%E4%BA%86%E3%80%81%E6%B6%88%E6%81%AF%E4%B9%9F%E5%8F%91%E4%BA%86%E2%80%9D%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：下单成功后要发消息扣积分，怎么保证”订单写了、消息也发了”？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E8%A6%81%E8%A7%A3%E5%86%B3%E4%BB%80%E4%B9%88%E9%97%AE%E9%A2%98"><span class="toc-number">1.2.</span> <span class="toc-text">一、要解决什么问题</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E6%9C%AC%E5%9C%B0%E6%B6%88%E6%81%AF%E8%A1%A8%E6%96%B9%E6%A1%88%E7%9A%84%E7%97%9B%E7%82%B9"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 本地消息表方案的痛点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E6%A0%B8%E5%BF%83%E6%80%9D%E8%B7%AF%EF%BC%9A%E4%B8%A4%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4%E7%9A%84%E5%8F%98%E4%BD%93"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 核心思路：两阶段提交的变体</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%8D%8A%E6%B6%88%E6%81%AF%EF%BC%88Half-Message%EF%BC%89%E6%9C%BA%E5%88%B6"><span class="toc-number">1.3.</span> <span class="toc-text">二、半消息（Half Message）机制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%8D%8A%E6%B6%88%E6%81%AF%E5%AD%98%E5%9C%A8%E5%93%AA"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 半消息存在哪</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%BB%8E%E5%8D%8A%E6%B6%88%E6%81%AF%E5%88%B0%E7%9C%9F%E5%AE%9E%E6%B6%88%E6%81%AF%EF%BC%9ACommit-%E5%81%9A%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 从半消息到真实消息：Commit 做了什么</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-Rollback-%E5%81%9A%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 Rollback 做了什么</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E4%BA%8B%E5%8A%A1%E5%9B%9E%E6%9F%A5%EF%BC%88Transaction-Check%EF%BC%89%E6%9C%BA%E5%88%B6"><span class="toc-number">1.4.</span> <span class="toc-text">三、事务回查（Transaction Check）机制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%9B%9E%E6%9F%A5%E7%9A%84%E8%A7%A6%E5%8F%91%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 回查的触发条件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E7%9C%9F%E7%9A%84%E2%80%9D%E8%B6%85%E6%97%B6%E2%80%9D%E5%88%A4%E6%96%AD%E5%9C%A8%E5%93%AA"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 真的”超时”判断在哪</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%9B%9E%E6%9F%A5%E8%AF%B7%E6%B1%82%E6%80%8E%E4%B9%88%E5%8F%91"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 回查请求怎么发</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%9B%9E%E6%9F%A5%E6%AC%A1%E6%95%B0%E4%B8%8E%E6%9C%80%E7%BB%88%E5%BD%92%E5%AE%BF"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 回查次数与最终归宿</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Producer-%E7%AB%AF-API-%E4%B8%8E%E4%BB%A3%E7%A0%81%E5%AE%9E%E6%88%98"><span class="toc-number">1.5.</span> <span class="toc-text">四、Producer 端 API 与代码实战</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%A0%B8%E5%BF%83%E6%8E%A5%E5%8F%A3%EF%BC%9ATransactionListener"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 核心接口：TransactionListener</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%AE%8C%E6%95%B4%E5%8F%91%E9%80%81%E7%A4%BA%E4%BE%8B"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 完整发送示例</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%85%B3%E9%94%AE%E7%82%B9%EF%BC%9A%E6%9C%AC%E5%9C%B0%E4%BA%8B%E5%8A%A1%E4%B8%8E%E6%B6%88%E6%81%AF%E5%8F%91%E9%80%81%E7%9A%84%E5%88%86%E5%B7%A5"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 关键点：本地事务与消息发送的分工</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E6%B6%88%E8%B4%B9%E7%AB%AF%E5%B9%82%E7%AD%89"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 消费端幂等</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BD%BF%E7%94%A8%E9%99%90%E5%88%B6%E4%B8%8E%E7%94%9F%E4%BA%A7%E9%99%B7%E9%98%B1"><span class="toc-number">1.6.</span> <span class="toc-text">五、使用限制与生产陷阱</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%BA%8B%E5%8A%A1%E6%B6%88%E6%81%AF%E7%9A%84%E7%A1%AC%E9%99%90%E5%88%B6"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 事务消息的硬限制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%B8%B8%E8%A7%81%E7%94%9F%E4%BA%A7%E9%99%B7%E9%98%B1"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 常见生产陷阱</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%8E%E6%9C%AC%E5%9C%B0%E6%B6%88%E6%81%AF%E8%A1%A8%E3%80%81Seata-%E7%9A%84%E5%AF%B9%E6%AF%94"><span class="toc-number">1.7.</span> <span class="toc-text">六、与本地消息表、Seata 的对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/30/java-collections-wrappers-unmodifiable-deep-dive/" title="【Java 核心】Collections 包装器深度解析：unmodifiable、synchronized、checked 与不可变集合实践">【Java 核心】Collections 包装器深度解析：unmodifiable、synchronized、checked 与不可变集合实践</a><time datetime="2026-09-30T00:00:00.000Z" title="发表于 2026-09-30 08:00:00">2026-09-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/30/mysql-multi-source-replication-deep-dive/" title="【MySQL 运维】多源复制（Multi-Source Replication）深度解析：多实例数据聚合与冲突治理">【MySQL 运维】多源复制（Multi-Source Replication）深度解析：多实例数据聚合与冲突治理</a><time datetime="2026-09-30T00:00:00.000Z" title="发表于 2026-09-30 08:00:00">2026-09-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/30/rocketmq-transaction-message-deep-dive/" title="【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地">【消息队列】RocketMQ 事务消息深度解析：半消息、回查机制与分布式事务落地</a><time datetime="2026-09-30T00:00:00.000Z" title="发表于 2026-09-30 08:00:00">2026-09-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/30/spring-mvc-content-negotiation-deep-dive/" title="【Spring MVC 源码】内容协商（Content Negotiation）深度解析：Accept 解析、MediaType 匹配与消息转换">【Spring MVC 源码】内容协商（Content Negotiation）深度解析：Accept 解析、MediaType 匹配与消息转换</a><time datetime="2026-09-30T00:00:00.000Z" title="发表于 2026-09-30 08:00:00">2026-09-30</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/09/30/tcp-congestion-control-cubic-bbr-deep-dive/" title="【网络编程】TCP 拥塞控制深度解析：从慢启动、CUBIC 到 BBR 的演进">【网络编程】TCP 拥塞控制深度解析：从慢启动、CUBIC 到 BBR 的演进</a><time datetime="2026-09-30T00:00:00.000Z" title="发表于 2026-09-30 08:00:00">2026-09-30</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
