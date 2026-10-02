@@ -1,0 +1,398 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算面试官：你们的交易&#x2F;登录&#x2F;营销活动怎么防刷？设计一个实时风控系统风控系统是很多后端工程师”知道很重要但没系统做过”的领域。它的难点不在于单个技术点，而在于架构分层、规则的可扩展性、以及实时性与准确性的平衡。 这篇文章从零搭建一个可落地的实时风控系统。  一、风控的本质：在 100ms 内判断”这个请求是">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/02/realtime-risk-control-system-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算面试官：你们的交易&#x2F;登录&#x2F;营销活动怎么防刷？设计一个实时风控系统风控系统是很多后端工程师”知道很重要但没系统做过”的领域。它的难点不在于单个技术点，而在于架构分层、规则的可扩展性、以及实时性与准确性的平衡。 这篇文章从零搭建一个可落地的实时风控系统。  一、风控的本质：在 100ms 内判断”这个请求是">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-02T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-10-02T00:04:17.955Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="规则引擎">
+<meta property="article:tag" content="风控">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算",
+  "url": "https://jiweidong.github.io/2026/10/02/realtime-risk-control-system-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-02T00:20:00.000Z",
+  "dateModified": "2026-10-02T00:04:17.955Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/02/realtime-risk-control-system-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">707</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">797</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">225</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-02T00:20:00.000Z" title="发表于 2026-10-02 08:20:00">2026-10-02</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-02T00:04:17.955Z" title="更新于 2026-10-02 08:04:17">2026-10-02</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/%E9%AB%98%E5%8F%AF%E7%94%A8/">高可用</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算"><a href="#【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算" class="headerlink" title="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算"></a>【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算</h1><h2 id="面试官：你们的交易-登录-营销活动怎么防刷？设计一个实时风控系统"><a href="#面试官：你们的交易-登录-营销活动怎么防刷？设计一个实时风控系统" class="headerlink" title="面试官：你们的交易&#x2F;登录&#x2F;营销活动怎么防刷？设计一个实时风控系统"></a>面试官：你们的交易&#x2F;登录&#x2F;营销活动怎么防刷？设计一个实时风控系统</h2><p>风控系统是很多后端工程师”知道很重要但没系统做过”的领域。它的难点不在于单个技术点，而在于<strong>架构分层、规则的可扩展性、以及实时性与准确性的平衡</strong>。</p>
+<p>这篇文章从零搭建一个可落地的实时风控系统。</p>
+<hr>
+<h2 id="一、风控的本质：在-100ms-内判断”这个请求是不是坏人”"><a href="#一、风控的本质：在-100ms-内判断”这个请求是不是坏人”" class="headerlink" title="一、风控的本质：在 100ms 内判断”这个请求是不是坏人”"></a>一、风控的本质：在 100ms 内判断”这个请求是不是坏人”</h2><p>风控系统的基本形态是一个<strong>同步决策接口</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">输入：事件（谁、在什么时间、用什么设备、做了什么）</span><br><span class="line">输出：决策（通过 / 拒绝 / 挑战 / 人工审核）+ 风险分</span><br><span class="line">约束：必须在 50~200ms 内返回，否则会拖垮业务主链路</span><br></pre></td></tr></table></figure>
+
+<p>它的输入通常是：</p>
+<ul>
+<li><strong>主体</strong>：用户 ID、设备指纹、IP、手机号、身份证哈希</li>
+<li><strong>行为</strong>：登录、下单、支付、领券、抽奖、发帖、改密码</li>
+<li><strong>上下文</strong>：时间、地理位置、网络环境、历史行为</li>
+</ul>
+<p>核心挑战：</p>
+<ol>
+<li><strong>低延迟</strong>：风控挂在主链路上，超时就等于业务不可用。</li>
+<li><strong>高召回</strong>：宁可错杀，不可放过（但要控制误杀率）。</li>
+<li><strong>可解释</strong>：被拒的用户要能说清楚为什么被拒。</li>
+<li><strong>可演进</strong>：黑产每天都在变，规则必须能小时级上线。</li>
+</ol>
+<hr>
+<h2 id="二、整体架构"><a href="#二、整体架构" class="headerlink" title="二、整体架构"></a>二、整体架构</h2><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line">      ┌──────────────────────────────────┐</span><br><span class="line">      │           接入层（SDK/网关）        │</span><br><span class="line">      │  风控事件上报、超时降级（默认放行）    │</span><br><span class="line">      └───────────────┬──────────────────┘</span><br><span class="line">                      │</span><br><span class="line">      ┌───────────────▼──────────────────┐</span><br><span class="line">      │        风控决策服务（无状态）        │</span><br><span class="line">      │  1. 名单查询  2. 特征获取  3. 规则执行│</span><br><span class="line">      └───┬──────────┬──────────┬────────┘</span><br><span class="line">          │          │          │</span><br><span class="line">┌─────────▼──┐ ┌─────▼─────┐ ┌──▼──────────┐</span><br><span class="line">│ 名单体系    │ │ 特征平台   │ │ 规则引擎     │</span><br><span class="line">│ Redis+Bloom│ │ Redis/本地 │ │ Drools/自研  │</span><br><span class="line">└────────────┘ └───────────┘ └─────────────┘</span><br><span class="line">          │          │          │</span><br><span class="line">┌─────────▼──────────▼──────────▼────────┐</span><br><span class="line">│      离线/近线计算（Flink / Spark）        │</span><br><span class="line">│  用户画像、设备图谱、特征回填、模型训练       │</span><br><span class="line">└───────────────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p>关键设计原则：</p>
+<ul>
+<li><strong>决策服务无状态</strong>，可以水平扩容。</li>
+<li><strong>多数据源并行获取</strong>，用超时控制（比如 30ms 拿不到特征就用默认值）。</li>
+<li><strong>超时降级为放行</strong>（fail-open），但异步记录，事后补偿。这是风控与业务可用性的取舍：登录接口因为风控超时而拒绝所有用户，损失远大于漏过几个黑产。</li>
+</ul>
+<hr>
+<h2 id="三、名单体系：最便宜也最有效的第一道防线"><a href="#三、名单体系：最便宜也最有效的第一道防线" class="headerlink" title="三、名单体系：最便宜也最有效的第一道防线"></a>三、名单体系：最便宜也最有效的第一道防线</h2><p>名单是风控里性价比最高的部分：<strong>O(1) 判断，效果立竿见影</strong>。</p>
+<h3 id="3-1-名单类型"><a href="#3-1-名单类型" class="headerlink" title="3.1 名单类型"></a>3.1 名单类型</h3><table>
+<thead>
+<tr>
+<th>名单</th>
+<th>用途</th>
+<th>存储</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>黑名单</td>
+<td>直接拒绝</td>
+<td>Redis Set &#x2F; 布隆过滤器</td>
+</tr>
+<tr>
+<td>白名单</td>
+<td>直接放行（内部员工、测试账号）</td>
+<td>Redis Set</td>
+</tr>
+<tr>
+<td>灰名单</td>
+<td>静默拦截（不告知用户）</td>
+<td>Redis Set</td>
+</tr>
+<tr>
+<td>设备名单</td>
+<td>设备维度封禁</td>
+<td>Redis Set + 布隆过滤器</td>
+</tr>
+</tbody></table>
+<h3 id="3-2-布隆过滤器：亿级名单的内存神器"><a href="#3-2-布隆过滤器：亿级名单的内存神器" class="headerlink" title="3.2 布隆过滤器：亿级名单的内存神器"></a>3.2 布隆过滤器：亿级名单的内存神器</h3><p>黑名单可能有上亿条，全放 Redis Set 内存扛不住。布隆过滤器用极小空间换”可能存在”的判断：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Guava BloomFilter</span></span><br><span class="line">BloomFilter&lt;String&gt; blacklist = BloomFilter.create(</span><br><span class="line">        Funnels.stringFunnel(StandardCharsets.UTF_8),</span><br><span class="line">        <span class="number">100_000_000</span>,   <span class="comment">// 预期元素数</span></span><br><span class="line">        <span class="number">0.0001</span>);       <span class="comment">// 误判率 0.01%</span></span><br><span class="line"></span><br><span class="line"><span class="type">boolean</span> <span class="variable">maybeBad</span> <span class="operator">=</span> blacklist.mightContain(deviceId);</span><br></pre></td></tr></table></figure>
+
+<p>特点：</p>
+<ul>
+<li><strong>可能有假阳性，不会有假阴性</strong>。所以布隆过滤器命中后还要查一次 Redis&#x2F;DB 二次确认。</li>
+<li><strong>不支持删除</strong>。要删除元素，用 Counting Bloom Filter 或 Redis 的 <code>BF.DEL</code>（RedisBloom 模块）。</li>
+</ul>
+<p>实践中的组合是：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">布隆过滤器（快速否决，99% 的流量在这里结束）</span><br><span class="line">    ↓ 命中</span><br><span class="line">Redis Set / DB（精确确认）</span><br><span class="line">    ↓ 命中</span><br><span class="line">决策：拒绝</span><br></pre></td></tr></table></figure>
+
+<p>用布隆过滤器做前置，可以把 99% 的正常请求挡在廉价判断上，只有少量请求需要查精确存储。</p>
+<hr>
+<h2 id="四、规则引擎：让规则可配置、可热更新"><a href="#四、规则引擎：让规则可配置、可热更新" class="headerlink" title="四、规则引擎：让规则可配置、可热更新"></a>四、规则引擎：让规则可配置、可热更新</h2><p>风控规则如果写死在代码里，每次调整都要发版，黑产早就跑完了。所以需要一个规则引擎。</p>
+<h3 id="4-1-方案对比"><a href="#4-1-方案对比" class="headerlink" title="4.1 方案对比"></a>4.1 方案对比</h3><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>缺点</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>硬编码 if-else</td>
+<td>性能最好</td>
+<td>不可配置</td>
+<td>极少数核心规则</td>
+</tr>
+<tr>
+<td>SpEL &#x2F; Aviator 表达式</td>
+<td>轻量、易用</td>
+<td>复杂逻辑难维护</td>
+<td>简单规则</td>
+</tr>
+<tr>
+<td>Drools</td>
+<td>功能强、DRL DSL</td>
+<td>重、学习成本高</td>
+<td>复杂规则集</td>
+</tr>
+<tr>
+<td>自研 DSL + 决策树</td>
+<td>完全可控</td>
+<td>开发成本高</td>
+<td>大厂常见</td>
+</tr>
+</tbody></table>
+<h3 id="4-2-规则模型"><a href="#4-2-规则模型" class="headerlink" title="4.2 规则模型"></a>4.2 规则模型</h3><p>一条规则通常包含：<strong>条件 + 动作 + 优先级 + 生效时间</strong>：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;ruleId&quot;</span><span class="punctuation">:</span> <span class="string">&quot;R1001&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;name&quot;</span><span class="punctuation">:</span> <span class="string">&quot;同设备1分钟登录超过10次&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;priority&quot;</span><span class="punctuation">:</span> <span class="number">100</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;enabled&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;condition&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;and&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span></span><br><span class="line">      <span class="punctuation">&#123;</span> <span class="attr">&quot;field&quot;</span><span class="punctuation">:</span> <span class="string">&quot;event.type&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;op&quot;</span><span class="punctuation">:</span> <span class="string">&quot;EQ&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;value&quot;</span><span class="punctuation">:</span> <span class="string">&quot;LOGIN&quot;</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">      <span class="punctuation">&#123;</span> <span class="attr">&quot;field&quot;</span><span class="punctuation">:</span> <span class="string">&quot;device.loginCount1m&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;op&quot;</span><span class="punctuation">:</span> <span class="string">&quot;GT&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;value&quot;</span><span class="punctuation">:</span> <span class="number">10</span> <span class="punctuation">&#125;</span></span><br><span class="line">    <span class="punctuation">]</span></span><br><span class="line">  <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;action&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;decision&quot;</span><span class="punctuation">:</span> <span class="string">&quot;REJECT&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;riskScore&quot;</span><span class="punctuation">:</span> <span class="number">80</span><span class="punctuation">,</span> <span class="attr">&quot;reason&quot;</span><span class="punctuation">:</span> <span class="string">&quot;FREQ_DEVICE_LOGIN&quot;</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;version&quot;</span><span class="punctuation">:</span> <span class="number">3</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>执行流程：按优先级顺序求值，命中即返回（first-match），或全部执行累加风险分（score-based）。</p>
+<h3 id="4-3-规则热更新"><a href="#4-3-规则热更新" class="headerlink" title="4.3 规则热更新"></a>4.3 规则热更新</h3><ul>
+<li>规则存在 DB &#x2F; 配置中心，决策服务本地缓存 + 长轮询&#x2F;推送刷新。</li>
+<li>规则变更要有<strong>灰度</strong>：先对 1% 流量生效，观察误杀率再全量。</li>
+<li>每次决策记录 <strong>ruleId + ruleVersion</strong>，便于回溯。</li>
+</ul>
+<hr>
+<h2 id="五、特征计算：滑动窗口是核心"><a href="#五、特征计算：滑动窗口是核心" class="headerlink" title="五、特征计算：滑动窗口是核心"></a>五、特征计算：滑动窗口是核心</h2><p>风控规则大多依赖”最近一段时间内的行为统计”，例如：</p>
+<ul>
+<li>最近 1 分钟登录次数</li>
+<li>最近 1 小时下单金额</li>
+<li>最近 24 小时不同设备数</li>
+<li>最近 10 分钟同 IP 注册数</li>
+</ul>
+<h3 id="5-1-Redis-ZSet-实现滑动窗口"><a href="#5-1-Redis-ZSet-实现滑动窗口" class="headerlink" title="5.1 Redis ZSet 实现滑动窗口"></a>5.1 Redis ZSet 实现滑动窗口</h3><p>用 ZSet 存事件时间戳，<code>ZREMRANGEBYSCORE</code> 清理过期，<code>ZCARD</code> 统计数量：</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- KEYS[1] = feature key, ARGV[1] = now(ms), ARGV[2] = window(ms), ARGV[3] = limit</span></span><br><span class="line"><span class="keyword">local</span> now = <span class="built_in">tonumber</span>(ARGV[<span class="number">1</span>])</span><br><span class="line"><span class="keyword">local</span> window = <span class="built_in">tonumber</span>(ARGV[<span class="number">2</span>])</span><br><span class="line"><span class="keyword">local</span> limit = <span class="built_in">tonumber</span>(ARGV[<span class="number">3</span>])</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 1. 清理窗口外数据</span></span><br><span class="line">redis.call(<span class="string">&#x27;ZREMRANGEBYSCORE&#x27;</span>, KEYS[<span class="number">1</span>], <span class="number">0</span>, now - window)</span><br><span class="line"><span class="comment">-- 2. 加入当前事件（用 now+随机后缀避免同毫秒覆盖）</span></span><br><span class="line">redis.call(<span class="string">&#x27;ZADD&#x27;</span>, KEYS[<span class="number">1</span>], now, ARGV[<span class="number">4</span>])</span><br><span class="line"><span class="comment">-- 3. 统计</span></span><br><span class="line"><span class="keyword">local</span> cnt = redis.call(<span class="string">&#x27;ZCARD&#x27;</span>, KEYS[<span class="number">1</span>])</span><br><span class="line">redis.call(<span class="string">&#x27;PEXPIRE&#x27;</span>, KEYS[<span class="number">1</span>], window + <span class="number">1000</span>)</span><br><span class="line"><span class="keyword">return</span> cnt</span><br></pre></td></tr></table></figure>
+
+<p>为什么 member 要用 <code>now + 随机后缀</code>？因为 ZSet 的 member 唯一，同一毫秒的多条事件如果 member 相同会被覆盖，导致计数偏小。</p>
+<h3 id="5-2-高效变体：分桶计数"><a href="#5-2-高效变体：分桶计数" class="headerlink" title="5.2 高效变体：分桶计数"></a>5.2 高效变体：分桶计数</h3><p>ZSet 存全量事件在超高频场景内存消耗大。更好的做法是<strong>时间分桶</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">feature:login:&#123;userId&#125;:202610021030 -&gt; 计数（1 分钟 1 桶）</span><br></pre></td></tr></table></figure>
+
+<p>统计最近 5 分钟 &#x3D; 当前桶（部分）+ 前 4 个完整桶。用 Redis Pipeline 一次取回，或者用 <code>MGET</code>。</p>
+<p>分桶法的误差最多是”一个桶的时间粒度”，对风控来说完全可以接受，但内存和 CPU 成本远低于 ZSet。</p>
+<h3 id="5-3-流式特征：Flink-窗口聚合"><a href="#5-3-流式特征：Flink-窗口聚合" class="headerlink" title="5.3 流式特征：Flink 窗口聚合"></a>5.3 流式特征：Flink 窗口聚合</h3><p>当特征维度多、需要 join（比如”设备关联了多少账号”）时，单靠 Redis 就不够了，需要流式计算：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Flink 滑动窗口：统计每个设备 1 分钟内的登录次数</span></span><br><span class="line">DataStream&lt;LoginEvent&gt; stream = env.addSource(kafkaSource);</span><br><span class="line"></span><br><span class="line">stream.keyBy(LoginEvent::deviceId)</span><br><span class="line">      .window(SlidingEventTimeWindows.of(Time.minutes(<span class="number">1</span>), Time.seconds(<span class="number">10</span>)))</span><br><span class="line">      .aggregate(<span class="keyword">new</span> <span class="title class_">CountAggregate</span>())</span><br><span class="line">      .addSink(<span class="keyword">new</span> <span class="title class_">RedisSink</span>&lt;&gt;());   <span class="comment">// 结果写回 Redis，供在线决策读取</span></span><br></pre></td></tr></table></figure>
+
+<p>流式计算负责<strong>离线&#x2F;近线</strong>产出宽表特征，在线决策只做读取，这样在线链路始终是 O(1) 查询。</p>
+<hr>
+<h2 id="六、决策与闭环"><a href="#六、决策与闭环" class="headerlink" title="六、决策与闭环"></a>六、决策与闭环</h2><h3 id="6-1-决策返回"><a href="#6-1-决策返回" class="headerlink" title="6.1 决策返回"></a>6.1 决策返回</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> Decision <span class="title function_">decide</span><span class="params">(RiskEvent event)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 名单（最快，先做）</span></span><br><span class="line">    <span class="keyword">if</span> (blacklist.mightContain(event.deviceId()) &amp;&amp; blacklistConfirm(event.deviceId())) &#123;</span><br><span class="line">        <span class="keyword">return</span> Decision.reject(<span class="string">&quot;BLACKLIST&quot;</span>, <span class="number">100</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (whitelist.contains(event.userId())) &#123;</span><br><span class="line">        <span class="keyword">return</span> Decision.pass();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 2. 并行取特征，带超时</span></span><br><span class="line">    <span class="type">FeatureBundle</span> <span class="variable">features</span> <span class="operator">=</span> featureService.load(event, Duration.ofMillis(<span class="number">30</span>));</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 3. 规则执行</span></span><br><span class="line">    List&lt;RuleHit&gt; hits = ruleEngine.execute(event, features);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 4. 汇总风险分</span></span><br><span class="line">    <span class="type">int</span> <span class="variable">score</span> <span class="operator">=</span> hits.stream().mapToInt(RuleHit::score).sum();</span><br><span class="line">    <span class="keyword">if</span> (score &gt;= <span class="number">90</span>) &#123;</span><br><span class="line">        <span class="keyword">return</span> Decision.reject(<span class="string">&quot;RISK_HIGH&quot;</span>, score);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (score &gt;= <span class="number">60</span>) &#123;</span><br><span class="line">        <span class="keyword">return</span> Decision.challenge(<span class="string">&quot;NEED_CAPTCHA&quot;</span>, score);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> Decision.pass();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-后置闭环：异步归因与模型迭代"><a href="#6-2-后置闭环：异步归因与模型迭代" class="headerlink" title="6.2 后置闭环：异步归因与模型迭代"></a>6.2 后置闭环：异步归因与模型迭代</h3><p>风控不能只看当下。用户被放行后，行为可能在一段时间后才被确认为恶意（比如拒付、投诉、投诉成功）。所以要有：</p>
+<ol>
+<li><strong>异步回填</strong>：把决策结果和后续真实标签关联，形成训练样本。</li>
+<li><strong>离线评估</strong>：每天跑一次”如果新规则上线，历史流量会误杀多少、拦截多少”。</li>
+<li><strong>对抗演进</strong>：黑产绕过规则后，及时补充特征和规则。</li>
+</ol>
+<p>这也是黑名单”动态化”的来源：今天放行的设备明天可能进黑名单。</p>
+<hr>
+<h2 id="七、高频追问"><a href="#七、高频追问" class="headerlink" title="七、高频追问"></a>七、高频追问</h2><p><strong>追问 1：风控超时了怎么办？</strong></p>
+<ul>
+<li>主链路用<strong>超时 + fail-open</strong>：拿不到决策就放行，异步补记。</li>
+<li>对高风险操作（如大额支付）可以 fail-close（拒绝并要求二次验证）。</li>
+<li>关键是<strong>区分业务</strong>，不能一刀切。</li>
+</ul>
+<p><strong>追问 2：如何降低误杀？</strong></p>
+<ul>
+<li>分层决策：低风险直接放行，中风险挑战（验证码），高风险拒绝。</li>
+<li>白名单与”老用户信任”机制。</li>
+<li>规则灰度 + A&#x2F;B 测试，用数据说话。</li>
+<li>人工审核兜底 + 申诉通道。</li>
+</ul>
+<p><strong>追问 3：规则冲突怎么办？</strong></p>
+<ul>
+<li>优先级（priority）决定执行顺序。</li>
+<li>明确”first-match”还是”score 累加”语义，不要混用。</li>
+<li>规则上线前做<strong>冲突检测</strong>（比如同一条件下两个规则给出相反结论）。</li>
+</ul>
+<p><strong>追问 4：怎么保证风控不影响主链路性能？</strong></p>
+<ul>
+<li>决策服务独立部署，与业务服务物理隔离。</li>
+<li>特征本地缓存 + Redis 二级缓存。</li>
+<li>全链路超时预算：网关 500ms → 业务 200ms → 风控 50ms。</li>
+<li>熔断降级：风控不可用时，业务侧自动放行并告警。</li>
+</ul>
+<p><strong>追问 5：设备指纹怎么做？</strong></p>
+<p>服务端可以采集 UA、屏幕分辨率、时区、字体、Canvas&#x2F;WebGL 指纹、IP、TLS 指纹等，组合生成设备 ID。注意合规：需要用户授权，且不能过度采集个人敏感信息。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>实时风控系统的骨架可以记成四句话：</p>
+<ol>
+<li><strong>名单先行</strong>：布隆过滤器 + 精确存储，O(1) 拦截大量风险。</li>
+<li><strong>规则可配</strong>：DSL&#x2F;引擎 + 热更新 + 灰度，让风控跟得上黑产。</li>
+<li><strong>特征实时</strong>：滑动窗口（Redis）负责在线，Flink 负责近线宽表。</li>
+<li><strong>闭环演进</strong>：异步归因 + 离线评估，让系统越用越准。</li>
+</ol>
+<p>风控的本质是<strong>在有限的延迟预算里，用最便宜的手段做最优决策</strong>。理解了这个 trade-off，架构自然就清晰了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/02/realtime-risk-control-system-design/">https://jiweidong.github.io/2026/10/02/realtime-risk-control-system-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E8%A7%84%E5%88%99%E5%BC%95%E6%93%8E/">规则引擎</a><a class="post-meta__tags" href="/tags/%E9%A3%8E%E6%8E%A7/">风控</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/02/comment-system-architecture-design/" title="【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析面试官：设计一个类似微博&#x2F;知乎的评论系统，支持多级回复、点赞和海量数据评论系统是系统设计面试的常客。它不像秒杀那样极端，但把数据建模、分页、计数一致性、缓存、排序这几个经典问题全揉在了一起。 尤其”多级评论”这一块，是区分候选人水平的分水岭——很多人上来就说”用 parent_id 递归查”，然后就被追问死了。  一、需求拆解   维度 需求    层级 支持一级评论 + 二级回复（最多两层），不无限嵌套   排序 一级按热度&#x2F;时间，二级按时间   分页 一级评论分页，二级默认展示前 3 条 + “查看更多”   计数 评论数、回复数、点赞数，允许秒级延迟   数据量 单内容最多百万评论，全站百亿级   操作 发表、删除、点赞、举报、审核   关键的产品决策：绝大多数成熟产品（微博、YouTube、Twitter）都采用两层结构——一级评论 + 二级回复拉平。为什么？因为无限嵌套在 UI 上难以展示、在查询上难以分页、在移动端体验极差。所以： 123456评论 A（一级）├── 回复 A1（二级...</div></div></div></a><a class="pagination-related" href="/2026/10/02/lottery-system-architecture-design/" title="【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流面试官：设计一个”双十一万人秒杀抽奖”活动，要求不超发、不重复、可审计抽奖系统是一个特别有意思的题目。它比秒杀更”软”——秒杀的核心是”抢到&#x2F;抢不到”的确定性，而抽奖的核心是概率；但它在工程上又和秒杀高度重合：都要处理库存、并发、幂等、防刷、限流。 这篇文章把抽奖系统从概率模型到分布式一致性拆开讲一遍。  一、需求拆解先定义清楚边界，再动手：    需求 说明    奖池 一等奖 1 个、二等奖 10 个、优惠券 10000 张、谢谢惠顾无限   概率 每个奖品有固定中奖概率，概率之和为 1   频次 每个用户每天最多抽 3 次   库存 实物奖品有数量上限，抽完即停   幂等 同一次抽奖请求重试不能重复发奖   防刷 防止脚本、批量小号恶意抽奖   可审计 每一次抽奖都要留流水，能对账   一套完整的抽奖系统，实际上由四个子系统组成：概率决策、库存扣减、幂等与限流、审计与对账。  二、概率决策：把”随机”做对2.1 方案一：区间法（最直观）给每个奖品分配一个区间，随机落到哪个区间就是哪个奖品： 12...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/18/short-url-system-design/" title="【系统设计】短链接系统架构设计：从发号器到跳转的完整方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案</div></div><div class="info-2"><div class="info-item-1">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案面试官：设计一个短链接系统，说下你的思路？短链接是系统设计面试的”经典题库题”（和秒杀、支付、消息推送并列）。它麻雀虽小五脏俱全：发号算法、存储设计、缓存、高并发跳转、数据统计全都涉及。而且它真实存在于你身边的每个场景——微博分享、营销短信、二维码里那一串 t.cn/xxxxx。 本文给出一个可以直接”背”进面试的完整设计方案。  一、需求分析功能需求 生成：输入长链接，返回短链接（如 https://s.dg.com/Ab3xY9）； 跳转：访问短链接，302 重定向到长链接； 统计：每个短链接的访问次数、来源、时间分布（加分项）； 管理：可自定义短码、可设置过期时间（加分项）。  非功能需求（关键！） 高并发：跳转是读多写少，QPS 可能极高（营销活动时秒级上万）； 高可用：跳转失败 &#x3D; 用户进不了页面，可用性要求 99.99%； 低延迟：跳转链路要快，缓存命中率要足够高。  容量估算（背下来，面试很加分） 每天新增短链接 1000 万 → 每年约 36.5 亿条； 短码长度：用 62 进制（a-zA-Z0-9...</div></div></div></a><a class="pagination-related" href="/2026/08/03/seckill-system-architecture-design/" title="【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减面试官：做过秒杀系统吗？说说你是怎么设计的？秒杀是后端面试中出现频率最高的系统设计题，没有之一。它把高并发场景下的所有经典问题都浓缩在了一起：高流量冲击、超卖、热点数据、缓存一致性、限流降级。今天这篇，我们从零开始，把秒杀系统的完整设计思路、核心代码和面试追问一次讲透。 一、秒杀的业务特点与核心难点秒杀（Seckill）的业务模型很简单：在极短时间内（通常几秒到几分钟），以极低价格限量售卖少量商品。但它的技术特征却极其极端：    特点 描述 带来的问题    瞬时流量巨大 开售瞬间 QPS 可达平时百倍千倍 打垮应用层与数据库   读写比例极端 读多写少，热点集中在少数商品 缓存热点、单点压力   库存有限 如 100 件商品，10 万人抢 超卖风险   时间敏感 开售前蓄客，开售后瞬间释放 流量脉冲，无法水平扩容应对   核心难点可以归纳为三个词：削峰（把瞬时流量摊平）、限流（保护下游）、防超卖（保证数据正确）。 二、整体架构设计：分层削峰一个成熟的秒杀架构，从用户请求到数据库，需要经过 6 层防线： 123456789...</div></div></div></a><a class="pagination-related" href="/2026/10/02/lottery-system-architecture-design/" title="【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流面试官：设计一个”双十一万人秒杀抽奖”活动，要求不超发、不重复、可审计抽奖系统是一个特别有意思的题目。它比秒杀更”软”——秒杀的核心是”抢到&#x2F;抢不到”的确定性，而抽奖的核心是概率；但它在工程上又和秒杀高度重合：都要处理库存、并发、幂等、防刷、限流。 这篇文章把抽奖系统从概率模型到分布式一致性拆开讲一遍。  一、需求拆解先定义清楚边界，再动手：    需求 说明    奖池 一等奖 1 个、二等奖 10 个、优惠券 10000 张、谢谢惠顾无限   概率 每个奖品有固定中奖概率，概率之和为 1   频次 每个用户每天最多抽 3 次   库存 实物奖品有数量上限，抽完即停   幂等 同一次抽奖请求重试不能重复发奖   防刷 防止脚本、批量小号恶意抽奖   可审计 每一次抽奖都要留流水，能对账   一套完整的抽奖系统，实际上由四个子系统组成：概率决策、库存扣减、幂等与限流、审计与对账。  二、概率决策：把”随机”做对2.1 方案一：区间法（最直观）给每个奖品分配一个区间，随机落到哪个区间就是哪个奖品： 12...</div></div></div></a><a class="pagination-related" href="/2026/08/19/im-system-architecture-design/" title="【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-19</div><div class="info-item-2">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线</div></div><div class="info-2"><div class="info-item-1">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线面试官：让你设计一个支持百万在线的 IM 系统，你怎么设计？IM（Instant Messaging）是系统设计面试的”压轴题”之一：它集齐了长连接、消息可靠性、顺序性、在线状态、群聊扩散、历史消息存储几乎所有分布式难点。微信、钉钉、Slack 的架构都能在这套骨架里找到影子。 本文按”需求分析 → 单机原型 → 分布式演进 → 核心难点逐个击破”的顺序，给你一套可以直接背诵+扩展的完整方案。  一、需求分析：先搞清楚要做什么1.1 核心功能   功能 说明 难点    单聊 点对点消息 路由、可靠性   群聊 一对多广播 扩散模型选择   在线状态 上下线感知 一致性、实时性   消息可靠性 不丢不重 ACK + 重传 + 幂等   消息顺序 单会话内有序 seq 机制   历史消息 离线拉取、漫游 海量存储、分页   已读回执 已读未读 状态同步   1.2 非功能需求 规模：100 万在线，峰值 QPS 10 万+，单聊消息峰值 5 万&#x2F;秒 延迟：消息端到端 &lt; 200ms 可靠性：消息不丢（至少...</div></div></div></a><a class="pagination-related" href="/2026/09/28/high-concurrency-like-counter-system-design/" title="【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-28</div><div class="info-item-2">【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析面试官：设计一个点赞系统，10 万 QPS，要求点赞数实时准确、不重复、不能丢看起来是个”小而美”的功能，实际上它把高并发系统的经典难点全踩了一遍：写放大（大量高并发写）、唯一性约束（去重）、计数一致性（并发加减）、热点（大 V 爆款）、持久化（不能丢）、以及”读多写更多”的混合负载。 很多人第一反应是”一张表 insert into likes(...) unique key(user_id, post_id) 完事”。这个方案在小流量下能用，一问”10 万 QPS 怎么办”就崩了。本文从需求拆解一路讲到可落地的分片架构。  一、需求与约束拆解先把模糊需求变成可设计的约束：    需求 隐含技术问题    10 万 QPS 点赞 单机 MySQL 写不动，必须前置缓存&#x2F;异步   不能重复点赞 需要 (userId, postId) 唯一性判断，且要原子   点赞数实时准确 计数必须强一致或准实时，不能等对账   不能丢 缓存是易失的，必须有持久化 + 补偿   取消点赞 计数可减，且需处理...</div></div></div></a><a class="pagination-related" href="/2026/08/22/feed-stream-system-design/" title="【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流</div></div><div class="info-2"><div class="info-item-1">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流面试官：微博的首页信息流是怎么做的？如果让你设计一个 Feed 流系统，你会怎么设计？Feed 流（信息流）是互联网最核心的业务形态之一：微博、朋友圈、抖音、小红书，全是 Feed 流。它和普通 CRUD 最大的区别在于——每个用户看到的首页内容都不一样，是”千人千面”的个性化时间线。设计 Feed 流，本质是解决三个问题：内容怎么分发、时间线怎么生成、读多写多怎么扛。 一、需求与指标先定义清楚规模，才有设计依据：  日活用户 1 亿，月活 3 亿； 平均每个用户关注 200 个账号； 每秒新增内容（发帖）1 万条，峰值 5 万条； 每秒读取时间线（刷首页）10 万次，峰值 50 万次； 要求：读延迟 &lt; 200ms，写后延迟 &lt; 1s 内可见。  读是写的 10 倍以上——这是所有 Feed 流设计的出发点：读多写少，必须为读优化。 二、三种核心模型：推、拉、推拉结合2.1 拉模式（Pull &#x2F; 读扩散）用户刷首页时，实时去拉取他关注的所有人的最新内容，再合并排序。 1用户刷首页 → 查关注列表...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">707</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">797</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">225</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E5%AE%9E%E6%97%B6%E9%A3%8E%E6%8E%A7%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E8%A7%84%E5%88%99%E5%BC%95%E6%93%8E%E3%80%81%E5%90%8D%E5%8D%95%E4%BD%93%E7%B3%BB%E3%80%81%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A3%E4%B8%8E%E6%B5%81%E5%BC%8F%E7%89%B9%E5%BE%81%E8%AE%A1%E7%AE%97"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E4%BD%A0%E4%BB%AC%E7%9A%84%E4%BA%A4%E6%98%93-%E7%99%BB%E5%BD%95-%E8%90%A5%E9%94%80%E6%B4%BB%E5%8A%A8%E6%80%8E%E4%B9%88%E9%98%B2%E5%88%B7%EF%BC%9F%E8%AE%BE%E8%AE%A1%E4%B8%80%E4%B8%AA%E5%AE%9E%E6%97%B6%E9%A3%8E%E6%8E%A7%E7%B3%BB%E7%BB%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：你们的交易&#x2F;登录&#x2F;营销活动怎么防刷？设计一个实时风控系统</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E9%A3%8E%E6%8E%A7%E7%9A%84%E6%9C%AC%E8%B4%A8%EF%BC%9A%E5%9C%A8-100ms-%E5%86%85%E5%88%A4%E6%96%AD%E2%80%9D%E8%BF%99%E4%B8%AA%E8%AF%B7%E6%B1%82%E6%98%AF%E4%B8%8D%E6%98%AF%E5%9D%8F%E4%BA%BA%E2%80%9D"><span class="toc-number">1.2.</span> <span class="toc-text">一、风控的本质：在 100ms 内判断”这个请求是不是坏人”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%95%B4%E4%BD%93%E6%9E%B6%E6%9E%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、整体架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%90%8D%E5%8D%95%E4%BD%93%E7%B3%BB%EF%BC%9A%E6%9C%80%E4%BE%BF%E5%AE%9C%E4%B9%9F%E6%9C%80%E6%9C%89%E6%95%88%E7%9A%84%E7%AC%AC%E4%B8%80%E9%81%93%E9%98%B2%E7%BA%BF"><span class="toc-number">1.4.</span> <span class="toc-text">三、名单体系：最便宜也最有效的第一道防线</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%90%8D%E5%8D%95%E7%B1%BB%E5%9E%8B"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 名单类型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%B8%83%E9%9A%86%E8%BF%87%E6%BB%A4%E5%99%A8%EF%BC%9A%E4%BA%BF%E7%BA%A7%E5%90%8D%E5%8D%95%E7%9A%84%E5%86%85%E5%AD%98%E7%A5%9E%E5%99%A8"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 布隆过滤器：亿级名单的内存神器</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%A7%84%E5%88%99%E5%BC%95%E6%93%8E%EF%BC%9A%E8%AE%A9%E8%A7%84%E5%88%99%E5%8F%AF%E9%85%8D%E7%BD%AE%E3%80%81%E5%8F%AF%E7%83%AD%E6%9B%B4%E6%96%B0"><span class="toc-number">1.5.</span> <span class="toc-text">四、规则引擎：让规则可配置、可热更新</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 方案对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%A7%84%E5%88%99%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 规则模型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E8%A7%84%E5%88%99%E7%83%AD%E6%9B%B4%E6%96%B0"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 规则热更新</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%89%B9%E5%BE%81%E8%AE%A1%E7%AE%97%EF%BC%9A%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A3%E6%98%AF%E6%A0%B8%E5%BF%83"><span class="toc-number">1.6.</span> <span class="toc-text">五、特征计算：滑动窗口是核心</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-Redis-ZSet-%E5%AE%9E%E7%8E%B0%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A3"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 Redis ZSet 实现滑动窗口</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E9%AB%98%E6%95%88%E5%8F%98%E4%BD%93%EF%BC%9A%E5%88%86%E6%A1%B6%E8%AE%A1%E6%95%B0"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 高效变体：分桶计数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E6%B5%81%E5%BC%8F%E7%89%B9%E5%BE%81%EF%BC%9AFlink-%E7%AA%97%E5%8F%A3%E8%81%9A%E5%90%88"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 流式特征：Flink 窗口聚合</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%86%B3%E7%AD%96%E4%B8%8E%E9%97%AD%E7%8E%AF"><span class="toc-number">1.7.</span> <span class="toc-text">六、决策与闭环</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%86%B3%E7%AD%96%E8%BF%94%E5%9B%9E"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 决策返回</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%90%8E%E7%BD%AE%E9%97%AD%E7%8E%AF%EF%BC%9A%E5%BC%82%E6%AD%A5%E5%BD%92%E5%9B%A0%E4%B8%8E%E6%A8%A1%E5%9E%8B%E8%BF%AD%E4%BB%A3"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 后置闭环：异步归因与模型迭代</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/02/java-web-crawler-jsoup-webmagic-deep-practice/" title="【Java 实战】Java 网络爬虫深度实战：Jsoup、WebMagic、反爬对抗与分布式抓取架构">【Java 实战】Java 网络爬虫深度实战：Jsoup、WebMagic、反爬对抗与分布式抓取架构</a><time datetime="2026-10-02T00:40:00.000Z" title="发表于 2026-10-02 08:40:00">2026-10-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/02/comment-system-architecture-design/" title="【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析">【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析</a><time datetime="2026-10-02T00:30:00.000Z" title="发表于 2026-10-02 08:30:00">2026-10-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/02/realtime-risk-control-system-design/" title="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算">【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算</a><time datetime="2026-10-02T00:20:00.000Z" title="发表于 2026-10-02 08:20:00">2026-10-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/02/lottery-system-architecture-design/" title="【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流">【系统设计】高并发抽奖系统架构设计：奖池概率、库存扣减、幂等防刷与限流</a><time datetime="2026-10-02T00:10:00.000Z" title="发表于 2026-10-02 08:10:00">2026-10-02</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/02/redis-ranking-system-architecture-design/" title="【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页">【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页</a><time datetime="2026-10-02T00:00:00.000Z" title="发表于 2026-10-02 08:00:00">2026-10-02</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
