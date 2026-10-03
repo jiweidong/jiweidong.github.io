@@ -1,0 +1,431 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查面试官：容器被 OOMKilled 了，但堆内存只用了 40%，内存去哪了？这是线上最让人头疼的一类问题。-Xmx4g，容器 limit 也是 4g，jstat 看堆稳稳的，GC 日志一切正常，结果 K8s 时不时把 Pod 干掉，事件里只有一行冷冰冰的： 1Rea">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/03/jvm-native-memory-tracking-nmt-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查面试官：容器被 OOMKilled 了，但堆内存只用了 40%，内存去哪了？这是线上最让人头疼的一类问题。-Xmx4g，容器 limit 也是 4g，jstat 看堆稳稳的，GC 日志一切正常，结果 K8s 时不时把 Pod 干掉，事件里只有一行冷冰冰的： 1Rea">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-03T00:00:02.000Z">
+<meta property="article:modified_time" content="2026-10-03T00:05:13.319Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="NMT">
+<meta property="article:tag" content="内存泄漏">
+<meta property="article:tag" content="性能调优">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查",
+  "url": "https://jiweidong.github.io/2026/10/03/jvm-native-memory-tracking-nmt-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-03T00:00:02.000Z",
+  "dateModified": "2026-10-03T00:05:13.319Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/03/jvm-native-memory-tracking-nmt-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">712</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">801</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">226</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-03T00:00:02.000Z" title="发表于 2026-10-03 08:00:02">2026-10-03</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-03T00:05:13.319Z" title="更新于 2026-10-03 08:05:13">2026-10-03</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/JVM/">JVM</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-实战】Native-Memory-Tracking（NMT）深度解析：本地内存追踪、直接内存与-Metaspace-泄漏排查"><a href="#【JVM-实战】Native-Memory-Tracking（NMT）深度解析：本地内存追踪、直接内存与-Metaspace-泄漏排查" class="headerlink" title="【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查"></a>【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查</h1><h2 id="面试官：容器被-OOMKilled-了，但堆内存只用了-40-，内存去哪了？"><a href="#面试官：容器被-OOMKilled-了，但堆内存只用了-40-，内存去哪了？" class="headerlink" title="面试官：容器被 OOMKilled 了，但堆内存只用了 40%，内存去哪了？"></a>面试官：容器被 OOMKilled 了，但堆内存只用了 40%，内存去哪了？</h2><p>这是线上最让人头疼的一类问题。<code>-Xmx4g</code>，容器 limit 也是 4g，<code>jstat</code> 看堆稳稳的，GC 日志一切正常，结果 K8s 时不时把 Pod 干掉，事件里只有一行冷冰冰的：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">Reason: OOMKilled  Exit Code: 137</span><br></pre></td></tr></table></figure>
+
+<p>堆没问题，那内存去哪了？答案通常是：<strong>堆外（Native Memory）</strong>。</p>
+<p>而要看清楚堆外内存的去向，JDK 自带了一个专门工具——<strong>Native Memory Tracking（NMT）</strong>。这篇文章把它从原理到实战讲清楚。</p>
+<hr>
+<h2 id="一、JVM-的内存到底由哪些部分组成"><a href="#一、JVM-的内存到底由哪些部分组成" class="headerlink" title="一、JVM 的内存到底由哪些部分组成"></a>一、JVM 的内存到底由哪些部分组成</h2><p>很多人脑中的 JVM 内存 &#x3D; 堆 + 栈 + 方法区。真实情况要复杂得多：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">进程 RSS（resident set size）</span><br><span class="line">├── Java Heap                 (-Xmx 控制)</span><br><span class="line">├── Metaspace                 (-XX:MaxMetaspaceSize)</span><br><span class="line">├── Compressed Class Space</span><br><span class="line">├── Code Cache                (-XX:ReservedCodeCacheSize)</span><br><span class="line">├── Thread Stacks             (线程数 × -Xss)</span><br><span class="line">├── GC 自身数据结构            (卡表、标记位图、G1 region 元数据…)</span><br><span class="line">├── Direct Memory             (-XX:MaxDirectMemorySize)</span><br><span class="line">├── JNI / Native Libraries    (Netty、RocksDB、JNA、native 加密库…)</span><br><span class="line">├── Mapped Files              (mmap、Lucene、Kafka…)</span><br><span class="line">├── NMT 自身开销</span><br><span class="line">└── 内核/glibc arena 碎片</span><br></pre></td></tr></table></figure>
+
+<p>注意最后几项：<strong>它们完全不受 <code>-Xmx</code> 约束</strong>。这就是”堆只用了 40%，进程却被杀”的根源。</p>
+<hr>
+<h2 id="二、NMT-是什么"><a href="#二、NMT-是什么" class="headerlink" title="二、NMT 是什么"></a>二、NMT 是什么</h2><p>NMT（Native Memory Tracking）是 HotSpot 提供的一个<strong>追踪 JVM 自身 native 内存分配</strong>的机制。它通过 hook JVM 内部的内存分配器（<code>malloc</code> 的封装层 <code>os::malloc</code> &#x2F; <code>Metaspace::allocate</code> 等），把每一次分配按<strong>类别</strong>记账。</p>
+<h3 id="开启方式"><a href="#开启方式" class="headerlink" title="开启方式"></a>开启方式</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">java -XX:NativeMemoryTracking=summary -Xmx4g -jar app.jar</span><br><span class="line"><span class="comment"># detail 更细，但开销更大</span></span><br><span class="line">java -XX:NativeMemoryTracking=detail -Xmx4g -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>粒度</th>
+<th>性能开销</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>off</code></td>
+<td>不追踪</td>
+<td>无</td>
+<td>默认</td>
+</tr>
+<tr>
+<td><code>summary</code></td>
+<td>按类别汇总</td>
+<td>约 2%~5%</td>
+<td>生产常驻</td>
+</tr>
+<tr>
+<td><code>detail</code></td>
+<td>精确到调用点</td>
+<td>约 5%~10%</td>
+<td>临时排查</td>
+</tr>
+</tbody></table>
+<p><strong>重要限制</strong>：NMT 只能在启动时开启，<strong>运行中无法打开</strong>（<code>jcmd</code> 改不了）。所以要么生产长期用 <code>summary</code>，要么提前在预发复现。</p>
+<hr>
+<h2 id="三、读懂-NMT-输出"><a href="#三、读懂-NMT-输出" class="headerlink" title="三、读懂 NMT 输出"></a>三、读懂 NMT 输出</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">jcmd &lt;pid&gt; VM.native_memory summary</span><br></pre></td></tr></table></figure>
+
+<p>典型输出（节选）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line">Native Memory Tracking:</span><br><span class="line"></span><br><span class="line">Total: reserved=6325871KB, committed=3289463KB</span><br><span class="line">-                 Java Heap (reserved=4194304KB, committed=2097152KB)</span><br><span class="line">                            (mmap: reserved=4194304KB, committed=2097152KB)</span><br><span class="line"></span><br><span class="line">-                     Class (reserved=1156789KB, committed=98561KB)</span><br><span class="line">                            (classes #17234)</span><br><span class="line">                            (  instance classes #16210, array classes #1024)</span><br><span class="line">                            (malloc=3429KB #63215)</span><br><span class="line">                            (mmap: reserved=1153360KB, committed=95132KB)</span><br><span class="line"></span><br><span class="line">-                    Thread (reserved=287432KB, committed=287432KB)</span><br><span class="line">                            (thread #278)</span><br><span class="line">                            (stack: reserved=286272KB, committed=286272KB)</span><br><span class="line">                            (malloc=848KB #1673)</span><br><span class="line">                            (arena=312KB #553)</span><br><span class="line"></span><br><span class="line">-                      Code (reserved=252118KB, committed=86518KB)</span><br><span class="line">                            (malloc=9318KB #10241)</span><br><span class="line">                            (mmap: reserved=242800KB, committed=77200KB)</span><br><span class="line"></span><br><span class="line">-                        GC (reserved=189342KB, committed=189342KB)</span><br><span class="line">-                  Compiler (reserved=1532KB, committed=1532KB)</span><br><span class="line">-                  Internal (reserved=8642KB, committed=8642KB)</span><br><span class="line">-                     Other (reserved=12482KB, committed=12482KB)</span><br><span class="line">-                    Symbol (reserved=21456KB, committed=21456KB)</span><br><span class="line">-    Native Memory Tracking (reserved=6720KB, committed=6720KB)</span><br><span class="line">-                     Arena (reserved=1245KB, committed=1245KB)</span><br></pre></td></tr></table></figure>
+
+<h3 id="逐项解读"><a href="#逐项解读" class="headerlink" title="逐项解读"></a>逐项解读</h3><table>
+<thead>
+<tr>
+<th>类别</th>
+<th>含义</th>
+<th>常见异常</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Java Heap</td>
+<td>堆，<code>-Xmx</code> 控制</td>
+<td>堆泄漏，GC 日志就能看出</td>
+</tr>
+<tr>
+<td>Class</td>
+<td>Metaspace + 压缩类空间</td>
+<td>动态类生成、热部署导致<strong>类泄漏</strong></td>
+</tr>
+<tr>
+<td>Thread</td>
+<td>线程栈</td>
+<td>线程泄漏，线程数 × <code>-Xss</code> 飙升</td>
+</tr>
+<tr>
+<td>Code</td>
+<td>JIT 编译后的机器码</td>
+<td>Code Cache 满，<code>ReservedCodeCacheSize</code> 太小</td>
+</tr>
+<tr>
+<td>GC</td>
+<td>垃圾收集器元数据</td>
+<td>G1 卡表随堆增长</td>
+</tr>
+<tr>
+<td>Compiler</td>
+<td>JIT 编译器自身</td>
+<td>一般很小</td>
+</tr>
+<tr>
+<td>Internal</td>
+<td>命令行解析、启动参数等</td>
+<td>一般很小</td>
+</tr>
+<tr>
+<td>Symbol</td>
+<td>常量池字符串、方法名</td>
+<td>intern 字符串过多</td>
+</tr>
+<tr>
+<td>Arena</td>
+<td>C++ 分配器 arena</td>
+<td>通常很小</td>
+</tr>
+<tr>
+<td><strong>Other</strong></td>
+<td>其它 native 分配</td>
+<td>这里经常藏着 DirectByteBuffer &#x2F; JNI</td>
+</tr>
+<tr>
+<td><strong>Unknown</strong></td>
+<td>未追踪到的</td>
+<td>第三方 native 库（NMT 追踪不到）</td>
+</tr>
+</tbody></table>
+<p><strong>关键提醒</strong>：<code>reserved</code> 是虚拟地址空间预留，<code>committed</code> 才是真正占用物理内存的部分。判断内存问题要看 <strong>committed</strong>，不要被巨大的 reserved 吓到。</p>
+<hr>
+<h2 id="四、实战：用-baseline-diff-定位增长"><a href="#四、实战：用-baseline-diff-定位增长" class="headerlink" title="四、实战：用 baseline + diff 定位增长"></a>四、实战：用 baseline + diff 定位增长</h2><p>NMT 最强大的用法是<strong>做差值</strong>——一次排查就看到”这段时间谁涨了”。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 建立基线</span></span><br><span class="line">jcmd &lt;pid&gt; VM.native_memory baseline</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. 等一段时间（或复现问题）</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. 查看差值</span></span><br><span class="line">jcmd &lt;pid&gt; VM.native_memory summary.diff</span><br></pre></td></tr></table></figure>
+
+<p>输出会带上 <code>+</code> &#x2F; <code>-</code> 标记，一眼看出增长来源：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">-                     Class (reserved=1156789KB, committed=98561KB +48213KB)</span><br><span class="line">                            (classes #17234 +4210)   &lt;-- 类数量持续增长！</span><br><span class="line">-                    Thread (reserved=287432KB, committed=287432KB +102400KB)</span><br><span class="line">                            (thread #278 +100)        &lt;-- 线程泄漏！</span><br></pre></td></tr></table></figure>
+
+<p>看到 <code>+4210</code> 个类、<code>+100</code> 个线程，问题基本锁定了。也可以用 <code>detail.diff</code> 拿到更细的调用栈。</p>
+<hr>
+<h2 id="五、四大”堆外凶手”逐个击破"><a href="#五、四大”堆外凶手”逐个击破" class="headerlink" title="五、四大”堆外凶手”逐个击破"></a>五、四大”堆外凶手”逐个击破</h2><h3 id="1）Metaspace-泄漏（Class-增长）"><a href="#1）Metaspace-泄漏（Class-增长）" class="headerlink" title="1）Metaspace 泄漏（Class 增长）"></a>1）Metaspace 泄漏（Class 增长）</h3><p><strong>症状</strong>：NMT 里 Class 的 committed 持续增长，<code>classes #</code> 不断增加，且 GC 后不回落。</p>
+<p><strong>根因</strong>：Metaspace 只有在<strong>类加载器被回收</strong>时才能卸载类。如果 ClassLoader 被强引用（缓存、静态字段、ThreadLocal、线程上下文），它加载的所有类就永远无法卸载。</p>
+<p><strong>高危场景</strong>：</p>
+<ul>
+<li>动态代理 &#x2F; CGLIB &#x2F; 字节码增强框架：每个代理类都会生成 <code>XXX$$EnhancerByCGLIB$$xxx</code>；</li>
+<li><strong>热部署 &#x2F; 热加载</strong>：每次 reload 新建一个 ClassLoader，旧的不释放；</li>
+<li>脚本引擎（Groovy&#x2F;Nashorn&#x2F;GraalJS）反复 eval；</li>
+<li><code>ThreadLocal</code> 的 key 弱引用、value 强引用导致的经典泄漏（线程池常驻线程尤其明显）。</li>
+</ul>
+<p><strong>排查</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">jcmd &lt;pid&gt; VM.classloader_stats   <span class="comment"># JDK 11+，看 classloader 数量</span></span><br><span class="line">jcmd &lt;pid&gt; GC.class_stats         <span class="comment"># 需要 -XX:+UnlockDiagnosticVMOptions</span></span><br><span class="line">jmap -clstats &lt;pid&gt;</span><br></pre></td></tr></table></figure>
+
+<p><strong>修复</strong>：定位到泄漏的 ClassLoader（通常是自定义的），确保无强引用；配置 <code>-XX:MaxMetaspaceSize</code> 做兜底，让泄漏尽早暴露成 OOM 而不是拖垮整机。</p>
+<h3 id="2）Thread-泄漏（线程数增长）"><a href="#2）Thread-泄漏（线程数增长）" class="headerlink" title="2）Thread 泄漏（线程数增长）"></a>2）Thread 泄漏（线程数增长）</h3><p><strong>症状</strong>：Thread committed 增长，<code>thread #</code> 上升；<code>jstack</code> 里有大量 parked&#x2F;waiting 线程。</p>
+<p><strong>根因</strong>：线程池用了 <code>Executors.newCachedThreadPool()</code>（无上限）、<code>newFixedThreadPool</code> 但任务阻塞导致排队、<code>ScheduledExecutorService</code> 未 <code>shutdown</code>、每个请求 new Thread。</p>
+<p><strong>脚手架代码</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 危险：缓存线程池，60s 空闲才回收，流量尖峰后线程数长期高位</span></span><br><span class="line"><span class="type">ExecutorService</span> <span class="variable">pool</span> <span class="operator">=</span> Executors.newCachedThreadPool();</span><br><span class="line"></span><br><span class="line"><span class="comment">// 推荐：显式参数 + 有界队列 + 命名线程</span></span><br><span class="line"><span class="type">ThreadPoolExecutor</span> <span class="variable">pool</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ThreadPoolExecutor</span>(</span><br><span class="line">        <span class="number">32</span>, <span class="number">64</span>, <span class="number">60</span>, TimeUnit.SECONDS,</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">ArrayBlockingQueue</span>&lt;&gt;(<span class="number">1000</span>),</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">ThreadFactoryBuilder</span>().setNameFormat(<span class="string">&quot;order-pool-%d&quot;</span>).build(),</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">ThreadPoolExecutor</span>.CallerRunsPolicy());</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意 <code>-Xss</code></strong>：默认 1MB（Linux x64），1000 个线程就是约 1GB 栈空间。这也是”线程数一多，native 内存暴涨”的原因。</p>
+<h3 id="3）Direct-Memory（直接内存）"><a href="#3）Direct-Memory（直接内存）" class="headerlink" title="3）Direct Memory（直接内存）"></a>3）Direct Memory（直接内存）</h3><p><strong>症状</strong>：NMT 里 <code>Other</code> 或 committed 总量增长，但堆正常。<code>java.lang.OutOfMemoryError: Direct buffer memory</code>。</p>
+<p><strong>根因</strong>：<code>ByteBuffer.allocateDirect()</code>、Netty 的 <code>PooledByteBufAllocator</code>、NIO Channel 的读写缓冲。</p>
+<p><strong>关键认知</strong>：DirectByteBuffer 的<strong>对象本身在堆里（很小）</strong>，但<strong>数据在堆外（很大）</strong>。JVM 靠 <code>Cleaner</code>（虚引用）在 GC 时回收堆外内存——所以<strong>堆空间充足时 GC 不触发，堆外就回收不了</strong>，这是最反直觉的坑。</p>
+<p><strong>控制手段</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">-XX:MaxDirectMemorySize=1g      <span class="comment"># 显式限制，超过抛 OOM 而不是被容器杀</span></span><br><span class="line">-Dio.netty.maxDirectMemory=0    <span class="comment"># Netty 用 no-cleaner 策略，由 Netty 自己管理</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么显式设置 <code>MaxDirectMemorySize</code> 很重要</strong>：不设置时，默认等于 <code>-Xmx</code>，堆外可以一直涨到进程被 OOMKilled 才报错；设置了之后，超限会抛 <code>OutOfMemoryError</code>，<strong>能被捕获、能告警、能优雅降级</strong>。</p>
+<h3 id="4）JNI-第三方-native-库"><a href="#4）JNI-第三方-native-库" class="headerlink" title="4）JNI &#x2F; 第三方 native 库"></a>4）JNI &#x2F; 第三方 native 库</h3><p>NMT <strong>追踪不到</strong> JNI 库自己用 <code>malloc</code> 分配的内存，这部分会落在 <code>Unknown</code> 或干脆不计入。典型：RocksDB、Lucene（mmap）、某些加密&#x2F;压缩库、JNA。</p>
+<p><strong>排查手段</strong>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">pmap -x &lt;pid&gt;                       <span class="comment"># 看进程内存映射总览</span></span><br><span class="line"><span class="built_in">cat</span> /proc/&lt;pid&gt;/smaps_rollup        <span class="comment"># 各段 RSS 汇总</span></span><br><span class="line"><span class="built_in">cat</span> /proc/&lt;pid&gt;/status | grep -i vm <span class="comment"># VmRSS / VmSwap</span></span><br><span class="line">gdb / pstack                        <span class="comment"># 必要时看 native 栈</span></span><br></pre></td></tr></table></figure>
+
+<p>再配合 glibc 的 <strong><code>malloc_trim</code></strong> 问题（<code>MALLOC_ARENA_MAX</code> 太多 arena 导致碎片），可以加：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">export</span> MALLOC_ARENA_MAX=2</span><br><span class="line">-jemalloc 或 -XX:+UseTransparentHugePages 的取舍</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、容器化场景的额外注意点"><a href="#六、容器化场景的额外注意点" class="headerlink" title="六、容器化场景的额外注意点"></a>六、容器化场景的额外注意点</h2><p>容器里有个”隐藏税”：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">容器内存限制 = JVM 各部分 + native 库 + glibc 碎片 + 页缓存 + 内核开销</span><br></pre></td></tr></table></figure>
+
+<p>实践建议：</p>
+<table>
+<thead>
+<tr>
+<th>建议</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>容器 limit 留 25%~30% 余量</td>
+<td>常用公式：<code>-Xmx = limit × 0.7</code>（再留出 CPU 密集型的 Code Cache 与线程栈）</td>
+</tr>
+<tr>
+<td>显式设置 <code>MaxDirectMemorySize</code></td>
+<td>把不可控变成可控 OOM</td>
+</tr>
+<tr>
+<td>显式设置 <code>MaxMetaspaceSize</code></td>
+<td>让类泄漏早暴露</td>
+</tr>
+<tr>
+<td>限制线程数</td>
+<td><code>-Xss512k</code> + 有界线程池</td>
+</tr>
+<tr>
+<td>关闭 swap 或严格限制</td>
+<td>避免 OOM 前的剧烈抖动</td>
+</tr>
+<tr>
+<td>用 <code>-XX:+ExitOnOutOfMemoryError</code></td>
+<td>OOM 后直接退出，让 K8s 重建，避免僵死</td>
+</tr>
+</tbody></table>
+<p>JDK 10+ 已默认 <code>-XX:+UseContainerSupport</code>，会自动感知 cgroup 限制设置默认堆大小——但<strong>它只算堆，不算堆外</strong>，所以上面的余量必须自己留。</p>
+<hr>
+<h2 id="七、NMT-的局限性"><a href="#七、NMT-的局限性" class="headerlink" title="七、NMT 的局限性"></a>七、NMT 的局限性</h2><ol>
+<li><strong>不追踪 JNI&#x2F;native 库</strong>——<code>Unknown</code> 里的内存可能来自任何地方。</li>
+<li><strong>不追踪 mmap 文件映射</strong>（部分计入）。</li>
+<li><strong>有开销</strong>——生产长期开 <code>summary</code> 需评估（通常 2%~5% 可接受）。</li>
+<li><strong>只能启动时开启</strong>——突发问题无法临时打开，”事后诸葛亮”式排查常常困难。</li>
+<li><strong><code>detail</code> 模式在高频分配下会拖慢应用</strong>，慎用。</li>
+</ol>
+<p>所以最佳实践是：<strong>生产长期开 <code>summary</code> + 建立定时 baseline&#x2F;diff 采集</strong>，把”native 内存增长速率”变成一个可观测指标。</p>
+<hr>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：堆外内存泄漏和堆内存泄漏，排查手段有什么区别？</strong><br>堆泄漏看 <code>jmap -histo</code> &#x2F; MAT 支配树；堆外泄漏看 NMT diff、<code>pmap</code>、<code>smaps</code>。堆外泄漏最坑的是<strong>堆 dump 里看不到</strong>，因为数据不在堆上。</p>
+<p><strong>Q2：为什么 <code>ByteBuffer.allocateDirect</code> 的内存要等 GC 才回收？</strong><br>因为回收依赖 <code>Cleaner</code>（基于虚引用）。虚引用只有在 GC 时才会入队并触发 <code>Deallocate</code>。堆不紧张 → 不 GC → 堆外不回收，这就是”堆外泄漏”的假象。</p>
+<p><strong>Q3：NMT 显示 Java Heap committed 比 <code>-Xmx</code> 小很多，正常吗？</strong><br>正常。堆是<strong>按需 commit</strong>的（<code>-XX:MinHeapFreeRatio</code> &#x2F; <code>MaxHeapFreeRatio</code>），reserved 才是 <code>-Xmx</code> 的预留地址空间。判断内存是否吃紧看 committed 和 GC 日志。</p>
+<p><strong>Q4：<code>Code Cache</code> 涨到顶会怎样？</strong><br>JIT 停止编译，应用退化为解释执行，性能骤降（不是 OOM）。可以通过 <code>-XX:ReservedCodeCacheSize</code> 调大，并关注 <code>jcmd &lt;pid&gt; Compiler.codecache</code>。</p>
+<p><strong>Q5：怎么快速判断”内存到底是不是堆外问题”？</strong><br>三步：① 看 GC 日志与 <code>jstat</code> 确认堆健康；② 看容器 RSS 与 <code>-Xmx</code> 的差值；③ <code>jcmd VM.native_memory summary</code> 或 <code>pmap</code> 看 committed 分布。堆正常 + RSS 高 &#x3D; 堆外问题。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><ul>
+<li><strong>NMT</strong> 是 HotSpot 内置的 native 内存追踪工具，按类别记账，<code>summary</code> 开销低、适合生产常驻。</li>
+<li>排查三板斧：<code>summary</code> 看分布 → <code>baseline</code> + <code>diff</code> 看增长 → <code>/proc/&lt;pid&gt;/smaps</code> 看映射。</li>
+<li>四大凶手：<strong>Metaspace（类加载器泄漏）、Thread（线程泄漏）、Direct Memory（Cleaner 延迟回收）、JNI&#x2F;native 库</strong>。</li>
+<li>容器场景务必：<strong>留 25%+ 余量、显式设置 <code>MaxDirectMemorySize</code> 与 <code>MaxMetaspaceSize</code>、限制线程数</strong>。</li>
+<li>NMT 有盲区（JNI&#x2F;mmap），要配合 <code>pmap</code>&#x2F;<code>smaps</code> 使用。</li>
+</ul>
+<p>一句话：<strong>别只盯着堆，进程内存是个综合体；NMT 就是那把照向黑暗角落的手电筒。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/03/jvm-native-memory-tracking-nmt-deep-dive/">https://jiweidong.github.io/2026/10/03/jvm-native-memory-tracking-nmt-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a><a class="post-meta__tags" href="/tags/%E5%86%85%E5%AD%98%E6%B3%84%E6%BC%8F/">内存泄漏</a><a class="post-meta__tags" href="/tags/NMT/">NMT</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/03/jdk-25-new-features-deep-dive/" title="【前沿】JDK 25 LTS 新特性深度解析：紧凑对象头、分代 Shenandoah、作用域值转正与升级实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【前沿】JDK 25 LTS 新特性深度解析：紧凑对象头、分代 Shenandoah、作用域值转正与升级实战</div></div><div class="info-2"><div class="info-item-1">【前沿】JDK 25 LTS 新特性深度解析：紧凑对象头、分代 Shenandoah、作用域值转正与升级实战面试官：JDK 21 之后，下一个该跳的 LTS 是哪个？如果还停留在 JDK 8 &#x2F; 11 &#x2F; 17 的”三年一跳”节奏，那你可能已经错过了近两年 Java 平台最快的一轮演进。 JDK 25 已于 2025 年 9 月发布，是继 JDK 8、11、17、21 之后的下一个 LTS，官方支持周期长达 8 年以上。它把过去几个版本中大量 Preview &#x2F; Incubator 特性正式转正，还带来了两个实打实的性能改进。 这篇文章把 JDK 25 的核心 JEP 逐个拆解，并给出升级建议。  一、JDK 25 一览表JDK 25 的正式特性（Final）与预览特性（Preview）汇总：    JEP 名称 状态 看点    519 Compact Object Headers 正式 对象头 12→8 字节，内存直降   521 Generational Shenandoah 正式 低延迟 GC 终于分代   506 Scoped Values...</div></div></div></a><a class="pagination-related" href="/2026/10/03/mysql-semi-consistent-read-deep-dive/" title="【MySQL 底层】半一致性读（Semi-Consistent Read）深度解析：UPDATE 锁膨胀、加锁优化与死锁规避"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 底层】半一致性读（Semi-Consistent Read）深度解析：UPDATE 锁膨胀、加锁优化与死锁规避</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】半一致性读（Semi-Consistent Read）深度解析：UPDATE 锁膨胀、加锁优化与死锁规避面试官：一个 UPDATE 语句没走索引，为什么把整张表都锁住了？这个问题的标准答案往往停在”因为没索引，所以要全表扫描，扫描到的行都要加锁”。但如果你继续追问：  为什么在 READ COMMITTED 下，同样没走索引的 UPDATE，锁住的却少了很多？ 不匹配 WHERE 条件的行，为什么有时候也加锁，有时候不加？ 这个机制叫什么？它有什么代价？  能答出”半一致性读（Semi-Consistent Read）“的人，就进入了 InnoDB 加锁机制的深水区。这篇文章把它讲透。  一、先复习：InnoDB 的加锁基本盘在分析之前，先把两条基准事实钉死：    隔离级别 普通 SELECT UPDATE&#x2F;DELETE 的 WHERE 匹配    READ UNCOMMITTED 不加锁 加锁   READ COMMITTED 快照读（语句级） 加锁，逐行判断并释放不匹配行的锁   REPEATABLE READ 快照读（事务级） 加锁，扫描过的...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/02/java-oom-troubleshooting-mat-practice/" title="【生产实战】Java OOM 排查实战：从堆转储到 MAT 分析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【生产实战】Java OOM 排查实战：从堆转储到 MAT 分析</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java OOM 排查实战：从堆转储到 MAT 分析概述OutOfMemoryError（OOM）是 Java 生产环境中最具破坏力的故障之一。一次 OOM 可能导致整个应用不可用，甚至引发雪崩效应。本文从实战角度出发，系统梳理 OOM 的排查思路、常用工具和典型案例。 一、OOM 的类型与触发场景1.1 Java heap space最常见的 OOM，堆内存不足。 12345// 典型触发场景：内存泄漏或堆太小List&lt;byte[]&gt; list = new ArrayList&lt;&gt;();while (true) &#123;    list.add(new byte[1024 * 1024]); // 每秒泄漏1MB&#125;  常见原因：  内存泄漏（对象无法被 GC 回收） 堆大小设置不足（-Xmx 过小） 大对象&#x2F;大数组直接进入老年代 流量突增导致对象创建远快于 GC 回收  1.2 Metaspace12345678// 使用 CGLIB 动态生成大量类while (true) &#123;    Enhancer enha...</div></div></div></a><a class="pagination-related" href="/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/" title="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</div></div><div class="info-2"><div class="info-item-1">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？如果候选人已经聊完 G1&#x2F;ZGC、堆大小、Region 大小，还答不出”页大小”这一层，说明他对 JVM 的认识停在了”Java 层面”，没下探到操作系统与 CPU 的交互。 大页（Huge Pages）是一个典型的”不懂不影响跑，懂了能救命”的调优点：它在某些场景能显著减少 GC 停顿和 TLB miss，在另一些场景却会让 JVM 启动变慢、内存居高不下。这篇文章把 THP、HugeTLB、-XX:+UseLargePages 的原理、配置、收益边界与踩坑全讲一遍。 一、为什么要关心”页”：从 TLB 说起现代 CPU 的内存访问链路是： 1虚拟地址 → [TLB 查表] → 页表遍历 → 物理地址 → [CPU Cache] → 内存  关键点：  操作系统按”页”管理内存，传统页大小 4KB； TLB（Translation Lookaside Buffer）是页表项的硬件缓存...</div></div></div></a><a class="pagination-related" href="/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/" title="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-27</div><div class="info-item-2">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战面试官：Java 的类会被卸载吗？这是一个「听起来简单，答起来很难」的问题。 大多数人的回答是：「类加载后就一直存在，直到 JVM 结束。」 这个答案只对了一半。准确地说：  类是可以被卸载的，但条件非常苛刻。 类卸载的前提是它的 ClassLoader 被回收，而 ClassLoader 被回收的前提是「它加载的所有类都不再被引用，且它自己也不被引用」。  而现实中，ClassLoader 泄漏是 Java 应用中非常隐蔽、后果非常严重的一类内存问题，尤其在：  Tomcat &#x2F; Jetty 热部署（reload&#x2F;undeploy）场景； OSGi、插件化框架； 频繁使用脚本引擎（Nashorn&#x2F;GraalJS）、字节码生成（CGLIB&#x2F;ASM&#x2F;ByteBuddy）、动态代理； 自定义 ClassLoader 做隔离（如 Dubbo 的 SPI 类隔离、Arthas）。  这些场景下，元空间（Metaspace）会持...</div></div></div></a><a class="pagination-related" href="/2026/09/16/async-profiler-flamegraph-deep-practice/" title="【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU&#x2F;内存&#x2F;锁全维度线上排障"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-16</div><div class="info-item-2">【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU&#x2F;内存&#x2F;锁全维度线上排障</div></div><div class="info-2"><div class="info-item-1">【生产实战】async-profiler 火焰图深度解析：从采样原理到 CPU&#x2F;内存&#x2F;锁全维度线上排障面试官：线上一个接口 CPU 飙到 100%，我给你 5 分钟，你怎么定位到具体代码行？先排除错误答案：  jstack 打 5 次，看哪个栈出现得多 —— 这是穷人的采样器，只能看”线程正在干什么”，看不到 CPU 时间占比，也看不到内核栈，命中率完全靠手气。 top -Hp 找出最热的线程，再 jstack 比对 nid —— 能定位到线程，但接口一多、线程池一摊开，编号对到眼瞎。 上 JProfiler&#x2F;YourKit —— 靠 JVMTI 方法进出插桩实现，方法级全量统计看着很爽，但采样有 SafePoint Bias（安全点偏差），而且开销大，生产环境不敢开。  真正在生产环境里的标准动作是：async-profiler 打一张火焰图，30 秒出结论。 它是目前 Java 世界最主流的低开销采样剖析器。这篇文章把它的采样原理、参数体系、火焰图读法以及 CPU&#x2F;内存&#x2F;锁三类实战案例一次讲清。  一、为什么 async-pr...</div></div></div></a><a class="pagination-related" href="/2026/07/02/java-cpu-high-troubleshooting-guide/" title="【生产实战】Java 应用 CPU 100% 问题排查实战：从定位到根治"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【生产实战】Java 应用 CPU 100% 问题排查实战：从定位到根治</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 应用 CPU 100% 问题排查实战：从定位到根治概述CPU 100% 是 Java 生产环境最常见的高危告警之一。应用响应变慢、请求超时、服务雪崩……背后往往都是 CPU 被打满。本文系统梳理 CPU 100% 的排查流程、十种典型案例和根治方案。 一、排查工具箱一览   阶段 工具 用途 定位速度    快速定位 top &#x2F; htop 找到 CPU 最高的进程 ⚡ 秒级   线程定位 top -Hp 找到 CPU 最高的线程 ⚡ 秒级   线程栈 jstack 查看线程正在执行的代码 ⏱ 分钟级   火焰图 async-profiler 可视化热点方法 🔥 最直观   在线诊断 Arthas 动态追踪，无需重启 🚀 秒级   性能剖析 JMC &#x2F; JProfiler 完整性能分析 📊 全面   二、六步排查法（标准流程）Step 1：找到 CPU 最高的进程12345# top 命令，按 CPU 降序top -c# 或者只看一次，过滤 Javatop -b -n 1 | grep java  输出示例： 12  PID USER...</div></div></div></a><a class="pagination-related" href="/2026/07/23/jvm-parameter-production-config-guide/" title="【JVM 调优】JVM 参数详解与生产级配置实战指南"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-23</div><div class="info-item-2">【JVM 调优】JVM 参数详解与生产级配置实战指南</div></div><div class="info-2"><div class="info-item-1">【JVM 调优】JVM 参数详解与生产级配置实战指南一、引言很多 Java 开发者遇到 JVM 配置就头大——几百个参数，到底该配置哪些？调多少？本文系统梳理了 JVM 参数体系，按照内存 → GC → 诊断 → 调优案例的路线，带你掌握生产级别的 JVM 配置能力。 二、JVM 参数分类   类型 格式 示例 说明    标准参数 -XX -version, -server 所有 JVM 实现都支持   X 参数 -X -Xms, -Xmx 非标准但长期稳定的参数   XX 参数 -XX: -XX:+UseG1GC 最广泛，布尔型用 +&#x2F;- 开关   布尔型 XX -XX:+Flag &#x2F; -XX:-Flag -XX:+PrintGCDetails + 开启，- 关闭   数值型 XX -XX:Flag=N -XX:MaxGCPauseMillis=200 赋值数字   字符串 XX -XX:Flag=String -XX:OnOutOfMemoryError=... 赋值字符串   查看当前 JVM 生效参数： 123456# 查看所有 XX 参数及其值ji...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">712</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">801</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">226</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%AE%9E%E6%88%98%E3%80%91Native-Memory-Tracking%EF%BC%88NMT%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E6%9C%AC%E5%9C%B0%E5%86%85%E5%AD%98%E8%BF%BD%E8%B8%AA%E3%80%81%E7%9B%B4%E6%8E%A5%E5%86%85%E5%AD%98%E4%B8%8E-Metaspace-%E6%B3%84%E6%BC%8F%E6%8E%92%E6%9F%A5"><span class="toc-number">1.</span> <span class="toc-text">【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E5%AE%B9%E5%99%A8%E8%A2%AB-OOMKilled-%E4%BA%86%EF%BC%8C%E4%BD%86%E5%A0%86%E5%86%85%E5%AD%98%E5%8F%AA%E7%94%A8%E4%BA%86-40-%EF%BC%8C%E5%86%85%E5%AD%98%E5%8E%BB%E5%93%AA%E4%BA%86%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：容器被 OOMKilled 了，但堆内存只用了 40%，内存去哪了？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81JVM-%E7%9A%84%E5%86%85%E5%AD%98%E5%88%B0%E5%BA%95%E7%94%B1%E5%93%AA%E4%BA%9B%E9%83%A8%E5%88%86%E7%BB%84%E6%88%90"><span class="toc-number">1.2.</span> <span class="toc-text">一、JVM 的内存到底由哪些部分组成</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81NMT-%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.</span> <span class="toc-text">二、NMT 是什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%BC%80%E5%90%AF%E6%96%B9%E5%BC%8F"><span class="toc-number">1.3.1.</span> <span class="toc-text">开启方式</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E8%AF%BB%E6%87%82-NMT-%E8%BE%93%E5%87%BA"><span class="toc-number">1.4.</span> <span class="toc-text">三、读懂 NMT 输出</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%80%90%E9%A1%B9%E8%A7%A3%E8%AF%BB"><span class="toc-number">1.4.1.</span> <span class="toc-text">逐项解读</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%AE%9E%E6%88%98%EF%BC%9A%E7%94%A8-baseline-diff-%E5%AE%9A%E4%BD%8D%E5%A2%9E%E9%95%BF"><span class="toc-number">1.5.</span> <span class="toc-text">四、实战：用 baseline + diff 定位增长</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%9B%9B%E5%A4%A7%E2%80%9D%E5%A0%86%E5%A4%96%E5%87%B6%E6%89%8B%E2%80%9D%E9%80%90%E4%B8%AA%E5%87%BB%E7%A0%B4"><span class="toc-number">1.6.</span> <span class="toc-text">五、四大”堆外凶手”逐个击破</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1%EF%BC%89Metaspace-%E6%B3%84%E6%BC%8F%EF%BC%88Class-%E5%A2%9E%E9%95%BF%EF%BC%89"><span class="toc-number">1.6.1.</span> <span class="toc-text">1）Metaspace 泄漏（Class 增长）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2%EF%BC%89Thread-%E6%B3%84%E6%BC%8F%EF%BC%88%E7%BA%BF%E7%A8%8B%E6%95%B0%E5%A2%9E%E9%95%BF%EF%BC%89"><span class="toc-number">1.6.2.</span> <span class="toc-text">2）Thread 泄漏（线程数增长）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3%EF%BC%89Direct-Memory%EF%BC%88%E7%9B%B4%E6%8E%A5%E5%86%85%E5%AD%98%EF%BC%89"><span class="toc-number">1.6.3.</span> <span class="toc-text">3）Direct Memory（直接内存）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4%EF%BC%89JNI-%E7%AC%AC%E4%B8%89%E6%96%B9-native-%E5%BA%93"><span class="toc-number">1.6.4.</span> <span class="toc-text">4）JNI &#x2F; 第三方 native 库</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%AE%B9%E5%99%A8%E5%8C%96%E5%9C%BA%E6%99%AF%E7%9A%84%E9%A2%9D%E5%A4%96%E6%B3%A8%E6%84%8F%E7%82%B9"><span class="toc-number">1.7.</span> <span class="toc-text">六、容器化场景的额外注意点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81NMT-%E7%9A%84%E5%B1%80%E9%99%90%E6%80%A7"><span class="toc-number">1.8.</span> <span class="toc-text">七、NMT 的局限性</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/03/java-serialization-filter-jep290-deep-dive/" title="【Java 安全】序列化过滤器（JEP 290 / ObjectInputFilter）深度解析：反序列化攻击的最后一道防线">【Java 安全】序列化过滤器（JEP 290 / ObjectInputFilter）深度解析：反序列化攻击的最后一道防线</a><time datetime="2026-10-03T00:00:04.000Z" title="发表于 2026-10-03 08:00:04">2026-10-03</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/03/jdk-25-new-features-deep-dive/" title="【前沿】JDK 25 LTS 新特性深度解析：紧凑对象头、分代 Shenandoah、作用域值转正与升级实战">【前沿】JDK 25 LTS 新特性深度解析：紧凑对象头、分代 Shenandoah、作用域值转正与升级实战</a><time datetime="2026-10-03T00:00:03.000Z" title="发表于 2026-10-03 08:00:03">2026-10-03</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/03/jvm-native-memory-tracking-nmt-deep-dive/" title="【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查">【JVM 实战】Native Memory Tracking（NMT）深度解析：本地内存追踪、直接内存与 Metaspace 泄漏排查</a><time datetime="2026-10-03T00:00:02.000Z" title="发表于 2026-10-03 08:00:02">2026-10-03</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/03/mysql-semi-consistent-read-deep-dive/" title="【MySQL 底层】半一致性读（Semi-Consistent Read）深度解析：UPDATE 锁膨胀、加锁优化与死锁规避">【MySQL 底层】半一致性读（Semi-Consistent Read）深度解析：UPDATE 锁膨胀、加锁优化与死锁规避</a><time datetime="2026-10-03T00:00:01.000Z" title="发表于 2026-10-03 08:00:01">2026-10-03</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/03/java-ipc-mechanisms-deep-dive/" title="【Java 底层】进程间通信（IPC）深度解析：管道、共享内存、Unix Domain Socket 与 SocketChannel 实战">【Java 底层】进程间通信（IPC）深度解析：管道、共享内存、Unix Domain Socket 与 SocketChannel 实战</a><time datetime="2026-10-03T00:00:00.000Z" title="发表于 2026-10-03 08:00:00">2026-10-03</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
