@@ -1,0 +1,422 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性面试官：设计一个支持亿级用户的关注关系系统关注关系看起来是”最简单的社交功能”——不就是一张表存 (follower_id, followee_id) 吗？ 但当你把量级摊开，会发现这里藏着三个非常经典的高并发难题：  存储：100 亿条关系怎么存、怎么分片？ 读写不对称：普通用户粉丝几百，大 V 粉丝几千万，同一个接口要同时扛住">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/05/social-follow-graph-system-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性面试官：设计一个支持亿级用户的关注关系系统关注关系看起来是”最简单的社交功能”——不就是一张表存 (follower_id, followee_id) 吗？ 但当你把量级摊开，会发现这里藏着三个非常经典的高并发难题：  存储：100 亿条关系怎么存、怎么分片？ 读写不对称：普通用户粉丝几百，大 V 粉丝几千万，同一个接口要同时扛住">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-05T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-10-05T00:04:17.741Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="关注">
+<meta property="article:tag" content="社交">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="缓存">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性",
+  "url": "https://jiweidong.github.io/2026/10/05/social-follow-graph-system-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-05T00:20:00.000Z",
+  "dateModified": "2026-10-05T00:04:17.741Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/05/social-follow-graph-system-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">722</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">812</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">229</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-05T00:20:00.000Z" title="发表于 2026-10-05 08:20:00">2026-10-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-05T00:04:17.741Z" title="更新于 2026-10-05 08:04:17">2026-10-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/%E5%90%8E%E7%AB%AF%E6%9E%B6%E6%9E%84/">后端架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性"><a href="#【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性" class="headerlink" title="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性"></a>【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</h1><h2 id="面试官：设计一个支持亿级用户的关注关系系统"><a href="#面试官：设计一个支持亿级用户的关注关系系统" class="headerlink" title="面试官：设计一个支持亿级用户的关注关系系统"></a>面试官：设计一个支持亿级用户的关注关系系统</h2><p>关注关系看起来是”最简单的社交功能”——不就是一张表存 <code>(follower_id, followee_id)</code> 吗？</p>
+<p>但当你把量级摊开，会发现这里藏着三个非常经典的高并发难题：</p>
+<ol>
+<li><strong>存储</strong>：100 亿条关系怎么存、怎么分片？</li>
+<li><strong>读写不对称</strong>：普通用户粉丝几百，大 V 粉丝几千万，同一个接口要同时扛住两种极端；</li>
+<li><strong>计数一致性</strong>：粉丝数显示 1000 万，点进去只能列出 500 万（因为大 V 粉丝列表根本不给你翻），这个”数字”怎么维护？</li>
+</ol>
+<p>面试官问”设计关注系统”，实际上是在考你对<strong>关系图谱、扇出模型、计数与缓存一致性</strong>的综合理解。</p>
+<hr>
+<h2 id="一、需求拆解与量级估算"><a href="#一、需求拆解与量级估算" class="headerlink" title="一、需求拆解与量级估算"></a>一、需求拆解与量级估算</h2><p>先把业务模型想清楚。关注系统的核心实体只有三种：</p>
+<table>
+<thead>
+<tr>
+<th>实体</th>
+<th>说明</th>
+<th>索引方向</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>关注关系</td>
+<td>A 关注 B</td>
+<td>follower → followee</td>
+</tr>
+<tr>
+<td>好友关系</td>
+<td>A 与 B 互关（或申请通过）</td>
+<td>双向</td>
+</tr>
+<tr>
+<td>黑名单</td>
+<td>A 拉黑 B</td>
+<td>单向屏蔽</td>
+</tr>
+</tbody></table>
+<p>还有一些扩展属性：<strong>特别关注、分组、备注、关注时间、来源渠道、是否互关</strong>。</p>
+<p>量级估算（按 5 亿注册用户、人均关注 200 算）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">关系总数 = 5 亿 × 200 = 1000 亿条</span><br><span class="line">写入 QPS：峰值关注/取关 50 万/秒（活动/热点事件）</span><br><span class="line">读取 QPS：Feed 流扇出读取 &gt; 500 万/秒</span><br><span class="line">单大 V 粉丝数：上限 5000 万</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键结论：1000 亿条关系必须分库分表，而”大 V 粉丝列表”这种查询在线服务端根本不可能做全量分页。</strong></p>
+<p>这里就必须引入一个核心设计原则：</p>
+<blockquote>
+<p><strong>关注关系是”双向查询、单向写入”的——关注列表（我关注了谁）必须强一致可查，粉丝列表（谁关注了我）可以做最终一致、可以截断。</strong></p>
+</blockquote>
+<p>因为用户视角里：<strong>我关注的人我要能马上看到；谁关注我，晚几秒、只看到前 1000 个也没关系。</strong></p>
+<p>这个”产品预期”直接决定了架构：两条独立的存储链路。</p>
+<hr>
+<h2 id="二、存储选型：三套引擎各司其职"><a href="#二、存储选型：三套引擎各司其职" class="headerlink" title="二、存储选型：三套引擎各司其职"></a>二、存储选型：三套引擎各司其职</h2><h3 id="2-1-MySQL：关系的事实来源（Source-of-Truth）"><a href="#2-1-MySQL：关系的事实来源（Source-of-Truth）" class="headerlink" title="2.1 MySQL：关系的事实来源（Source of Truth）"></a>2.1 MySQL：关系的事实来源（Source of Truth）</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE TABLE</span> t_follow (</span><br><span class="line">  id          <span class="type">BIGINT</span> UNSIGNED <span class="keyword">NOT NULL</span> AUTO_INCREMENT,</span><br><span class="line">  follower_id <span class="type">BIGINT</span> UNSIGNED <span class="keyword">NOT NULL</span>,   <span class="comment">-- 关注者</span></span><br><span class="line">  followee_id <span class="type">BIGINT</span> UNSIGNED <span class="keyword">NOT NULL</span>,   <span class="comment">-- 被关注者</span></span><br><span class="line">  rel_type    TINYINT  <span class="keyword">NOT NULL</span> <span class="keyword">DEFAULT</span> <span class="number">1</span>,<span class="comment">-- 1普通 2特别关注</span></span><br><span class="line">  group_id    <span class="type">INT</span>      <span class="keyword">NOT NULL</span> <span class="keyword">DEFAULT</span> <span class="number">0</span>,</span><br><span class="line">  status      TINYINT  <span class="keyword">NOT NULL</span> <span class="keyword">DEFAULT</span> <span class="number">1</span>,<span class="comment">-- 1有效 0取消</span></span><br><span class="line">  create_time DATETIME <span class="keyword">NOT NULL</span> <span class="keyword">DEFAULT</span> <span class="built_in">CURRENT_TIMESTAMP</span>,</span><br><span class="line">  <span class="keyword">PRIMARY KEY</span> (id),</span><br><span class="line">  <span class="keyword">UNIQUE</span> KEY uk_follower_followee (follower_id, followee_id),</span><br><span class="line">  KEY idx_followee_time (followee_id, create_time)</span><br><span class="line">) ENGINE<span class="operator">=</span>InnoDB;</span><br></pre></td></tr></table></figure>
+
+<p>分库分表策略：</p>
+<ul>
+<li><strong>按 <code>follower_id</code> 分片</strong>：保证”我关注了谁”的查询单库命中，这是最高频的查询。</li>
+<li><strong>按 <code>followee_id</code> 建异步副本表（宽表&#x2F;从表）</strong>：用 binlog 同步（Canal&#x2F;Debezium）生成”谁关注了我”的读副本。</li>
+<li>分片数：1024 库表，用 <code>follower_id % 1024</code> 或一致性哈希。</li>
+</ul>
+<p>为什么不做双向都同步写？因为<strong>关注是一次写、两次读（关注列表 + 粉丝列表）</strong>。同步写两张表意味着写放大 2 倍、还要分布式事务。用 binlog 异步生成粉丝副本，把写冲突和一致性复杂度全部后移。</p>
+<h3 id="2-2-Redis：高性能关系缓存"><a href="#2-2-Redis：高性能关系缓存" class="headerlink" title="2.2 Redis：高性能关系缓存"></a>2.2 Redis：高性能关系缓存</h3><p>MySQL 扛不住 500 万 QPS 的关系判断（”我有没有关注他”）。所以 Redis 承担三类职责：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">1. 关注列表缓存：SET  follow:list:&#123;userId&#125;  → member = followeeId</span><br><span class="line">2. 粉丝集合（部分）：SET follow:fans:&#123;userId&#125; → 只存&quot;活跃粉丝/前 N 页&quot;</span><br><span class="line">3. 关系判断：SISMEMBER follow:list:&#123;userId&#125; &#123;followeeId&#125;  → O(1)</span><br></pre></td></tr></table></figure>
+
+<p><strong>大 V 的粉丝集合怎么办？</strong> 5000 万粉丝全塞进一个 Redis Set，单 key 内存几个 G，直接触发大 key 问题。方案：</p>
+<ul>
+<li>大 V 粉丝集合<strong>只存最近&#x2F;活跃的粉丝</strong>（比如最近 30 天内互动过的），超过阈值直接截断；</li>
+<li>或用 <strong>分桶 Set</strong>：<code>follow:fans:{userId}:bucket:{0..1023}</code>，按 <code>followerId % 1024</code> 分桶，单桶几十 KB，可并行取；</li>
+<li>粉丝列表产品上本身就做了”仅展示前 N 页”的限制，所以缓存也只需前 N 页。</li>
+</ul>
+<h3 id="2-3-图数据库：用于”关系探索”而非主链路"><a href="#2-3-图数据库：用于”关系探索”而非主链路" class="headerlink" title="2.3 图数据库：用于”关系探索”而非主链路"></a>2.3 图数据库：用于”关系探索”而非主链路</h3><p>共同关注、二度人脉、社交推荐属于<strong>图遍历查询</strong>，用 Neo4j 很自然，但<strong>绝不能放在主链路上</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>查询</th>
+<th>引擎</th>
+<th>是否主链路</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>我关注列表</td>
+<td>MySQL&#x2F;Redis</td>
+<td>✅ 主链路</td>
+</tr>
+<tr>
+<td>是否关注</td>
+<td>Redis</td>
+<td>✅ 主链路</td>
+</tr>
+<tr>
+<td>粉丝列表</td>
+<td>MySQL 读副本</td>
+<td>✅ 主链路</td>
+</tr>
+<tr>
+<td>共同关注</td>
+<td>Redis SINTER 或图库</td>
+<td>⚠️ 半在线</td>
+</tr>
+<tr>
+<td>二度人脉&#x2F;推荐</td>
+<td>离线图计算</td>
+<td>❌ 离线</td>
+</tr>
+</tbody></table>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">共同关注的最快实现：SINTER follow:list:A follow:list:B</span><br><span class="line">（Redis 集合交，O(N)，N 取小的那个集合，对小 V 场景毫秒级）</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、大-V-扇出：写扩散还是读扩散"><a href="#三、大-V-扇出：写扩散还是读扩散" class="headerlink" title="三、大 V 扇出：写扩散还是读扩散"></a>三、大 V 扇出：写扩散还是读扩散</h2><p>这是关注系统最经典的面试深水区。关注关系本身不扇出，但<strong>关注之后要影响 Feed 流</strong>，就出现了扇出模型选择。</p>
+<h3 id="3-1-写扩散（Push-Fan-out-on-Write）"><a href="#3-1-写扩散（Push-Fan-out-on-Write）" class="headerlink" title="3.1 写扩散（Push &#x2F; Fan-out on Write）"></a>3.1 写扩散（Push &#x2F; Fan-out on Write）</h3><p>A 发内容时，立刻写进所有粉丝的收件箱（inbox）。</p>
+<ul>
+<li>优点：读极快（直接读自己的 inbox）</li>
+<li>缺点：大 V 发一条，要写 5000 万次——<strong>写放大灾难</strong></li>
+</ul>
+<h3 id="3-2-读扩散（Pull-Fan-out-on-Read）"><a href="#3-2-读扩散（Pull-Fan-out-on-Read）" class="headerlink" title="3.2 读扩散（Pull &#x2F; Fan-out on Read）"></a>3.2 读扩散（Pull &#x2F; Fan-out on Read）</h3><p>A 发内容只写自己的发件箱（outbox），粉丝读时实时拉取所有关注的人再合并。</p>
+<ul>
+<li>优点：写极轻</li>
+<li>缺点：读放大——关注 2000 人，读一次要 merge 2000 个 outbox</li>
+</ul>
+<h3 id="3-3-混合模型（工业界实际方案）"><a href="#3-3-混合模型（工业界实际方案）" class="headerlink" title="3.3 混合模型（工业界实际方案）"></a>3.3 混合模型（工业界实际方案）</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">普通用户（粉丝 &lt; 阈值 T，如 10 万）→ 写扩散，粉丝 inbox 预计算</span><br><span class="line">大 V（粉丝 ≥ T）                 → 读扩散，粉丝读时在线合并</span><br><span class="line">                                      ↓</span><br><span class="line">                              读时：inbox（普通关注） + 拉取大V outbox 合并排序</span><br></pre></td></tr></table></figure>
+
+<p>这个阈值通常做成<strong>动态阈值</strong>（<code>T = 总请求量 / 平均扇出承受能力</code>），并且大 V 的内容会<strong>缓存在 Rank 服务的热池</strong>里，避免每次真去拉。</p>
+<p>面试时能说出”混合模型 + 动态阈值 + 大V热池”这三点，基本就过关了。</p>
+<h3 id="3-4-扇出延迟队列"><a href="#3-4-扇出延迟队列" class="headerlink" title="3.4 扇出延迟队列"></a>3.4 扇出延迟队列</h3><p>写扩散不能同步做（用户点”发布”不能等 5000 万次写）。所以走异步：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">发布 → outbox 落库 → 投递 Kafka(topic=post_publish) → 扇出消费者</span><br><span class="line">        → 批量写粉丝 inbox（Redis ZSet，score=发布时间）→ 截断到 1000 条</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 扇出消费者：分批扫描粉丝并写 inbox</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">fanout</span><span class="params">(Post post)</span> &#123;</span><br><span class="line">    <span class="type">long</span> <span class="variable">cursor</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">    <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">        List&lt;Long&gt; fans = fanRepo.pageFollowers(post.getAuthorId(), cursor, <span class="number">5000</span>);</span><br><span class="line">        <span class="keyword">if</span> (fans.isEmpty()) <span class="keyword">break</span>;</span><br><span class="line">        <span class="comment">// pipeline 批量写，降低 RTT</span></span><br><span class="line">        redis.pipelined(p -&gt; &#123;</span><br><span class="line">            <span class="keyword">for</span> (Long fanId : fans) &#123;</span><br><span class="line">                <span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> <span class="string">&quot;inbox:&quot;</span> + fanId;</span><br><span class="line">                p.zadd(key, post.getPublishTime(), String.valueOf(post.getId()));</span><br><span class="line">                p.zremrangeByRank(key, <span class="number">0</span>, -<span class="number">1001</span>);   <span class="comment">// 只留最近 1000 条</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125;);</span><br><span class="line">        cursor = fans.get(fans.size() - <span class="number">1</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意 <code>zremrangeByRank</code> 的截断——<strong>收件箱只保留最近 1000 条</strong>，这就是”允许丢”的产品兜底（用户不会翻到第 1001 条）。</p>
+<hr>
+<h2 id="四、计数一致性：粉丝数这个”坑”"><a href="#四、计数一致性：粉丝数这个”坑”" class="headerlink" title="四、计数一致性：粉丝数这个”坑”"></a>四、计数一致性：粉丝数这个”坑”</h2><p><code>粉丝数</code> 这个数字，是关注系统里最容易出错的地方。因为它<strong>写频繁、读更高频、且要求最终一致</strong>。</p>
+<h3 id="4-1-计数存储分层"><a href="#4-1-计数存储分层" class="headerlink" title="4.1 计数存储分层"></a>4.1 计数存储分层</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">Redis String：follow:count:fans:&#123;userId&#125;   （毫秒级读，可能不准）</span><br><span class="line">MySQL 计数列：t_user_stat.fans_count        （准，但慢）</span><br><span class="line">离线对账任务：每天校准                               （真相）</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键设计：Redis 计数用 INCR&#x2F;DECR 原子自增，绝不用 <code>SCARD</code> 去数集合</strong>（大 key 上 <code>SCARD</code> 是 O(1)，但桶化之后就不行了，且 Set 会被截断）。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 关注操作：MySQL 事务内写关系 + 异步改计数</span></span><br><span class="line"><span class="meta">@Transactional</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">follow</span><span class="params">(<span class="type">long</span> followerId, <span class="type">long</span> followeeId)</span> &#123;</span><br><span class="line">    <span class="type">boolean</span> <span class="variable">inserted</span> <span class="operator">=</span> followMapper.insertIgnore(followerId, followeeId);</span><br><span class="line">    <span class="keyword">if</span> (!inserted) <span class="keyword">return</span>;                     <span class="comment">// 幂等：已关注直接返回</span></span><br><span class="line">    <span class="comment">// 事务提交后异步更新计数（本地消息表保证不丢）</span></span><br><span class="line">    localMessageService.send(FollowCountMsg.of(followerId, followeeId, +<span class="number">1</span>));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-为什么不能”事务里直接-INCR-Redis”"><a href="#4-2-为什么不能”事务里直接-INCR-Redis”" class="headerlink" title="4.2 为什么不能”事务里直接 INCR Redis”"></a>4.2 为什么不能”事务里直接 INCR Redis”</h3><p>因为 Redis 和 MySQL 不在一个事务里。做法是：</p>
+<ol>
+<li>事务内写 MySQL 关系 + 写<strong>本地消息表</strong>；</li>
+<li>事务提交后，异步消费者读本地消息表 → <code>INCR</code> Redis 计数；</li>
+<li>每天离线任务 <code>SELECT COUNT(*)</code> 校准 Redis 与 MySQL 统计列。</li>
+</ol>
+<h3 id="4-3-计数漂移的三种典型场景"><a href="#4-3-计数漂移的三种典型场景" class="headerlink" title="4.3 计数漂移的三种典型场景"></a>4.3 计数漂移的三种典型场景</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>原因</th>
+<th>解决</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>重复关注导致计数虚高</td>
+<td>并发重复 insert</td>
+<td>唯一索引 + insertIgnore 幂等</td>
+</tr>
+<tr>
+<td>取关后计数没减</td>
+<td>异步消息丢失</td>
+<td>本地消息表 + 重试 + 对账</td>
+</tr>
+<tr>
+<td>大 V 计数不准</td>
+<td>Redis 被截断&#x2F;分桶</td>
+<td>计数独立 key，不依赖集合大小</td>
+</tr>
+<tr>
+<td>拉黑后计数不变</td>
+<td>业务定义（拉黑不解除关注）</td>
+<td>明确产品语义，别乱减</td>
+</tr>
+</tbody></table>
+<p><strong>面试加分点</strong>：主动说出”计数不是精确值，而是缓存值 + 定期对账”，比硬讲”强一致性”要专业得多。</p>
+<hr>
+<h2 id="五、缓存设计：热点-Key-与穿透"><a href="#五、缓存设计：热点-Key-与穿透" class="headerlink" title="五、缓存设计：热点 Key 与穿透"></a>五、缓存设计：热点 Key 与穿透</h2><p>关注系统有两个典型缓存问题：</p>
+<h3 id="5-1-热点大-V"><a href="#5-1-热点大-V" class="headerlink" title="5.1 热点大 V"></a>5.1 热点大 V</h3><p>某明星发声明，1 秒内 100 万人点开他的主页并查询”我是否关注他”。</p>
+<ul>
+<li>Redis 单 key 热点：可以用<strong>本地缓存（Caffeine）+ 多级缓存</strong>，本地缓存只放”是否关注”这种布尔值，TTL 3~5 秒；</li>
+<li>或者用 <strong>Redis Cluster 的 hash tag</strong> 把同一用户的数据打散到不同分片，避免单分片打爆。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 多级缓存：Caffeine(50ms TTL) → Redis → MySQL</span></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">isFollowing</span><span class="params">(<span class="type">long</span> me, <span class="type">long</span> target)</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> me + <span class="string">&quot;:&quot;</span> + target;</span><br><span class="line">    <span class="type">Boolean</span> <span class="variable">local</span> <span class="operator">=</span> localCache.getIfPresent(key);</span><br><span class="line">    <span class="keyword">if</span> (local != <span class="literal">null</span>) <span class="keyword">return</span> local;</span><br><span class="line"></span><br><span class="line">    <span class="type">Boolean</span> <span class="variable">inRedis</span> <span class="operator">=</span> redis.sismember(<span class="string">&quot;follow:list:&quot;</span> + me, target);</span><br><span class="line">    localCache.put(key, inRedis);</span><br><span class="line">    <span class="keyword">return</span> inRedis;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意本地缓存 TTL 一定要<strong>极短</strong>（几十毫秒到几秒），否则取关后用户会看到”还关注着”的脏读。</p>
+<h3 id="5-2-缓存穿透与雪崩"><a href="#5-2-缓存穿透与雪崩" class="headerlink" title="5.2 缓存穿透与雪崩"></a>5.2 缓存穿透与雪崩</h3><ul>
+<li>用户不存在 &#x2F; 无关系 → 缓存空值（<code>&quot;NULL&quot;</code> + 短 TTL），别每次都打 DB；</li>
+<li>热点 key 过期时间加<strong>随机抖动</strong>，防雪崩；</li>
+<li>用<strong>布隆过滤器</strong>挡掉不存在的 <code>userId</code>。</li>
+</ul>
+<hr>
+<h2 id="六、关注链路的性能与幂等"><a href="#六、关注链路的性能与幂等" class="headerlink" title="六、关注链路的性能与幂等"></a>六、关注链路的性能与幂等</h2><p>一次”关注”点击，完整链路：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">1. 参数校验 + 风控（防刷、拉黑检查、关注上限）</span><br><span class="line">2. Redis 预判：SISMEMBER 快速幂等判断</span><br><span class="line">3. MySQL 幂等写入（唯一索引 insert ignore）</span><br><span class="line">4. 写本地消息表（计数、扇出、通知）</span><br><span class="line">5. 删除/更新相关缓存</span><br><span class="line">6. 异步：更新计数、投递通知、构建 Feed 关系</span><br></pre></td></tr></table></figure>
+
+<p>几个工程细节：</p>
+<ul>
+<li><strong>关注上限</strong>：普通用户最多关注 5000 人，防止恶意刷粉；存在 Redis ZSet 里按时间淘汰；</li>
+<li><strong>频繁关注&#x2F;取关</strong>：加<strong>用户级令牌桶限流</strong>，并且”取关立即生效、关注延迟生效”可减少抖动；</li>
+<li><strong>拉黑语义</strong>：A 拉黑 B 时，B 对 A 的关注关系要”隐藏”但不删除（产品上还要恢复），用 <code>status</code> 字段区分，别物理删。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 关注上限：ZSet 按时间保留最近 5000 个</span></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">tryAcquireFollowQuota</span><span class="params">(<span class="type">long</span> userId)</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> <span class="string">&quot;follow:quota:&quot;</span> + userId;</span><br><span class="line">    <span class="type">Long</span> <span class="variable">cnt</span> <span class="operator">=</span> redis.zcard(key);</span><br><span class="line">    <span class="keyword">if</span> (cnt != <span class="literal">null</span> &amp;&amp; cnt &gt;= <span class="number">5000</span>) &#123;</span><br><span class="line">        <span class="comment">// 允许&quot;取关再关注&quot;，不新增总量</span></span><br><span class="line">        <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    redis.zadd(key, System.currentTimeMillis(), UUID.randomUUID().toString());</span><br><span class="line">    <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：为什么不用一个中间表存双向关系？</strong><br>互关不等于好友（微博互关≠好友）。且双向存储会让写入放大 2 倍，语义也难以承载”单向屏蔽””特别关注”等属性。<strong>用单向关系 + 运行时判定互关（双向存在）</strong> 最灵活。</p>
+<p><strong>Q2：粉丝数为什么可以和真实条数不一致？</strong><br>因为它只是<strong>展示值</strong>，产品不需要精确。工业界统一做法是 Redis 计数 + 离线对账；一致性的成本远高于收益。</p>
+<p><strong>Q3：大 V 粉丝列表怎么分页？</strong><br>不让分页。产品上限制最多查看前 5 页（或前 1000），超出提示”仅展示部分”。技术上按 <code>(followee_id, create_time)</code> 走覆盖索引 + 游标分页，避免深分页。</p>
+<p><strong>Q4：怎么算共同关注？</strong><br><code>SINTER</code> 两个关注列表（小集合优先）；超大 V 用<strong>离线预计算 + BitMap</strong>：把 5000 万粉丝映射到位图，两两 AND 求共同粉丝，百万级用户的共同关注用 RoaringBitmap 毫秒出结果。</p>
+<p><strong>Q5：关注关系需要事务吗？</strong><br>只需要保证”关系表”本身的唯一性和计数最终一致。跨服务用本地消息表 &#x2F; 事务消息，别上分布式事务——关注这种业务天然可容忍短暂不一致。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>关注关系系统的四根支柱：</p>
+<ol>
+<li><strong>单向关系 + 双向索引</strong>：主表按 <code>follower_id</code> 分片，粉丝表用 binlog 异步生成读副本；</li>
+<li><strong>混合扇出</strong>：普通用户写扩散，大 V 读扩散，阈值动态可调；</li>
+<li><strong>计数是缓存不是事实</strong>：Redis INCR + 离线对账，接受最终一致；</li>
+<li><strong>大 V 是万恶之源</strong>：大 key 分桶、本地缓存、位图求交、产品截断，全是为它准备的。</li>
+</ol>
+<p>把”产品预期决定架构取舍”这句话讲透，这道题就不再是背八股，而是真正的架构设计了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/05/social-follow-graph-system-design/">https://jiweidong.github.io/2026/10/05/social-follow-graph-system-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a><a class="post-meta__tags" href="/tags/%E7%A4%BE%E4%BA%A4/">社交</a><a class="post-meta__tags" href="/tags/%E5%85%B3%E6%B3%A8/">关注</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/05/notification-center-system-design/" title="面试官：设计一个推送通知中心，怎么保证&quot;不重、不漏、不扰民&quot;？"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">面试官：设计一个推送通知中心，怎么保证"不重、不漏、不扰民"？</div></div><div class="info-2"><div class="info-item-1">面试官：设计一个推送通知中心，怎么保证”不重、不漏、不扰民”？面试官：订单支付成功后要给用户发通知，你怎么设计？这个问题的第一反应通常是：”发个短信不就行了？” 但顺着问下去，面试官的三个追问会把大部分人问穿：  用户没收到怎么办？（不漏） 用户收到两条怎么办？（不重） 用户半夜收到一条营销推送，投诉了怎么办？（不扰民）  这三问，就是通知中心架构的全部核心。通知中心是典型的”看起来简单、做起来全是坑”的系统——它同时踩中了异步、幂等、多级降级、频控、可观测性五个高并发课题。  一、通知中心到底管什么先划清边界。通知中心和 IM 的区别：    维度 IM 通知中心    触发方 用户主动 系统事件驱动   渠道 长连接 多渠道（Push&#x2F;短信&#x2F;邮件&#x2F;站内信&#x2F;微信）   可靠性 必达有序 尽力送达 + 可追溯   语义 会话 模板 + 变量   关注点 连接 触达率、成本、骚扰控制   通知中心要解决四个问题： 12341. 谁来发     → 业务系统通过统一 API / MQ 事件投递2. 怎么发     → 模板渲染 + 渠道编排 +...</div></div></div></a><a class="pagination-related" href="/2026/10/05/danmaku-live-system-architecture-design/" title="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</div></div><div class="info-2"><div class="info-item-1">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统先说一句大实话：弹幕系统本质上是一个”高扇出、低价值、可丢失”的实时消息系统。 它和 IM 的根本区别在于业务预期：    维度 IM 私聊 直播弹幕    消息模型 点对点 &#x2F; 小群 一对百万（广播扇出）   可靠性 必达、有序、可回溯 尽力而为，允许丢   延迟要求 秒级可接受 300ms 内最佳   价值密度 极高 极低（丢了没人发现）   峰值特征 平缓 脉冲式（大主播开播瞬间）   存储 长期可查 短期可查 + 抽样留存   想清楚这句话，整个架构的取舍就顺了：弹幕不需要像 IM 一样做 ACK 重传和离线消息，但必须在扇出、成本、治理上做到极致。 面到这一步，面试官通常会顺着往下问五层：量级估算 → 长连接网关 → 房间分片 → 消息扇出 → 治理与存储。我们一层层拆。  一、量级估算：先算清楚”到底难在哪”面试时不要一上来画架构图，先把数字摊开。 假设场景：  在线峰值 100 万观众 单直播间峰值 30 万人（头部主播） 峰值弹幕发...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/24/api-idempotence-design-practice/" title="【高并发设计】接口幂等性方案全解析：从原理到代码实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-24</div><div class="info-item-2">【高并发设计】接口幂等性方案全解析：从原理到代码实战</div></div><div class="info-2"><div class="info-item-1">【高并发设计】接口幂等性方案全解析：从原理到代码实战一、什么是幂等性？ 幂等（Idempotent）：在编程中，一个幂等操作的特点是其任意多次执行所产生的影响均与一次执行的影响相同。  举个生活例子：电梯按钮——按一次电梯到1楼，按十次电梯还是到1楼，结果不会变。这就是幂等。 在分布式系统中，幂等性尤为重要，因为网络不可靠，重试是常态。 为什么需要幂等？   场景 问题 后果    支付接口重试 用户点了两次”支付” 重复扣款   订单创建重试 提交订单超时，自动重试 生成重复订单   MQ 消息重复消费 消费成功但 ACK 失败 重复处理   前端重复提交 用户狂点提交按钮 数据重复    幂等设计是分布式系统的第一道防线。  二、幂等实现方案全景图1234567891011方案对比总览┌─────────────────────────────────────────────────┐│                 幂等方案                          │├───────────────────────────────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/10/04/shopping-cart-system-architecture-design/" title="【系统设计】购物车系统架构设计：存储选型、多端合并、价格计算与过期治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">【系统设计】购物车系统架构设计：存储选型、多端合并、价格计算与过期治理</div></div><div class="info-2"><div class="info-item-1">【系统设计】购物车系统架构设计：存储选型、多端合并、价格计算与过期治理面试官：设计一个淘宝&#x2F;京东的购物车，支持未登录、多端、海量商品“购物车不就是存个商品列表吗？”——如果这么答，面试基本就结束了。 购物车真正的难点在于：它是唯一一个既要在未登录态工作、又要在登录后合并、还要保证价格永远实时的模块。它同时踩了缓存设计、读写分离、数据一致性、热点 key 四个坑。  一、需求拆解   维度 需求    未登录 本地&#x2F;游客购物车，无需登录即可添加   登录后 游客车与用户车合并，同商品数量叠加   多端 App、H5、小程序、PC 数据同步   容量 单用户上限 200 个 SKU（防刷）   价格 永远实时，不能存快照价   操作 加购、改数量、删除、选中、清空、失效商品区   规模 数亿用户，QPS 峰值数十万   关键决策一：购物车不存价格。存价格会导致商品调价后购物车显示错误，且每次改价要全量刷新缓存。所以只存 skuId + 数量 + 选中状态 + 加入时间，价格在下单&#x2F;展示时批量查。 关键决策二：购物车不是订单。购物车可以随时丢，所以可以容忍...</div></div></div></a><a class="pagination-related" href="/2026/10/02/comment-system-architecture-design/" title="【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】评论系统架构设计：多级评论、存储模型、计数与排序全解析面试官：设计一个类似微博&#x2F;知乎的评论系统，支持多级回复、点赞和海量数据评论系统是系统设计面试的常客。它不像秒杀那样极端，但把数据建模、分页、计数一致性、缓存、排序这几个经典问题全揉在了一起。 尤其”多级评论”这一块，是区分候选人水平的分水岭——很多人上来就说”用 parent_id 递归查”，然后就被追问死了。  一、需求拆解   维度 需求    层级 支持一级评论 + 二级回复（最多两层），不无限嵌套   排序 一级按热度&#x2F;时间，二级按时间   分页 一级评论分页，二级默认展示前 3 条 + “查看更多”   计数 评论数、回复数、点赞数，允许秒级延迟   数据量 单内容最多百万评论，全站百亿级   操作 发表、删除、点赞、举报、审核   关键的产品决策：绝大多数成熟产品（微博、YouTube、Twitter）都采用两层结构——一级评论 + 二级回复拉平。为什么？因为无限嵌套在 UI 上难以展示、在查询上难以分页、在移动端体验极差。所以： 123456评论 A（一级）├── 回复 A1（二级...</div></div></div></a><a class="pagination-related" href="/2026/10/02/realtime-risk-control-system-design/" title="【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算</div></div><div class="info-2"><div class="info-item-1">【系统设计】实时风控系统架构设计：规则引擎、名单体系、滑动窗口与流式特征计算面试官：你们的交易&#x2F;登录&#x2F;营销活动怎么防刷？设计一个实时风控系统风控系统是很多后端工程师”知道很重要但没系统做过”的领域。它的难点不在于单个技术点，而在于架构分层、规则的可扩展性、以及实时性与准确性的平衡。 这篇文章从零搭建一个可落地的实时风控系统。  一、风控的本质：在 100ms 内判断”这个请求是不是坏人”风控系统的基本形态是一个同步决策接口： 123输入：事件（谁、在什么时间、用什么设备、做了什么）输出：决策（通过 / 拒绝 / 挑战 / 人工审核）+ 风险分约束：必须在 50~200ms 内返回，否则会拖垮业务主链路  它的输入通常是：  主体：用户 ID、设备指纹、IP、手机号、身份证哈希 行为：登录、下单、支付、领券、抽奖、发帖、改密码 上下文：时间、地理位置、网络环境、历史行为  核心挑战：  低延迟：风控挂在主链路上，超时就等于业务不可用。 高召回：宁可错杀，不可放过（但要控制误杀率）。 可解释：被拒的用户要能说清楚为什么被拒。 可演进：黑产每天都在变，规则必须能小时...</div></div></div></a><a class="pagination-related" href="/2026/10/02/redis-ranking-system-architecture-design/" title="【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页面试官：让你设计一个千万级用户的积分排行榜，你会怎么做？这是系统设计面试里非常经典的一道题。看起来简单——“排个序而已”——但它几乎把高并发场景里所有的坑都踩了一遍：海量数据、实时更新、热点写入、深分页、周期榜与总榜的切换、缓存与数据库的一致性。 很多人第一反应是： 123SELECT user_id, score FROM user_scoreORDER BY score DESCLIMIT 0, 100;  在小数据量下没问题，但一旦数据量到千万级，这条 SQL 就会全表扫描 + 文件排序（filesort），再加上高并发 QPS，数据库基本必挂。 所以我们要从”能用”一步步推到”生产级高并发可用”。  一、需求拆解：先把问题定义清楚在动手之前，先把需求拆成几个维度，不同维度的答案完全不同：    维度 需要问清楚的问题    数据规模 用户量是百万、千万还是上亿？   榜单类型 总榜 &#x2F; 日榜 &#x2F; 周榜 &#x2F; 月榜 &#x2F; 好友榜？   实时性 秒级...</div></div></div></a><a class="pagination-related" href="/2026/08/18/short-url-system-design/" title="【系统设计】短链接系统架构设计：从发号器到跳转的完整方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案</div></div><div class="info-2"><div class="info-item-1">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案面试官：设计一个短链接系统，说下你的思路？短链接是系统设计面试的”经典题库题”（和秒杀、支付、消息推送并列）。它麻雀虽小五脏俱全：发号算法、存储设计、缓存、高并发跳转、数据统计全都涉及。而且它真实存在于你身边的每个场景——微博分享、营销短信、二维码里那一串 t.cn/xxxxx。 本文给出一个可以直接”背”进面试的完整设计方案。  一、需求分析功能需求 生成：输入长链接，返回短链接（如 https://s.dg.com/Ab3xY9）； 跳转：访问短链接，302 重定向到长链接； 统计：每个短链接的访问次数、来源、时间分布（加分项）； 管理：可自定义短码、可设置过期时间（加分项）。  非功能需求（关键！） 高并发：跳转是读多写少，QPS 可能极高（营销活动时秒级上万）； 高可用：跳转失败 &#x3D; 用户进不了页面，可用性要求 99.99%； 低延迟：跳转链路要快，缓存命中率要足够高。  容量估算（背下来，面试很加分） 每天新增短链接 1000 万 → 每年约 36.5 亿条； 短码长度：用 62 进制（a-zA-Z0-9...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">722</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">812</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">229</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E7%A4%BE%E4%BA%A4%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E5%85%B3%E7%B3%BB%E5%AD%98%E5%82%A8%E3%80%81%E5%A4%A7V%E6%89%87%E5%87%BA%E4%B8%8E%E8%AE%A1%E6%95%B0%E4%B8%80%E8%87%B4%E6%80%A7"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AE%BE%E8%AE%A1%E4%B8%80%E4%B8%AA%E6%94%AF%E6%8C%81%E4%BA%BF%E7%BA%A7%E7%94%A8%E6%88%B7%E7%9A%84%E5%85%B3%E6%B3%A8%E5%85%B3%E7%B3%BB%E7%B3%BB%E7%BB%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：设计一个支持亿级用户的关注关系系统</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E9%9C%80%E6%B1%82%E6%8B%86%E8%A7%A3%E4%B8%8E%E9%87%8F%E7%BA%A7%E4%BC%B0%E7%AE%97"><span class="toc-number">1.2.</span> <span class="toc-text">一、需求拆解与量级估算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%AD%98%E5%82%A8%E9%80%89%E5%9E%8B%EF%BC%9A%E4%B8%89%E5%A5%97%E5%BC%95%E6%93%8E%E5%90%84%E5%8F%B8%E5%85%B6%E8%81%8C"><span class="toc-number">1.3.</span> <span class="toc-text">二、存储选型：三套引擎各司其职</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-MySQL%EF%BC%9A%E5%85%B3%E7%B3%BB%E7%9A%84%E4%BA%8B%E5%AE%9E%E6%9D%A5%E6%BA%90%EF%BC%88Source-of-Truth%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 MySQL：关系的事实来源（Source of Truth）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-Redis%EF%BC%9A%E9%AB%98%E6%80%A7%E8%83%BD%E5%85%B3%E7%B3%BB%E7%BC%93%E5%AD%98"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 Redis：高性能关系缓存</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%9B%BE%E6%95%B0%E6%8D%AE%E5%BA%93%EF%BC%9A%E7%94%A8%E4%BA%8E%E2%80%9D%E5%85%B3%E7%B3%BB%E6%8E%A2%E7%B4%A2%E2%80%9D%E8%80%8C%E9%9D%9E%E4%B8%BB%E9%93%BE%E8%B7%AF"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 图数据库：用于”关系探索”而非主链路</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%A4%A7-V-%E6%89%87%E5%87%BA%EF%BC%9A%E5%86%99%E6%89%A9%E6%95%A3%E8%BF%98%E6%98%AF%E8%AF%BB%E6%89%A9%E6%95%A3"><span class="toc-number">1.4.</span> <span class="toc-text">三、大 V 扇出：写扩散还是读扩散</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%86%99%E6%89%A9%E6%95%A3%EF%BC%88Push-Fan-out-on-Write%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 写扩散（Push &#x2F; Fan-out on Write）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E8%AF%BB%E6%89%A9%E6%95%A3%EF%BC%88Pull-Fan-out-on-Read%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 读扩散（Pull &#x2F; Fan-out on Read）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E6%B7%B7%E5%90%88%E6%A8%A1%E5%9E%8B%EF%BC%88%E5%B7%A5%E4%B8%9A%E7%95%8C%E5%AE%9E%E9%99%85%E6%96%B9%E6%A1%88%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 混合模型（工业界实际方案）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E6%89%87%E5%87%BA%E5%BB%B6%E8%BF%9F%E9%98%9F%E5%88%97"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 扇出延迟队列</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%AE%A1%E6%95%B0%E4%B8%80%E8%87%B4%E6%80%A7%EF%BC%9A%E7%B2%89%E4%B8%9D%E6%95%B0%E8%BF%99%E4%B8%AA%E2%80%9D%E5%9D%91%E2%80%9D"><span class="toc-number">1.5.</span> <span class="toc-text">四、计数一致性：粉丝数这个”坑”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E8%AE%A1%E6%95%B0%E5%AD%98%E5%82%A8%E5%88%86%E5%B1%82"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 计数存储分层</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E8%83%BD%E2%80%9D%E4%BA%8B%E5%8A%A1%E9%87%8C%E7%9B%B4%E6%8E%A5-INCR-Redis%E2%80%9D"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 为什么不能”事务里直接 INCR Redis”</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E8%AE%A1%E6%95%B0%E6%BC%82%E7%A7%BB%E7%9A%84%E4%B8%89%E7%A7%8D%E5%85%B8%E5%9E%8B%E5%9C%BA%E6%99%AF"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 计数漂移的三种典型场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%BC%93%E5%AD%98%E8%AE%BE%E8%AE%A1%EF%BC%9A%E7%83%AD%E7%82%B9-Key-%E4%B8%8E%E7%A9%BF%E9%80%8F"><span class="toc-number">1.6.</span> <span class="toc-text">五、缓存设计：热点 Key 与穿透</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E7%83%AD%E7%82%B9%E5%A4%A7-V"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 热点大 V</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%BC%93%E5%AD%98%E7%A9%BF%E9%80%8F%E4%B8%8E%E9%9B%AA%E5%B4%A9"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 缓存穿透与雪崩</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%85%B3%E6%B3%A8%E9%93%BE%E8%B7%AF%E7%9A%84%E6%80%A7%E8%83%BD%E4%B8%8E%E5%B9%82%E7%AD%89"><span class="toc-number">1.7.</span> <span class="toc-text">六、关注链路的性能与幂等</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/spring-fn-router-function-web-programming-deep-dive/" title="【Spring 实战】Spring 函数式 Web 编程深度解析：RouterFunction、HandlerFilterFunction 与 WebMvc.fn/WebFlux.fn 全解析">【Spring 实战】Spring 函数式 Web 编程深度解析：RouterFunction、HandlerFilterFunction 与 WebMvc.fn/WebFlux.fn 全解析</a><time datetime="2026-10-05T00:50:00.000Z" title="发表于 2026-10-05 08:50:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/dubbo-generic-invocation-cluster-fault-tolerance-deep-dive/" title="【Dubbo 源码】Dubbo 泛化调用与集群容错深度解析：Triple 协议、Router 路由与 Cluster 容错">【Dubbo 源码】Dubbo 泛化调用与集群容错深度解析：Triple 协议、Router 路由与 Cluster 容错</a><time datetime="2026-10-05T00:40:00.000Z" title="发表于 2026-10-05 08:40:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/notification-center-system-design/" title="面试官：设计一个推送通知中心，怎么保证&quot;不重、不漏、不扰民&quot;？">面试官：设计一个推送通知中心，怎么保证&quot;不重、不漏、不扰民&quot;？</a><time datetime="2026-10-05T00:30:00.000Z" title="发表于 2026-10-05 08:30:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/social-follow-graph-system-design/" title="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</a><time datetime="2026-10-05T00:20:00.000Z" title="发表于 2026-10-05 08:20:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/danmaku-live-system-architecture-design/" title="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</a><time datetime="2026-10-05T00:10:00.000Z" title="发表于 2026-10-05 08:10:00">2026-10-05</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

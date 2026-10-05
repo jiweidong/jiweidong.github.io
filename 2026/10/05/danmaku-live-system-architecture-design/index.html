@@ -1,0 +1,465 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统先说一句大实话：弹幕系统本质上是一个”高扇出、低价值、可丢失”的实时消息系统。 它和 IM 的根本区别在于业务预期：    维度 IM 私聊 直播弹幕    消息模型 点对点 &#x2F; 小群 一对百万（广播扇出）   可靠性 必达、有序、可回溯 尽力而为，允许丢   延迟">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/05/danmaku-live-system-architecture-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统先说一句大实话：弹幕系统本质上是一个”高扇出、低价值、可丢失”的实时消息系统。 它和 IM 的根本区别在于业务预期：    维度 IM 私聊 直播弹幕    消息模型 点对点 &#x2F; 小群 一对百万（广播扇出）   可靠性 必达、有序、可回溯 尽力而为，允许丢   延迟">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-05T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-10-05T00:03:48.971Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="弹幕">
+<meta property="article:tag" content="直播">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="长连接">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理",
+  "url": "https://jiweidong.github.io/2026/10/05/danmaku-live-system-architecture-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-05T00:10:00.000Z",
+  "dateModified": "2026-10-05T00:03:48.971Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/05/danmaku-live-system-architecture-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">722</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">812</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">229</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-05T00:10:00.000Z" title="发表于 2026-10-05 08:10:00">2026-10-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-05T00:03:48.971Z" title="更新于 2026-10-05 08:03:48">2026-10-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/%E5%90%8E%E7%AB%AF%E6%9E%B6%E6%9E%84/">后端架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理"><a href="#【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理" class="headerlink" title="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理"></a>【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</h1><h2 id="面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统"><a href="#面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统" class="headerlink" title="面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统"></a>面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统</h2><p>先说一句大实话：<strong>弹幕系统本质上是一个”高扇出、低价值、可丢失”的实时消息系统</strong>。</p>
+<p>它和 IM 的根本区别在于业务预期：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>IM 私聊</th>
+<th>直播弹幕</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>消息模型</td>
+<td>点对点 &#x2F; 小群</td>
+<td>一对百万（广播扇出）</td>
+</tr>
+<tr>
+<td>可靠性</td>
+<td>必达、有序、可回溯</td>
+<td>尽力而为，允许丢</td>
+</tr>
+<tr>
+<td>延迟要求</td>
+<td>秒级可接受</td>
+<td>300ms 内最佳</td>
+</tr>
+<tr>
+<td>价值密度</td>
+<td>极高</td>
+<td>极低（丢了没人发现）</td>
+</tr>
+<tr>
+<td>峰值特征</td>
+<td>平缓</td>
+<td>脉冲式（大主播开播瞬间）</td>
+</tr>
+<tr>
+<td>存储</td>
+<td>长期可查</td>
+<td>短期可查 + 抽样留存</td>
+</tr>
+</tbody></table>
+<p>想清楚这句话，整个架构的取舍就顺了：<strong>弹幕不需要像 IM 一样做 ACK 重传和离线消息，但必须在扇出、成本、治理上做到极致。</strong></p>
+<p>面到这一步，面试官通常会顺着往下问五层：量级估算 → 长连接网关 → 房间分片 → 消息扇出 → 治理与存储。我们一层层拆。</p>
+<hr>
+<h2 id="一、量级估算：先算清楚”到底难在哪”"><a href="#一、量级估算：先算清楚”到底难在哪”" class="headerlink" title="一、量级估算：先算清楚”到底难在哪”"></a>一、量级估算：先算清楚”到底难在哪”</h2><p>面试时不要一上来画架构图，先把数字摊开。</p>
+<p>假设场景：</p>
+<ul>
+<li>在线峰值 100 万观众</li>
+<li>单直播间峰值 30 万人（头部主播）</li>
+<li>峰值弹幕发送 20 万条&#x2F;秒，其中 5 万条&#x2F;秒来自头部房间</li>
+<li>每个房间平均 20 个热门房间占掉 60% 的弹幕量</li>
+</ul>
+<p><strong>扇出放大系数</strong>是第一个关键指标：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">总下行消息数 = Σ(房间在线人数 × 房间弹幕速率)</span><br></pre></td></tr></table></figure>
+
+<p>头部房间：30 万人 × 假设每秒该房间 5000 条弹幕 &#x3D; <strong>1.5 亿条&#x2F;秒下行</strong>。</p>
+<p>这个数字说明：<strong>单纯靠”一条弹幕发给房间所有人”的朴素实现，网络出口直接爆掉。</strong> 所以必须在两个层面做削减：</p>
+<ol>
+<li><strong>源头削减</strong>：弹幕在服务端先做合并、去重、降采样，再扇出（比如客户端每秒最多渲染 20 条，服务端就没必要推 5000 条）。</li>
+<li><strong>按需削减</strong>：低频观众只推送”高价值弹幕”（含关键词、付费弹幕、@、抽奖中奖），普通弹幕按帧聚合下发。</li>
+</ol>
+<p>一个非常实用的降采样策略：<strong>服务端按房间做”时间窗聚合”</strong>，把 100ms 内的 N 条弹幕打包成一个批量帧下发。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 伪代码：按房间做 100ms 窗口聚合下发</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">DanmakuBatchDispatcher</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Map&lt;String, MessageAccumulator&gt; accumulators = <span class="keyword">new</span> <span class="title class_">ConcurrentHashMap</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onDanmaku</span><span class="params">(String roomId, Danmaku msg)</span> &#123;</span><br><span class="line">        <span class="type">MessageAccumulator</span> <span class="variable">acc</span> <span class="operator">=</span> accumulators.computeIfAbsent(roomId,</span><br><span class="line">                k -&gt; <span class="keyword">new</span> <span class="title class_">MessageAccumulator</span>(k));</span><br><span class="line">        acc.add(msg); <span class="comment">// 内部队列 + 定时 flush</span></span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 每 100ms 触发一次</span></span><br><span class="line">    <span class="keyword">void</span> <span class="title function_">flush</span><span class="params">(String roomId)</span> &#123;</span><br><span class="line">        <span class="type">MessageAccumulator</span> <span class="variable">acc</span> <span class="operator">=</span> accumulators.get(roomId);</span><br><span class="line">        <span class="keyword">if</span> (acc == <span class="literal">null</span>) <span class="keyword">return</span>;</span><br><span class="line">        List&lt;Danmaku&gt; batch = acc.drain();</span><br><span class="line">        <span class="keyword">if</span> (batch.isEmpty()) <span class="keyword">return</span>;</span><br><span class="line">        <span class="comment">// 一帧推给房间内所有连接</span></span><br><span class="line">        gateway.push(roomId, Frame.danmakuBatch(batch));</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这一个改动，就能把下行消息数从 1.5 亿&#x2F;秒降到千万级，因为<strong>把”按条扇出”变成了”按帧扇出”</strong>。这是弹幕系统第一个、也是收益最大的优化点。</p>
+<hr>
+<h2 id="二、长连接网关：怎么扛住百万连接"><a href="#二、长连接网关：怎么扛住百万连接" class="headerlink" title="二、长连接网关：怎么扛住百万连接"></a>二、长连接网关：怎么扛住百万连接</h2><p>弹幕的下行通道必须走长连接。选项有三个：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>缺点</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>轮询（HTTP 短轮询）</td>
+<td>实现最简单</td>
+<td>延迟高、无效请求多</td>
+<td>已淘汰</td>
+</tr>
+<tr>
+<td>SSE</td>
+<td>单向、天然适合下行</td>
+<td>浏览器并发连接数限制、无法上行</td>
+<td>小众场景</td>
+</tr>
+<tr>
+<td>WebSocket</td>
+<td>双向、协议成熟</td>
+<td>需要长连接治理</td>
+<td><strong>主流选择</strong></td>
+</tr>
+<tr>
+<td>QUIC &#x2F; WebTransport</td>
+<td>弱网表现好、无队头阻塞</td>
+<td>生态仍在演进</td>
+<td>前沿</td>
+</tr>
+</tbody></table>
+<p>主流是 <strong>WebSocket + Netty</strong>。单机连接数怎么估？</p>
+<ul>
+<li>Netty 单机 5 万～10 万连接是稳态值（取决于内存与文件描述符）</li>
+<li>100 万在线 → <strong>20 台网关</strong>，留 2 倍冗余 → 40 台</li>
+<li>每连接内存预算：ByteBuf 池化后约 10～30KB，加上业务 session 约 50KB</li>
+</ul>
+<p>网关的核心职责其实只有三件事：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">1. 连接管理：握手鉴权、心跳保活、断线重连、连接数限流</span><br><span class="line">2. 协议编解码：私有二进制协议（帧头 + 房间号 + 消息类型 + 负载）</span><br><span class="line">3. 消息转发：订阅房间、接收弹幕、按房间下发</span><br></pre></td></tr></table></figure>
+
+<p><strong>网关必须无状态化</strong>。连接是有状态的，但业务状态（用户在哪个房间、身份信息）必须放在外部 Redis，否则热重启会丢掉所有连接的用户上下文。</p>
+<p>心跳设计要点：</p>
+<ul>
+<li>客户端 30s 发一次 ping，服务端 90s 未收到则断开（<code>IdleStateHandler</code>）</li>
+<li>心跳不要走业务线程池，走独立 Handler 避免被慢业务拖死</li>
+<li>断线重连用<strong>指数退避 + 抖动</strong>，避免整点大主播开播时全网惊群</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Netty 心跳与空闲检测</span></span><br><span class="line">pipeline.addLast(<span class="keyword">new</span> <span class="title class_">IdleStateHandler</span>(<span class="number">90</span>, <span class="number">30</span>, <span class="number">0</span>, TimeUnit.SECONDS));</span><br><span class="line">pipeline.addLast(<span class="keyword">new</span> <span class="title class_">HeartbeatHandler</span>());</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、房间分片：百万房间怎么路由"><a href="#三、房间分片：百万房间怎么路由" class="headerlink" title="三、房间分片：百万房间怎么路由"></a>三、房间分片：百万房间怎么路由</h2><p>一个平台可能有几十万到几百万个房间（大部分是长尾冷房间）。<strong>路由的核心问题是：一个房间的所有连接应该落到同一台&#x2F;同一组网关上吗？</strong></p>
+<p>答案是<strong>要做两级路由</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">客户端 → 接入层（LVS/四层 LB）→ 网关集群（一致性哈希按 roomId 取模）</span><br><span class="line">                                    ↓</span><br><span class="line">                             房间订阅关系存 Redis</span><br><span class="line">                                    ↓</span><br><span class="line">                             弹幕消息总线（Kafka/Pulsar/自研 UDP 总线）</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么按 roomId 哈希分片？</strong></p>
+<ul>
+<li>同一房间的弹幕只需要广播给订阅了该房间的网关，而不是全网关</li>
+<li>哈希分片后，网关只需订阅”自己负责的房间”的 topic&#x2F;频道</li>
+<li>冷房间可以多个房间共享一个分片槽（时间轮 + 租约）</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 房间 → 网关分片路由（带虚拟节点的一致性哈希）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RoomRouter</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> ConsistentHash&lt;String&gt; ring;      <span class="comment">// 虚拟节点 160</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> List&lt;String&gt; gatewayNodes;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">route</span><span class="params">(String roomId)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> ring.get(roomId);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 冷房间合租：把空闲房间映射到共享槽</span></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">routeColdRoom</span><span class="params">(String roomId)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="string">&quot;shared-slot-&quot;</span> + (Math.abs(roomId.hashCode()) % <span class="number">64</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这里有个面试高频追问：<strong>网关扩缩容时怎么办？</strong></p>
+<p>一致性哈希解决的是”扩缩容时只迁移 1&#x2F;N 的房间”，但迁移瞬间会有短暂的消息丢失&#x2F;重复。对弹幕这是<strong>完全可接受</strong>的——这就是开篇说的”允许丢”的价值。</p>
+<p>如果是 IM，这里就必须做复杂的迁移协商；弹幕直接让客户端重连、重新订阅新分片即可。</p>
+<hr>
+<h2 id="四、消息扇出：推-拉-混合"><a href="#四、消息扇出：推-拉-混合" class="headerlink" title="四、消息扇出：推 &#x2F; 拉 &#x2F; 混合"></a>四、消息扇出：推 &#x2F; 拉 &#x2F; 混合</h2><p>扇出模式有三种，弹幕系统实际上是<strong>混合模式</strong>：</p>
+<h3 id="4-1-小房间（-1000-人）——推模式"><a href="#4-1-小房间（-1000-人）——推模式" class="headerlink" title="4.1 小房间（&lt; 1000 人）——推模式"></a>4.1 小房间（&lt; 1000 人）——推模式</h3><p>网关直接遍历房间内的连接下发，简单直接。</p>
+<h3 id="4-2-中房间（1000-5-万人）——批量推-帧聚合"><a href="#4-2-中房间（1000-5-万人）——批量推-帧聚合" class="headerlink" title="4.2 中房间（1000 ~ 5 万人）——批量推 + 帧聚合"></a>4.2 中房间（1000 ~ 5 万人）——批量推 + 帧聚合</h3><p>前面说的 100ms 批量帧，配合 Netty 的 <code>ChannelGroup</code> 写。</p>
+<h3 id="4-3-大房间（-5-万人）——分层扇出（树形广播）"><a href="#4-3-大房间（-5-万人）——分层扇出（树形广播）" class="headerlink" title="4.3 大房间（&gt; 5 万人）——分层扇出（树形广播）"></a>4.3 大房间（&gt; 5 万人）——分层扇出（树形广播）</h3><p>单个网关持有 3 万条连接的话，一次广播要写 3 万次。可以用 <strong>扇出树</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">源网关 → 一级中转（10 台）→ 二级中转（每台挂 10 台）→ 边缘网关 → 客户端</span><br></pre></td></tr></table></figure>
+
+<p>让中转节点只负责”复制+转发”，把压力从”1 个节点写 30 万次”变成”每层写 10 次”。这是 CDN 的思路迁移。</p>
+<h3 id="4-4-观众视角的”拉”：不要把不该看的都推下去"><a href="#4-4-观众视角的”拉”：不要把不该看的都推下去" class="headerlink" title="4.4 观众视角的”拉”：不要把不该看的都推下去"></a>4.4 观众视角的”拉”：不要把不该看的都推下去</h3><p>真实产品里，用户看到的弹幕远少于总弹幕。所以是<strong>推拉结合</strong>：</p>
+<ul>
+<li>服务端推”高优先级弹幕”：付费弹幕、房管&#x2F;主播弹幕、中奖通知、@我</li>
+<li>普通弹幕按订阅关系推送，客户端本地做渲染裁剪（同屏最多 N 条）</li>
+<li>观众如果往回翻历史弹幕，走<strong>拉</strong>（HTTP 拉取历史弹幕分页）</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 弹幕优先级调度：高优先级立刻推，普通弹幕进聚合窗口</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">enum</span> <span class="title class_">DanmakuPriority</span> &#123; HIGH, NORMAL, LOW &#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">dispatch</span><span class="params">(String roomId, Danmaku msg)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (msg.priority() == DanmakuPriority.HIGH) &#123;</span><br><span class="line">        gateway.push(roomId, Frame.single(msg));   <span class="comment">// 立即推</span></span><br><span class="line">    &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">        batchDispatcher.onDanmaku(roomId, msg);    <span class="comment">// 聚合后推</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、弹幕存储：冷热分离-抽样"><a href="#五、弹幕存储：冷热分离-抽样" class="headerlink" title="五、弹幕存储：冷热分离 + 抽样"></a>五、弹幕存储：冷热分离 + 抽样</h2><p>弹幕量级决定了<strong>不可能全量持久化到 MySQL</strong>。分三层：</p>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>存储</th>
+<th>保留期</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>热</td>
+<td>Redis List &#x2F; ZSet（按房间）</td>
+<td>最近 15 分钟 ~ 1 小时</td>
+<td>新进房用户拉历史、回放</td>
+</tr>
+<tr>
+<td>温</td>
+<td>Kafka → HBase &#x2F; TiDB &#x2F; ClickHouse</td>
+<td>7 ~ 30 天</td>
+<td>回放、报表、弹幕分析</td>
+</tr>
+<tr>
+<td>冷</td>
+<td>对象存储（压缩片段）</td>
+<td>长期</td>
+<td>直播回放视频挂载弹幕文件</td>
+</tr>
+</tbody></table>
+<p>面试加分点：<strong>弹幕可以”抽样存储”</strong>。比如普通弹幕只存 1&#x2F;10，付费弹幕全存。这样存储成本直接降一个数量级，而回放体验几乎无感。</p>
+<p>写入路径：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">网关 → 消息总线(Kafka, 按 roomId 分区) → 落库消费者(批量写 HBase) + 分析消费者(ClickHouse)</span><br></pre></td></tr></table></figure>
+
+<p>按 <code>roomId</code> 做 Kafka 分区键，保证同房间弹幕有序；批量写用 <code>BufferedMutator</code>（HBase）或 <code>JDBC batch</code>（TiDB），把随机写变成顺序批量写。</p>
+<hr>
+<h2 id="六、弹幕治理：这才是真正的工程活"><a href="#六、弹幕治理：这才是真正的工程活" class="headerlink" title="六、弹幕治理：这才是真正的工程活"></a>六、弹幕治理：这才是真正的工程活</h2><p>架构图画完不算完，弹幕的”脏活”全在治理上。</p>
+<h3 id="6-1-限流：分维度、分层级"><a href="#6-1-限流：分维度、分层级" class="headerlink" title="6.1 限流：分维度、分层级"></a>6.1 限流：分维度、分层级</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">用户级：单用户 1 条/秒（普通）、5 条/秒（付费）</span><br><span class="line">房间级：单房间下行限速（保护网关出口）</span><br><span class="line">全局级：总入口 QPS 限流（保护后端）</span><br></pre></td></tr></table></figure>
+
+<p>用 <strong>滑动窗口 + Redis Lua</strong> 做原子限流，比固定窗口更平滑：</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 滑动窗口限流（单位：毫秒）</span></span><br><span class="line"><span class="keyword">local</span> key = KEYS[<span class="number">1</span>]</span><br><span class="line"><span class="keyword">local</span> now = <span class="built_in">tonumber</span>(ARGV[<span class="number">1</span>])</span><br><span class="line"><span class="keyword">local</span> window = <span class="built_in">tonumber</span>(ARGV[<span class="number">2</span>])</span><br><span class="line"><span class="keyword">local</span> limit = <span class="built_in">tonumber</span>(ARGV[<span class="number">3</span>])</span><br><span class="line">redis.call(<span class="string">&#x27;ZREMRANGEBYSCORE&#x27;</span>, key, <span class="number">0</span>, now - window)</span><br><span class="line"><span class="keyword">local</span> count = redis.call(<span class="string">&#x27;ZCARD&#x27;</span>, key)</span><br><span class="line"><span class="keyword">if</span> count &gt;= limit <span class="keyword">then</span> <span class="keyword">return</span> <span class="number">0</span> <span class="keyword">end</span></span><br><span class="line">redis.call(<span class="string">&#x27;ZADD&#x27;</span>, key, now, now .. <span class="string">&#x27;-&#x27;</span> .. <span class="built_in">math</span>.<span class="built_in">random</span>(<span class="number">1000000</span>))</span><br><span class="line">redis.call(<span class="string">&#x27;PEXPIRE&#x27;</span>, key, window)</span><br><span class="line"><span class="keyword">return</span> <span class="number">1</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-去重与折叠"><a href="#6-2-去重与折叠" class="headerlink" title="6.2 去重与折叠"></a>6.2 去重与折叠</h3><ul>
+<li><strong>幂等去重</strong>：客户端生成 <code>clientMsgId</code>，服务端用 Redis SETNX + 短 TTL 去重，防止重连补发造成刷屏。</li>
+<li><strong>刷屏折叠</strong>：同一用户短时间内重复内容，折叠为”xxx 发送了 N 条相似弹幕”。</li>
+<li><strong>敏感词</strong>：用 <strong>AC 自动机（Aho-Corasick）+ DFA</strong> 做多模式匹配，比逐个 <code>contains</code> 快几个数量级；词库热更新用版本号 + 本地缓存。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 基于 Aho-Corasick 的敏感词过滤（简化示意）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SensitiveWordFilter</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">volatile</span> TrieNode root;   <span class="comment">// 支持热更新</span></span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">filter</span><span class="params">(String text)</span> &#123;</span><br><span class="line">        <span class="type">TrieNode</span> <span class="variable">node</span> <span class="operator">=</span> root;</span><br><span class="line">        <span class="type">StringBuilder</span> <span class="variable">sb</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">StringBuilder</span>(text);</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; text.length(); i++) &#123;</span><br><span class="line">            node = node.next(text.charAt(i));</span><br><span class="line">            <span class="keyword">if</span> (node != <span class="literal">null</span> &amp;&amp; node.isEnd()) &#123;</span><br><span class="line">                <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">j</span> <span class="operator">=</span> node.start(); j &lt;= i; j++) sb.setCharAt(j, <span class="string">&#x27;*&#x27;</span>);</span><br><span class="line">                node = root;</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="keyword">if</span> (node == <span class="literal">null</span>) node = root;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> sb.toString();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-风控与反垃圾"><a href="#6-3-风控与反垃圾" class="headerlink" title="6.3 风控与反垃圾"></a>6.3 风控与反垃圾</h3><ul>
+<li>新号 &#x2F; 无消费记录的账号弹幕进”影子队列”，仅自己可见（<strong>shadow ban</strong>）</li>
+<li>高频关键词触发人工审核队列</li>
+<li>机器刷屏特征：内容重复度 + 发送间隔方差 + 设备指纹</li>
+</ul>
+<hr>
+<h2 id="七、高可用与降级"><a href="#七、高可用与降级" class="headerlink" title="七、高可用与降级"></a>七、高可用与降级</h2><p>弹幕系统的降级策略要”分层降级”，而不是一刀切挂掉：</p>
+<table>
+<thead>
+<tr>
+<th>故障</th>
+<th>降级策略</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>消息总线不可用</td>
+<td>网关本地直投本机连接，跨机降级为不投</td>
+</tr>
+<tr>
+<td>Redis 不可用</td>
+<td>限流放行 + 本地缓存兜底（宁可多放不可全挂）</td>
+</tr>
+<tr>
+<td>存储写入慢</td>
+<td>丢弃低优先级弹幕，只保付费&#x2F;主播弹幕</td>
+</tr>
+<tr>
+<td>网关过载</td>
+<td>拒绝新连接，老连接继续服务（保大主播）</td>
+</tr>
+<tr>
+<td>全链路异常</td>
+<td>客户端降级为本地”机器人弹幕”兜底</td>
+</tr>
+</tbody></table>
+<p>最后一条很真实：<strong>很多直播平台在服务端异常时会下发一个预置的弹幕池</strong>，用户体验上几乎感知不到。这就是”弹幕可丢失”的价值最大化利用。</p>
+<hr>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：弹幕为什么不用 Kafka 直接扇出给客户端？</strong><br>Kafka 是拉模型，客户端不可能直连 Kafka（几十万消费者、安全、协议不匹配）。正确做法是 Kafka 做网关间的消息总线，网关再推给客户端。</p>
+<p><strong>Q2：怎么保证同一用户看到的弹幕顺序一致？</strong><br>按 <code>roomId</code> 分区保证 Kafka 内有序；网关单线程写 <code>Channel</code> 保证连接内有序。跨网关不保证全局有序——业务上也不需要。</p>
+<p><strong>Q3：30 万人房间，一个网关挂了怎么办？</strong><br>网关无状态 + 客户端自动重连到哈希后的新网关；一致性哈希只影响 1&#x2F;N 房间。断线期间弹幕丢失可接受，重连后拉最近 15 分钟 Redis 热数据补上。</p>
+<p><strong>Q4：弹幕和礼物&#x2F;点赞能共用一套架构吗？</strong><br>能。礼物是”高优先级弹幕”，点赞是”高频低价值事件”，用同一总线 + 不同优先级通道即可。点赞尤其适合<strong>客户端聚合 + 服务端累加</strong>（不需要每条都上行）。</p>
+<p><strong>Q5：怎么防”弹幕机器人”刷屏？</strong><br>三层：接入层设备指纹&#x2F;行为特征 → 业务层限流+去重 → 内容层敏感词+语义模型。再叠加”影子队列”让刷子以为发出去了。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>弹幕系统的设计精髓，可以浓缩成四句话：</p>
+<ol>
+<li><strong>承认它可丢失</strong>——放弃 IM 那套可靠性机制，是最大的架构红利；</li>
+<li><strong>把按条扇出改成按帧扇出</strong>——一个窗口聚合，行量降一个数量级；</li>
+<li><strong>按 roomId 分片 + 网关无状态</strong>——扩容、容灾、迁移都变成可接受的”丢一点”；</li>
+<li><strong>治理比架构更重要</strong>——限流、去重、折叠、风控、降级，才是线上不出事的关键。</li>
+</ol>
+<p>下次面试官再问”设计一个弹幕系统”，你就从量级估算开始，一路讲到影子队列和降级池——层次感出来了，面试基本就稳了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/05/danmaku-live-system-architecture-design/">https://jiweidong.github.io/2026/10/05/danmaku-live-system-architecture-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E7%9B%B4%E6%92%AD/">直播</a><a class="post-meta__tags" href="/tags/%E5%BC%B9%E5%B9%95/">弹幕</a><a class="post-meta__tags" href="/tags/%E9%95%BF%E8%BF%9E%E6%8E%A5/">长连接</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/05/social-follow-graph-system-design/" title="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</div></div><div class="info-2"><div class="info-item-1">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性面试官：设计一个支持亿级用户的关注关系系统关注关系看起来是”最简单的社交功能”——不就是一张表存 (follower_id, followee_id) 吗？ 但当你把量级摊开，会发现这里藏着三个非常经典的高并发难题：  存储：100 亿条关系怎么存、怎么分片？ 读写不对称：普通用户粉丝几百，大 V 粉丝几千万，同一个接口要同时扛住两种极端； 计数一致性：粉丝数显示 1000 万，点进去只能列出 500 万（因为大 V 粉丝列表根本不给你翻），这个”数字”怎么维护？  面试官问”设计关注系统”，实际上是在考你对关系图谱、扇出模型、计数与缓存一致性的综合理解。  一、需求拆解与量级估算先把业务模型想清楚。关注系统的核心实体只有三种：    实体 说明 索引方向    关注关系 A 关注 B follower → followee   好友关系 A 与 B 互关（或申请通过） 双向   黑名单 A 拉黑 B 单向屏蔽   还有一些扩展属性：特别关注、分组、备注、关注时间、来源渠道、是否互关。 量级估算（按 5 亿注册用...</div></div></div></a><a class="pagination-related" href="/2026/10/04/mysql-optimizer-hint-deep-dive/" title="【MySQL 优化】优化器提示（Optimizer Hint）深度解析：从 INDEX HINT 到执行计划干预与 Optimizer Trace"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 优化】优化器提示（Optimizer Hint）深度解析：从 INDEX HINT 到执行计划干预与 Optimizer Trace</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】优化器提示（Optimizer Hint）深度解析：从 INDEX HINT 到执行计划干预与 Optimizer Trace面试官：如果 MySQL 选错了索引，你会怎么办？一个很常见的生产场景：某条 SQL 明明有更优的索引，但优化器就是不走，导致慢查询。 很多人第一反应是 FORCE INDEX。但 FORCE INDEX 只是最粗粒度的一种手段，而且它无法解决 join 顺序、子查询策略、半连接策略等问题。真正系统的答案是：优化器 Hint（Optimizer Hints）。 这一篇把 MySQL 的 Hint 体系讲透：分类、语法、常用 Hint、失效原因，以及如何用 Optimizer Trace 定位优化器为什么”想错了”。  一、为什么要干预优化器MySQL 优化器是基于成本（Cost-Based）的。成本估算依赖统计信息，而统计信息天然有误差：    误差来源 说明    采样估算 InnoDB 默认采样 20 个页估算基数，数据倾斜时严重失真   直方图缺失 未建直方图时，范围条件的选择性靠猜   关联假设 优化器假设列之间独立，多列条件会...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/22/feed-stream-system-design/" title="【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流</div></div><div class="info-2"><div class="info-item-1">【系统设计】Feed 流系统架构设计：从推拉结合到百亿级信息流面试官：微博的首页信息流是怎么做的？如果让你设计一个 Feed 流系统，你会怎么设计？Feed 流（信息流）是互联网最核心的业务形态之一：微博、朋友圈、抖音、小红书，全是 Feed 流。它和普通 CRUD 最大的区别在于——每个用户看到的首页内容都不一样，是”千人千面”的个性化时间线。设计 Feed 流，本质是解决三个问题：内容怎么分发、时间线怎么生成、读多写多怎么扛。 一、需求与指标先定义清楚规模，才有设计依据：  日活用户 1 亿，月活 3 亿； 平均每个用户关注 200 个账号； 每秒新增内容（发帖）1 万条，峰值 5 万条； 每秒读取时间线（刷首页）10 万次，峰值 50 万次； 要求：读延迟 &lt; 200ms，写后延迟 &lt; 1s 内可见。  读是写的 10 倍以上——这是所有 Feed 流设计的出发点：读多写少，必须为读优化。 二、三种核心模型：推、拉、推拉结合2.1 拉模式（Pull &#x2F; 读扩散）用户刷首页时，实时去拉取他关注的所有人的最新内容，再合并排序。 1用户刷首页 → 查关注列表...</div></div></div></a><a class="pagination-related" href="/2026/08/19/im-system-architecture-design/" title="【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-19</div><div class="info-item-2">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线</div></div><div class="info-2"><div class="info-item-1">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线面试官：让你设计一个支持百万在线的 IM 系统，你怎么设计？IM（Instant Messaging）是系统设计面试的”压轴题”之一：它集齐了长连接、消息可靠性、顺序性、在线状态、群聊扩散、历史消息存储几乎所有分布式难点。微信、钉钉、Slack 的架构都能在这套骨架里找到影子。 本文按”需求分析 → 单机原型 → 分布式演进 → 核心难点逐个击破”的顺序，给你一套可以直接背诵+扩展的完整方案。  一、需求分析：先搞清楚要做什么1.1 核心功能   功能 说明 难点    单聊 点对点消息 路由、可靠性   群聊 一对多广播 扩散模型选择   在线状态 上下线感知 一致性、实时性   消息可靠性 不丢不重 ACK + 重传 + 幂等   消息顺序 单会话内有序 seq 机制   历史消息 离线拉取、漫游 海量存储、分页   已读回执 已读未读 状态同步   1.2 非功能需求 规模：100 万在线，峰值 QPS 10 万+，单聊消息峰值 5 万&#x2F;秒 延迟：消息端到端 &lt; 200ms 可靠性：消息不丢（至少...</div></div></div></a><a class="pagination-related" href="/2026/10/05/social-follow-graph-system-design/" title="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-05</div><div class="info-item-2">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</div></div><div class="info-2"><div class="info-item-1">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性面试官：设计一个支持亿级用户的关注关系系统关注关系看起来是”最简单的社交功能”——不就是一张表存 (follower_id, followee_id) 吗？ 但当你把量级摊开，会发现这里藏着三个非常经典的高并发难题：  存储：100 亿条关系怎么存、怎么分片？ 读写不对称：普通用户粉丝几百，大 V 粉丝几千万，同一个接口要同时扛住两种极端； 计数一致性：粉丝数显示 1000 万，点进去只能列出 500 万（因为大 V 粉丝列表根本不给你翻），这个”数字”怎么维护？  面试官问”设计关注系统”，实际上是在考你对关系图谱、扇出模型、计数与缓存一致性的综合理解。  一、需求拆解与量级估算先把业务模型想清楚。关注系统的核心实体只有三种：    实体 说明 索引方向    关注关系 A 关注 B follower → followee   好友关系 A 与 B 互关（或申请通过） 双向   黑名单 A 拉黑 B 单向屏蔽   还有一些扩展属性：特别关注、分组、备注、关注时间、来源渠道、是否互关。 量级估算（按 5 亿注册用...</div></div></div></a><a class="pagination-related" href="/2026/09/28/high-concurrency-like-counter-system-design/" title="【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-28</div><div class="info-item-2">【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析面试官：设计一个点赞系统，10 万 QPS，要求点赞数实时准确、不重复、不能丢看起来是个”小而美”的功能，实际上它把高并发系统的经典难点全踩了一遍：写放大（大量高并发写）、唯一性约束（去重）、计数一致性（并发加减）、热点（大 V 爆款）、持久化（不能丢）、以及”读多写更多”的混合负载。 很多人第一反应是”一张表 insert into likes(...) unique key(user_id, post_id) 完事”。这个方案在小流量下能用，一问”10 万 QPS 怎么办”就崩了。本文从需求拆解一路讲到可落地的分片架构。  一、需求与约束拆解先把模糊需求变成可设计的约束：    需求 隐含技术问题    10 万 QPS 点赞 单机 MySQL 写不动，必须前置缓存&#x2F;异步   不能重复点赞 需要 (userId, postId) 唯一性判断，且要原子   点赞数实时准确 计数必须强一致或准实时，不能等对账   不能丢 缓存是易失的，必须有持久化 + 补偿   取消点赞 计数可减，且需处理...</div></div></div></a><a class="pagination-related" href="/2026/10/04/order-system-architecture-design/" title="【系统设计】订单系统架构设计：状态机、分库分表、超时取消与幂等设计"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">【系统设计】订单系统架构设计：状态机、分库分表、超时取消与幂等设计</div></div><div class="info-2"><div class="info-item-1">【系统设计】订单系统架构设计：状态机、分库分表、超时取消与幂等设计面试官：设计一个电商订单系统，要支持下单、支付、超时关闭、退款和亿级数据订单是电商的”合同”——它一旦生成就不能丢、不能错、不能重。所有高并发、一致性、幂等的问题，在订单系统里都会被放大。 这一篇按”下单链路 → 状态机 → 幂等 → 超时取消 → 分库分表 → 一致性”的顺序拆开讲。  一、下单链路一笔正常下单要经历这些步骤： 123456781. 参数校验（商品、地址、优惠券）2. 价格试算（商品价 + 运费 - 优惠）3. 预占库存（下单减库存 or 支付减库存）4. 生成订单（订单主表 + 明细表）5. 预占优惠券6. 发起支付7. 支付回调 → 扣减真实库存 → 更新订单状态8. 履约（发货）→ 确认收货 → 完成  关键决策：下单减库存还是支付减库存？    时机 优点 缺点    下单减库存 不会超卖，用户体验好 恶意占库存（下单不付款）   支付减库存 无占库存 支付时可能没货，体验差   主流做法是下单预占（Redis 扣减 + 订单维度锁定），支付确认，超时释放——本质是”预占 + 超时回收”，...</div></div></div></a><a class="pagination-related" href="/2026/10/02/redis-ranking-system-architecture-design/" title="【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-02</div><div class="info-item-2">【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发排行榜系统架构设计：Redis ZSet、分桶策略、实时更新与海量数据分页面试官：让你设计一个千万级用户的积分排行榜，你会怎么做？这是系统设计面试里非常经典的一道题。看起来简单——“排个序而已”——但它几乎把高并发场景里所有的坑都踩了一遍：海量数据、实时更新、热点写入、深分页、周期榜与总榜的切换、缓存与数据库的一致性。 很多人第一反应是： 123SELECT user_id, score FROM user_scoreORDER BY score DESCLIMIT 0, 100;  在小数据量下没问题，但一旦数据量到千万级，这条 SQL 就会全表扫描 + 文件排序（filesort），再加上高并发 QPS，数据库基本必挂。 所以我们要从”能用”一步步推到”生产级高并发可用”。  一、需求拆解：先把问题定义清楚在动手之前，先把需求拆成几个维度，不同维度的答案完全不同：    维度 需要问清楚的问题    数据规模 用户量是百万、千万还是上亿？   榜单类型 总榜 &#x2F; 日榜 &#x2F; 周榜 &#x2F; 月榜 &#x2F; 好友榜？   实时性 秒级...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">722</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">812</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">229</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E7%9B%B4%E6%92%AD%E5%BC%B9%E5%B9%95%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E6%B5%B7%E9%87%8F%E6%B6%88%E6%81%AF%E5%88%86%E5%8F%91%E3%80%81%E6%88%BF%E9%97%B4%E5%88%86%E7%89%87%E4%B8%8E%E5%BC%B9%E5%B9%95%E6%B2%BB%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AE%BE%E8%AE%A1%E4%B8%80%E4%B8%AA%E6%94%AF%E6%8C%81%E7%99%BE%E4%B8%87%E4%BA%BA%E5%9C%A8%E7%BA%BF%E3%80%81%E6%AF%8F%E7%A7%92%E5%87%A0%E5%8D%81%E4%B8%87%E6%9D%A1%E5%BC%B9%E5%B9%95%E7%9A%84%E7%9B%B4%E6%92%AD%E7%B3%BB%E7%BB%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：设计一个支持百万人在线、每秒几十万条弹幕的直播系统</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E9%87%8F%E7%BA%A7%E4%BC%B0%E7%AE%97%EF%BC%9A%E5%85%88%E7%AE%97%E6%B8%85%E6%A5%9A%E2%80%9D%E5%88%B0%E5%BA%95%E9%9A%BE%E5%9C%A8%E5%93%AA%E2%80%9D"><span class="toc-number">1.2.</span> <span class="toc-text">一、量级估算：先算清楚”到底难在哪”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E9%95%BF%E8%BF%9E%E6%8E%A5%E7%BD%91%E5%85%B3%EF%BC%9A%E6%80%8E%E4%B9%88%E6%89%9B%E4%BD%8F%E7%99%BE%E4%B8%87%E8%BF%9E%E6%8E%A5"><span class="toc-number">1.3.</span> <span class="toc-text">二、长连接网关：怎么扛住百万连接</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%88%BF%E9%97%B4%E5%88%86%E7%89%87%EF%BC%9A%E7%99%BE%E4%B8%87%E6%88%BF%E9%97%B4%E6%80%8E%E4%B9%88%E8%B7%AF%E7%94%B1"><span class="toc-number">1.4.</span> <span class="toc-text">三、房间分片：百万房间怎么路由</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%B6%88%E6%81%AF%E6%89%87%E5%87%BA%EF%BC%9A%E6%8E%A8-%E6%8B%89-%E6%B7%B7%E5%90%88"><span class="toc-number">1.5.</span> <span class="toc-text">四、消息扇出：推 &#x2F; 拉 &#x2F; 混合</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%B0%8F%E6%88%BF%E9%97%B4%EF%BC%88-1000-%E4%BA%BA%EF%BC%89%E2%80%94%E2%80%94%E6%8E%A8%E6%A8%A1%E5%BC%8F"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 小房间（&lt; 1000 人）——推模式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%AD%E6%88%BF%E9%97%B4%EF%BC%881000-5-%E4%B8%87%E4%BA%BA%EF%BC%89%E2%80%94%E2%80%94%E6%89%B9%E9%87%8F%E6%8E%A8-%E5%B8%A7%E8%81%9A%E5%90%88"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 中房间（1000 ~ 5 万人）——批量推 + 帧聚合</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%A4%A7%E6%88%BF%E9%97%B4%EF%BC%88-5-%E4%B8%87%E4%BA%BA%EF%BC%89%E2%80%94%E2%80%94%E5%88%86%E5%B1%82%E6%89%87%E5%87%BA%EF%BC%88%E6%A0%91%E5%BD%A2%E5%B9%BF%E6%92%AD%EF%BC%89"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 大房间（&gt; 5 万人）——分层扇出（树形广播）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E8%A7%82%E4%BC%97%E8%A7%86%E8%A7%92%E7%9A%84%E2%80%9D%E6%8B%89%E2%80%9D%EF%BC%9A%E4%B8%8D%E8%A6%81%E6%8A%8A%E4%B8%8D%E8%AF%A5%E7%9C%8B%E7%9A%84%E9%83%BD%E6%8E%A8%E4%B8%8B%E5%8E%BB"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 观众视角的”拉”：不要把不该看的都推下去</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%BC%B9%E5%B9%95%E5%AD%98%E5%82%A8%EF%BC%9A%E5%86%B7%E7%83%AD%E5%88%86%E7%A6%BB-%E6%8A%BD%E6%A0%B7"><span class="toc-number">1.6.</span> <span class="toc-text">五、弹幕存储：冷热分离 + 抽样</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%BC%B9%E5%B9%95%E6%B2%BB%E7%90%86%EF%BC%9A%E8%BF%99%E6%89%8D%E6%98%AF%E7%9C%9F%E6%AD%A3%E7%9A%84%E5%B7%A5%E7%A8%8B%E6%B4%BB"><span class="toc-number">1.7.</span> <span class="toc-text">六、弹幕治理：这才是真正的工程活</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E9%99%90%E6%B5%81%EF%BC%9A%E5%88%86%E7%BB%B4%E5%BA%A6%E3%80%81%E5%88%86%E5%B1%82%E7%BA%A7"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 限流：分维度、分层级</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%8E%BB%E9%87%8D%E4%B8%8E%E6%8A%98%E5%8F%A0"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 去重与折叠</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E9%A3%8E%E6%8E%A7%E4%B8%8E%E5%8F%8D%E5%9E%83%E5%9C%BE"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 风控与反垃圾</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%AB%98%E5%8F%AF%E7%94%A8%E4%B8%8E%E9%99%8D%E7%BA%A7"><span class="toc-number">1.8.</span> <span class="toc-text">七、高可用与降级</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/spring-fn-router-function-web-programming-deep-dive/" title="【Spring 实战】Spring 函数式 Web 编程深度解析：RouterFunction、HandlerFilterFunction 与 WebMvc.fn/WebFlux.fn 全解析">【Spring 实战】Spring 函数式 Web 编程深度解析：RouterFunction、HandlerFilterFunction 与 WebMvc.fn/WebFlux.fn 全解析</a><time datetime="2026-10-05T00:50:00.000Z" title="发表于 2026-10-05 08:50:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/dubbo-generic-invocation-cluster-fault-tolerance-deep-dive/" title="【Dubbo 源码】Dubbo 泛化调用与集群容错深度解析：Triple 协议、Router 路由与 Cluster 容错">【Dubbo 源码】Dubbo 泛化调用与集群容错深度解析：Triple 协议、Router 路由与 Cluster 容错</a><time datetime="2026-10-05T00:40:00.000Z" title="发表于 2026-10-05 08:40:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/notification-center-system-design/" title="面试官：设计一个推送通知中心，怎么保证&quot;不重、不漏、不扰民&quot;？">面试官：设计一个推送通知中心，怎么保证&quot;不重、不漏、不扰民&quot;？</a><time datetime="2026-10-05T00:30:00.000Z" title="发表于 2026-10-05 08:30:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/social-follow-graph-system-design/" title="【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性">【系统设计】社交关注关系系统架构设计：关系存储、大V扇出与计数一致性</a><time datetime="2026-10-05T00:20:00.000Z" title="发表于 2026-10-05 08:20:00">2026-10-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/05/danmaku-live-system-architecture-design/" title="【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理">【系统设计】直播弹幕系统架构设计：海量消息分发、房间分片与弹幕治理</a><time datetime="2026-10-05T00:10:00.000Z" title="发表于 2026-10-05 08:10:00">2026-10-05</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
