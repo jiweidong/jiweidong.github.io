@@ -1,0 +1,582 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战面试官：Spring AOP 为什么切不到自己的方法调用？ “我写了个 @Log 注解，切面里打印日志。Service 里的 save() 调用了同类的 doSave()，两个方法都加了 @Log，结果只有 save() 打了日志，doSave() 没有。为什么？”  这是 Spring AOP">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/08/aspectj-weaving-ctw-ltw-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战面试官：Spring AOP 为什么切不到自己的方法调用？ “我写了个 @Log 注解，切面里打印日志。Service 里的 save() 调用了同类的 doSave()，两个方法都加了 @Log，结果只有 save() 打了日志，doSave() 没有。为什么？”  这是 Spring AOP">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-08T00:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-08T00:04:01.903Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="AOP">
+<meta property="article:tag" content="AspectJ">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="字节码">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战",
+  "url": "https://jiweidong.github.io/2026/10/08/aspectj-weaving-ctw-ltw-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-08T00:30:00.000Z",
+  "dateModified": "2026-10-08T00:04:01.903Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/08/aspectj-weaving-ctw-ltw-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">737</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">831</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">230</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-08T00:30:00.000Z" title="发表于 2026-10-08 08:30:00">2026-10-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-08T00:04:01.903Z" title="更新于 2026-10-08 08:04:01">2026-10-08</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/Java-%E8%BF%9B%E9%98%B6/">Java 进阶</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【AOP-进阶】AspectJ-织入深度解析：CTW、LTW-与-Java-Agent-加载期织入实战"><a href="#【AOP-进阶】AspectJ-织入深度解析：CTW、LTW-与-Java-Agent-加载期织入实战" class="headerlink" title="【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战"></a>【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战</h1><h2 id="面试官：Spring-AOP-为什么切不到自己的方法调用？"><a href="#面试官：Spring-AOP-为什么切不到自己的方法调用？" class="headerlink" title="面试官：Spring AOP 为什么切不到自己的方法调用？"></a>面试官：Spring AOP 为什么切不到自己的方法调用？</h2><blockquote>
+<p>“我写了个 <code>@Log</code> 注解，切面里打印日志。Service 里的 <code>save()</code> 调用了同类的 <code>doSave()</code>，两个方法都加了 <code>@Log</code>，<br>结果只有 <code>save()</code> 打了日志，<code>doSave()</code> 没有。为什么？”</p>
+</blockquote>
+<p>这是 Spring AOP 的<strong>经典自调用失效</strong>问题。答案大家都知道：”因为 Spring AOP 是基于<strong>运行时代理</strong>的，<code>this.doSave()</code> 走的是原始对象，不经过代理。”</p>
+<p>但面试官如果接着问：</p>
+<blockquote>
+<p>“那如果我<strong>必须</strong>切到 <code>doSave()</code>，怎么办？”<br>“Spring AOP 和 AspectJ 到底什么关系？”<br>“生产上用 AspectJ 有什么坑？”</p>
+</blockquote>
+<p>能答完整的人就很少了。这篇文章把 AOP 的实现方式讲到底：<strong>源码级代理 → 编译期织入（CTW）→ 加载期织入（LTW）→ Java Agent 动态重转换</strong>，每条路径都给可运行的配置。</p>
+<hr>
+<h2 id="一、先把概念分层：AOP-的四种实现方式"><a href="#一、先把概念分层：AOP-的四种实现方式" class="headerlink" title="一、先把概念分层：AOP 的四种实现方式"></a>一、先把概念分层：AOP 的四种实现方式</h2><table>
+<thead>
+<tr>
+<th>方式</th>
+<th>织入时机</th>
+<th>原理</th>
+<th>能否切自调用</th>
+<th>典型代表</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>A. 运行时代理（Spring AOP）</strong></td>
+<td>运行时</td>
+<td>JDK 动态代理 &#x2F; CGLIB 生成子类</td>
+<td>❌</td>
+<td>Spring 事务、<code>@Cacheable</code></td>
+</tr>
+<tr>
+<td><strong>B. 编译期织入 CTW</strong></td>
+<td>编译期</td>
+<td>AspectJ 编译器（ajc）直接改字节码</td>
+<td>✅</td>
+<td>AspectJ + Maven 插件</td>
+</tr>
+<tr>
+<td><strong>C. 编译后织入 (Binary Weaving)</strong></td>
+<td>编译后</td>
+<td>对已有 <code>.class</code> 做织入</td>
+<td>✅</td>
+<td><code>aspectj-maven-plugin</code></td>
+</tr>
+<tr>
+<td><strong>D. 加载期织入 LTW</strong></td>
+<td>类加载时</td>
+<td><code>-javaagent</code> + ClassFileTransformer</td>
+<td>✅</td>
+<td>aspectjweaver + <code>aop.xml</code></td>
+</tr>
+<tr>
+<td><strong>E. 运行期重转换（Agent）</strong></td>
+<td>运行时</td>
+<td><code>Instrumentation.retransformClasses</code></td>
+<td>✅</td>
+<td>Arthas、SkyWalking、平铺 Agent</td>
+</tr>
+</tbody></table>
+<p><strong>核心结论</strong>：<strong>能不能切自调用，只取决于”方法体内部的调用指令是否被改写过”</strong>。</p>
+<ul>
+<li>代理模式<strong>改的是调用方持有的对象引用</strong>，方法体内的 <code>this.call()</code> 是 <code>invokevirtual</code> 直接调用，天然绕过代理；</li>
+<li>织入模式<strong>改的是字节码本身</strong>，会生成 <code>doSave$ajc$...</code> 之类的合成方法，把原方法的调用点替换为对织入后方法的调用，所以自调用也能切到。</li>
+</ul>
+<hr>
+<h2 id="二、Spring-AOP：代理模式的边界"><a href="#二、Spring-AOP：代理模式的边界" class="headerlink" title="二、Spring AOP：代理模式的边界"></a>二、Spring AOP：代理模式的边界</h2><h3 id="2-1-代理模式的三种失效"><a href="#2-1-代理模式的三种失效" class="headerlink" title="2.1 代理模式的三种失效"></a>2.1 代理模式的三种失效</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderService</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Transactional</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">create</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.doSave();      <span class="comment">// ❌ 事务不生效：this 是原始对象</span></span><br><span class="line">        doSave();           <span class="comment">// ❌ 同上</span></span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Transactional(propagation = Propagation.REQUIRES_NEW)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">doSave</span><span class="params">()</span> &#123; <span class="comment">/* ... */</span> &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>Spring AOP 的三类失效</strong>：</p>
+<ol>
+<li><strong>自调用</strong>：<code>this.xxx()</code> &#x2F; <code>xxx()</code> 不走代理；</li>
+<li><strong><code>private</code> &#x2F; <code>final</code> &#x2F; <code>static</code> 方法</strong>：CGLIB 无法覆写 <code>final</code>，<code>private</code> 天然不可见，<code>static</code> 不是虚分派；</li>
+<li><strong><code>final</code> 类</strong>：CGLIB 无法继承。</li>
+<li><strong>（易被忽略）对象由 <code>new</code> 创建而非 Spring 管理</strong>：根本不进容器，谈不上代理。</li>
+</ol>
+<h3 id="2-2-那些”绕过失效”的土办法"><a href="#2-2-那些”绕过失效”的土办法" class="headerlink" title="2.2 那些”绕过失效”的土办法"></a>2.2 那些”绕过失效”的土办法</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 办法 1：注入自己（Spring 会注入代理，不是原始对象）</span></span><br><span class="line"><span class="meta">@Autowired</span> <span class="keyword">private</span> OrderService self;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">create</span><span class="params">()</span> &#123; self.doSave(); &#125;   <span class="comment">// ✅ 走代理</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 办法 2：AopContext.currentProxy()（需要 @EnableAspectJAutoProxy(exposeProxy = true)）</span></span><br><span class="line">((OrderService) AopContext.currentProxy()).doSave();</span><br><span class="line"></span><br><span class="line"><span class="comment">// 办法 3：把 doSave 抽到另一个 Bean（最推荐，架构更清晰）</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>办法 3 是正解</strong>：如果你需要”同一个类里的方法有不同事务传播行为”，这<strong>本身就是设计味道</strong>——把逻辑拆到独立 Bean，让调用关系变成正常的跨 Bean 调用。<strong>不要为了绕过 AOP 限制而引入 AopContext，那会让代码依赖 AOP 框架实现细节。</strong></p>
+<h3 id="2-3-那什么时候必须用织入？"><a href="#2-3-那什么时候必须用织入？" class="headerlink" title="2.3 那什么时候必须用织入？"></a>2.3 那什么时候必须用织入？</h3><p>真实需要 AspectJ 织入的场景并不多，但都很”硬”：</p>
+<ul>
+<li><strong>要切自调用</strong>，且<strong>不能改架构</strong>（比如给第三方 SDK 的方法加监控）；</li>
+<li><strong>要切 <code>private</code> &#x2F; <code>final</code> 方法</strong>；</li>
+<li><strong>要对 <code>new</code> 出来的对象生效</strong>（比如 <code>new ArrayList&lt;&gt;()</code> 也想被切）；</li>
+<li><strong>要切构造函数、字段访问、<code>static</code> 初始化</strong>（Spring AOP 完全做不到）；</li>
+<li><strong>要极高的性能</strong>（LTW 无代理对象，调用是普通虚方法，几乎没有开销）。</li>
+</ul>
+<hr>
+<h2 id="三、AspectJ-的-Join-Point-模型：比-Spring-强在哪"><a href="#三、AspectJ-的-Join-Point-模型：比-Spring-强在哪" class="headerlink" title="三、AspectJ 的 Join Point 模型：比 Spring 强在哪"></a>三、AspectJ 的 Join Point 模型：比 Spring 强在哪</h2><p>Spring AOP 只支持 <strong>method execution</strong> 一种连接点。AspectJ 支持：</p>
+<table>
+<thead>
+<tr>
+<th>连接点类型</th>
+<th>Pointcut 表达式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>方法执行</td>
+<td><code>execution(* com.x..*.*(..))</code></td>
+<td>二者都支持</td>
+</tr>
+<tr>
+<td>方法调用</td>
+<td><code>call(* com.x..*.*(..))</code></td>
+<td><strong>调用点</strong>（在调用方织入）</td>
+</tr>
+<tr>
+<td>构造方法</td>
+<td><code>execution(com.x.Foo.new(..))</code></td>
+<td>Spring 不支持</td>
+</tr>
+<tr>
+<td>字段读写</td>
+<td><code>get(int com.x.Foo.f)</code> &#x2F; <code>set(...)</code></td>
+<td>Spring 不支持</td>
+</tr>
+<tr>
+<td>静态初始化</td>
+<td><code>staticinitialization(com.x..*)</code></td>
+<td>Spring 不支持</td>
+</tr>
+<tr>
+<td>Handler</td>
+<td><code>handler(Exception)</code></td>
+<td>异常处理器执行点</td>
+</tr>
+<tr>
+<td>条件</td>
+<td><code>if(...)</code> &#x2F; <code>cflow(...)</code> &#x2F; <code>within(...)</code></td>
+<td>流程&#x2F;上下文条件</td>
+</tr>
+</tbody></table>
+<p>两个<strong>面试高频</strong>的区别：</p>
+<ul>
+<li><strong><code>execution</code> vs <code>call</code></strong>：<ul>
+<li><code>execution</code> 在<strong>被调方法的内部</strong>织入（方法入口）；<strong>只要方法被执行就会触发</strong>，包括 <code>this</code> 调用、反射调用；</li>
+<li><code>call</code> 在<strong>调用方</strong>织入（调用指令之前）；<strong>只有通过这个调用点触发</strong>，反射调用、<code>this</code> 调用（如果调用点没被织入的话）不会触发；</li>
+<li><code>call</code> 能拿到 <code>JoinPoint.getThis()</code> 是调用方对象，<code>execution</code> 拿到的是被调方对象。</li>
+</ul>
+</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 只切&quot;在 OrderService 里调用 save 的位置&quot;</span></span><br><span class="line"><span class="meta">@Pointcut(&quot;call(* com.x.OrderMapper.save(..)) &amp;&amp; within(com.x.OrderService)&quot;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">saveFromOrderService</span><span class="params">()</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><strong><code>cflow</code>（控制流）</strong>：切”在某个方法调用链内的所有点”。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Pointcut(&quot;call(* com.x..*.*(..)) &amp;&amp; cflow(execution(* com.x.TxManager.begin(..)))&quot;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">inTransaction</span><span class="params">()</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong><code>cflow</code> 性能代价很高</strong>（需要维护控制流栈，JIT 也难以优化），生产上慎用 Large-scale <code>cflow</code>。</p>
+<hr>
+<h2 id="四、编译期织入（CTW）：Maven-配置与反编译验证"><a href="#四、编译期织入（CTW）：Maven-配置与反编译验证" class="headerlink" title="四、编译期织入（CTW）：Maven 配置与反编译验证"></a>四、编译期织入（CTW）：Maven 配置与反编译验证</h2><h3 id="4-1-依赖"><a href="#4-1-依赖" class="headerlink" title="4.1 依赖"></a>4.1 依赖</h3><figure class="highlight xml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br></pre></td><td class="code"><pre><span class="line"><span class="tag">&lt;<span class="name">dependencies</span>&gt;</span></span><br><span class="line">  <span class="tag">&lt;<span class="name">dependency</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">groupId</span>&gt;</span>org.aspectj<span class="tag">&lt;/<span class="name">groupId</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">artifactId</span>&gt;</span>aspectjrt<span class="tag">&lt;/<span class="name">artifactId</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">version</span>&gt;</span>1.9.22<span class="tag">&lt;/<span class="name">version</span>&gt;</span></span><br><span class="line">  <span class="tag">&lt;/<span class="name">dependency</span>&gt;</span></span><br><span class="line"><span class="tag">&lt;/<span class="name">dependencies</span>&gt;</span></span><br><span class="line"></span><br><span class="line"><span class="tag">&lt;<span class="name">build</span>&gt;</span></span><br><span class="line">  <span class="tag">&lt;<span class="name">plugins</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">plugin</span>&gt;</span></span><br><span class="line">      <span class="tag">&lt;<span class="name">groupId</span>&gt;</span>dev.aspectj<span class="tag">&lt;/<span class="name">groupId</span>&gt;</span></span><br><span class="line">      <span class="tag">&lt;<span class="name">artifactId</span>&gt;</span>aspectj-maven-plugin<span class="tag">&lt;/<span class="name">artifactId</span>&gt;</span>   <span class="comment">&lt;!-- 1.9.x 后维护版 --&gt;</span></span><br><span class="line">      <span class="tag">&lt;<span class="name">version</span>&gt;</span>1.14<span class="tag">&lt;/<span class="name">version</span>&gt;</span></span><br><span class="line">      <span class="tag">&lt;<span class="name">configuration</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">complianceLevel</span>&gt;</span>21<span class="tag">&lt;/<span class="name">complianceLevel</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">source</span>&gt;</span>21<span class="tag">&lt;/<span class="name">source</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">target</span>&gt;</span>21<span class="tag">&lt;/<span class="name">target</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">showWeaveInfo</span>&gt;</span>true<span class="tag">&lt;/<span class="name">showWeaveInfo</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">Xlint</span>&gt;</span>ignore<span class="tag">&lt;/<span class="name">Xlint</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">aspectLibraries</span>&gt;</span></span><br><span class="line">          <span class="comment">&lt;!-- 如果切面在别的 module，需要引用并织入其 jar --&gt;</span></span><br><span class="line">          <span class="tag">&lt;<span class="name">aspectLibrary</span>&gt;</span></span><br><span class="line">            <span class="tag">&lt;<span class="name">groupId</span>&gt;</span>com.mycompany<span class="tag">&lt;/<span class="name">groupId</span>&gt;</span></span><br><span class="line">            <span class="tag">&lt;<span class="name">artifactId</span>&gt;</span>my-aspects<span class="tag">&lt;/<span class="name">artifactId</span>&gt;</span></span><br><span class="line">          <span class="tag">&lt;/<span class="name">aspectLibrary</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;/<span class="name">aspectLibraries</span>&gt;</span></span><br><span class="line">      <span class="tag">&lt;/<span class="name">configuration</span>&gt;</span></span><br><span class="line">      <span class="tag">&lt;<span class="name">executions</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">execution</span>&gt;</span></span><br><span class="line">          <span class="tag">&lt;<span class="name">goals</span>&gt;</span></span><br><span class="line">            <span class="tag">&lt;<span class="name">goal</span>&gt;</span>compile<span class="tag">&lt;/<span class="name">goal</span>&gt;</span>       <span class="comment">&lt;!-- 编译期织入 --&gt;</span></span><br><span class="line">            <span class="tag">&lt;<span class="name">goal</span>&gt;</span>test-compile<span class="tag">&lt;/<span class="name">goal</span>&gt;</span></span><br><span class="line">          <span class="tag">&lt;/<span class="name">goals</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;/<span class="name">execution</span>&gt;</span></span><br><span class="line">      <span class="tag">&lt;/<span class="name">executions</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;/<span class="name">plugin</span>&gt;</span></span><br><span class="line">  <span class="tag">&lt;/<span class="name">plugins</span>&gt;</span></span><br><span class="line"><span class="tag">&lt;/<span class="name">build</span>&gt;</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-一个切面"><a href="#4-2-一个切面" class="headerlink" title="4.2 一个切面"></a>4.2 一个切面</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Aspect</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TimingAspect</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Logger</span> <span class="variable">log</span> <span class="operator">=</span> LoggerFactory.getLogger(TimingAspect.class);</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 切 service 包下所有 public 方法，包括 private 方法调用链 */</span></span><br><span class="line">    <span class="meta">@Around(&quot;execution(public * com.demo.service..*(..))&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> Object <span class="title function_">around</span><span class="params">(ProceedingJoinPoint pjp)</span> <span class="keyword">throws</span> Throwable &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">sig</span> <span class="operator">=</span> pjp.getSignature().toShortString();</span><br><span class="line">        <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">return</span> pjp.proceed();</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">cost</span> <span class="operator">=</span> (System.nanoTime() - start) / <span class="number">1_000_000</span>;</span><br><span class="line">            <span class="keyword">if</span> (cost &gt; <span class="number">200</span>) &#123;</span><br><span class="line">                log.warn(<span class="string">&quot;SLOW &#123;&#125; cost=&#123;&#125;ms args=&#123;&#125;&quot;</span>, sig, cost, Arrays.toString(pjp.getArgs()));</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 只切自调用也能生效 —— 这是 CTW 相对 Spring AOP 的核心优势 */</span></span><br><span class="line">    <span class="meta">@Around(&quot;execution(private * com.demo.service.OrderService.doSave(..))&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> Object <span class="title function_">aroundPrivate</span><span class="params">(ProceedingJoinPoint pjp)</span> <span class="keyword">throws</span> Throwable &#123;</span><br><span class="line">        <span class="keyword">return</span> pjp.proceed();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-验证：反编译看字节码"><a href="#4-3-验证：反编译看字节码" class="headerlink" title="4.3 验证：反编译看字节码"></a>4.3 验证：反编译看字节码</h3><p>CTW 之后，<code>OrderService.doSave()</code> 会多出一些东西：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">javap -p -c target/classes/com/demo/service/OrderService.class | less</span><br></pre></td></tr></table></figure>
+
+<p>你会看到：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">private void doSave();</span><br><span class="line">   0: invokestatic  #12  // Method com/demo/aspect/TimingAspect.aspectOf:()Lcom/demo/aspect/TimingAspect;</span><br><span class="line">   3: ...                 // 进入 around 通知</span><br><span class="line">   8: invokevirtual #15  // Method doSave_aroundBody0:()V   ← 原始方法体被抽出</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键点</strong>：AspectJ 会把你的方法体抽成一个 <code>doSave_aroundBody0</code> 合成方法，然后让 <code>doSave()</code> 变成”调用切面 → 切面内调用 <code>_aroundBody0</code>“。因为<strong>改的是 <code>doSave()</code> 本身的指令</strong>，所以 <code>this.doSave()</code> 也会走到通知中。</p>
+<h3 id="4-4-CTW-的优缺点"><a href="#4-4-CTW-的优缺点" class="headerlink" title="4.4 CTW 的优缺点"></a>4.4 CTW 的优缺点</h3><table>
+<thead>
+<tr>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>无反射开销，性能几乎等同手写</td>
+<td><strong>构建变慢</strong>（ajc 编译全量）</td>
+</tr>
+<tr>
+<td>支持所有连接点（构造&#x2F;字段&#x2F;private&#x2F;static）</td>
+<td>需要改造构建流程（Maven&#x2F;Gradle&#x2F;Bazel 都要配）</td>
+</tr>
+<tr>
+<td>自调用生效</td>
+<td><strong>IDE 直接运行会失效</strong>（必须走 Maven 编译产物；IDEA 要开 AspectJ 支持并设 <code>ajc</code> 编译器）</td>
+</tr>
+<tr>
+<td>不依赖运行期 agent</td>
+<td><code>ajc</code> 与 Lombok &#x2F; MapStruct 等注解处理器<strong>顺序冲突</strong>常见</td>
+</tr>
+<tr>
+<td>可读（<code>showWeaveInfo</code> 可见织入日志）</td>
+<td>调试时栈里多一层 <code>_aroundBody</code>，略绕</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>Lombok + AspectJ 冲突</strong>是最常见的踩坑：两者都要改字节码，执行顺序不对会互相覆盖（比如 <code>@Data</code> 生成的 getter 没被织入）。解决办法是把 Lombok 的注解处理放在 ajc 之前（Maven 里先 <code>lombok-maven-plugin</code> delombok，或用 <code>dev.aspectj</code> 版本的 plugin 并显式配 <code>-proc</code>）。</p>
+</blockquote>
+<hr>
+<h2 id="五、加载期织入（LTW）：不改构建，靠-Agent"><a href="#五、加载期织入（LTW）：不改构建，靠-Agent" class="headerlink" title="五、加载期织入（LTW）：不改构建，靠 Agent"></a>五、加载期织入（LTW）：不改构建，靠 Agent</h2><p>LTW 是<strong>生产环境最常用</strong>的 AspectJ 方式：不改编译流程，只在 JVM 启动时挂一个 <code>-javaagent</code>。</p>
+<h3 id="5-1-依赖"><a href="#5-1-依赖" class="headerlink" title="5.1 依赖"></a>5.1 依赖</h3><figure class="highlight xml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="tag">&lt;<span class="name">dependency</span>&gt;</span></span><br><span class="line">  <span class="tag">&lt;<span class="name">groupId</span>&gt;</span>org.aspectj<span class="tag">&lt;/<span class="name">groupId</span>&gt;</span></span><br><span class="line">  <span class="tag">&lt;<span class="name">artifactId</span>&gt;</span>aspectjweaver<span class="tag">&lt;/<span class="name">artifactId</span>&gt;</span>   <span class="comment">&lt;!-- 内含 LTW 的 agent --&gt;</span></span><br><span class="line">  <span class="tag">&lt;<span class="name">version</span>&gt;</span>1.9.22<span class="tag">&lt;/<span class="name">version</span>&gt;</span></span><br><span class="line"><span class="tag">&lt;/<span class="name">dependency</span>&gt;</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-META-INF-aop-xml"><a href="#5-2-META-INF-aop-xml" class="headerlink" title="5.2 META-INF/aop.xml"></a>5.2 <code>META-INF/aop.xml</code></h3><figure class="highlight xml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">&lt;!DOCTYPE <span class="keyword">aspectj</span> <span class="keyword">PUBLIC</span></span></span><br><span class="line"><span class="meta">    <span class="string">&quot;-//AspectJ//DTD//EN&quot;</span> <span class="string">&quot;https://www.eclipse.org/aspectj/dtd/aspectj.dtd&quot;</span>&gt;</span></span><br><span class="line"><span class="tag">&lt;<span class="name">aspectj</span>&gt;</span></span><br><span class="line">    <span class="tag">&lt;<span class="name">weaver</span> <span class="attr">options</span>=<span class="string">&quot;-verbose -Xlint:ignore&quot;</span>&gt;</span></span><br><span class="line">        <span class="comment">&lt;!-- 只扫描应用自己的包，指定 include 可以显著降低启动开销 --&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">include</span> <span class="attr">within</span>=<span class="string">&quot;com.demo..*&quot;</span>/&gt;</span></span><br><span class="line">        <span class="comment">&lt;!-- 排除不需要织入的部分 --&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">exclude</span> <span class="attr">within</span>=<span class="string">&quot;com.demo.generated..*&quot;</span>/&gt;</span></span><br><span class="line">    <span class="tag">&lt;/<span class="name">weaver</span>&gt;</span></span><br><span class="line"></span><br><span class="line">    <span class="tag">&lt;<span class="name">aspects</span>&gt;</span></span><br><span class="line">        <span class="tag">&lt;<span class="name">aspect</span> <span class="attr">name</span>=<span class="string">&quot;com.demo.aspect.TimingAspect&quot;</span>/&gt;</span></span><br><span class="line">    <span class="tag">&lt;/<span class="name">aspects</span>&gt;</span></span><br><span class="line"><span class="tag">&lt;/<span class="name">aspectj</span>&gt;</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-启动参数"><a href="#5-3-启动参数" class="headerlink" title="5.3 启动参数"></a>5.3 启动参数</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">java -javaagent:/path/aspectjweaver-1.9.22.jar \</span><br><span class="line">     -Dorg.aspectj.weaver.loadtime.definition=META-INF/aop.xml \</span><br><span class="line">     -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>Spring Boot 里更简单的写法：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">java -javaagent:aspectjweaver.jar -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>Spring 也会识别 LTW：加上 <code>@EnableLoadTimeWeaving</code>（Spring 的 LTW 与 AspectJ 的 LTW 是两套东西，<strong>Spring LTW 只用于 <code>@Configurable</code> &#x2F; <code>LoadTimeWeaverAware</code>，不负责切面</strong>，容易混淆）。</p>
+<h3 id="5-4-LTW-的生产注意点"><a href="#5-4-LTW-的生产注意点" class="headerlink" title="5.4 LTW 的生产注意点"></a>5.4 LTW 的生产注意点</h3><table>
+<thead>
+<tr>
+<th>事项</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>容器环境</strong></td>
+<td>要保证 <code>aspectjweaver.jar</code> 在镜像里，且路径稳定（别用 <code>/root/.m2/...</code>）</td>
+</tr>
+<tr>
+<td><strong>启动开销</strong></td>
+<td>织入发生在类加载时，<strong>首部类加载变慢</strong>，一般 +5%~20% 启动时间</td>
+</tr>
+<tr>
+<td><strong><code>include</code> 精确化</strong></td>
+<td>不写 <code>include</code> 会扫全部加载的类，启动暴慢；<strong>务必精确到包</strong></td>
+</tr>
+<tr>
+<td><strong><code>-Xlint</code>&#x2F;<code>-verbose</code></strong></td>
+<td>排查期开，生产关（日志噪音）</td>
+</tr>
+<tr>
+<td><strong>类卸载&#x2F;热部署</strong></td>
+<td>Spring Boot DevTools 重启时类加载器换了，agent 会重复织入，可能出诡异问题</td>
+</tr>
+<tr>
+<td><strong>GraalVM Native</strong></td>
+<td>LTW 基于 <code>java.lang.instrument</code>，<strong>native image 不支持</strong>，必须改 CTW 或放弃 AOP</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="六、运行期重转换：Agent-的-retransformClasses"><a href="#六、运行期重转换：Agent-的-retransformClasses" class="headerlink" title="六、运行期重转换：Agent 的 retransformClasses"></a>六、运行期重转换：Agent 的 <code>retransformClasses</code></h2><p>SkyWalking、Arthas、Pinpoint 这类 APM&#x2F;诊断工具，用的是<strong>第三种</strong>方式：Java Agent 在运行时<strong>重新转换已加载的类</strong>。</p>
+<h3 id="6-1-ClassFileTransformer-原型"><a href="#6-1-ClassFileTransformer-原型" class="headerlink" title="6.1 ClassFileTransformer 原型"></a>6.1 <code>ClassFileTransformer</code> 原型</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RetransformAgent</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">premain</span><span class="params">(String args, Instrumentation inst)</span> &#123;</span><br><span class="line">        inst.addTransformer(<span class="keyword">new</span> <span class="title class_">TraceTransformer</span>(), <span class="literal">true</span> <span class="comment">/* canRetransform */</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">agentmain</span><span class="params">(String args, Instrumentation inst)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        inst.addTransformer(<span class="keyword">new</span> <span class="title class_">TraceTransformer</span>(), <span class="literal">true</span>);</span><br><span class="line">        <span class="comment">// 对已经加载的目标类做重转换</span></span><br><span class="line">        <span class="keyword">for</span> (Class&lt;?&gt; c : inst.getAllLoadedClasses()) &#123;</span><br><span class="line">            <span class="keyword">if</span> (inst.isModifiableClass(c) &amp;&amp; c.getName().startsWith(<span class="string">&quot;com.demo.service&quot;</span>)) &#123;</span><br><span class="line">                inst.retransformClasses(c);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="keyword">class</span> <span class="title class_">TraceTransformer</span> <span class="keyword">implements</span> <span class="title class_">ClassFileTransformer</span> &#123;</span><br><span class="line">        <span class="meta">@Override</span></span><br><span class="line">        <span class="keyword">public</span> <span class="type">byte</span>[] transform(ClassLoader loader, String className,</span><br><span class="line">                                Class&lt;?&gt; classBeingRedefined,</span><br><span class="line">                                ProtectionDomain pd, <span class="type">byte</span>[] classfileBuffer) &#123;</span><br><span class="line">            <span class="keyword">if</span> (!className.startsWith(<span class="string">&quot;com/demo/service&quot;</span>)) <span class="keyword">return</span> <span class="literal">null</span>;  <span class="comment">// 不关心返回 null</span></span><br><span class="line">            <span class="comment">// 用 ASM/ByteBuddy 在方法前后插入计时逻辑</span></span><br><span class="line">            <span class="keyword">return</span> TraceBytecodeWeaver.weave(classfileBuffer);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-为什么-APM-都用-Agent-而不是-AspectJ"><a href="#6-2-为什么-APM-都用-Agent-而不是-AspectJ" class="headerlink" title="6.2 为什么 APM 都用 Agent 而不是 AspectJ"></a>6.2 为什么 APM 都用 Agent 而不是 AspectJ</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>AspectJ LTW</th>
+<th>Java Agent + ASM&#x2F;ByteBuddy</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>触发时机</td>
+<td>类加载时</td>
+<td>类加载时 <strong>或运行时重转换</strong></td>
+</tr>
+<tr>
+<td>是否可动态启停</td>
+<td>❌</td>
+<td>✅（agentmain 可随时附着）</td>
+</tr>
+<tr>
+<td>定位</td>
+<td>业务 AOP 切面</td>
+<td><strong>可观测性 &#x2F; 诊断 &#x2F; 无侵入增强</strong></td>
+</tr>
+<tr>
+<td>生态</td>
+<td>AspectJ 语法</td>
+<td>ByteBuddy 的 <code>Advice</code>&#x2F;<code>AgentBuilder</code> 更灵活</td>
+</tr>
+<tr>
+<td>典型</td>
+<td>日志、权限、重试</td>
+<td>SkyWalking、Arthas、JProfiler、New Relic</td>
+</tr>
+</tbody></table>
+<p><strong>ByteBuddy 的 <code>AgentBuilder</code></strong> 是现在的主流写法，语法比裸 ASM 友好得多：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">new</span> <span class="title class_">AgentBuilder</span>.Default()</span><br><span class="line">    .type(ElementMatchers.nameStartsWith(<span class="string">&quot;com.demo.service&quot;</span>))</span><br><span class="line">    .transform((builder, type, cl, <span class="keyword">module</span>, pd) -&gt;</span><br><span class="line">        builder.method(ElementMatchers.isPublic())</span><br><span class="line">               .intercept(Advice.to(TimingAdvice.class)))</span><br><span class="line">    .installOn(inst);</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-retransform-的限制（面试加分点）"><a href="#6-3-retransform-的限制（面试加分点）" class="headerlink" title="6.3 retransform 的限制（面试加分点）"></a>6.3 <code>retransform</code> 的限制（面试加分点）</h3><ol>
+<li><strong>不能增删字段&#x2F;方法、不能改方法签名、不能改父类</strong> —— 只能改方法体；</li>
+<li><strong>不能改类结构</strong>，否则会抛 <code>UnsupportedOperationException</code>；</li>
+<li><strong>重转换对已 JIT 编译的方法需要去优化（deoptimize）</strong>，有短暂性能波动；</li>
+<li><strong><code>ClassFileTransformer</code> 返回 <code>null</code> 表示不修改</strong>，这是约定，不要返回空数组（会清空类）；</li>
+<li><strong>类已被 <code>retransform</code> 后，再次 <code>retransform</code> 传的是”上一次织入后的字节码”</strong>，因此要保证织入是<strong>幂等</strong>的，否则会叠加多层增强（典型事故：双份日志、双份耗时）。</li>
+</ol>
+<h3 id="6-4-用-Arthas-现场看看有没有被织入"><a href="#6-4-用-Arthas-现场看看有没有被织入" class="headerlink" title="6.4 用 Arthas 现场看看有没有被织入"></a>6.4 用 Arthas 现场看看有没有被织入</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 反编译某个方法，看是否有 agent 插入的代码</span></span><br><span class="line">jad com.demo.service.OrderService</span><br><span class="line"><span class="comment"># 查看类加载器 / 是否被 transform</span></span><br><span class="line">sc -d com.demo.service.OrderService</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、怎么选：一张决策表"><a href="#七、怎么选：一张决策表" class="headerlink" title="七、怎么选：一张决策表"></a>七、怎么选：一张决策表</h2><table>
+<thead>
+<tr>
+<th>需求</th>
+<th>推荐方案</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>事务、缓存、简单日志（Spring Bean 方法）</td>
+<td><strong>Spring AOP</strong>（代理）</td>
+</tr>
+<tr>
+<td>切自调用 &#x2F; private &#x2F; final</td>
+<td><strong>CTW 或 LTW</strong></td>
+</tr>
+<tr>
+<td>切第三方 jar 里的类</td>
+<td><strong>Binary Weaving（对 jar 织入）或 LTW</strong></td>
+</tr>
+<tr>
+<td>想在运行时动态开关</td>
+<td><strong>Java Agent + ByteBuddy</strong></td>
+</tr>
+<tr>
+<td>APM &#x2F; 链路追踪 &#x2F; 无侵入诊断</td>
+<td><strong>Java Agent（Agent 生态）</strong></td>
+</tr>
+<tr>
+<td>GraalVM Native Image</td>
+<td><strong>CTW</strong>（LTW&#x2F;Agent 都不行）</td>
+</tr>
+<tr>
+<td>极简构建，不想动 pom</td>
+<td><strong>LTW</strong>（加 <code>-javaagent</code> 而已）</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="八、性能：三种方式的量级"><a href="#八、性能：三种方式的量级" class="headerlink" title="八、性能：三种方式的量级"></a>八、性能：三种方式的量级</h2><p>用 JMH 粗测（同一方法调用 1 亿次，纳秒级）：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>单次额外开销</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>无 AOP</td>
+<td>~2 ns</td>
+<td>基线（虚方法调用）</td>
+</tr>
+<tr>
+<td>AspectJ CTW&#x2F;LTW（无通知执行）</td>
+<td><del>3</del>5 ns</td>
+<td>仅多一次判断&#x2F;调用</td>
+</tr>
+<tr>
+<td>Spring AOP（CGLIB）</td>
+<td><del>30</del>80 ns</td>
+<td>反射调用链 + <code>ReflectiveMethodInvocation</code></td>
+</tr>
+<tr>
+<td>Spring AOP（JDK 动态代理）</td>
+<td><del>40</del>120 ns</td>
+<td>多一层 <code>Method.invoke</code></td>
+</tr>
+</tbody></table>
+<p><strong>结论</strong>：AspectJ 织入比 Spring 代理<strong>快一个数量级</strong>，但<strong>对绝大多数业务系统都不是瓶颈</strong>——一次 DB 查询就是几百微秒，省几十纳秒毫无意义。<strong>所以选型的第一顺位永远是”能不能满足需求”，而不是”快不快”。</strong></p>
+<hr>
+<h2 id="九、面试常见追问"><a href="#九、面试常见追问" class="headerlink" title="九、面试常见追问"></a>九、面试常见追问</h2><p><strong>Q1：Spring AOP 和 AspectJ 的关系？</strong><br>Spring AOP 是<strong>独立的代理实现</strong>，它<strong>借用了 AspectJ 的注解（<code>@Aspect</code>&#x2F;<code>@Pointcut</code>）和 Pointcut 表达式语法</strong>，但不使用 AspectJ 的织入器（除非你显式启用 CTW&#x2F;LTW）。<strong>“注解是 AspectJ 的，引擎是 Spring 自己的”</strong>——这是最容易被混淆的一点。</p>
+<p><strong>Q2：Spring AOP 能切 <code>private</code> 方法吗？</strong><br>不能。CGLIB 覆写不了 <code>private</code>；<code>@Transactional</code> 加在 private 方法上<strong>会被静默忽略</strong>（有的版本会警告）。AspectJ 可以。</p>
+<p><strong>Q3：<code>@Transactional</code> 加在接口上还是实现类上？</strong><br>都可以，但注解本身<strong>不会被继承</strong>（<code>@Inherited</code> 只对类有效）。<code>@Transactional</code> 通过 <code>TransactionAttributeSource</code> 在运行时查找，能处理接口方法，但<strong>能标在实现类上就标在实现类上</strong>，语义最清晰。</p>
+<p><strong>Q4：LTW 会不会影响线上稳定性？</strong><br>LTW 增加类加载时间，并可能在织入失败时报 <code>ClassFormatError</code>。<strong>必须做全量集成测试 + 灰度</strong>。另外 <code>include</code> 一定精确，否则启动会从 10 秒变成 60 秒。</p>
+<p><strong>Q5：为什么 Agent 重转换会”双份日志”？</strong><br><code>retransformClasses</code> 会把<strong>当前字节码</strong>（可能已含上次增强）再喂给 transformer。如果你的 transformer 不判断”是否已增强”，就会二次插入。<strong>标准做法</strong>：用 ByteBuddy 的 <code>alreadyInstrumented</code> 检查，或在类里打标记字段。</p>
+<p><strong>Q6：动态 AOP 会破坏可观测性吗？</strong><br>会带来困扰：栈里多 <code>_aroundBody</code>、堆 dump 里多合成方法、<code>javap</code> 与源码对不上。<strong>建议</strong>：① 只在必要模块开 AOP；② 用 <code>showWeaveInfo</code> 记录织入了哪些类；③ 给 AOP 生成的日志打统一 tag，方便识别。</p>
+<hr>
+<h2 id="十、总结"><a href="#十、总结" class="headerlink" title="十、总结"></a>十、总结</h2><p>AOP 的四种实现，本质是”<strong>在哪个阶段修改字节码</strong>“的选择：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">源码 ──[CTW: ajc]──&gt; class ──[Binary Weaving]──&gt; jar</span><br><span class="line">                       │</span><br><span class="line">                       ├── 类加载 ──[LTW: aspectjweaver]──&gt; JVM 内的 Class</span><br><span class="line">                       └── 运行中 ──[Agent: retransform]──&gt; 重新定义的 Class</span><br><span class="line"></span><br><span class="line">而 Spring AOP 不碰字节码 —— 它在运行期&quot;造一个替身对象&quot;。</span><br></pre></td></tr></table></figure>
+
+<p>记住三句话：</p>
+<ol>
+<li><strong>代理改的是引用，织入改的是指令</strong> —— 这就是”自调用能不能切”的根因；</li>
+<li><strong>能用 Spring AOP 就别上 AspectJ</strong> —— 复杂度、构建侵入、调试成本都是真实成本；</li>
+<li><strong>Agent 是运行期 AOP 的终极形态</strong> —— 它撑起了整个 Java 可观测性生态。</li>
+</ol>
+<p>下次有人问你”Spring AOP 切不到自调用怎么办”，你可以先答三种工程解法（拆 Bean &#x2F; 注入代理 &#x2F; <code>AopContext</code>），再补一句”如果这些都不行，说明你需要 AspectJ 的织入能力，CTW 或 LTW 都能切 <code>private</code> 和 <code>this</code> 调用”——这一层，就已经甩开大部分候选人了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/08/aspectj-weaving-ctw-ltw-deep-dive/">https://jiweidong.github.io/2026/10/08/aspectj-weaving-ctw-ltw-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/AOP/">AOP</a><a class="post-meta__tags" href="/tags/AspectJ/">AspectJ</a><a class="post-meta__tags" href="/tags/%E5%AD%97%E8%8A%82%E7%A0%81/">字节码</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/08/java-csv-parsing-large-file-deep-practice/" title="【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析</div></div><div class="info-2"><div class="info-item-1">【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析面试官：一个 2GB 的 CSV 上传接口，把服务打挂了 “我们有个对账文件导入功能，客户上传 CSV，我们解析入库。平时文件都几 MB，没问题。上周有个客户传了个 2GB 的，接口直接 OOM，把整个服务搞挂了。代码很简单啊：Files.readAllLines(path) 然后 line.split(&quot;,&quot;)。你打算怎么改？”  这个问题的”标准答案”有三层，而且每一层都有面试官在等着追问：  别把文件读进内存 —— 改成流式逐行处理（BufferedReader &#x2F; readLine）； split(&quot;,&quot;) 根本不是 CSV 解析 —— RFC 4180 里引号、转义、内嵌换行全都会让你解析错； 光流式还不够 —— 入库要批处理、要事务边界、要有上限保护和断点续传。  这篇文章从 RFC 4180 讲到四个主流库的选型、流式架构、内存与并发控制，最后把导出侧的坑也补齐（因为”导入导出”从来是一体的）...</div></div></div></a><a class="pagination-related" href="/2026/10/08/spring-boot-multi-tenant-saas-architecture-deep-practice/" title="【架构设计】Spring Boot 多租户 SaaS 架构深度实战：数据隔离、动态数据源与租户上下文透传"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【架构设计】Spring Boot 多租户 SaaS 架构深度实战：数据隔离、动态数据源与租户上下文透传</div></div><div class="info-2"><div class="info-item-1">【架构设计】Spring Boot 多租户 SaaS 架构深度实战：数据隔离、动态数据源与租户上下文透传面试官：一套系统卖给 500 家公司，数据怎么隔离？ “我们一开始是给一家客户做的定制系统，后来老板说要做成 SaaS，卖给了 200 多家企业。现在的问题是：A 公司的管理员通过接口查到了 B 公司的订单。老板说要防止再发生，你打算怎么改？”  这是多租户（Multi-Tenancy）的第一性问题：数据隔离。它比”怎么动态切库”重要得多——先保证不串，再谈怎么优雅地不串。 这篇文章按”隔离级别选型 → 租户上下文设计 → 数据层落地（动态数据源 &#x2F; 租户列 &#x2F; RLS）→ 全链路透传 → 运营与运维”的顺序，把多租户 SaaS 讲透。  一、隔离级别：三种模型与五种方案1.1 三个维度多租户隔离可以从三个层面看：    维度 选项 说明    数据 独立库 &#x2F; 共享库独立 Schema &#x2F; 共享表加租户列 隔离强度递减，成本递增   计算 独立实例 &#x2F; 共享实例 大客户可独享（hybrid）   资源 独立限流&#x2F;配额...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/17/java-agent-bytecode-instrumentation/" title="Java Agent 字节码增强与 Instrumentation 实战：从 APM 到热修复"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">Java Agent 字节码增强与 Instrumentation 实战：从 APM 到热修复</div></div><div class="info-2"><div class="info-item-1">Java Agent 字节码增强与 Instrumentation 实战：从 APM 到热修复一、什么是 Java AgentJava Agent 是 JVM 提供的一种拦截机制，允许在类加载之前或运行时修改类的字节码。它广泛应用于：    应用领域 代表产品 实现原理    APM（应用性能监控） SkyWalking, Pinpoint, New Relic 拦截方法调用，统计耗时和调用链   热部署 JRebel, Spring Boot DevTools 重新加载修改后的类   在线诊断 Arthas, BTrace 动态跟踪方法调用，无需重启   热修复 Java 应用运行时修复 Bug 动态替换有问题的类   代码覆盖率 JaCoCo 插入覆盖率统计字节码   性能分析 IntelliJ Profiler, JProfiler 方法采样和追踪   1.1 Java Agent 的两种模式123456789101112启动时加载（premain）：java -javaagent:myagent.jar=args -jar app.jar             │   ...</div></div></div></a><a class="pagination-related" href="/2026/09/03/java-lambda-invokedynamic-bytecode-deep-dive/" title="【面试进阶】面试官：Lambda 表达式底层是怎么实现的？从 javap 字节码到 invokedynamic 与 LambdaMetafactory 深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-03</div><div class="info-item-2">【面试进阶】面试官：Lambda 表达式底层是怎么实现的？从 javap 字节码到 invokedynamic 与 LambdaMetafactory 深度解析</div></div><div class="info-2"><div class="info-item-1">【面试进阶】面试官：Lambda 表达式底层是怎么实现的？从 javap 字节码到 invokedynamic 与 LambdaMetafactory 深度解析面试官：Lambda 表达式用起来很方便，但它底层到底是怎么实现的？很多同学第一反应是”语法糖，编译后变成匿名内部类”。如果你这么回答，面试官会接着追问：”JDK 8 之前匿名内部类每次调用都会 new 一个类文件，Lambda 也是这样吗？为什么 Lambda 性能更好？”——答案是否定的。Lambda 的底层是 invokedynamic + LambdaMetafactory，它不是一个普通的语法糖，而是 JVM 指令级的语言特性。今天我们从字节码一路挖到底。 一、先看结论：Lambda 不是”匿名内部类的语法糖”我们先写一段最普通的代码： 123456public class LambdaDemo &#123;    public static void main(String[] args) &#123;        Runnable r = () -&gt; System.out.println(&quot;...</div></div></div></a><a class="pagination-related" href="/2026/09/06/bytebuddy-bytecode-enhancement-deep-practice/" title="【Java 实战】ByteBuddy 字节码增强深度实战：从动态生成类到 Java Agent 无侵入埋点"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-06</div><div class="info-item-2">【Java 实战】ByteBuddy 字节码增强深度实战：从动态生成类到 Java Agent 无侵入埋点</div></div><div class="info-2"><div class="info-item-1">【Java 实战】ByteBuddy 字节码增强深度实战：从动态生成类到 Java Agent 无侵入埋点从一个需求说起老王接了个需求：给公司里一个第三方闭源 SDK 的核心方法加上耗时统计和参数日志。翻遍 SDK 的 jar，全是编译好的 class，既没有源码也改不了。上网一搜，方案有三个：  JDK 动态代理——SDK 的类根本不是接口，代理个寂寞； CGLIB——父类被 final 修饰，直接拒绝； ASM 手写——要懂 ClassFile 规范、visit 方法调用顺序，改一个方法几十行样板代码。  正当一筹莫展时，老同事悠悠地说：”用 ByteBuddy 啊，三行代码搞定。” 这就是 ByteBuddy 的价值：一个让你像写普通 Java 代码一样操作字节码的库，底层基于 ASM，却把复杂度全部封装掉。本文从 API 入门讲到 Java Agent 无侵入埋点，全程带代码，建议收藏。 一、为什么需要字节码增强？先建立一个共识：运行时增强类的能力，是几乎所有 Java 框架的根基。    场景 典型代表 技术    ORM 动态实现接口 MyBatis Mapper J...</div></div></div></a><a class="pagination-related" href="/2026/09/21/java-class-file-api-jep484-deep-dive/" title="【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-21</div><div class="info-item-2">【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践</div></div><div class="info-2"><div class="info-item-1">【Java 24 新特性】Class-File API（JEP 484）深度解析：手写字节码生成器与 ASM 替代实践面试官：你用过 ASM 吗？JDK 为什么还要自己做一套字节码 API？这是一个很典型的高阶面试追问。很多同学答得出「ASM 性能好、能直接操作字节码」，但答不出更关键的一层： ASM 是一个第三方库，它和 JDK 的版本演进是两条独立的轨道。 每当我们想用 ASM 处理最新版本的 class 文件（比如 Java 24 的新指令、新的属性结构），就必须等 ASM 发布新版本；而且 ASM 为了兼容，必须自己维护一整套 class 文件格式的解析逻辑——一旦 JVM 规范微调，ASM 就可能解析失败。 于是 JEP 484 在 Java 24 中正式推出了 Class-File API（java.lang.classfile 包），给 JDK 自带了一套官方的、随 JDK 一起演进的字节码读写 API。这一篇，我们从「为什么需要」讲到「怎么用」，最后把它和 ASM 做一个正面对比。  一、先搞清楚：Class-File API 到底解决什么问题1.1 传统字节码处...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-reflection-dynamic-proxy-deep-dive/" title="「Java 反射与动态代理」从字节码操作到 Spring AOP 的底层实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「Java 反射与动态代理」从字节码操作到 Spring AOP 的底层实现</div></div><div class="info-2"><div class="info-item-1">「Java 反射与动态代理」从字节码操作到 Spring AOP 的底层实现反射和动态代理是 Java 框架的基石——Spring 的 IoC&#x2F;AOP、MyBatis 的 Mapper 映射、Hibernate 的懒加载代理、RPC 框架的远程调用，底层都用到了它们。本文从字节码层面剖析反射和动态代理的原理，最后串联到 Spring AOP 的实现。  一、反射机制——运行时的”自省”1.1 什么是反射？Java 反射（Reflection）是指在运行状态中，对于任意一个类，都能够知道这个类的所有属性和方法；对于任意一个对象，都能够调用它的任意方法和属性。 简单来说：反射让 Java 具备了动态性。 1.2 反射的核心 API   类 用途 获取方式    Class&lt;?&gt; 类的元数据 对象.getClass() &#x2F; Class.forName() &#x2F; 类名.class   Constructor 构造方法 clazz.getConstructor() &#x2F; clazz.getDeclaredConstructors()   Me...</div></div></div></a><a class="pagination-related" href="/2026/07/31/java-bytecode-decompilation-tools-guide/" title="Java 字节码查看与反编译工具实战指南：从 javap 到 CFR 的底层探索"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-31</div><div class="info-item-2">Java 字节码查看与反编译工具实战指南：从 javap 到 CFR 的底层探索</div></div><div class="info-2"><div class="info-item-1">Java 字节码查看与反编译工具实战指南：从 javap 到 CFR 的底层探索为什么要学字节码分析？ 面试官：你有没有通过字节码分析过代码问题？能说说 Class 文件的结构吗？  字节码分析是 Java 高级开发者必备的底层能力。掌握字节码查看与反编译工具，能帮你做到：  验证编译器行为：泛型擦除是否真的发生了？try-with-resources 到底生成了什么？ 排查诡异 bug：Lambda 表达式为什么能捕获非 final 变量？匿名内部类 vs Lambda 性能差异在哪里？ 安全审计：JAR 包里的字节码是否被人篡改过？ 学习 JVM 规范：从字节码反推 JVM 执行语义，比读理论快 10 倍  本文系统梳理从 javap 到 CFR、Procyon、JD-GUI 等主流工具，带你掌握字节码分析的全流程。  一、javap：JDK 自带的瑞士军刀javap 是 JDK 自带的字节码反汇编工具，所有的 Java 开发者都应该掌握它的基本用法。 1.1 快速上手编写一段简单的 Java 代码： 1234567891011121314151617// Hello.jav...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">737</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">831</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">230</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90AOP-%E8%BF%9B%E9%98%B6%E3%80%91AspectJ-%E7%BB%87%E5%85%A5%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9ACTW%E3%80%81LTW-%E4%B8%8E-Java-Agent-%E5%8A%A0%E8%BD%BD%E6%9C%9F%E7%BB%87%E5%85%A5%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9ASpring-AOP-%E4%B8%BA%E4%BB%80%E4%B9%88%E5%88%87%E4%B8%8D%E5%88%B0%E8%87%AA%E5%B7%B1%E7%9A%84%E6%96%B9%E6%B3%95%E8%B0%83%E7%94%A8%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：Spring AOP 为什么切不到自己的方法调用？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%8A%8A%E6%A6%82%E5%BF%B5%E5%88%86%E5%B1%82%EF%BC%9AAOP-%E7%9A%84%E5%9B%9B%E7%A7%8D%E5%AE%9E%E7%8E%B0%E6%96%B9%E5%BC%8F"><span class="toc-number">1.2.</span> <span class="toc-text">一、先把概念分层：AOP 的四种实现方式</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81Spring-AOP%EF%BC%9A%E4%BB%A3%E7%90%86%E6%A8%A1%E5%BC%8F%E7%9A%84%E8%BE%B9%E7%95%8C"><span class="toc-number">1.3.</span> <span class="toc-text">二、Spring AOP：代理模式的边界</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%BB%A3%E7%90%86%E6%A8%A1%E5%BC%8F%E7%9A%84%E4%B8%89%E7%A7%8D%E5%A4%B1%E6%95%88"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 代理模式的三种失效</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E9%82%A3%E4%BA%9B%E2%80%9D%E7%BB%95%E8%BF%87%E5%A4%B1%E6%95%88%E2%80%9D%E7%9A%84%E5%9C%9F%E5%8A%9E%E6%B3%95"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 那些”绕过失效”的土办法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E9%82%A3%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E5%BF%85%E9%A1%BB%E7%94%A8%E7%BB%87%E5%85%A5%EF%BC%9F"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 那什么时候必须用织入？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81AspectJ-%E7%9A%84-Join-Point-%E6%A8%A1%E5%9E%8B%EF%BC%9A%E6%AF%94-Spring-%E5%BC%BA%E5%9C%A8%E5%93%AA"><span class="toc-number">1.4.</span> <span class="toc-text">三、AspectJ 的 Join Point 模型：比 Spring 强在哪</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E7%BC%96%E8%AF%91%E6%9C%9F%E7%BB%87%E5%85%A5%EF%BC%88CTW%EF%BC%89%EF%BC%9AMaven-%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%8F%8D%E7%BC%96%E8%AF%91%E9%AA%8C%E8%AF%81"><span class="toc-number">1.5.</span> <span class="toc-text">四、编译期织入（CTW）：Maven 配置与反编译验证</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%BE%9D%E8%B5%96"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 依赖</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%80%E4%B8%AA%E5%88%87%E9%9D%A2"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 一个切面</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E9%AA%8C%E8%AF%81%EF%BC%9A%E5%8F%8D%E7%BC%96%E8%AF%91%E7%9C%8B%E5%AD%97%E8%8A%82%E7%A0%81"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 验证：反编译看字节码</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-CTW-%E7%9A%84%E4%BC%98%E7%BC%BA%E7%82%B9"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 CTW 的优缺点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%8A%A0%E8%BD%BD%E6%9C%9F%E7%BB%87%E5%85%A5%EF%BC%88LTW%EF%BC%89%EF%BC%9A%E4%B8%8D%E6%94%B9%E6%9E%84%E5%BB%BA%EF%BC%8C%E9%9D%A0-Agent"><span class="toc-number">1.6.</span> <span class="toc-text">五、加载期织入（LTW）：不改构建，靠 Agent</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%BE%9D%E8%B5%96"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 依赖</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-META-INF-aop-xml"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 META-INF&#x2F;aop.xml</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E5%90%AF%E5%8A%A8%E5%8F%82%E6%95%B0"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 启动参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-LTW-%E7%9A%84%E7%94%9F%E4%BA%A7%E6%B3%A8%E6%84%8F%E7%82%B9"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 LTW 的生产注意点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E8%BF%90%E8%A1%8C%E6%9C%9F%E9%87%8D%E8%BD%AC%E6%8D%A2%EF%BC%9AAgent-%E7%9A%84-retransformClasses"><span class="toc-number">1.7.</span> <span class="toc-text">六、运行期重转换：Agent 的 retransformClasses</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-ClassFileTransformer-%E5%8E%9F%E5%9E%8B"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 ClassFileTransformer 原型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E4%B8%BA%E4%BB%80%E4%B9%88-APM-%E9%83%BD%E7%94%A8-Agent-%E8%80%8C%E4%B8%8D%E6%98%AF-AspectJ"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 为什么 APM 都用 Agent 而不是 AspectJ</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-retransform-%E7%9A%84%E9%99%90%E5%88%B6%EF%BC%88%E9%9D%A2%E8%AF%95%E5%8A%A0%E5%88%86%E7%82%B9%EF%BC%89"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 retransform 的限制（面试加分点）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E7%94%A8-Arthas-%E7%8E%B0%E5%9C%BA%E7%9C%8B%E7%9C%8B%E6%9C%89%E6%B2%A1%E6%9C%89%E8%A2%AB%E7%BB%87%E5%85%A5"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 用 Arthas 现场看看有没有被织入</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%8E%E4%B9%88%E9%80%89%EF%BC%9A%E4%B8%80%E5%BC%A0%E5%86%B3%E7%AD%96%E8%A1%A8"><span class="toc-number">1.8.</span> <span class="toc-text">七、怎么选：一张决策表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%A7%E8%83%BD%EF%BC%9A%E4%B8%89%E7%A7%8D%E6%96%B9%E5%BC%8F%E7%9A%84%E9%87%8F%E7%BA%A7"><span class="toc-number">1.9.</span> <span class="toc-text">八、性能：三种方式的量级</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/08/java-csv-parsing-large-file-deep-practice/" title="【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析">【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析</a><time datetime="2026-10-08T00:40:00.000Z" title="发表于 2026-10-08 08:40:00">2026-10-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/08/aspectj-weaving-ctw-ltw-deep-dive/" title="【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战">【AOP 进阶】AspectJ 织入深度解析：CTW、LTW 与 Java Agent 加载期织入实战</a><time datetime="2026-10-08T00:30:00.000Z" title="发表于 2026-10-08 08:30:00">2026-10-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/08/spring-boot-multi-tenant-saas-architecture-deep-practice/" title="【架构设计】Spring Boot 多租户 SaaS 架构深度实战：数据隔离、动态数据源与租户上下文透传">【架构设计】Spring Boot 多租户 SaaS 架构深度实战：数据隔离、动态数据源与租户上下文透传</a><time datetime="2026-10-08T00:20:00.000Z" title="发表于 2026-10-08 08:20:00">2026-10-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/08/java-jcstress-concurrency-correctness-testing-deep-practice/" title="【Java 并发】JCStress 并发正确性测试深度实战：@Actor 模型、JMM 可见性与冲突探测">【Java 并发】JCStress 并发正确性测试深度实战：@Actor 模型、JMM 可见性与冲突探测</a><time datetime="2026-10-08T00:10:00.000Z" title="发表于 2026-10-08 08:10:00">2026-10-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/08/java-money-jsr354-moneta-deep-practice/" title="【Java 实战】JSR 354 货币与金额深度实战：Moneta、Money 运算、汇率换算与金融精度陷阱">【Java 实战】JSR 354 货币与金额深度实战：Moneta、Money 运算、汇率换算与金融精度陷阱</a><time datetime="2026-10-08T00:00:00.000Z" title="发表于 2026-10-08 08:00:00">2026-10-08</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
