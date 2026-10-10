@@ -1,0 +1,470 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性面试官：如果让你设计一个”12306 抢票”系统，瞬时几十万 QPS，怎么保证不崩？这是系统设计面试里最经典的”三高”题目之一。答不好的人通常有两个毛病：  上来就说”加 Redis 缓存、加 MQ 削峰”，但说不出为什么要削、削完之后一致性怎么保证； 完全忽略抢票业务的两个特殊约束——库存必须严格不超卖，以及必须对用户公平（不能谁">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/10/ticket-booking-system-architecture-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性面试官：如果让你设计一个”12306 抢票”系统，瞬时几十万 QPS，怎么保证不崩？这是系统设计面试里最经典的”三高”题目之一。答不好的人通常有两个毛病：  上来就说”加 Redis 缓存、加 MQ 削峰”，但说不出为什么要削、削完之后一致性怎么保证； 完全忽略抢票业务的两个特殊约束——库存必须严格不超卖，以及必须对用户公平（不能谁">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-10T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-10T00:04:30.697Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="架构">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="面试">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性",
+  "url": "https://jiweidong.github.io/2026/10/10/ticket-booking-system-architecture-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-10T00:00:00.000Z",
+  "dateModified": "2026-10-10T00:04:30.697Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/10/ticket-booking-system-architecture-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">747</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">835</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">230</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-10T00:00:00.000Z" title="发表于 2026-10-10 08:00:00">2026-10-10</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-10T00:04:30.697Z" title="更新于 2026-10-10 08:04:30">2026-10-10</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性"><a href="#【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性" class="headerlink" title="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性"></a>【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性</h1><h2 id="面试官：如果让你设计一个”12306-抢票”系统，瞬时几十万-QPS，怎么保证不崩？"><a href="#面试官：如果让你设计一个”12306-抢票”系统，瞬时几十万-QPS，怎么保证不崩？" class="headerlink" title="面试官：如果让你设计一个”12306 抢票”系统，瞬时几十万 QPS，怎么保证不崩？"></a>面试官：如果让你设计一个”12306 抢票”系统，瞬时几十万 QPS，怎么保证不崩？</h2><p>这是系统设计面试里最经典的”三高”题目之一。答不好的人通常有两个毛病：</p>
+<ol>
+<li>上来就说”加 Redis 缓存、加 MQ 削峰”，但说不出<strong>为什么要削、削完之后一致性怎么保证</strong>；</li>
+<li>完全忽略抢票业务的两个特殊约束——<strong>库存必须严格不超卖</strong>，以及<strong>必须对用户公平</strong>（不能谁网速快谁先买到）。</li>
+</ol>
+<p>这篇文章我从业务特征出发，一层层把架构拆开讲清楚：流量怎么进来、库存怎么扣、订单怎么落、故障怎么兜底。全程配代码和表格，可以直接拿去面试复述。</p>
+<hr>
+<h2 id="一、先分析业务特征，别急着画架构图"><a href="#一、先分析业务特征，别急着画架构图" class="headerlink" title="一、先分析业务特征，别急着画架构图"></a>一、先分析业务特征，别急着画架构图</h2><p>抢票和普通电商下单的差别，决定了架构的取舍：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>普通电商下单</th>
+<th>抢票</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>流量形态</td>
+<td>相对平稳，可预测</td>
+<td><strong>瞬时尖峰</strong>，开售 1 秒涌入全量流量</td>
+</tr>
+<tr>
+<td>读写比</td>
+<td>读多写少</td>
+<td>读极多、写在开售瞬间极度集中</td>
+</tr>
+<tr>
+<td>库存粒度</td>
+<td>SKU 级</td>
+<td><strong>车次 × 日期 × 席别 × 区间</strong> 多维度</td>
+</tr>
+<tr>
+<td>一致性要求</td>
+<td>允许短暂超卖后补偿</td>
+<td><strong>绝不允许超卖</strong>（涉及实名制与运力）</td>
+</tr>
+<tr>
+<td>公平性</td>
+<td>不关心</td>
+<td><strong>强要求</strong>，需要排队&#x2F;随机化</td>
+</tr>
+<tr>
+<td>用户行为</td>
+<td>少量正常请求</td>
+<td>大量脚本、代抢、黄牛</td>
+</tr>
+</tbody></table>
+<p>两个关键结论：</p>
+<ul>
+<li><strong>读请求可以无限水平扩展，写请求必须被”排队”</strong>——因为库存这个资源本身就是串行的。</li>
+<li><strong>峰值远大于均值</strong>，所以架构设计的目标不是”扛住峰值”，而是”把峰值削成均值能承受的形状”。</li>
+</ul>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">graph LR</span><br><span class="line">  A[瞬时百万请求] --&gt; B[前端排队页/静态化]</span><br><span class="line">  B --&gt; C[接入层限流+验证码]</span><br><span class="line">  C --&gt; D[网关: 风控+限购+签名]</span><br><span class="line">  D --&gt; E[排队服务/令牌发放]</span><br><span class="line">  E --&gt; F[异步抢票队列 MQ]</span><br><span class="line">  F --&gt; G[库存服务: 分桶扣减]</span><br><span class="line">  G --&gt; H[订单服务: 落库]</span><br><span class="line">  H --&gt; I[支付/超时回滚]</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、接入层：把-90-的无效流量挡在外面"><a href="#二、接入层：把-90-的无效流量挡在外面" class="headerlink" title="二、接入层：把 90% 的无效流量挡在外面"></a>二、接入层：把 90% 的无效流量挡在外面</h2><h3 id="1-静态化-CDN"><a href="#1-静态化-CDN" class="headerlink" title="1. 静态化 + CDN"></a>1. 静态化 + CDN</h3><p>车次信息、余票<strong>展示</strong>这类接口，本质上是”几乎只读”的。做法：</p>
+<ul>
+<li>车次基础信息全量静态化，推到 CDN；</li>
+<li>余票用”<strong>近似值 + 秒级刷新</strong>“口径，允许展示层有 1~2 秒延迟，前端提示”余票仅供参考，以提交结果为准”。</li>
+</ul>
+<p>一句话：<strong>展示层可以不准，扣减层必须精确。</strong></p>
+<h3 id="2-多级限流"><a href="#2-多级限流" class="headerlink" title="2. 多级限流"></a>2. 多级限流</h3><p>按维度分别限：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>手段</th>
+<th>目的</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>用户维度</td>
+<td>设备指纹 + 账号维度频控</td>
+<td>拦截脚本刷</td>
+</tr>
+<tr>
+<td>接口维度</td>
+<td>令牌桶 &#x2F; 滑动窗口</td>
+<td>保护后端</td>
+</tr>
+<tr>
+<td>全局维度</td>
+<td>集群限流（Sentinel 集群流控 &#x2F; Redis + Lua）</td>
+<td>兜底</td>
+</tr>
+<tr>
+<td>地域维度</td>
+<td>边缘节点限流</td>
+<td>就近拦截</td>
+</tr>
+</tbody></table>
+<p>Redis + Lua 做用户维度频控的经典实现：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// KEYS[1] = 频控 key, ARGV[1] = 窗口秒数, ARGV[2] = 阈值</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">RATE_LIMIT_LUA</span> <span class="operator">=</span></span><br><span class="line">    <span class="string">&quot;local n = redis.call(&#x27;INCR&#x27;, KEYS[1]) &quot;</span> +</span><br><span class="line">    <span class="string">&quot;if n == 1 then redis.call(&#x27;EXPIRE&#x27;, KEYS[1], ARGV[1]) end &quot;</span> +</span><br><span class="line">    <span class="string">&quot;if n &gt; tonumber(ARGV[2]) then return 0 else return 1 end&quot;</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">allow</span><span class="params">(String uid, String api, <span class="type">int</span> limit)</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> <span class="string">&quot;rl:&quot;</span> + api + <span class="string">&quot;:&quot;</span> + uid;</span><br><span class="line">    <span class="type">Long</span> <span class="variable">r</span> <span class="operator">=</span> redis.execute(</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">DefaultRedisScript</span>&lt;&gt;(RATE_LIMIT_LUA, Long.class),</span><br><span class="line">        Collections.singletonList(key),</span><br><span class="line">        String.valueOf(limit), <span class="string">&quot;1&quot;</span>);</span><br><span class="line">    <span class="keyword">return</span> r != <span class="literal">null</span> &amp;&amp; r == <span class="number">1L</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>为什么用 Lua？因为 <code>INCR</code> 和 <code>EXPIRE</code> 必须是原子的。如果分两条命令发，第一次 INCR 之后进程崩溃，这个 key 会变成永不过期的计数器，用户被永久封禁。</p>
+</blockquote>
+<h3 id="3-验证码与”答题”"><a href="#3-验证码与”答题”" class="headerlink" title="3. 验证码与”答题”"></a>3. 验证码与”答题”</h3><p>验证码不是为了”证明你是人”，而是为了<strong>给请求加一个几十到几百毫秒的延迟</strong>。这个延迟本身就是最有效的削峰手段——它把”1 秒内 100 万并发”摊平成了”10 秒内 100 万请求”。</p>
+<hr>
+<h2 id="三、核心难题：库存怎么扣才不超卖、不热点"><a href="#三、核心难题：库存怎么扣才不超卖、不热点" class="headerlink" title="三、核心难题：库存怎么扣才不超卖、不热点"></a>三、核心难题：库存怎么扣才不超卖、不热点</h2><h3 id="1-为什么不能直接-UPDATE-WHERE-stock-0"><a href="#1-为什么不能直接-UPDATE-WHERE-stock-0" class="headerlink" title="1. 为什么不能直接 UPDATE ... WHERE stock &gt; 0"></a>1. 为什么不能直接 <code>UPDATE ... WHERE stock &gt; 0</code></h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">UPDATE</span> ticket_stock <span class="keyword">SET</span> stock <span class="operator">=</span> stock <span class="operator">-</span> <span class="number">1</span></span><br><span class="line"><span class="keyword">WHERE</span> train_no <span class="operator">=</span> ? <span class="keyword">AND</span> travel_date <span class="operator">=</span> ? <span class="keyword">AND</span> seat_type <span class="operator">=</span> ? <span class="keyword">AND</span> stock <span class="operator">&gt;</span> <span class="number">0</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这条 SQL 本身是幂等安全的（乐观锁思想，靠 <code>stock &gt; 0</code> 兜底），单机场景能用。但在抢票场景里它有两个致命问题：</p>
+<ul>
+<li><strong>行锁热点</strong>：同一个车次所有请求都锁同一行，InnoDB 行锁直接变成串行排队，TPS 上不去；</li>
+<li><strong>打满数据库连接</strong>：瞬时几十万请求，连接池瞬间耗尽。</li>
+</ul>
+<h3 id="2-方案：Redis-预扣减-库存分桶"><a href="#2-方案：Redis-预扣减-库存分桶" class="headerlink" title="2. 方案：Redis 预扣减 + 库存分桶"></a>2. 方案：Redis 预扣减 + 库存分桶</h3><p><strong>第一步：把库存搬到 Redis，用 Lua 保证原子扣减。</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// KEYS[1] = 库存 key</span></span><br><span class="line"><span class="comment">// ARGV[1] = 本次扣减数量</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">DEDUCT_LUA</span> <span class="operator">=</span></span><br><span class="line">    <span class="string">&quot;local stock = tonumber(redis.call(&#x27;GET&#x27;, KEYS[1]) or &#x27;-1&#x27;) &quot;</span> +</span><br><span class="line">    <span class="string">&quot;if stock &lt; 0 then return -1 end &quot;</span> +          <span class="comment">// 未预热</span></span><br><span class="line">    <span class="string">&quot;if stock &lt; tonumber(ARGV[1]) then return 0 end &quot;</span> + <span class="comment">// 库存不足</span></span><br><span class="line">    <span class="string">&quot;redis.call(&#x27;DECRBY&#x27;, KEYS[1], ARGV[1]) &quot;</span> +</span><br><span class="line">    <span class="string">&quot;return 1&quot;</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> DeductResult <span class="title function_">deduct</span><span class="params">(String key, <span class="type">int</span> qty)</span> &#123;</span><br><span class="line">    <span class="type">Long</span> <span class="variable">r</span> <span class="operator">=</span> redis.execute(<span class="keyword">new</span> <span class="title class_">DefaultRedisScript</span>&lt;&gt;(DEDUCT_LUA, Long.class),</span><br><span class="line">        Collections.singletonList(key), String.valueOf(qty));</span><br><span class="line">    <span class="keyword">if</span> (r == <span class="literal">null</span> || r == -<span class="number">1</span>) <span class="keyword">return</span> DeductResult.NOT_READY;</span><br><span class="line">    <span class="keyword">return</span> r == <span class="number">1</span> ? DeductResult.SUCCESS : DeductResult.SOLD_OUT;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>第二步：分桶，解决单 key 热点。</strong></p>
+<p>即便用 Lua，所有请求打同一个 key 仍然会集中在 Redis 的<strong>同一个 slot、同一个节点</strong>上。解决办法是把 1000 张票拆成 20 个桶，每个桶 50 张：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">int</span> <span class="variable">BUCKET_COUNT</span> <span class="operator">=</span> <span class="number">20</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">// KEY 形如 stock:train:G1234:2026-10-10:seat:0 ~ seat:19</span></span><br><span class="line"><span class="keyword">public</span> String <span class="title function_">pickBucket</span><span class="params">(String base)</span> &#123;</span><br><span class="line">    <span class="comment">// 随机 + 时间片轮转，避免所有请求都打到 0 号桶</span></span><br><span class="line">    <span class="type">int</span> <span class="variable">idx</span> <span class="operator">=</span> ThreadLocalRandom.current().nextInt(BUCKET_COUNT);</span><br><span class="line">    <span class="keyword">return</span> base + <span class="string">&quot;:&quot;</span> + idx;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 扣减失败（本桶耗尽）时，再遍历其余桶，纯内存操作，很快</span></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">deductWithFallback</span><span class="params">(String base, <span class="type">int</span> qty)</span> &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">start</span> <span class="operator">=</span> ThreadLocalRandom.current().nextInt(BUCKET_COUNT);</span><br><span class="line">    <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; BUCKET_COUNT; i++) &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">idx</span> <span class="operator">=</span> (start + i) % BUCKET_COUNT;</span><br><span class="line">        <span class="keyword">if</span> (deduct(base + <span class="string">&quot;:&quot;</span> + idx, qty) == DeductResult.SUCCESS) &#123;</span><br><span class="line">            <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>分桶的收益非常直观：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>单 key QPS 上限</th>
+<th>热点问题</th>
+<th>实现复杂度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>直接 MySQL 扣减</td>
+<td>数百</td>
+<td>严重行锁</td>
+<td>低</td>
+</tr>
+<tr>
+<td>单 key Redis Lua</td>
+<td>数万</td>
+<td>Redis 单节点热点</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>分桶 + Redis Lua</strong></td>
+<td><strong>线性扩展</strong></td>
+<td><strong>基本消除</strong></td>
+<td>中</td>
+</tr>
+<tr>
+<td>Redis Cluster 分桶</td>
+<td>线性扩展</td>
+<td>消除且可横向扩</td>
+<td>中高</td>
+</tr>
+</tbody></table>
+<p><strong>第三步：异步落库，保证最终一致。</strong></p>
+<p>Redis 扣减成功后，发送 MQ 消息，由订单服务消费落库：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">tryGrab</span><span class="params">(GrabRequest req)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 幂等校验（用户维度请求号去重）</span></span><br><span class="line">    <span class="keyword">if</span> (!idempotentService.firstTime(req.getRequestId())) &#123;</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">BizException</span>(<span class="string">&quot;重复提交&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 2. Redis 分桶扣减</span></span><br><span class="line">    <span class="keyword">if</span> (!stockService.deductWithFallback(stockBase(req), <span class="number">1</span>)) &#123;</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">BizException</span>(<span class="string">&quot;已售罄&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 3. 发消息（事务消息/本地消息表保证不丢）</span></span><br><span class="line">    mqProducer.send(<span class="string">&quot;TICKET_ORDER_CREATE&quot;</span>, req);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="四、排队削峰：把”抢”变成”排”"><a href="#四、排队削峰：把”抢”变成”排”" class="headerlink" title="四、排队削峰：把”抢”变成”排”"></a>四、排队削峰：把”抢”变成”排”</h2><p>这是 12306 真正的精髓：<strong>用户看到的是”排队中”，系统内部其实是在按序放行</strong>。</p>
+<h3 id="1-排队令牌模型"><a href="#1-排队令牌模型" class="headerlink" title="1. 排队令牌模型"></a>1. 排队令牌模型</h3><ol>
+<li>用户点击”提交订单” → 网关生成一个<strong>排队号</strong>（Redis <code>INCR</code> 全局自增），返回前端进入排队页；</li>
+<li>前端轮询排队进度（或长连接推送）；</li>
+<li>后台 worker 按排队号顺序<strong>放行</strong>到库存扣减环节，每次放行 N 个（N 根据后端水位动态调整）；</li>
+<li>放行成功的用户拿到”下单资格”（token，短 TTL），才允许真正提交订单。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 放行：每批放行的数量随后端水位动态调整</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">release</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">available</span> <span class="operator">=</span> backendWaterLevel();     <span class="comment">// 后端剩余处理能力</span></span><br><span class="line">    <span class="type">int</span> <span class="variable">batch</span> <span class="operator">=</span> Math.max(<span class="number">1</span>, Math.min(available, MAX_BATCH));</span><br><span class="line">    <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; batch; i++) &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">uid</span> <span class="operator">=</span> redis.lpop(<span class="string">&quot;queue:waiting&quot;</span>);</span><br><span class="line">        <span class="keyword">if</span> (uid == <span class="literal">null</span>) <span class="keyword">break</span>;</span><br><span class="line">        redis.setex(<span class="string">&quot;queue:pass:&quot;</span> + uid, <span class="number">60</span>, <span class="string">&quot;1&quot;</span>); <span class="comment">// 60 秒下单资格</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-排队-vs-直接扣减-的本质区别"><a href="#2-排队-vs-直接扣减-的本质区别" class="headerlink" title="2. 排队 vs 直接扣减 的本质区别"></a>2. 排队 vs 直接扣减 的本质区别</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>直接扣减</th>
+<th>排队放行</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>后端压力</td>
+<td>等于请求量</td>
+<td><strong>可控水位</strong></td>
+</tr>
+<tr>
+<td>用户体验</td>
+<td>秒回”已售罄”</td>
+<td>排队中，有心理预期</td>
+</tr>
+<tr>
+<td>公平性</td>
+<td>拼网速</td>
+<td><strong>先到先得</strong></td>
+</tr>
+<tr>
+<td>实现复杂度</td>
+<td>低</td>
+<td>高（需排队页 + 推送）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>面试话术：<strong>排队的本质是用空间换时间，用”确定的等待”换”确定的不崩”。</strong> 峰值请求量除以可承受的处理速率，就是排队时长；只要排队时长在用户容忍范围内，这个方案就是成立的。</p>
+</blockquote>
+<hr>
+<h2 id="五、订单一致性与超时回滚"><a href="#五、订单一致性与超时回滚" class="headerlink" title="五、订单一致性与超时回滚"></a>五、订单一致性与超时回滚</h2><p>库存预扣了，但用户可能不付款。所以必须有一个<strong>超时回滚</strong>机制。</p>
+<h3 id="1-订单状态机"><a href="#1-订单状态机" class="headerlink" title="1. 订单状态机"></a>1. 订单状态机</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">WAIT_PAY ──支付成功──&gt; PAID ──出票──&gt; ISSUED</span><br><span class="line">    │</span><br><span class="line">    └──15分钟超时/取消──&gt; CANCELLED ──&gt; 回滚库存</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-延时消息实现超时回滚"><a href="#2-延时消息实现超时回滚" class="headerlink" title="2. 延时消息实现超时回滚"></a>2. 延时消息实现超时回滚</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// RocketMQ 任意时间定时消息 / RabbitMQ 死信队列 / Redis ZSet 时间轮均可</span></span><br><span class="line">mqProducer.sendDelay(<span class="string">&quot;TICKET_ORDER_TIMEOUT&quot;</span>, orderId, <span class="number">15</span> * <span class="number">60</span> * <span class="number">1000</span>);</span><br><span class="line"></span><br><span class="line"><span class="meta">@MQListener(&quot;TICKET_ORDER_TIMEOUT&quot;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onTimeout</span><span class="params">(String orderId)</span> &#123;</span><br><span class="line">    <span class="comment">// CAS 改状态，只有从 WAIT_PAY 才能改成 CANCELLED，天然幂等</span></span><br><span class="line">    <span class="type">boolean</span> <span class="variable">ok</span> <span class="operator">=</span> orderMapper.cancelIfWaitingPay(orderId);</span><br><span class="line">    <span class="keyword">if</span> (ok) &#123;</span><br><span class="line">        ticketStockService.giveBack(orderId);   <span class="comment">// 回滚 Redis 分桶 + 后续落库</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">UPDATE</span> ticket_order</span><br><span class="line"><span class="keyword">SET</span> status <span class="operator">=</span> <span class="string">&#x27;CANCELLED&#x27;</span></span><br><span class="line"><span class="keyword">WHERE</span> order_id <span class="operator">=</span> ? <span class="keyword">AND</span> status <span class="operator">=</span> <span class="string">&#x27;WAIT_PAY&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键：靠”状态机 + CAS 更新 + 唯一索引”保证幂等，不要靠”消息只投递一次”。</strong></p>
+<h3 id="3-库存回滚也要幂等"><a href="#3-库存回滚也要幂等" class="headerlink" title="3. 库存回滚也要幂等"></a>3. 库存回滚也要幂等</h3><p>用一张 <code>stock_rollback_log</code> 表，<code>order_id</code> 建唯一索引。回滚前先插入，插入冲突说明已经回滚过，直接返回。这是”<strong>去重表</strong>“的经典用法。</p>
+<hr>
+<h2 id="六、防刷与公平性"><a href="#六、防刷与公平性" class="headerlink" title="六、防刷与公平性"></a>六、防刷与公平性</h2><table>
+<thead>
+<tr>
+<th>手段</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>设备指纹</td>
+<td>单设备并发&#x2F;频率限制</td>
+</tr>
+<tr>
+<td>实名 + 限购</td>
+<td>一个证件同一车次限 N 张</td>
+</tr>
+<tr>
+<td>行为风控</td>
+<td>抢票脚本特征（固定 UA、无鼠标轨迹）接入风控模型</td>
+</tr>
+<tr>
+<td>候补队列</td>
+<td>售罄后转入候补，退票时按候补顺序分配，削弱”瞬时抢”的收益</td>
+</tr>
+<tr>
+<td>随机化放票</td>
+<td>分批次放票时间抖动，避免所有人卡在同一毫秒</td>
+</tr>
+</tbody></table>
+<p><strong>候补机制是公平性的终极大招</strong>：它把”抢”变成了”排队等”，黄牛的脚本优势直接被抹平。这也是 12306 实际采用的方案。</p>
+<hr>
+<h2 id="七、降级预案"><a href="#七、降级预案" class="headerlink" title="七、降级预案"></a>七、降级预案</h2><p>抢票系统的稳定性优先级排序：<strong>下单 &gt; 余票查询 &gt; 推荐&#x2F;广告</strong>。</p>
+<ol>
+<li>余票查询失败 → 返回缓存快照，前端提示”数据可能有延迟”；</li>
+<li>风控服务超时 → <strong>放行</strong>（风控是”宁可漏过不可错杀”吗？不是，抢票场景建议降级为”仅放行低风险用户”）；</li>
+<li>支付链路拥堵 → 排队页限流；</li>
+<li>Redis 分桶不可用 → 切到”数据库乐观锁直扣”的降级通道（容量骤降，但保证不超卖）。</li>
+</ol>
+<hr>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：Redis 挂了，库存不就丢了吗？</strong><br>答：Redis 只是”预扣减”，最终库存以 MySQL 为准。Redis 挂掉后可以从 DB 重建库存快照（重建期间用降级通道，数据库乐观锁直扣）。真正的风险是”Redis 扣减成功但 MQ 丢了”，这要靠<strong>本地消息表 &#x2F; 事务消息</strong>兜底。</p>
+<p><strong>Q2：分桶会不会导致某桶售罄但总量还有？</strong><br>答：会，所以要”扣减失败就遍历其余桶”。桶数量不宜过多（20<del>100 足够），否则遍历开销和库存碎片都会变大。桶的粒度可以是”每桶 20</del>50 张”。</p>
+<p><strong>Q3：为什么不用消息队列直接削峰就行？</strong><br>答：MQ 削的是”处理速率”，削不了”库存争抢”。库存扣减必须在<strong>用户同步等待的窗口内</strong>给出确定结果（买到&#x2F;没买到），否则无法返回用户。所以削峰和库存一致性是两个正交的问题，都要解决。</p>
+<p><strong>Q4：秒杀和抢票的区别？</strong><br>答：秒杀是”少量商品 + 大量人”，核心是<strong>防超卖 + 限购 + 削峰</strong>；抢票是”分维度库存 + 实名 + 公平性硬要求”，还要处理<strong>区间票复用</strong>（同一座位不同区间可复用）这个真正的难点——这需要把库存拆到”站间段”维度，用位图或区间树管理。</p>
+<p><strong>Q5：区间票复用怎么建模？</strong><br>答：把一趟车拆成若干站间段（如 A-B、B-C、C-D），每张票占用一段或连续多段。用 <code>BitSet</code>&#x2F;<code>RoaringBitmap</code> 表示每个座位的占用区间，<code>A→D</code> 需要 B、C 两段都空闲。查询”能否买入”就变成位运算的与操作，天然适合 Redis Bitmap。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>抢票系统的设计主线就三句话：</p>
+<ol>
+<li><strong>接入层做减法</strong>——静态化、多级限流、验证码延迟，把无效流量挡在门外；</li>
+<li><strong>扣减层做拆分</strong>——Redis Lua 原子化 + 库存分桶消除热点 + 排队放行控制水位；</li>
+<li><strong>一致性做兜底</strong>——异步落库 + 状态机 CAS + 去重表 + 超时回滚，保证最终不超卖、不重复。</li>
+</ol>
+<p>把这三条讲清楚，再补上防刷、降级、公平性的思考，这道系统设计题基本就是满分回答了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/10/ticket-booking-system-architecture-design/">https://jiweidong.github.io/2026/10/10/ticket-booking-system-architecture-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84/">架构</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/10/open-platform-api-gateway-architecture-design/" title="【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理</div></div><div class="info-2"><div class="info-item-1">【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理面试官：如果公司要把核心能力开放出去，比如开放给第三方 ISV 调用，网关该怎么设计？这道题的关键词不是”网关”，而是”开放“。内部网关只需要做路由和灰度，而开放网关要面对一群不受你控制的调用方：他们可能写错代码、可能疯狂重试、可能是竞争对手在爬数据、也可能拿着泄露的密钥干坏事。 所以开放平台网关的核心命题是四件事：你是谁（鉴权）、你能调多少（配额）、你调了什么（审计）、出事我怎么止血（治理）。本文逐层展开，配 Java 代码与限流算法对比。  一、整体分层12345678910graph LR  A[ISV 应用] --&gt; B[接入层 LB]  B --&gt; C[网关核心]  C --&gt; C1[鉴权: API Key + HMAC 签名]  C --&gt; C2[防重放: timestamp + nonce]  C --&gt; C3[配额限流: 令牌桶 + Redis]  C --&gt; C4[路由 &amp; 协议转换]  C --&gt; C5[审计日志]  C --&gt; D[业务...</div></div></div></a><a class="pagination-related" href="/2026/10/09/spring-extension-points-deep-dive/" title="【Spring 源码】Spring 扩展点全景深度解析：BeanPostProcessor、BeanFactoryPostProcessor、Aware 与 InitializingBean 的执行时机"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Spring 源码】Spring 扩展点全景深度解析：BeanPostProcessor、BeanFactoryPostProcessor、Aware 与 InitializingBean 的执行时机</div></div><div class="info-2"><div class="info-item-1">【Spring 源码】Spring 扩展点全景深度解析：BeanPostProcessor、BeanFactoryPostProcessor、Aware 与 InitializingBean 的执行时机面试官：如果让你在 Spring 启动时”动点手脚”，你能用哪些扩展点？大多数人只答得出”BeanPostProcessor“，再深问一句就露馅：  BeanPostProcessor 和 BeanFactoryPostProcessor 差在哪？ @Autowired 是哪个扩展点干的活？ @PostConstruct 和 InitializingBean.afterPropertiesSet() 谁先执行？ Aware 接口为什么能拿到容器对象？ BeanPostProcessor 里的 postProcessBeforeInitialization 和 postProcessAfterInitialization 分别被谁调用？ 一个 Bean 的完整生命周期里，扩展点的精确顺序是什么？  这篇文章把 Spring 的扩展点体系梳理成一张图，并给出源码级执行顺序。 一、先分清...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/09/reconciliation-clearing-settlement-system-design/" title="【系统设计】清结算与对账系统架构设计：账务模型、双边对账、差错处理与资金安全全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">【系统设计】清结算与对账系统架构设计：账务模型、双边对账、差错处理与资金安全全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】清结算与对账系统架构设计：账务模型、双边对账、差错处理与资金安全全解析面试官：支付做完就完了吗？钱怎么和商户、渠道对平？很多人做支付只想到”下单 + 扣款 + 回调”，但真正让系统”能上线”的是后半段——清分（Clearing）、结算（Settlement）、对账（Reconciliation）。 面试官一追问就很致命：  用户付了钱，钱在哪个账户？怎么记账？ 微信账单和你系统差 3 分钱，你怎么定位？ T+1 给商户打款，打多了怎么办？ 每天几百万笔，对账怎么做才能在一小时内跑完？ 渠道回调丢了、重复回调了，账怎么才能对平？  这篇文章把清结算&#x2F;对账的账务模型、对账体系、差错处理、资金安全讲清楚。 一、概念先理清：支付 ≠ 清算 ≠ 结算 ≠ 对账   概念 英文 含义    支付 Payment 用户完成资金动作（扣款成功）   清分 Clearing 算清楚”这笔钱该归谁、分多少”（按费率、分润拆分）   结算 Settlement 把清分结果变成真实的资金划转（打款给商户）   对账 Reconciliation 平台、渠道、商户三方账单核对，找出差...</div></div></div></a><a class="pagination-related" href="/2026/09/28/high-concurrency-like-counter-system-design/" title="【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-28</div><div class="info-item-2">【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发点赞系统架构设计：Redis 计数、去重、热点与异步落库全解析面试官：设计一个点赞系统，10 万 QPS，要求点赞数实时准确、不重复、不能丢看起来是个”小而美”的功能，实际上它把高并发系统的经典难点全踩了一遍：写放大（大量高并发写）、唯一性约束（去重）、计数一致性（并发加减）、热点（大 V 爆款）、持久化（不能丢）、以及”读多写更多”的混合负载。 很多人第一反应是”一张表 insert into likes(...) unique key(user_id, post_id) 完事”。这个方案在小流量下能用，一问”10 万 QPS 怎么办”就崩了。本文从需求拆解一路讲到可落地的分片架构。  一、需求与约束拆解先把模糊需求变成可设计的约束：    需求 隐含技术问题    10 万 QPS 点赞 单机 MySQL 写不动，必须前置缓存&#x2F;异步   不能重复点赞 需要 (userId, postId) 唯一性判断，且要原子   点赞数实时准确 计数必须强一致或准实时，不能等对账   不能丢 缓存是易失的，必须有持久化 + 补偿   取消点赞 计数可减，且需处理...</div></div></div></a><a class="pagination-related" href="/2026/08/19/im-system-architecture-design/" title="【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-19</div><div class="info-item-2">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线</div></div><div class="info-2"><div class="info-item-1">【系统设计】IM 即时通讯系统架构设计：从单机到分布式百万在线面试官：让你设计一个支持百万在线的 IM 系统，你怎么设计？IM（Instant Messaging）是系统设计面试的”压轴题”之一：它集齐了长连接、消息可靠性、顺序性、在线状态、群聊扩散、历史消息存储几乎所有分布式难点。微信、钉钉、Slack 的架构都能在这套骨架里找到影子。 本文按”需求分析 → 单机原型 → 分布式演进 → 核心难点逐个击破”的顺序，给你一套可以直接背诵+扩展的完整方案。  一、需求分析：先搞清楚要做什么1.1 核心功能   功能 说明 难点    单聊 点对点消息 路由、可靠性   群聊 一对多广播 扩散模型选择   在线状态 上下线感知 一致性、实时性   消息可靠性 不丢不重 ACK + 重传 + 幂等   消息顺序 单会话内有序 seq 机制   历史消息 离线拉取、漫游 海量存储、分页   已读回执 已读未读 状态同步   1.2 非功能需求 规模：100 万在线，峰值 QPS 10 万+，单聊消息峰值 5 万&#x2F;秒 延迟：消息端到端 &lt; 200ms 可靠性：消息不丢（至少...</div></div></div></a><a class="pagination-related" href="/2026/10/09/ride-hailing-system-architecture-design/" title="【系统设计】网约车（打车）系统架构设计：LBS 派单、行程状态机与计费结算全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">【系统设计】网约车（打车）系统架构设计：LBS 派单、行程状态机与计费结算全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】网约车（打车）系统架构设计：LBS 派单、行程状态机与计费结算全解析面试官：让你设计一个网约车系统，你会怎么拆？网约车（打车）是系统设计面试里的”高阶题”——它同时考验 LBS 地理索引、实时匹配、状态机、计费与结算、高并发地标 五个方向，比秒杀、订单更难糊弄。 面试官通常会层层递进：  乘客发单，司机怎么找？为什么不用 MySQL 查距离？ 峰值几十万司机同时上报位置，位置数据怎么存？ 派单怎么保证公平和效率？抢单和派单有什么区别？ 行程状态怎么管？司机掉线、乘客取消怎么办？ 计费怎么算不出错？结算怎么和司机对账？  下面逐层拆。 一、整体架构与领域拆分先做限界上下文（领域）划分：    领域 职责 核心存储    乘客端（Passenger） 发单、取消、评价、支付 MySQL   司机端（Driver） 出车&#x2F;收车、抢单、状态上报 MySQL + Redis   位置服务（Location） 轨迹上报、附近司机查询 Redis GEO &#x2F; 自建 LBS   派单引擎（Dispatch） 匹配、派单、超时重派 Redis + 规则引擎   行程...</div></div></div></a><a class="pagination-related" href="/2026/10/10/open-platform-api-gateway-architecture-design/" title="【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-10</div><div class="info-item-2">【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理</div></div><div class="info-2"><div class="info-item-1">【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理面试官：如果公司要把核心能力开放出去，比如开放给第三方 ISV 调用，网关该怎么设计？这道题的关键词不是”网关”，而是”开放“。内部网关只需要做路由和灰度，而开放网关要面对一群不受你控制的调用方：他们可能写错代码、可能疯狂重试、可能是竞争对手在爬数据、也可能拿着泄露的密钥干坏事。 所以开放平台网关的核心命题是四件事：你是谁（鉴权）、你能调多少（配额）、你调了什么（审计）、出事我怎么止血（治理）。本文逐层展开，配 Java 代码与限流算法对比。  一、整体分层12345678910graph LR  A[ISV 应用] --&gt; B[接入层 LB]  B --&gt; C[网关核心]  C --&gt; C1[鉴权: API Key + HMAC 签名]  C --&gt; C2[防重放: timestamp + nonce]  C --&gt; C3[配额限流: 令牌桶 + Redis]  C --&gt; C4[路由 &amp; 协议转换]  C --&gt; C5[审计日志]  C --&gt; D[业务...</div></div></div></a><a class="pagination-related" href="/2026/08/20/multi-site-active-active-architecture-deep-dive/" title="【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化</div></div><div class="info-2"><div class="info-item-1">【系统设计】异地多活架构深度解析：同城双活、两地三中心与单元化面试官：机房挂了怎么办？说说异地多活“高可用”做到 99.99% 以上，单机房已经不够了——机房级故障（断电、光缆被挖断、自然灾害）无法靠机内冗余解决。异地多活（Multi-Site Active-Active）就是为了解决机房级容灾而生的架构设计。 但很多人对多活的理解停留在”多部署几套”的层面。真正的难点在于：数据怎么同步？流量怎么切？冲突怎么处理？ 本文从容灾等级讲起，逐步深入到单元化架构与冲突处理，最后给出落地路线图。 一、先搞清楚容灾等级   级别 名称 RTO RPO 说明    RTO 恢复时间目标 — — 故障后多久恢复服务   RPO 恢复点目标 — — 最多丢失多少数据   冷备 数据备份 + 手动恢复 小时级 天级 定期备份，恢复靠人   热备 主备 + 自动切换 分钟级 秒级~分钟级 备机实时同步，故障自动切换，但备机不承担流量   同城双活 两个机房同时承担流量 秒级~分钟级 秒级 距离近（&lt;50km），专线互联，延迟低   两地三中心 同城双活 + 异地灾备 分钟级 分钟级 同城两机房...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">747</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">835</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">230</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E9%AB%98%E5%B9%B6%E5%8F%91%E6%8A%A2%E7%A5%A8%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E5%BA%93%E5%AD%98%E5%88%86%E6%A1%B6%E3%80%81%E6%8E%92%E9%98%9F%E5%89%8A%E5%B3%B0%E4%B8%8E%E8%AE%A2%E5%8D%95%E4%B8%80%E8%87%B4%E6%80%A7"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E5%A6%82%E6%9E%9C%E8%AE%A9%E4%BD%A0%E8%AE%BE%E8%AE%A1%E4%B8%80%E4%B8%AA%E2%80%9D12306-%E6%8A%A2%E7%A5%A8%E2%80%9D%E7%B3%BB%E7%BB%9F%EF%BC%8C%E7%9E%AC%E6%97%B6%E5%87%A0%E5%8D%81%E4%B8%87-QPS%EF%BC%8C%E6%80%8E%E4%B9%88%E4%BF%9D%E8%AF%81%E4%B8%8D%E5%B4%A9%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：如果让你设计一个”12306 抢票”系统，瞬时几十万 QPS，怎么保证不崩？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%88%86%E6%9E%90%E4%B8%9A%E5%8A%A1%E7%89%B9%E5%BE%81%EF%BC%8C%E5%88%AB%E6%80%A5%E7%9D%80%E7%94%BB%E6%9E%B6%E6%9E%84%E5%9B%BE"><span class="toc-number">1.2.</span> <span class="toc-text">一、先分析业务特征，别急着画架构图</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%8E%A5%E5%85%A5%E5%B1%82%EF%BC%9A%E6%8A%8A-90-%E7%9A%84%E6%97%A0%E6%95%88%E6%B5%81%E9%87%8F%E6%8C%A1%E5%9C%A8%E5%A4%96%E9%9D%A2"><span class="toc-number">1.3.</span> <span class="toc-text">二、接入层：把 90% 的无效流量挡在外面</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E9%9D%99%E6%80%81%E5%8C%96-CDN"><span class="toc-number">1.3.1.</span> <span class="toc-text">1. 静态化 + CDN</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E5%A4%9A%E7%BA%A7%E9%99%90%E6%B5%81"><span class="toc-number">1.3.2.</span> <span class="toc-text">2. 多级限流</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-%E9%AA%8C%E8%AF%81%E7%A0%81%E4%B8%8E%E2%80%9D%E7%AD%94%E9%A2%98%E2%80%9D"><span class="toc-number">1.3.3.</span> <span class="toc-text">3. 验证码与”答题”</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%A0%B8%E5%BF%83%E9%9A%BE%E9%A2%98%EF%BC%9A%E5%BA%93%E5%AD%98%E6%80%8E%E4%B9%88%E6%89%A3%E6%89%8D%E4%B8%8D%E8%B6%85%E5%8D%96%E3%80%81%E4%B8%8D%E7%83%AD%E7%82%B9"><span class="toc-number">1.4.</span> <span class="toc-text">三、核心难题：库存怎么扣才不超卖、不热点</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E4%B8%BA%E4%BB%80%E4%B9%88%E4%B8%8D%E8%83%BD%E7%9B%B4%E6%8E%A5-UPDATE-WHERE-stock-0"><span class="toc-number">1.4.1.</span> <span class="toc-text">1. 为什么不能直接 UPDATE ... WHERE stock &gt; 0</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E6%96%B9%E6%A1%88%EF%BC%9ARedis-%E9%A2%84%E6%89%A3%E5%87%8F-%E5%BA%93%E5%AD%98%E5%88%86%E6%A1%B6"><span class="toc-number">1.4.2.</span> <span class="toc-text">2. 方案：Redis 预扣减 + 库存分桶</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%8E%92%E9%98%9F%E5%89%8A%E5%B3%B0%EF%BC%9A%E6%8A%8A%E2%80%9D%E6%8A%A2%E2%80%9D%E5%8F%98%E6%88%90%E2%80%9D%E6%8E%92%E2%80%9D"><span class="toc-number">1.5.</span> <span class="toc-text">四、排队削峰：把”抢”变成”排”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E6%8E%92%E9%98%9F%E4%BB%A4%E7%89%8C%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.5.1.</span> <span class="toc-text">1. 排队令牌模型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E6%8E%92%E9%98%9F-vs-%E7%9B%B4%E6%8E%A5%E6%89%A3%E5%87%8F-%E7%9A%84%E6%9C%AC%E8%B4%A8%E5%8C%BA%E5%88%AB"><span class="toc-number">1.5.2.</span> <span class="toc-text">2. 排队 vs 直接扣减 的本质区别</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E8%AE%A2%E5%8D%95%E4%B8%80%E8%87%B4%E6%80%A7%E4%B8%8E%E8%B6%85%E6%97%B6%E5%9B%9E%E6%BB%9A"><span class="toc-number">1.6.</span> <span class="toc-text">五、订单一致性与超时回滚</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-%E8%AE%A2%E5%8D%95%E7%8A%B6%E6%80%81%E6%9C%BA"><span class="toc-number">1.6.1.</span> <span class="toc-text">1. 订单状态机</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-%E5%BB%B6%E6%97%B6%E6%B6%88%E6%81%AF%E5%AE%9E%E7%8E%B0%E8%B6%85%E6%97%B6%E5%9B%9E%E6%BB%9A"><span class="toc-number">1.6.2.</span> <span class="toc-text">2. 延时消息实现超时回滚</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-%E5%BA%93%E5%AD%98%E5%9B%9E%E6%BB%9A%E4%B9%9F%E8%A6%81%E5%B9%82%E7%AD%89"><span class="toc-number">1.6.3.</span> <span class="toc-text">3. 库存回滚也要幂等</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%98%B2%E5%88%B7%E4%B8%8E%E5%85%AC%E5%B9%B3%E6%80%A7"><span class="toc-number">1.7.</span> <span class="toc-text">六、防刷与公平性</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%99%8D%E7%BA%A7%E9%A2%84%E6%A1%88"><span class="toc-number">1.8.</span> <span class="toc-text">七、降级预案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/10/java-text-blocks-deep-dive/" title="【Java 核心】文本块（Text Blocks）深度解析：缩进剥离、转义规则与模板化演进">【Java 核心】文本块（Text Blocks）深度解析：缩进剥离、转义规则与模板化演进</a><time datetime="2026-10-10T00:40:00.000Z" title="发表于 2026-10-10 08:40:00">2026-10-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/10/lucene-full-text-search-deep-practice/" title="【中间件实战】Lucene 全文检索深度实战：IndexWriter、分词器与查询解析">【中间件实战】Lucene 全文检索深度实战：IndexWriter、分词器与查询解析</a><time datetime="2026-10-10T00:30:00.000Z" title="发表于 2026-10-10 08:30:00">2026-10-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/10/redis-redlock-distributed-lock-deep-dive/" title="【分布式锁】Redis Redlock 红锁深度解析：时钟漂移、论战争议与 Fencing Token">【分布式锁】Redis Redlock 红锁深度解析：时钟漂移、论战争议与 Fencing Token</a><time datetime="2026-10-10T00:20:00.000Z" title="发表于 2026-10-10 08:20:00">2026-10-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/10/open-platform-api-gateway-architecture-design/" title="【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理">【架构设计】开放平台 API 网关设计：签名鉴权、配额限流与审计治理</a><time datetime="2026-10-10T00:10:00.000Z" title="发表于 2026-10-10 08:10:00">2026-10-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/10/ticket-booking-system-architecture-design/" title="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性">【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性</a><time datetime="2026-10-10T00:00:00.000Z" title="发表于 2026-10-10 08:00:00">2026-10-10</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
