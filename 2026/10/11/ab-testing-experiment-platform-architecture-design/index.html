@@ -1,0 +1,428 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验这是一道考工程架构 + 数据统计 + 业务理解的综合题。它不像”设计秒杀”那样有标准答案，面试官真正在观察的是：  你知不知道实验平台的核心是分流而不是”配置界面”？ 你分得清 AA 实验、样本量、显著性 这些统计概念吗？ 你能不能说出”同一用户">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/11/ab-testing-experiment-platform-architecture-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验这是一道考工程架构 + 数据统计 + 业务理解的综合题。它不像”设计秒杀”那样有标准答案，面试官真正在观察的是：  你知不知道实验平台的核心是分流而不是”配置界面”？ 你分得清 AA 实验、样本量、显著性 这些统计概念吗？ 你能不能说出”同一用户">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-11T01:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-11T00:02:53.393Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="A&#x2F;B测试">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="数据平台">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析",
+  "url": "https://jiweidong.github.io/2026/10/11/ab-testing-experiment-platform-architecture-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-11T01:00:00.000Z",
+  "dateModified": "2026-10-11T00:02:53.393Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/11/ab-testing-experiment-platform-architecture-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">752</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">842</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">231</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-11T01:00:00.000Z" title="发表于 2026-10-11 09:00:00">2026-10-11</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-11T00:02:53.393Z" title="更新于 2026-10-11 08:02:53">2026-10-11</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/%E6%9E%B6%E6%9E%84/">架构</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】A-B-实验平台架构设计：流量分桶、指标计算与显著性检验全解析"><a href="#【系统设计】A-B-实验平台架构设计：流量分桶、指标计算与显著性检验全解析" class="headerlink" title="【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析"></a>【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</h1><h2 id="面试官：设计一个-A-B-实验平台，让产品经理能自己配置实验"><a href="#面试官：设计一个-A-B-实验平台，让产品经理能自己配置实验" class="headerlink" title="面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验"></a>面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验</h2><p>这是一道<strong>考工程架构 + 数据统计 + 业务理解</strong>的综合题。它不像”设计秒杀”那样有标准答案，面试官真正在观察的是：</p>
+<ul>
+<li>你知不知道实验平台的核心是<strong>分流</strong>而不是”配置界面”？</li>
+<li>你分得清 <strong>AA 实验、样本量、显著性</strong> 这些统计概念吗？</li>
+<li>你能不能说出”同一用户必须稳定命中同一个实验组”这种工程约束？</li>
+</ul>
+<p>下面按面试节奏，从需求澄清到落地细节，完整推一遍。</p>
+<hr>
+<h2 id="一、需求澄清：先问清楚再设计"><a href="#一、需求澄清：先问清楚再设计" class="headerlink" title="一、需求澄清：先问清楚再设计"></a>一、需求澄清：先问清楚再设计</h2><p><strong>Q1：实验的粒度是什么？</strong> 用户级、设备级、请求级、还是租户级？绝大多数是<strong>用户级</strong>（同一用户在一次实验周期内体验一致）。</p>
+<p><strong>Q2：一个用户能同时参与几个实验？</strong> 通常分层（Layer）后可以几十个，但<strong>同一层内的多个实验必须互斥</strong>。</p>
+<p><strong>Q3：指标谁来定义？</strong> 产品定义业务指标（点击率、转化率、GMV），平台提供指标计算框架。</p>
+<p><strong>Q4：QPS 和延迟要求？</strong> 分流是<strong>在线链路</strong>，必须做到毫秒级、高可用——<strong>实验系统挂了不能影响主站</strong>。</p>
+<p><strong>Q5：谁能看到什么？</strong> 实验数据权限隔离，避免”产品看到别组的中间结果去干预实验”（这是<strong>实验泄露</strong>）。</p>
+<hr>
+<h2 id="二、整体架构"><a href="#二、整体架构" class="headerlink" title="二、整体架构"></a>二、整体架构</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line">┌───────────────────────────────────────────────────────────┐</span><br><span class="line">│                      业务应用（Java 服务）                  │</span><br><span class="line">│   Annotation/API:  variant = ExperimentClient.get(userId, key)│</span><br><span class="line">└───────────────────────────┬───────────────────────────────┘</span><br><span class="line">                            │ ① 毫秒级分流（本地缓存 + SDK）</span><br><span class="line">┌───────────────────────────▼───────────────────────────────┐</span><br><span class="line">│                   分流决策层 (Experiment SDK)               │</span><br><span class="line">│   本地规则缓存 ← 长轮询/推送 ← 配置中心                       │</span><br><span class="line">└───────────────────────────┬───────────────────────────────┘</span><br><span class="line">                            │ ② 命中日志（异步，不阻塞业务）</span><br><span class="line">┌───────────────────────────▼───────────────────────────────┐</span><br><span class="line">│                 曝光/行为数据采集 (MQ)                       │</span><br><span class="line">│    Kafka: exposure_topic / action_topic                    │</span><br><span class="line">└───────────────────────────┬───────────────────────────────┘</span><br><span class="line">                            │ ③ 消费入库</span><br><span class="line">┌───────────────────────────▼───────────────────────────────┐</span><br><span class="line">│             数据层：OLAP（ClickHouse/Doris）                 │</span><br><span class="line">│   明细 + 聚合（按实验/组/指标/天）                            │</span><br><span class="line">└───────────────────────────┬───────────────────────────────┘</span><br><span class="line">                            │ ④ 统计计算</span><br><span class="line">┌───────────────────────────▼───────────────────────────────┐</span><br><span class="line">│        实验管理平台（配置/审批/报表/显著性检验）               │</span><br><span class="line">└───────────────────────────────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>核心思想：在线分流与离线计算彻底解耦。</strong></p>
+<ul>
+<li><strong>在线</strong>：只做”一锤定音”的分流，越简单越快越好；</li>
+<li><strong>离线</strong>：采集曝光、关联行为、算指标、跑统计。</li>
+</ul>
+<hr>
+<h2 id="三、分流设计：这是实验平台的灵魂"><a href="#三、分流设计：这是实验平台的灵魂" class="headerlink" title="三、分流设计：这是实验平台的灵魂"></a>三、分流设计：这是实验平台的灵魂</h2><h3 id="3-1-哈希分桶"><a href="#3-1-哈希分桶" class="headerlink" title="3.1 哈希分桶"></a>3.1 哈希分桶</h3><p>核心公式：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">bucket = hash(experimentKey + &quot;:&quot; + salt + &quot;:&quot; + userId) % 10000</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>salt</code>：每个实验独立的盐，保证<strong>同一用户在实验 A 和实验 B 的分布相互独立</strong>（避免实验间相关性）；</li>
+<li><code>10000</code>：分桶精度，即支持 0.01% 的最小流量粒度；</li>
+<li><code>userId</code>：分桶主体，必须<strong>稳定</strong>（登录用户用 uid，未登录用设备 ID）。</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">Bucketer</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** MurmurHash3，速度快、分布均匀 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="type">int</span> <span class="title function_">bucket</span><span class="params">(String experimentKey, String salt, String unitId)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> experimentKey + <span class="string">&quot;:&quot;</span> + salt + <span class="string">&quot;:&quot;</span> + unitId;</span><br><span class="line">        <span class="type">int</span> <span class="variable">hash</span> <span class="operator">=</span> Hashing.murmur3_32_fixed().hashString(key, UTF_8).asInt();</span><br><span class="line">        <span class="keyword">return</span> Math.floorMod(hash, <span class="number">10_000</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 根据流量区间决定变体 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> Variant <span class="title function_">assign</span><span class="params">(Experiment exp, String unitId)</span> &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">b</span> <span class="operator">=</span> bucket(exp.getKey(), exp.getSalt(), unitId);</span><br><span class="line">        <span class="type">int</span> <span class="variable">cursor</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">        <span class="keyword">for</span> (Variant v : exp.getVariants()) &#123;</span><br><span class="line">            cursor += v.getTrafficRatio();   <span class="comment">// 单位：万分比</span></span><br><span class="line">            <span class="keyword">if</span> (b &lt; cursor) <span class="keyword">return</span> v;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> Variant.CONTROL;   <span class="comment">// 兜底：不命中任何组则走对照</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么用 MurmurHash 而不是 <code>hashCode()</code>？</strong> Java 的 <code>String.hashCode()</code> 分布不够均匀，且不同 JVM 版本实现可能变化（虽然实际稳定），更重要的是<strong>容易被构造出碰撞</strong>。生产用 MurmurHash3 或 xxHash。</p>
+<h3 id="3-2-分层（Layer）与互斥（Domain）"><a href="#3-2-分层（Layer）与互斥（Domain）" class="headerlink" title="3.2 分层（Layer）与互斥（Domain）"></a>3.2 分层（Layer）与互斥（Domain）</h3><p>实验平台必须支持两种正交关系：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>解决的问题</th>
+<th>实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>分层 Layer</strong></td>
+<td>让多个实验<strong>可以同时跑在同一个用户身上</strong></td>
+<td>不同层用不同 salt，哈希独立</td>
+</tr>
+<tr>
+<td><strong>互斥 Domain</strong></td>
+<td>让同域内的实验<strong>不能同时命中</strong></td>
+<td>同域共用一个 salt，按流量区间切分</td>
+</tr>
+</tbody></table>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 互斥域：同域实验共享同一份流量池</span></span><br><span class="line"><span class="type">int</span> <span class="variable">b</span> <span class="operator">=</span> bucket(domain.getSalt(), <span class="string">&quot;&quot;</span>, unitId);   <span class="comment">// 域级哈希</span></span><br><span class="line"><span class="comment">// 实验 A 占 0~3000，实验 B 占 3000~5000，天然互斥</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>面试加分点</strong>：能说出”<strong>不同层之间必须相互独立，同一层内必须互斥</strong>“，并用”正交分层 &#x2F; 互斥域”这两个词，立刻拉开差距。</p>
+<h3 id="3-3-流量扩大：慎之又慎"><a href="#3-3-流量扩大：慎之又慎" class="headerlink" title="3.3 流量扩大：慎之又慎"></a>3.3 流量扩大：慎之又慎</h3><p>实验从 1% 扩到 10% 时，<strong>绝不能改变已命中用户的组别</strong>。正确做法是：扩流只把”原先未命中的用户”纳入，已命中的保持原组。这就要求<strong>变体的流量区间是”前缀式”扩展</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">阶段1: 对照 0-500,  实验 500-1000   （各 5%）</span><br><span class="line">阶段2: 对照 0-5000, 实验 5000-10000 （各 50%）</span><br></pre></td></tr></table></figure>
+
+<p>这样原先 <code>b=600</code> 的人始终在实验组。<strong>如果区间顺序被打乱，同一个用户组别会漂移，实验数据直接作废。</strong></p>
+<h3 id="3-4-在线分流的可用性设计"><a href="#3-4-在线分流的可用性设计" class="headerlink" title="3.4 在线分流的可用性设计"></a>3.4 在线分流的可用性设计</h3><p>分流是主链路，必须做到：</p>
+<ol>
+<li><strong>SDK 本地缓存</strong>：实验配置全量缓存在应用内存，分流<strong>不上网</strong>，纯本地计算；</li>
+<li><strong>配置推送</strong>：通过配置中心长轮询（Apollo&#x2F;Nacos）或推送，秒级生效；</li>
+<li><strong>兜底策略</strong>：配置拉取失败时<strong>走对照&#x2F;默认值</strong>，绝不阻塞业务；</li>
+<li><strong>降级开关</strong>：实验平台故障时一键全量回滚到原始逻辑；</li>
+<li><strong>防超时</strong>：任何远程调用都设 50ms 超时，宁可降级不可拖慢。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> Variant <span class="title function_">getVariant</span><span class="params">(String experimentKey, String unitId)</span> &#123;</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="type">Experiment</span> <span class="variable">exp</span> <span class="operator">=</span> cache.get(experimentKey);</span><br><span class="line">        <span class="keyword">if</span> (exp == <span class="literal">null</span> || !exp.isRunning()) &#123;</span><br><span class="line">            <span class="keyword">return</span> Variant.CONTROL;          <span class="comment">// 实验不存在或已停 → 对照</span></span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">if</span> (!exp.isInTraffic(unitId)) &#123;</span><br><span class="line">            <span class="keyword">return</span> Variant.CONTROL;          <span class="comment">// 未命中流量 → 对照</span></span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> Bucketer.assign(exp, unitId);</span><br><span class="line">    &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">        log.warn(<span class="string">&quot;experiment degrade&quot;</span>, e);</span><br><span class="line">        <span class="keyword">return</span> Variant.CONTROL;              <span class="comment">// 任何异常都降级，不抛给业务</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="四、数据采集：曝光与行为要能关联"><a href="#四、数据采集：曝光与行为要能关联" class="headerlink" title="四、数据采集：曝光与行为要能关联"></a>四、数据采集：曝光与行为要能关联</h2><p>分流之后必须回答：”<strong>这个用户到底看到了什么，然后做了什么？</strong>“</p>
+<h3 id="4-1-两类数据"><a href="#4-1-两类数据" class="headerlink" title="4.1 两类数据"></a>4.1 两类数据</h3><ul>
+<li><strong>曝光日志（Exposure）</strong>：<code>user_id, experiment_key, variant, timestamp, page, ...</code></li>
+<li><strong>行为日志（Action）</strong>：<code>user_id, action_type, value, timestamp, ...</code>（点击、下单、支付）</li>
+</ul>
+<h3 id="4-2-采集原则"><a href="#4-2-采集原则" class="headerlink" title="4.2 采集原则"></a>4.2 采集原则</h3><ol>
+<li><strong>异步上报</strong>：业务线程只写本地队列&#x2F;Dispatchers，后台批量发送到 Kafka；</li>
+<li><strong>不阻塞</strong>：采样率可调（如 10% 抽样），但<strong>实验组和对照组采样率必须一致</strong>，否则数据有偏；</li>
+<li><strong>幂等</strong>：同一用户同一实验重复曝光要去重（按 <code>userId + expKey + variant + 天</code>）；</li>
+<li><strong>不丢</strong>：本地落盘兜底，进程重启后补传。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Async(&quot;expReportExecutor&quot;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">report</span><span class="params">(String unitId, String experimentKey, Variant variant)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 本地去重（按天）</span></span><br><span class="line">    <span class="type">String</span> <span class="variable">dedupKey</span> <span class="operator">=</span> unitId + <span class="string">&quot;:&quot;</span> + experimentKey + <span class="string">&quot;:&quot;</span> + variant;</span><br><span class="line">    <span class="keyword">if</span> (!dedupBloom.mightContain(dedupKey)) &#123;</span><br><span class="line">        dedupBloom.put(dedupKey);</span><br><span class="line">        <span class="comment">// 2. 发送 MQ</span></span><br><span class="line">        kafkaTemplate.send(<span class="string">&quot;exp_exposure&quot;</span>,</span><br><span class="line">                <span class="keyword">new</span> <span class="title class_">ExposureEvent</span>(unitId, experimentKey, variant.name(), now()));</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、指标计算：从明细到结论"><a href="#五、指标计算：从明细到结论" class="headerlink" title="五、指标计算：从明细到结论"></a>五、指标计算：从明细到结论</h2><h3 id="5-1-实验指标分层"><a href="#5-1-实验指标分层" class="headerlink" title="5.1 实验指标分层"></a>5.1 实验指标分层</h3><table>
+<thead>
+<tr>
+<th>层级</th>
+<th>指标</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>北极星指标</strong></td>
+<td>GMV、留存</td>
+<td>实验最终要看的目标</td>
+</tr>
+<tr>
+<td><strong>核心指标</strong></td>
+<td>转化率、人均订单数</td>
+<td>直接反映实验效果</td>
+</tr>
+<tr>
+<td><strong>护栏指标</strong></td>
+<td>崩溃率、P99 延迟、负反馈率</td>
+<td><strong>必须不劣化</strong>，防止”提升转化但搞崩性能”</td>
+</tr>
+<tr>
+<td><strong>探索指标</strong></td>
+<td>点击分布、停留时长</td>
+<td>辅助归因</td>
+</tr>
+</tbody></table>
+<p><strong>面试必说</strong>：<strong>护栏指标（Guardrail Metrics）</strong> 是很多候选人的盲区。没有护栏指标，实验可能”赢了指标输了体验”。</p>
+<h3 id="5-2-SQL-计算示例（ClickHouse）"><a href="#5-2-SQL-计算示例（ClickHouse）" class="headerlink" title="5.2 SQL 计算示例（ClickHouse）"></a>5.2 SQL 计算示例（ClickHouse）</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 每个实验组的转化率 = 转化用户数 / 曝光用户数</span></span><br><span class="line"><span class="keyword">SELECT</span></span><br><span class="line">    variant,</span><br><span class="line">    uniqExactIf(user_id, event <span class="operator">=</span> <span class="string">&#x27;exposure&#x27;</span>)            <span class="keyword">AS</span> uv,</span><br><span class="line">    uniqExactIf(user_id, event <span class="operator">=</span> <span class="string">&#x27;order_paid&#x27;</span>)          <span class="keyword">AS</span> converted_uv,</span><br><span class="line">    round(converted_uv <span class="operator">/</span> uv, <span class="number">4</span>)                         <span class="keyword">AS</span> cvr</span><br><span class="line"><span class="keyword">FROM</span> exp_events</span><br><span class="line"><span class="keyword">WHERE</span> experiment_key <span class="operator">=</span> <span class="string">&#x27;checkout_button_color&#x27;</span></span><br><span class="line">  <span class="keyword">AND</span> dt <span class="keyword">BETWEEN</span> <span class="string">&#x27;2026-10-01&#x27;</span> <span class="keyword">AND</span> <span class="string">&#x27;2026-10-11&#x27;</span></span><br><span class="line"><span class="keyword">GROUP</span> <span class="keyword">BY</span> variant;</span><br></pre></td></tr></table></figure>
+
+<p><strong>指标计算的三个正确姿势</strong>：</p>
+<ol>
+<li><strong>分母用 UV 不是 PV</strong>：转化率的分母必须是”曝光去重用户数”；</li>
+<li><strong>归因窗口</strong>：定义”曝光后多久内的行为算数”（如 7 天内下单），窗口不一致没法比；</li>
+<li><strong>实验中新增用户剔除</strong>：只统计实验开始前就存在的用户，避免样本污染。</li>
+</ol>
+<hr>
+<h2 id="六、显著性检验：A-B-测试的科学性"><a href="#六、显著性检验：A-B-测试的科学性" class="headerlink" title="六、显著性检验：A&#x2F;B 测试的科学性"></a>六、显著性检验：A&#x2F;B 测试的科学性</h2><h3 id="6-1-假设检验框架"><a href="#6-1-假设检验框架" class="headerlink" title="6.1 假设检验框架"></a>6.1 假设检验框架</h3><ul>
+<li><strong>原假设 H₀</strong>：实验组与对照组<strong>无差异</strong>；</li>
+<li><strong>备择假设 H₁</strong>：存在差异；</li>
+<li><strong>p 值</strong>：在 H₀ 成立时，观测到当前（或更极端）结果的概率；</li>
+<li><strong>显著性水平 α &#x3D; 0.05</strong>：p &lt; 0.05 时拒绝 H₀，认为差异显著。</li>
+</ul>
+<h3 id="6-2-转化率（比率型指标）用双样本比例检验"><a href="#6-2-转化率（比率型指标）用双样本比例检验" class="headerlink" title="6.2 转化率（比率型指标）用双样本比例检验"></a>6.2 转化率（比率型指标）用双样本比例检验</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ZTest</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 双样本比例 z 检验 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> TestResult <span class="title function_">testProportion</span><span class="params">(<span class="type">long</span> convA, <span class="type">long</span> nA,</span></span><br><span class="line"><span class="params">                                            <span class="type">long</span> convB, <span class="type">long</span> nB,</span></span><br><span class="line"><span class="params">                                            <span class="type">double</span> alpha)</span> &#123;</span><br><span class="line">        <span class="type">double</span> <span class="variable">pA</span> <span class="operator">=</span> (<span class="type">double</span>) convA / nA;</span><br><span class="line">        <span class="type">double</span> <span class="variable">pB</span> <span class="operator">=</span> (<span class="type">double</span>) convB / nB;</span><br><span class="line">        <span class="type">double</span> <span class="variable">pPool</span> <span class="operator">=</span> (<span class="type">double</span>) (convA + convB) / (nA + nB);</span><br><span class="line"></span><br><span class="line">        <span class="type">double</span> <span class="variable">se</span> <span class="operator">=</span> Math.sqrt(pPool * (<span class="number">1</span> - pPool) * (<span class="number">1.0</span> / nA + <span class="number">1.0</span> / nB));</span><br><span class="line">        <span class="keyword">if</span> (se == <span class="number">0</span>) <span class="keyword">return</span> TestResult.noDifference();</span><br><span class="line"></span><br><span class="line">        <span class="type">double</span> <span class="variable">z</span> <span class="operator">=</span> (pB - pA) / se;</span><br><span class="line">        <span class="type">double</span> <span class="variable">pValue</span> <span class="operator">=</span> <span class="number">2</span> * (<span class="number">1</span> - normalCdf(Math.abs(z)));   <span class="comment">// 双尾</span></span><br><span class="line"></span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">TestResult</span>(</span><br><span class="line">                z, pValue, pValue &lt; alpha,</span><br><span class="line">                (pB - pA) / pA,                              <span class="comment">// 相对提升</span></span><br><span class="line">                confidenceInterval(pA, pB, nA, nB, <span class="number">1</span> - alpha)</span><br><span class="line">        );</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-连续型指标（均值）用-t-检验"><a href="#6-3-连续型指标（均值）用-t-检验" class="headerlink" title="6.3 连续型指标（均值）用 t 检验"></a>6.3 连续型指标（均值）用 t 检验</h3><p>人均金额、停留时长这类指标，用 <strong>Welch’s t-test</strong>（不假设方差相等）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">t = (x̄B - x̄A) / sqrt(sA²/nA + sB²/nB)</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-4-样本量：实验开始前必须算"><a href="#6-4-样本量：实验开始前必须算" class="headerlink" title="6.4 样本量：实验开始前必须算"></a>6.4 样本量：实验开始前必须算</h3><p><strong>这是面试的关键分点</strong>。样本量不够就跑实验，等于抛硬币。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">n = 2 * (z_&#123;1-α/2&#125; + z_&#123;1-β&#125;)² * σ² / Δ²</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>Δ</code>：最小可检测效应（MDE），如”能检测出 2% 的提升”；</li>
+<li><code>σ</code>：指标标准差（历史数据估算）；</li>
+<li><code>β</code>：第二类错误概率，通常取 0.2（统计功效 &#x3D; 80%）。</li>
+</ul>
+<p>经验值：<strong>日活 10 万、转化率 5%、想检测 5% 的相对提升，大约需要 1~2 周</strong>。产品经理总想”跑三天看结果”，你要能拿公式怼回去。</p>
+<h3 id="6-5-常见统计陷阱"><a href="#6-5-常见统计陷阱" class="headerlink" title="6.5 常见统计陷阱"></a>6.5 常见统计陷阱</h3><table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>后果</th>
+<th>规避</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>多次偷看（Peeking）</strong></td>
+<td>显著性被人为放大，假阳性飙升</td>
+<td>固定实验周期，或用序贯检验</td>
+</tr>
+<tr>
+<td><strong>多重比较</strong></td>
+<td>测 20 个指标必有一个”显著”</td>
+<td>Bonferroni 校正 &#x2F; FDR</td>
+</tr>
+<tr>
+<td><strong>Simpson 悖论</strong></td>
+<td>整体看 A 好，分层看 B 好</td>
+<td>分层分析、检验分流均衡性</td>
+</tr>
+<tr>
+<td><strong>AA 实验失败</strong></td>
+<td>分流有偏，一切结论无效</td>
+<td>实验前跑 AA 实验验证</td>
+</tr>
+<tr>
+<td><strong>幸存者偏差</strong></td>
+<td>只看完成实验的用户</td>
+<td>用 ITT（意向性分析）</td>
+</tr>
+</tbody></table>
+<h3 id="6-6-AA-实验：上线的准入门槛"><a href="#6-6-AA-实验：上线的准入门槛" class="headerlink" title="6.6 AA 实验：上线的准入门槛"></a>6.6 AA 实验：上线的准入门槛</h3><p><strong>任何实验平台上线前，必须能跑通 AA 实验</strong>：把流量随机分成两组，施加<strong>完全相同</strong>的策略，结果应该<strong>不显著</strong>（p &gt; 0.05）。如果 AA 实验就显著，说明分流不均匀或埋点有问题。</p>
+<blockquote>
+<p>AA 实验是对<strong>整个平台</strong>的体检：哈希算法、分桶、埋点、指标计算、统计方法，任何一个环节有偏都会暴露。</p>
+</blockquote>
+<hr>
+<h2 id="七、实验生命周期管理"><a href="#七、实验生命周期管理" class="headerlink" title="七、实验生命周期管理"></a>七、实验生命周期管理</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">创建 → 审批 → 灰度（1%）→ 扩量（10% → 50%）→ 观察 → 决策 → 全量/回滚 → 归档</span><br></pre></td></tr></table></figure>
+
+<p><strong>工程要点</strong>：</p>
+<ol>
+<li><strong>审批流</strong>：高风险实验（改动核心链路）需要评审；</li>
+<li><strong>一键回滚</strong>：发现护栏指标劣化，秒级停止实验；</li>
+<li><strong>实验互斥检查</strong>：创建时自动检测是否与运行中的同域实验冲突；</li>
+<li><strong>实验快照</strong>：记录每个实验的配置、时间、参与人，可复现；</li>
+<li><strong>元数据版本</strong>：配置改动要留历史，否则报表口径会漂。</li>
+</ol>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>追问一：分流为什么不放在服务端统一做？</strong></p>
+<p>可以，但服务端统一分流会引入<strong>网络调用</strong>到主链路，延迟与可用性都是问题。业界主流是<strong>SDK 本地分流 + 配置下发</strong>，把决策成本降到纳秒级。</p>
+<p><strong>追问二：用户 ID 不稳定怎么办（未登录）？</strong></p>
+<p>用<strong>设备 ID（deviceId）</strong>；若 deviceId 也没有，用 IP + UA 哈希（不推荐，分布会偏）。关键原则：<strong>同一次实验周期内，分桶主体必须稳定</strong>。</p>
+<p><strong>追问三：如何避免实验相互干扰？</strong></p>
+<p>正交分层（Layer）。不同层用不同 salt，使各层分桶独立；需要互斥的实验放同一域（Domain）。</p>
+<p><strong>追问四：实时报表还是离线报表？</strong></p>
+<p><strong>都要</strong>。实时报表（Flink + OLAP）给产品看趋势、及时止损；离线报表（T+1）做精确统计与显著性检验。实时数据做决策要慎重，易被短期波动误导。</p>
+<p><strong>追问五：实验平台的 QPS 有多大？</strong></p>
+<p>按 DAU 1 亿、人均 100 次曝光估算，曝光上报约 <strong>10 万 QPS</strong>，必须走 Kafka 削峰 + 采样；而<strong>分流</strong>本身是本地内存计算，QPS 等同于业务 QPS，不构成瓶颈。</p>
+<p><strong>追问六：怎么防止实验数据被”选择性汇报”？</strong></p>
+<p>① 平台强制展示所有预设指标，不允许只挑显著的；② 实验注册时冻结指标口径；③ 审批流 + 只读报表，杜绝”看到好结果才上报”。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>A&#x2F;B 实验平台的本质是四件事：</p>
+<ol>
+<li><strong>分流要稳</strong>：哈希分桶 + 正交分层 + 互斥域 + 前缀扩流，保证同一用户稳定命中；</li>
+<li><strong>采集要准</strong>：曝光与行为异步上报、幂等去重、实验组与对照组采样一致；</li>
+<li><strong>计算要对</strong>：UV 作分母、定义归因窗口、剔除新增用户、护栏指标兜底；</li>
+<li><strong>结论要科学</strong>：先算样本量、跑 AA 实验、防偷看与多重比较。</li>
+</ol>
+<p>一句话收尾：<strong>实验平台不是”配置页面 + 报表”，而是一套”从分桶到统计”的因果推断基础设施。</strong> 在线分流决定<strong>谁看到什么</strong>，离线计算决定<strong>能不能下结论</strong>，两者缺一，实验就是在自欺欺人。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/11/ab-testing-experiment-platform-architecture-design/">https://jiweidong.github.io/2026/10/11/ab-testing-experiment-platform-architecture-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/A-B%E6%B5%8B%E8%AF%95/">A/B测试</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%B9%B3%E5%8F%B0/">数据平台</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/10/11/mysql-unique-index-duplicate-key-deep-dive/" title="【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理面试官：怎么保证用户名不重复？最直接的回答是”给 username 加唯一索引”，这句话只值 20 分。面试官接着会问：  加了唯一索引，并发注册两条同名怎么处理？ INSERT IGNORE、ON DUPLICATE KEY UPDATE、REPLACE INTO 有什么区别？ 唯一索引冲突时，为什么有时候会死锁？ 逻辑删除和唯一索引为什么会打架？  这四个问题，才是这道题从 20 分到 90 分的分水岭。本文一次性讲透。  一、唯一索引的底层：唯一性是怎么被保证的InnoDB 中，唯一索引也是 B+ 树，区别在于插入时多了一步唯一性校验：  先在索引树中定位到待插入位置； 检查该位置（以及相邻记录）是否存在相同键值； 不存在 → 插入；存在 → 报 ERROR 1062 (23000): Duplicate entry。  关键点：唯一性检查是在”加锁后、插入前”完成的，这决定了并发行为。 1.1 二级唯一索引 vs ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/24/api-idempotence-design-practice/" title="【高并发设计】接口幂等性方案全解析：从原理到代码实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-24</div><div class="info-item-2">【高并发设计】接口幂等性方案全解析：从原理到代码实战</div></div><div class="info-2"><div class="info-item-1">【高并发设计】接口幂等性方案全解析：从原理到代码实战一、什么是幂等性？ 幂等（Idempotent）：在编程中，一个幂等操作的特点是其任意多次执行所产生的影响均与一次执行的影响相同。  举个生活例子：电梯按钮——按一次电梯到1楼，按十次电梯还是到1楼，结果不会变。这就是幂等。 在分布式系统中，幂等性尤为重要，因为网络不可靠，重试是常态。 为什么需要幂等？   场景 问题 后果    支付接口重试 用户点了两次”支付” 重复扣款   订单创建重试 提交订单超时，自动重试 生成重复订单   MQ 消息重复消费 消费成功但 ACK 失败 重复处理   前端重复提交 用户狂点提交按钮 数据重复    幂等设计是分布式系统的第一道防线。  二、幂等实现方案全景图1234567891011方案对比总览┌─────────────────────────────────────────────────┐│                 幂等方案                          │├───────────────────────────────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/08/03/seckill-system-architecture-design/" title="【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发秒杀系统架构设计：从流量削峰到库存扣减面试官：做过秒杀系统吗？说说你是怎么设计的？秒杀是后端面试中出现频率最高的系统设计题，没有之一。它把高并发场景下的所有经典问题都浓缩在了一起：高流量冲击、超卖、热点数据、缓存一致性、限流降级。今天这篇，我们从零开始，把秒杀系统的完整设计思路、核心代码和面试追问一次讲透。 一、秒杀的业务特点与核心难点秒杀（Seckill）的业务模型很简单：在极短时间内（通常几秒到几分钟），以极低价格限量售卖少量商品。但它的技术特征却极其极端：    特点 描述 带来的问题    瞬时流量巨大 开售瞬间 QPS 可达平时百倍千倍 打垮应用层与数据库   读写比例极端 读多写少，热点集中在少数商品 缓存热点、单点压力   库存有限 如 100 件商品，10 万人抢 超卖风险   时间敏感 开售前蓄客，开售后瞬间释放 流量脉冲，无法水平扩容应对   核心难点可以归纳为三个词：削峰（把瞬时流量摊平）、限流（保护下游）、防超卖（保证数据正确）。 二、整体架构设计：分层削峰一个成熟的秒杀架构，从用户请求到数据库，需要经过 6 层防线： 123456789...</div></div></div></a><a class="pagination-related" href="/2026/10/10/ticket-booking-system-architecture-design/" title="【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-10</div><div class="info-item-2">【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发抢票系统架构设计：库存分桶、排队削峰与订单一致性面试官：如果让你设计一个”12306 抢票”系统，瞬时几十万 QPS，怎么保证不崩？这是系统设计面试里最经典的”三高”题目之一。答不好的人通常有两个毛病：  上来就说”加 Redis 缓存、加 MQ 削峰”，但说不出为什么要削、削完之后一致性怎么保证； 完全忽略抢票业务的两个特殊约束——库存必须严格不超卖，以及必须对用户公平（不能谁网速快谁先买到）。  这篇文章我从业务特征出发，一层层把架构拆开讲清楚：流量怎么进来、库存怎么扣、订单怎么落、故障怎么兜底。全程配代码和表格，可以直接拿去面试复述。  一、先分析业务特征，别急着画架构图抢票和普通电商下单的差别，决定了架构的取舍：    维度 普通电商下单 抢票    流量形态 相对平稳，可预测 瞬时尖峰，开售 1 秒涌入全量流量   读写比 读多写少 读极多、写在开售瞬间极度集中   库存粒度 SKU 级 车次 × 日期 × 席别 × 区间 多维度   一致性要求 允许短暂超卖后补偿 绝不允许超卖（涉及实名制与运力）   公平性 不关心 强要求，需要排队&#x2F;随机...</div></div></div></a><a class="pagination-related" href="/2026/10/09/ride-hailing-system-architecture-design/" title="【系统设计】网约车（打车）系统架构设计：LBS 派单、行程状态机与计费结算全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">【系统设计】网约车（打车）系统架构设计：LBS 派单、行程状态机与计费结算全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】网约车（打车）系统架构设计：LBS 派单、行程状态机与计费结算全解析面试官：让你设计一个网约车系统，你会怎么拆？网约车（打车）是系统设计面试里的”高阶题”——它同时考验 LBS 地理索引、实时匹配、状态机、计费与结算、高并发地标 五个方向，比秒杀、订单更难糊弄。 面试官通常会层层递进：  乘客发单，司机怎么找？为什么不用 MySQL 查距离？ 峰值几十万司机同时上报位置，位置数据怎么存？ 派单怎么保证公平和效率？抢单和派单有什么区别？ 行程状态怎么管？司机掉线、乘客取消怎么办？ 计费怎么算不出错？结算怎么和司机对账？  下面逐层拆。 一、整体架构与领域拆分先做限界上下文（领域）划分：    领域 职责 核心存储    乘客端（Passenger） 发单、取消、评价、支付 MySQL   司机端（Driver） 出车&#x2F;收车、抢单、状态上报 MySQL + Redis   位置服务（Location） 轨迹上报、附近司机查询 Redis GEO &#x2F; 自建 LBS   派单引擎（Dispatch） 匹配、派单、超时重派 Redis + 规则引擎   行程...</div></div></div></a><a class="pagination-related" href="/2026/08/28/qr-code-login-system-design/" title="【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-28</div><div class="info-item-2">【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案</div></div><div class="info-2"><div class="info-item-1">【系统设计】扫码登录系统设计：从二维码生成到轮询&#x2F;WebSocket 实时通知的完整方案面试官：说说扫码登录的完整流程？扫码登录已经是 PC 端登录的标配交互——微信、钉钉、淘宝、GitHub 全在用。面试官问这个题，考察的不是你会不会调接口，而是状态机设计、轮询 vs 长连接、二维码安全、过期与失效处理这些系统设计基本功。 先画一个整体流程： 123456789101112131415用户打开 PC 登录页         手机 App              后端服务    │                        │                      │    ├─ 1.请求生成二维码 ──────►                      │    │                        │  2.返回 qrId + 二维码图 │    │◄── 3.展示二维码 ────────┤                      │    │  4.启动轮询/建立长连接   │                      │    │   ...</div></div></div></a><a class="pagination-related" href="/2026/08/28/sso-single-sign-on-architecture-deep-dive/" title="【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-28</div><div class="info-item-2">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进</div></div><div class="info-2"><div class="info-item-1">【系统设计】单点登录 SSO 架构深度解析：从 Session 共享到 CAS 票据与 OAuth2&#x2F;OIDC 的演进面试官：公司有 20 个系统，怎么做到”一次登录，全网通行”？单点登录（Single Sign-On，SSO）是企业级应用绕不开的话题。面试官问这个问题，通常从最简单的场景开始，一路追问到 CAS 票据、OAuth2&#x2F;OIDC、跨域 Cookie 这些细节。本文从为什么要 SSO 讲起，梳理三条技术路线，最后给出生产级方案。 一、为什么需要 SSO：痛点分析没有 SSO 的世界是这样的：员工每天要登录 OA、ERP、GitLab、Jira、监控平台……每个系统一套账号密码，记不住、不安全、体验差。管理员的噩梦则是：离职员工的账号要在 20 个系统里逐个禁用。 SSO 的核心价值：  一次认证，多处访问：在认证中心登录一次，所有接入系统免登录。 集中账号管理：账号生命周期（入职&#x2F;离职&#x2F;改密）只在一处维护。 统一安全策略：密码策略、二次认证（MFA）、风控集中在认证中心。  架构上引入一个认证中心（Auth Center &#x...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">752</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">842</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">231</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91A-B-%E5%AE%9E%E9%AA%8C%E5%B9%B3%E5%8F%B0%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E6%B5%81%E9%87%8F%E5%88%86%E6%A1%B6%E3%80%81%E6%8C%87%E6%A0%87%E8%AE%A1%E7%AE%97%E4%B8%8E%E6%98%BE%E8%91%97%E6%80%A7%E6%A3%80%E9%AA%8C%E5%85%A8%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AE%BE%E8%AE%A1%E4%B8%80%E4%B8%AA-A-B-%E5%AE%9E%E9%AA%8C%E5%B9%B3%E5%8F%B0%EF%BC%8C%E8%AE%A9%E4%BA%A7%E5%93%81%E7%BB%8F%E7%90%86%E8%83%BD%E8%87%AA%E5%B7%B1%E9%85%8D%E7%BD%AE%E5%AE%9E%E9%AA%8C"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E9%9C%80%E6%B1%82%E6%BE%84%E6%B8%85%EF%BC%9A%E5%85%88%E9%97%AE%E6%B8%85%E6%A5%9A%E5%86%8D%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.2.</span> <span class="toc-text">一、需求澄清：先问清楚再设计</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%95%B4%E4%BD%93%E6%9E%B6%E6%9E%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、整体架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%88%86%E6%B5%81%E8%AE%BE%E8%AE%A1%EF%BC%9A%E8%BF%99%E6%98%AF%E5%AE%9E%E9%AA%8C%E5%B9%B3%E5%8F%B0%E7%9A%84%E7%81%B5%E9%AD%82"><span class="toc-number">1.4.</span> <span class="toc-text">三、分流设计：这是实验平台的灵魂</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%93%88%E5%B8%8C%E5%88%86%E6%A1%B6"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 哈希分桶</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%88%86%E5%B1%82%EF%BC%88Layer%EF%BC%89%E4%B8%8E%E4%BA%92%E6%96%A5%EF%BC%88Domain%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 分层（Layer）与互斥（Domain）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E6%B5%81%E9%87%8F%E6%89%A9%E5%A4%A7%EF%BC%9A%E6%85%8E%E4%B9%8B%E5%8F%88%E6%85%8E"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 流量扩大：慎之又慎</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%9C%A8%E7%BA%BF%E5%88%86%E6%B5%81%E7%9A%84%E5%8F%AF%E7%94%A8%E6%80%A7%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 在线分流的可用性设计</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%95%B0%E6%8D%AE%E9%87%87%E9%9B%86%EF%BC%9A%E6%9B%9D%E5%85%89%E4%B8%8E%E8%A1%8C%E4%B8%BA%E8%A6%81%E8%83%BD%E5%85%B3%E8%81%94"><span class="toc-number">1.5.</span> <span class="toc-text">四、数据采集：曝光与行为要能关联</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%B8%A4%E7%B1%BB%E6%95%B0%E6%8D%AE"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 两类数据</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E9%87%87%E9%9B%86%E5%8E%9F%E5%88%99"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 采集原则</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8C%87%E6%A0%87%E8%AE%A1%E7%AE%97%EF%BC%9A%E4%BB%8E%E6%98%8E%E7%BB%86%E5%88%B0%E7%BB%93%E8%AE%BA"><span class="toc-number">1.6.</span> <span class="toc-text">五、指标计算：从明细到结论</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%AE%9E%E9%AA%8C%E6%8C%87%E6%A0%87%E5%88%86%E5%B1%82"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 实验指标分层</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-SQL-%E8%AE%A1%E7%AE%97%E7%A4%BA%E4%BE%8B%EF%BC%88ClickHouse%EF%BC%89"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 SQL 计算示例（ClickHouse）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%98%BE%E8%91%97%E6%80%A7%E6%A3%80%E9%AA%8C%EF%BC%9AA-B-%E6%B5%8B%E8%AF%95%E7%9A%84%E7%A7%91%E5%AD%A6%E6%80%A7"><span class="toc-number">1.7.</span> <span class="toc-text">六、显著性检验：A&#x2F;B 测试的科学性</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%81%87%E8%AE%BE%E6%A3%80%E9%AA%8C%E6%A1%86%E6%9E%B6"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 假设检验框架</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E8%BD%AC%E5%8C%96%E7%8E%87%EF%BC%88%E6%AF%94%E7%8E%87%E5%9E%8B%E6%8C%87%E6%A0%87%EF%BC%89%E7%94%A8%E5%8F%8C%E6%A0%B7%E6%9C%AC%E6%AF%94%E4%BE%8B%E6%A3%80%E9%AA%8C"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 转化率（比率型指标）用双样本比例检验</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E8%BF%9E%E7%BB%AD%E5%9E%8B%E6%8C%87%E6%A0%87%EF%BC%88%E5%9D%87%E5%80%BC%EF%BC%89%E7%94%A8-t-%E6%A3%80%E9%AA%8C"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 连续型指标（均值）用 t 检验</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E6%A0%B7%E6%9C%AC%E9%87%8F%EF%BC%9A%E5%AE%9E%E9%AA%8C%E5%BC%80%E5%A7%8B%E5%89%8D%E5%BF%85%E9%A1%BB%E7%AE%97"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 样本量：实验开始前必须算</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-5-%E5%B8%B8%E8%A7%81%E7%BB%9F%E8%AE%A1%E9%99%B7%E9%98%B1"><span class="toc-number">1.7.5.</span> <span class="toc-text">6.5 常见统计陷阱</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-6-AA-%E5%AE%9E%E9%AA%8C%EF%BC%9A%E4%B8%8A%E7%BA%BF%E7%9A%84%E5%87%86%E5%85%A5%E9%97%A8%E6%A7%9B"><span class="toc-number">1.7.6.</span> <span class="toc-text">6.6 AA 实验：上线的准入门槛</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%AE%9E%E9%AA%8C%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F%E7%AE%A1%E7%90%86"><span class="toc-number">1.8.</span> <span class="toc-text">七、实验生命周期管理</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/11/ab-testing-experiment-platform-architecture-design/" title="【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析">【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</a><time datetime="2026-10-11T01:00:00.000Z" title="发表于 2026-10-11 09:00:00">2026-10-11</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/11/mysql-unique-index-duplicate-key-deep-dive/" title="【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理">【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理</a><time datetime="2026-10-11T00:45:00.000Z" title="发表于 2026-10-11 08:45:00">2026-10-11</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/11/operation-audit-log-aop-deep-practice/" title="【Java 实战】操作日志与数据变更审计深度实战：AOP、注解与变更 Diff 全解析">【Java 实战】操作日志与数据变更审计深度实战：AOP、注解与变更 Diff 全解析</a><time datetime="2026-10-11T00:30:00.000Z" title="发表于 2026-10-11 08:30:00">2026-10-11</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/11/mcp-model-context-protocol-java-deep-dive/" title="【Java AI】MCP（Model Context Protocol）深度解析：从协议规范到 Java 客户端与服务端落地">【Java AI】MCP（Model Context Protocol）深度解析：从协议规范到 Java 客户端与服务端落地</a><time datetime="2026-10-11T00:15:00.000Z" title="发表于 2026-10-11 08:15:00">2026-10-11</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/11/langchain4j-java-llm-deep-practice/" title="【Java AI】LangChain4j 深度实战：AiServices、工具调用与 RAG 生产落地">【Java AI】LangChain4j 深度实战：AiServices、工具调用与 RAG 生产落地</a><time datetime="2026-10-11T00:00:00.000Z" title="发表于 2026-10-11 08:00:00">2026-10-11</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
