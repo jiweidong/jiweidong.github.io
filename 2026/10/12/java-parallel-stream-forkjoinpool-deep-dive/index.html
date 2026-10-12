@@ -1,0 +1,447 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱面试官：list.parallelStream() 和 list.stream() 有什么区别？很多同学张口就来：「加个 parallel 就是并行，跑得更快」。 这个回答在面试里基本是及格线以下。真正被追问的是：  它底层用的哪个线程池？线程数是几个？ 为什么线上用并行流反而更">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱面试官：list.parallelStream() 和 list.stream() 有什么区别？很多同学张口就来：「加个 parallel 就是并行，跑得更快」。 这个回答在面试里基本是及格线以下。真正被追问的是：  它底层用的哪个线程池？线程数是几个？ 为什么线上用并行流反而更">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-12T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-12T00:02:41.459Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="ForkJoinPool">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Stream">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="性能优化">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱",
+  "url": "https://jiweidong.github.io/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-12T00:00:00.000Z",
+  "dateModified": "2026-10-12T00:02:41.459Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">757</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">847</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">232</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-12T00:00:00.000Z" title="发表于 2026-10-12 08:00:00">2026-10-12</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-12T00:02:41.459Z" title="更新于 2026-10-12 08:02:41">2026-10-12</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/">Java</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/">并发编程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-并发】并行流（Parallel-Stream）深度解析：ForkJoinPool-公共池、工作窃取与性能陷阱"><a href="#【Java-并发】并行流（Parallel-Stream）深度解析：ForkJoinPool-公共池、工作窃取与性能陷阱" class="headerlink" title="【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱"></a>【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱</h1><h2 id="面试官：list-parallelStream-和-list-stream-有什么区别？"><a href="#面试官：list-parallelStream-和-list-stream-有什么区别？" class="headerlink" title="面试官：list.parallelStream() 和 list.stream() 有什么区别？"></a>面试官：<code>list.parallelStream()</code> 和 <code>list.stream()</code> 有什么区别？</h2><p>很多同学张口就来：「加个 <code>parallel</code> 就是并行，跑得更快」。</p>
+<p>这个回答在面试里基本是及格线以下。真正被追问的是：</p>
+<ul>
+<li>它底层用的哪个线程池？线程数是几个？</li>
+<li>为什么线上用并行流反而更慢，甚至把服务打挂？</li>
+<li>并行流的<strong>任务拆分规则</strong>是什么？小集合拆分有意义吗？</li>
+<li>为什么在并行流里调 RPC &#x2F; 查数据库是灾难？</li>
+</ul>
+<p>今天这篇文章，我们从 API 表面一路挖到 <code>ForkJoinPool</code> 的工作窃取、<code>Spliterator</code> 拆分机制和「公共池陷阱」，把并行流讲透。</p>
+<hr>
+<h2 id="一、并行流的本质：一条-parallel-标志位"><a href="#一、并行流的本质：一条-parallel-标志位" class="headerlink" title="一、并行流的本质：一条 parallel 标志位"></a>一、并行流的本质：一条 <code>parallel</code> 标志位</h2><p><code>Collection.stream()</code> 返回的是 <code>Head</code> 流，<code>parallelStream()</code> 返回的是 <code>Head</code> 但 <code>parallel</code> 标志位为 <code>true</code>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">default</span> Stream&lt;E&gt; <span class="title function_">stream</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> StreamSupport.stream(spliterator(), <span class="literal">false</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">default</span> Stream&lt;E&gt; <span class="title function_">parallelStream</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> StreamSupport.stream(spliterator(), <span class="literal">true</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意：<code>parallel</code> 只是一个<strong>布尔状态</strong>。你甚至可以在流中间随意切换：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">list.stream()</span><br><span class="line">    .filter(x -&gt; x &gt; <span class="number">0</span>)</span><br><span class="line">    .parallel()          <span class="comment">// 从此处开始转为并行</span></span><br><span class="line">    .map(<span class="built_in">this</span>::compute)</span><br><span class="line">    .sequential()        <span class="comment">// 又切回串行</span></span><br><span class="line">    .forEach(System.out::println);</span><br></pre></td></tr></table></figure>
+
+<p>也就是说，<strong>并行流不是一种新的数据结构，而是执行模式的开关</strong>。这个开关的最终落点是 <code>TerminalOp</code>，比如 <code>ReduceOp</code>、<code>ForEachOp</code>。</p>
+<h3 id="流水线结构"><a href="#流水线结构" class="headerlink" title="流水线结构"></a>流水线结构</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">Head(数据源) → StatelessOp(filter/map) → StatefulOp(sorted/distinct) → TerminalOp</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><strong>无状态中间操作</strong>（<code>filter</code>、<code>map</code>、<code>flatMap</code>）：元素之间互不影响，可以任意并行拆分。</li>
+<li><strong>有状态中间操作</strong>（<code>sorted</code>、<code>distinct</code>、<code>limit</code>、<code>skip</code>）：需要看到部分或全部元素，拆分会受到限制，并行收益大幅下降。</li>
+<li><strong>终止操作</strong>：决定是「每个元素独立处理」还是「需要归约合并」。</li>
+</ul>
+<hr>
+<h2 id="二、执行引擎：ForkJoinPool-与工作窃取"><a href="#二、执行引擎：ForkJoinPool-与工作窃取" class="headerlink" title="二、执行引擎：ForkJoinPool 与工作窃取"></a>二、执行引擎：ForkJoinPool 与工作窃取</h2><p>并行流的终止操作由 <code>AbstractTask</code> 家族实现，本质是一个 <code>ForkJoinTask</code>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 简化后的核心流程</span></span><br><span class="line"><span class="keyword">abstract</span> <span class="keyword">class</span> <span class="title class_">AbstractTask</span>&lt;P_IN, P_OUT, R, K <span class="keyword">extends</span> <span class="title class_">AbstractTask</span>&lt;P_IN, P_OUT, R, K&gt;&gt;</span><br><span class="line">        <span class="keyword">extends</span> <span class="title class_">CountedCompleter</span>&lt;R&gt; &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">compute</span><span class="params">()</span> &#123;</span><br><span class="line">        Spliterator&lt;P_IN&gt; rs = spliterator, ls;</span><br><span class="line">        <span class="type">long</span> <span class="variable">sizeEstimate</span> <span class="operator">=</span> rs.estimateSize();</span><br><span class="line">        <span class="type">long</span> <span class="variable">sizeThreshold</span> <span class="operator">=</span> getTargetSize(sizeEstimate);</span><br><span class="line">        <span class="type">boolean</span> <span class="variable">forkRight</span> <span class="operator">=</span> <span class="literal">false</span>;</span><br><span class="line">        <span class="type">K</span> <span class="variable">task</span> <span class="operator">=</span> <span class="built_in">this</span>;</span><br><span class="line">        <span class="keyword">while</span> (sizeEstimate &gt; sizeThreshold &amp;&amp; (ls = rs.trySplit()) != <span class="literal">null</span>) &#123;</span><br><span class="line">            K leftChild, rightChild;</span><br><span class="line">            task.leftChild = leftChild = task.makeChild(ls);</span><br><span class="line">            task.rightChild = rightChild = task.makeChild(rs);</span><br><span class="line">            task.setPendingCount(<span class="number">1</span>);</span><br><span class="line">            <span class="keyword">if</span> (forkRight) &#123;</span><br><span class="line">                forkRight = <span class="literal">false</span>;</span><br><span class="line">                rs = ls;</span><br><span class="line">                task = leftChild;</span><br><span class="line">                task.fork();      <span class="comment">// 右边任务丢给其他线程“偷”</span></span><br><span class="line">            &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">                forkRight = <span class="literal">true</span>;</span><br><span class="line">                task = rightChild;</span><br><span class="line">                leftChild.fork();</span><br><span class="line">            &#125;</span><br><span class="line">            sizeEstimate = rs.estimateSize();</span><br><span class="line">        &#125;</span><br><span class="line">        task.setLocalResult(task.doLeaf());</span><br><span class="line">        task.tryComplete();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>几个关键点：</p>
+<ol>
+<li><strong>递归二分 + <code>trySplit</code></strong>：每次把当前待处理区间一分为二，直到 <code>estimateSize()</code> 小于阈值。</li>
+<li><strong><code>fork()</code> 把子任务压入当前线程的工作队列</strong>（队尾），自己继续处理另一半。</li>
+<li><strong>工作窃取（Work-Stealing）</strong>：空闲线程从其他线程队列的<strong>队头</strong>偷任务，减少竞争。</li>
+</ol>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">线程 A 的工作队列: [Task5][Task3][Task1]  ← fork 从尾部压入</span><br><span class="line">线程 B (空闲) 从头部偷: Task5 → 开始执行</span><br></pre></td></tr></table></figure>
+
+<p>工作窃取的精髓在于：<strong>自己处理用 LIFO（尾部），被别人偷用 FIFO（头部）</strong>，既提高了局部性（刚 fork 的任务数据可能还在缓存里），又减少了线程间锁竞争。</p>
+<h3 id="阈值是怎么算的？"><a href="#阈值是怎么算的？" class="headerlink" title="阈值是怎么算的？"></a>阈值是怎么算的？</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">LEAF_TARGET</span> <span class="operator">=</span> ForkJoinPool.getCommonPoolParallelism() &lt;&lt; <span class="number">2</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">protected</span> <span class="type">long</span> <span class="title function_">getTargetSize</span><span class="params">(<span class="type">long</span> sizeEstimate)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> sizeEstimate / (LEAF_TARGET &lt;&lt; <span class="number">1</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">final</span> <span class="type">long</span> <span class="title function_">suggestTargetSize</span><span class="params">(<span class="type">long</span> sizeEstimate)</span> &#123;</span><br><span class="line">    <span class="type">long</span> <span class="variable">est</span> <span class="operator">=</span> sizeEstimate / LEAF_TARGET;</span><br><span class="line">    <span class="keyword">return</span> est &gt; <span class="number">0L</span> ? est : <span class="number">1L</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>getCommonPoolParallelism()</code> 默认是 <code>CPU 核心数 - 1</code>（最少 1）。</li>
+<li><code>LEAF_TARGET = 并行度 &lt;&lt; 2</code>，即 8 核机器上大约是 <code>7 * 4 = 28</code>。</li>
+<li>阈值 &#x3D; <code>集合大小 / (28 * 2)</code>。</li>
+</ul>
+<p>这解释了一个常见现象：<strong>小集合用并行流纯粹是负优化</strong>。100 个元素的集合，阈值是 <code>100 / 56 = 1</code>，几乎每个元素都要走一遍 fork&#x2F;join 的消息传递，线程调度开销远超计算本身。</p>
+<p>经验值：<strong>元素处理时间 × 元素数量 ≫ 任务拆分开销</strong> 时才值得并行，一般建议数据量在 <strong>1 万以上</strong>且单个元素计算较耗时（毫秒级）再用。</p>
+<hr>
+<h2 id="三、致命陷阱一：公共池（Common-Pool）被阻塞"><a href="#三、致命陷阱一：公共池（Common-Pool）被阻塞" class="headerlink" title="三、致命陷阱一：公共池（Common Pool）被阻塞"></a>三、致命陷阱一：公共池（Common Pool）被阻塞</h2><p><code>parallelStream()</code> 默认使用的是 <code>ForkJoinPool.commonPool()</code>——一个<strong>全局共享</strong>的线程池。它的并行度：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 默认为 CPU 核心数 - 1，可通过系统属性调整</span></span><br><span class="line">System.getProperty(<span class="string">&quot;java.util.concurrent.ForkJoinPool.common.parallelism&quot;</span>);</span><br></pre></td></tr></table></figure>
+
+<h3 id="为什么危险？"><a href="#为什么危险？" class="headerlink" title="为什么危险？"></a>为什么危险？</h3><p>假设你在并行流里发起 HTTP 调用：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ☠️ 千万别这么写</span></span><br><span class="line">List&lt;Result&gt; results = ids.parallelStream()</span><br><span class="line">    .map(id -&gt; httpClient.call(id))   <span class="comment">// 阻塞 200ms</span></span><br><span class="line">    .collect(Collectors.toList());</span><br></pre></td></tr></table></figure>
+
+<p>8 核机器上公共池只有 7 个线程。一旦这 7 个线程全部阻塞在 IO 上：</p>
+<ul>
+<li>并行流卡住，<code>parallelStream()</code> 退化成「串行的 1&#x2F;7 速度」；</li>
+<li><strong>更严重的是，同一个 JVM 里任何其他使用公共池的代码（包括某些库内部使用的并行流）都会被拖死</strong>。</li>
+</ul>
+<p>这就是所谓的<strong>公共池污染</strong>。一个业务的慢查询能让整个应用里所有的并行流全部排队。</p>
+<h3 id="正确做法：自定义-ForkJoinPool"><a href="#正确做法：自定义-ForkJoinPool" class="headerlink" title="正确做法：自定义 ForkJoinPool"></a>正确做法：自定义 ForkJoinPool</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">ForkJoinPool</span> <span class="variable">pool</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ForkJoinPool</span>(<span class="number">16</span>);   <span class="comment">// 按 IO 场景放大</span></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">    List&lt;Result&gt; results = pool.submit(() -&gt;</span><br><span class="line">        ids.parallelStream()</span><br><span class="line">           .map(id -&gt; httpClient.call(id))</span><br><span class="line">           .collect(Collectors.toList())</span><br><span class="line">    ).get();</span><br><span class="line">&#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">    pool.shutdown();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键原理</strong>：<code>parallelStream()</code> 会调用 <code>ForkJoinTask.fork()</code>，而 <code>fork()</code> 会把任务提交到<strong>当前线程所属的池</strong>。如果你在 <code>pool.submit(...)</code> 的 lambda 里执行并行流，那么这段代码运行在一个 ForkJoinPool 的 worker 线程上，<code>ForkJoinTask.getPool()</code> 返回的就是这个自定义池，而不是公共池。</p>
+<p>这是面试里非常值得讲的一个点：<strong>并行流用哪个池，取决于「执行并行流代码的线程属于哪个池」</strong>。</p>
+<hr>
+<h2 id="四、致命陷阱二：forEach-顺序与副作用"><a href="#四、致命陷阱二：forEach-顺序与副作用" class="headerlink" title="四、致命陷阱二：forEach 顺序与副作用"></a>四、致命陷阱二：<code>forEach</code> 顺序与副作用</h2><p>并行流的 <code>forEach</code> <strong>不保证顺序</strong>，<code>forEachOrdered</code> 才保证（但会引入同步开销，性能往往比串行还差）。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 输出顺序不确定</span></span><br><span class="line">IntStream.range(<span class="number">1</span>, <span class="number">100</span>).parallel().forEach(System.out::print);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 输出顺序确定，但内部有同步</span></span><br><span class="line">IntStream.range(<span class="number">1</span>, <span class="number">100</span>).parallel().forEachOrdered(System.out::print);</span><br></pre></td></tr></table></figure>
+
+<p>更常见的翻车是<strong>共享可变状态</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ☠️ 结果丢失（ArrayList 非线程安全）</span></span><br><span class="line">List&lt;Integer&gt; result = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line">IntStream.range(<span class="number">0</span>, <span class="number">10000</span>).parallel().forEach(result::add);</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 用 collect 做归约</span></span><br><span class="line">List&lt;Integer&gt; ok = IntStream.range(<span class="number">0</span>, <span class="number">10000</span>).parallel()</span><br><span class="line">        .boxed()</span><br><span class="line">        .collect(Collectors.toList());</span><br></pre></td></tr></table></figure>
+
+<p><code>forEach</code> 传的是 <code>Consumer</code>，语义上就要求<strong>无副作用</strong>。需要汇聚结果请一律用 <code>collect</code>，让框架去做正确的并发归约。</p>
+<hr>
+<h2 id="五、性能实测：并行流到底快不快？"><a href="#五、性能实测：并行流到底快不快？" class="headerlink" title="五、性能实测：并行流到底快不快？"></a>五、性能实测：并行流到底快不快？</h2><p>下面用一个微基准（实际项目请用 JMH，见 <code>jmh-microbenchmark-practice</code>）观察不同数据规模下的表现：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">static</span> <span class="type">long</span> <span class="title function_">sumSerial</span><span class="params">(<span class="type">long</span> n)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> LongStream.rangeClosed(<span class="number">1</span>, n).sum();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">static</span> <span class="type">long</span> <span class="title function_">sumParallel</span><span class="params">(<span class="type">long</span> n)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> LongStream.rangeClosed(<span class="number">1</span>, n).parallel().sum();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>数据规模</th>
+<th>串行耗时</th>
+<th>并行耗时</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1,000</td>
+<td>~2 μs</td>
+<td>~20 μs</td>
+<td>并行更慢 10 倍</td>
+</tr>
+<tr>
+<td>100,000</td>
+<td>~150 μs</td>
+<td>~60 μs</td>
+<td>并行略优</td>
+</tr>
+<tr>
+<td>10,000,000</td>
+<td>~15 ms</td>
+<td>~3 ms</td>
+<td>并行明显优势</td>
+</tr>
+<tr>
+<td>10,000,000（含阻塞 IO）</td>
+<td>~2 s</td>
+<td>~30 s（线程耗尽）</td>
+<td>并行灾难</td>
+</tr>
+</tbody></table>
+<p>规律很清晰：</p>
+<ul>
+<li><strong>数据量小</strong> → 拆分&#x2F;调度开销占主导，负优化；</li>
+<li><strong>计算密集 + 数据量大</strong> → 收益明显；</li>
+<li><strong>IO 密集 &#x2F; 阻塞</strong> → 公共池线程被占满，性能暴跌。</li>
+</ul>
+<h3 id="影响性能的其他细节"><a href="#影响性能的其他细节" class="headerlink" title="影响性能的其他细节"></a>影响性能的其他细节</h3><ol>
+<li><strong>装箱开销</strong>：<code>Stream&lt;Integer&gt;</code> 大量装箱，优先用 <code>IntStream</code>&#x2F;<code>LongStream</code>&#x2F;<code>DoubleStream</code>。</li>
+<li><strong>自动拆分的质量取决于数据源</strong>：<code>ArrayList</code>、数组、<code>IntStream.range</code> 的 <code>Spliterator</code> 支持精确拆分（<code>estimateSize</code> 准确、<code>trySplit</code> 均分），是并行的理想数据源；而 <code>LinkedList</code>、<code>Stream.iterate</code>、<code>BufferedReader.lines()</code> 拆分能力差，并行效果很差。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 差：LinkedList 的 split 几乎无法均分</span></span><br><span class="line">linkedList.parallelStream()...</span><br><span class="line"></span><br><span class="line"><span class="comment">// 好：ArrayList 支持精确二分</span></span><br><span class="line">arrayList.parallelStream()...</span><br></pre></td></tr></table></figure>
+
+<ol start="3">
+<li><strong><code>sorted</code>&#x2F;<code>distinct</code> 会破坏并行度</strong>：它们是有状态操作，需要在归约阶段合并，往往退化为串行。</li>
+<li><strong><code>findFirst</code> vs <code>findAny</code></strong>：<code>findFirst</code> 在并行下需要等待最前面的元素，代价高；<code>findAny</code> 直接返回任意一个，更适合并行。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 并行下 findAny 更快</span></span><br><span class="line">list.parallelStream().filter(...).findAny();</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、Spliterator：并行流的拆分底座"><a href="#六、Spliterator：并行流的拆分底座" class="headerlink" title="六、Spliterator：并行流的拆分底座"></a>六、Spliterator：并行流的拆分底座</h2><p><code>Spliterator</code>（splitable iterator）是并行流能「分而治之」的根本。核心方法：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">Spliterator</span>&lt;T&gt; &#123;</span><br><span class="line">    <span class="type">boolean</span> <span class="title function_">tryAdvance</span><span class="params">(Consumer&lt;? <span class="built_in">super</span> T&gt; action)</span>;   <span class="comment">// 顺序遍历一个元素</span></span><br><span class="line">    Spliterator&lt;T&gt; <span class="title function_">trySplit</span><span class="params">()</span>;                        <span class="comment">// 尝试拆分出一半</span></span><br><span class="line">    <span class="type">long</span> <span class="title function_">estimateSize</span><span class="params">()</span>;                              <span class="comment">// 预估剩余元素数</span></span><br><span class="line">    <span class="type">int</span> <span class="title function_">characteristics</span><span class="params">()</span>;                            <span class="comment">// 特征位</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>特征位（<code>characteristics()</code>）非常关键，直接决定并行优化的可行性：</p>
+<table>
+<thead>
+<tr>
+<th>特征</th>
+<th>含义</th>
+<th>对并行的影响</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ORDERED</code></td>
+<td>元素有顺序</td>
+<td><code>forEach</code> 无序、<code>forEachOrdered</code> 有序</td>
+</tr>
+<tr>
+<td><code>DISTINCT</code></td>
+<td>元素唯一</td>
+<td><code>distinct()</code> 可省一次去重</td>
+</tr>
+<tr>
+<td><code>SORTED</code></td>
+<td>已排序</td>
+<td><code>sorted()</code> 可跳过</td>
+</tr>
+<tr>
+<td><code>SIZED</code></td>
+<td>大小已知</td>
+<td>精确估算、便于均分</td>
+</tr>
+<tr>
+<td><code>SUBSIZED</code></td>
+<td>子分割大小也已知</td>
+<td>支持精确并行拆分</td>
+</tr>
+<tr>
+<td><code>NONNULL</code></td>
+<td>不含 null</td>
+<td>可省 null 检查</td>
+</tr>
+<tr>
+<td><code>IMMUTABLE</code> &#x2F; <code>CONCURRENT</code></td>
+<td>源不可变&#x2F;并发安全</td>
+<td>影响并发修改策略</td>
+</tr>
+</tbody></table>
+<p><code>ArrayList.spliterator()</code> 返回的是 <code>ArrayListSpliterator</code>，<code>characteristics()</code> 包含 <code>SIZED | SUBSIZED | ORDERED</code>，所以它是<strong>并行友好</strong>的数据源。</p>
+<p>手写一个支持并行的自定义 <code>Spliterator</code>（比如分片读取数据库）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RangeSpliterator</span> <span class="keyword">implements</span> <span class="title class_">Spliterator</span>&lt;Integer&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="type">int</span> lo, hi;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">RangeSpliterator</span><span class="params">(<span class="type">int</span> lo, <span class="type">int</span> hi)</span> &#123; <span class="built_in">this</span>.lo = lo; <span class="built_in">this</span>.hi = hi; &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">tryAdvance</span><span class="params">(Consumer&lt;? <span class="built_in">super</span> Integer&gt; action)</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (lo &gt;= hi) <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">        action.accept(lo++);</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> Spliterator&lt;Integer&gt; <span class="title function_">trySplit</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">mid</span> <span class="operator">=</span> (lo + hi) &gt;&gt;&gt; <span class="number">1</span>;</span><br><span class="line">        <span class="keyword">if</span> (mid &lt;= lo) <span class="keyword">return</span> <span class="literal">null</span>;          <span class="comment">// 太小，不再拆</span></span><br><span class="line">        <span class="type">RangeSpliterator</span> <span class="variable">prefix</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">RangeSpliterator</span>(lo, mid);</span><br><span class="line">        lo = mid;</span><br><span class="line">        <span class="keyword">return</span> prefix;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">long</span> <span class="title function_">estimateSize</span><span class="params">()</span> &#123; <span class="keyword">return</span> hi - lo; &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">int</span> <span class="title function_">characteristics</span><span class="params">()</span> &#123; <span class="keyword">return</span> SIZED | SUBSIZED | ORDERED | IMMUTABLE; &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>要点：<strong><code>trySplit()</code> 返回 null 表示「不再拆分」</strong>，这是终止递归的重要信号。如果 <code>trySplit</code> 返回的虽然是新对象但尺寸几乎没变小，会导致无限拆分或极差的分摊效果。</p>
+<hr>
+<h2 id="七、并行流是「可复用的」，但务必注意状态"><a href="#七、并行流是「可复用的」，但务必注意状态" class="headerlink" title="七、并行流是「可复用的」，但务必注意状态"></a>七、并行流是「可复用的」，但务必注意状态</h2><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">Stream&lt;Integer&gt; s = list.stream().parallel();</span><br><span class="line"><span class="type">long</span> <span class="variable">count</span> <span class="operator">=</span> s.count();       <span class="comment">// ✅ 第一次终止，流被消费</span></span><br><span class="line"><span class="type">long</span> <span class="variable">sum</span> <span class="operator">=</span> s.mapToInt(x -&gt; x).sum();  <span class="comment">// ❌ IllegalStateException: stream has already been operated upon</span></span><br></pre></td></tr></table></figure>
+
+<p>流是<strong>一次性</strong>的，终止操作后不可复用。并行流也一样。</p>
+<p>另外，<code>parallelStream()</code> 的调用本身有成本（构造 <code>ForkJoinTask</code>），高频小任务不要反复创建。</p>
+<hr>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：并行流的线程数能改吗？</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 改公共池并行度（全局生效，慎用）</span></span><br><span class="line">-Djava.util.concurrent.ForkJoinPool.common.parallelism=16</span><br></pre></td></tr></table></figure>
+
+<p>但<strong>不推荐</strong>动公共池，正确姿势是自定义 <code>ForkJoinPool</code> 并用 <code>submit</code> 包住并行流。</p>
+<p><strong>Q2：<code>parallel()</code> 和 <code>parallelStream()</code> 有区别吗？</strong></p>
+<p>没有本质区别，都是设置 <code>parallel</code> 标志位。<code>parallelStream()</code> 只是集合上的语法糖。</p>
+<p><strong>Q3：并行流和线程池提交任务，谁更好？</strong></p>
+<ul>
+<li>对于<strong>纯计算、数据量大、无共享状态</strong>的任务，并行流代码更简洁，性能接近。</li>
+<li>对于<strong>IO 密集、需要控制并发度、需要隔离&#x2F;超时&#x2F;降级</strong>的任务，必须用显式线程池（<code>ExecutorService</code> + <code>CompletableFuture</code>），因为并行流：<ul>
+<li>无法设置超时；</li>
+<li>无法优雅处理异常（异常会包成 <code>CompletionException</code> 向外抛）；</li>
+<li>无法限流、无法隔离；</li>
+<li>阻塞会污染公共池。</li>
+</ul>
+</li>
+</ul>
+<p><strong>Q4：并行流里抛异常会怎样？</strong></p>
+<p>并行的 <code>map</code> 里抛出的异常，会被包装进 <code>ForkJoinTask</code> 内部，最终在终止操作时以 <code>RuntimeException</code>&#x2F;<code>CompletionException</code> 抛出，<strong>其他子任务的结果被丢弃，且无法优雅降级</strong>。这也是它不适合生产 IO 场景的重要原因。</p>
+<p><strong>Q5：为什么 <code>sorted()</code> 之后并行度会下降？</strong></p>
+<p><code>sorted</code> 是有状态操作，它会在归约阶段把各个子任务的结果<strong>合并后统一排序</strong>，合并本身是串行或半串行的，拆分收益被吃掉。<code>distinct</code>、<code>limit</code>、<code>skip</code> 同理。</p>
+<hr>
+<h2 id="九、生产实践清单"><a href="#九、生产实践清单" class="headerlink" title="九、生产实践清单"></a>九、生产实践清单</h2><ol>
+<li><strong>数据量 &lt; 1 万或单元素计算 &lt; 1ms</strong>：不要用并行流。</li>
+<li><strong>有 IO、RPC、DB 调用</strong>：禁止用并行流，改用显式线程池 + <code>CompletableFuture</code>。</li>
+<li><strong>必须并行的计算场景</strong>：用自定义 <code>ForkJoinPool</code> 包住，避免污染公共池。</li>
+<li><strong>严禁在并行流中修改共享可变状态</strong>，一律用 <code>collect</code> 归约。</li>
+<li><strong>优先选择 <code>ArrayList</code>、数组、<code>range</code> 这类可精确拆分的数据源</strong>，避免 <code>LinkedList</code>、<code>iterate()</code>。</li>
+<li><strong>涉及顺序时用 <code>forEachOrdered</code></strong>，但要意识到它会削弱并行收益。</li>
+<li><strong>基准测试一律用 JMH</strong>，不要用 <code>System.currentTimeMillis()</code> 手搓。</li>
+</ol>
+<hr>
+<h2 id="十、总结"><a href="#十、总结" class="headerlink" title="十、总结"></a>十、总结</h2><p>一句话概括并行流：<strong>它是「把串行计算自动映射到 ForkJoinPool」的语法糖，而不是万能加速器。</strong></p>
+<p>它的三层结构值得记住：</p>
+<ul>
+<li><strong>语法层</strong>：<code>parallel</code> 标志位 + 流水线（无状态&#x2F;有状态中间操作）；</li>
+<li><strong>执行层</strong>：<code>AbstractTask</code> 递归二分 + <code>ForkJoinPool</code> 工作窃取；</li>
+<li><strong>数据层</strong>：<code>Spliterator</code> 的 <code>trySplit</code> 与特征位决定拆分质量。</li>
+</ul>
+<p>三个高频翻车点：</p>
+<ul>
+<li>公共池污染（阻塞 IO）；</li>
+<li><code>forEach</code> 无序 + 共享状态；</li>
+<li>小数据量负优化。</li>
+</ul>
+<p>面试时如果能主动说出「并行流用哪个池取决于执行线程所属的池」以及「<code>Spliterator</code> 的 <code>SUBSIZED</code> 特征决定拆分质量」，基本就能和「只会背 API」的候选人拉开差距了。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/">https://jiweidong.github.io/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a><a class="post-meta__tags" href="/tags/ForkJoinPool/">ForkJoinPool</a><a class="post-meta__tags" href="/tags/Stream/">Stream</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/12/nexus-maven-dependency-governance-deep-practice/" title="【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描</div></div><div class="info-2"><div class="info-item-1">【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描面试官：你们公司的 Maven 依赖是怎么管理的？如果你的回答是「直接在 pom.xml 里写依赖，Maven 自己从中央仓库下」，那说明你还没经历过多团队协作的「依赖地狱」。 在真实的研发环境里，依赖治理要回答四个问题：  从哪下——网络隔离、下载速度、外部仓库不可用怎么办？（私服） 下什么——怎么保证所有人用的版本一致？（BOM &#x2F; 依赖约束） 冲突了怎么办——同一个类被两个版本引入，JVM 用的是哪一个？（依赖调解） 安全吗——引进来的三方包有没有已知 CVE？（依赖安全扫描）  这篇文章从 Nexus 私服讲起，一路讲到 Maven 依赖调解、依赖冲突排查、安全扫描和依赖治理体系。  一、为什么必须有私服直接连 Maven Central 的痛点：    痛点 说明    网络不可靠 国外仓库慢、间歇性超时，CI 构建经常红   外部依赖不可控 中央仓库删版本（如 log4j 曾有版本下架），构建直接失败   内部构件无处放 公司自研的 SDK、公共模块无法发布到公网  ...</div></div></div></a><a class="pagination-related" href="/2026/10/11/ab-testing-experiment-platform-architecture-design/" title="【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】A/B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验这是一道考工程架构 + 数据统计 + 业务理解的综合题。它不像”设计秒杀”那样有标准答案，面试官真正在观察的是：  你知不知道实验平台的核心是分流而不是”配置界面”？ 你分得清 AA 实验、样本量、显著性 这些统计概念吗？ 你能不能说出”同一用户必须稳定命中同一个实验组”这种工程约束？  下面按面试节奏，从需求澄清到落地细节，完整推一遍。  一、需求澄清：先问清楚再设计Q1：实验的粒度是什么？ 用户级、设备级、请求级、还是租户级？绝大多数是用户级（同一用户在一次实验周期内体验一致）。 Q2：一个用户能同时参与几个实验？ 通常分层（Layer）后可以几十个，但同一层内的多个实验必须互斥。 Q3：指标谁来定义？ 产品定义业务指标（点击率、转化率、GMV），平台提供指标计算框架。 Q4：QPS 和延迟要求？ 分流是在线链路，必须做到毫秒级、高可用——实验系统挂了不能影响主站。 Q5：谁能看到什么？ 实验数据权限隔离，避免”产品看到别组...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/24/java-false-sharing-cache-line-padding/" title="【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java 伪共享（False Sharing）与 CPU 缓存行填充深度解析前言在高并发场景下，很多开发者会下意识地关注锁竞争、线程上下文切换等显性性能瓶颈，却忽略了一个「看不见的杀手」——伪共享（False Sharing）。这个问题隐藏在 CPU 缓存体系之中，即使你的代码没有使用任何锁，多个线程操作看似独立的数据，也可能因为共享同一个缓存行而导致性能断崖式下跌。 本文将深入剖析伪共享的原理、检测手段与解决方案，帮助你在高并发场景中写出真正高性能的代码。  一、从 CPU 缓存体系说起1.1 缓存层级结构现代 CPU 的运算速度远超内存访问速度，为了弥合这个差距，CPU 引入了多级缓存： 123456789101112131415CPU Core 0          CPU Core 1┌─────────┐        ┌─────────┐│  L1/L2  │        │  L1/L2  ││  私有   │        │  私有   │└────┬────┘        └────┬────┘     │               ...</div></div></div></a><a class="pagination-related" href="/2026/07/04/java-stream-performance-comparison/" title="【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-04</div><div class="info-item-2">【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java Stream API 深度对比：串行 vs 并行，性能真相与实战避坑前言Java 8 引入的 Stream API 已经成为了 Java 开发者每天都要使用的核心工具。但其背后有一些常见的误解：  “并行流一定比串行流快” “Stream 性能比 for 循环差” “所有集合都适合用 parallelStream”  本文将通过 JMH 基准测试，用数据揭示 Stream 性能的真实面，并深入分析并行流的工作原理和适用场景。  一、Stream 基础回顾1.1 Stream 操作分类   类型 特点 示例 说明    中间操作 惰性求值（lazy） filter() &#x2F; map() &#x2F; sorted() 不触发实际计算   短路中间操作 可以提前终止 limit() &#x2F; skip() 优化处理   终端操作 触发流水线执行 collect() &#x2F; forEach() &#x2F; count() 产生结果或副作用   短路终端操作 满足条件时提前终止 findFirst() &#x2F; anyMatch() 性...</div></div></div></a><a class="pagination-related" href="/2026/08/17/http2-http3-protocol-deep-dive/" title="【网络协议】HTTP&#x2F;2 与 HTTP&#x2F;3 深度解析：多路复用、队头阻塞与 Java 客户端实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-17</div><div class="info-item-2">【网络协议】HTTP&#x2F;2 与 HTTP&#x2F;3 深度解析：多路复用、队头阻塞与 Java 客户端实战</div></div><div class="info-2"><div class="info-item-1">【网络协议】HTTP&#x2F;2 与 HTTP&#x2F;3 深度解析：多路复用、队头阻塞与 Java 客户端实战一、从 HTTP&#x2F;1.1 的痛点说起HTTP&#x2F;1.1 有几个根深蒂固的问题：  队头阻塞（Head-of-Line Blocking）：同一连接上请求必须串行，前一个响应没返回，后面的请求只能排队。浏览器用”每个域名 6 个连接”来缓解，但治标不治本。 头部冗余：Cookie、User-Agent 等请求头动辄几百字节，每次请求都要完整重发。 只能客户端主动请求：服务端想推送资源（比如 HTML 里的 JS&#x2F;CSS），做不到。  HTTP&#x2F;2 和 HTTP&#x2F;3 就是针对这些问题给出的两代答案。面试高频题：”HTTP&#x2F;2 解决了什么问题？HTTP&#x2F;2 的队头阻塞为什么没根除？HTTP&#x2F;3 为什么用 UDP？”——看完这篇你都能答。 二、HTTP&#x2F;2 的核心机制1. 二进制分帧（Binary Framing Layer）HTTP&#x2F;1.1 是文本协议（GET /index ...</div></div></div></a><a class="pagination-related" href="/2026/08/18/optimistic-pessimistic-lock-deep-dive/" title="【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现</div></div><div class="info-2"><div class="info-item-1">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现面试官：你项目里扣库存，用的乐观锁还是悲观锁？这是并发场景的”必考题”。很多人的答案是背出来的：”悲观锁就是锁住，乐观锁就是 CAS”。但一问到”什么场景选哪个、各自的坑在哪”，就露馅了。 本文把乐观锁和悲观锁从思想、实现、源码到实战场景一次讲透。  一、两种锁的哲学悲观锁（Pessimistic Lock）思想：冲突一定会发生，所以先锁再干。  操作数据前先加锁，其他事务&#x2F;线程必须等待； 数据库层面：SELECT ... FOR UPDATE、SELECT ... LOCK IN SHARE MODE； Java 层面：synchronized、ReentrantLock； 适用：写多读少、冲突概率高的场景。  乐观锁（Optimistic Lock）思想：冲突是少数，所以先干再验，冲突了重试。  不加锁，更新时校验数据是否被改过（版本号&#x2F;时间戳&#x2F;CAS）； 数据库层面：UPDATE ... SET version = version + 1 WHERE version = ?； J...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-synchronized-lock-upgrade/" title="面试官：说说 Synchronized 的锁升级过程？"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">面试官：说说 Synchronized 的锁升级过程？</div></div><div class="info-2"><div class="info-item-1">面试官：说说 Synchronized 的锁升级过程？面试官：先说说 Synchronized 的基本用法吧Synchronized 是 Java 最基础的同步机制，从 JDK 1.0 就有了。用法分三种：    用法 锁对象 作用范围    修饰实例方法 当前实例对象 this 整个方法   修饰静态方法 当前 Class 对象 整个方法   同步代码块 指定的任意对象 代码块内   123456789101112131415161718public class SyncDemo &#123;    // 实例方法锁 - 锁的是 this    public synchronized void instanceMethod() &#123;        // ...    &#125;        // 静态方法锁 - 锁的是 Class 对象    public static synchronized void staticMethod() &#123;        // ...    &#125;        // 代码块锁 - 锁的是指定对象    public ...</div></div></div></a><a class="pagination-related" href="/2026/06/30/java-memory-leak-investigation-guide/" title="Java 内存泄漏排查全攻略：从堆转储到 MAT 实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战</div></div><div class="info-2"><div class="info-item-1">Java 内存泄漏排查全攻略：从堆转储到 MAT 实战一、内存泄漏 vs 内存溢出先理清两个概念：    概念 定义 表现    内存泄漏（Memory Leak） 无用对象持续被引用，GC 无法回收 占用逐渐增加，最终 OOM   内存溢出（OOM） 对象需要内存但堆空间不足 直接抛出 OutOfMemoryError   泄漏是溢出的原因之一，但不是唯一原因（也可能是对象过多、堆太小等）。 二、Java 内存泄漏的典型模式2.1 静态集合类最常见的内存泄漏——static 集合的生命周期 &#x3D; 应用生命周期： 12345678public class CacheManager &#123;    // ❌ 静态 HashMap 永远不会被回收    private static Map&lt;String, Object&gt; cache = new HashMap&lt;&gt;();        public static void addData(String key, Object data) &#123;        cache.put(key, da...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">757</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">847</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">232</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-%E5%B9%B6%E5%8F%91%E3%80%91%E5%B9%B6%E8%A1%8C%E6%B5%81%EF%BC%88Parallel-Stream%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AForkJoinPool-%E5%85%AC%E5%85%B1%E6%B1%A0%E3%80%81%E5%B7%A5%E4%BD%9C%E7%AA%83%E5%8F%96%E4%B8%8E%E6%80%A7%E8%83%BD%E9%99%B7%E9%98%B1"><span class="toc-number">1.</span> <span class="toc-text">【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9Alist-parallelStream-%E5%92%8C-list-stream-%E6%9C%89%E4%BB%80%E4%B9%88%E5%8C%BA%E5%88%AB%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：list.parallelStream() 和 list.stream() 有什么区别？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%B9%B6%E8%A1%8C%E6%B5%81%E7%9A%84%E6%9C%AC%E8%B4%A8%EF%BC%9A%E4%B8%80%E6%9D%A1-parallel-%E6%A0%87%E5%BF%97%E4%BD%8D"><span class="toc-number">1.2.</span> <span class="toc-text">一、并行流的本质：一条 parallel 标志位</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%B5%81%E6%B0%B4%E7%BA%BF%E7%BB%93%E6%9E%84"><span class="toc-number">1.2.1.</span> <span class="toc-text">流水线结构</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%89%A7%E8%A1%8C%E5%BC%95%E6%93%8E%EF%BC%9AForkJoinPool-%E4%B8%8E%E5%B7%A5%E4%BD%9C%E7%AA%83%E5%8F%96"><span class="toc-number">1.3.</span> <span class="toc-text">二、执行引擎：ForkJoinPool 与工作窃取</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%98%88%E5%80%BC%E6%98%AF%E6%80%8E%E4%B9%88%E7%AE%97%E7%9A%84%EF%BC%9F"><span class="toc-number">1.3.1.</span> <span class="toc-text">阈值是怎么算的？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E8%87%B4%E5%91%BD%E9%99%B7%E9%98%B1%E4%B8%80%EF%BC%9A%E5%85%AC%E5%85%B1%E6%B1%A0%EF%BC%88Common-Pool%EF%BC%89%E8%A2%AB%E9%98%BB%E5%A1%9E"><span class="toc-number">1.4.</span> <span class="toc-text">三、致命陷阱一：公共池（Common Pool）被阻塞</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%BA%E4%BB%80%E4%B9%88%E5%8D%B1%E9%99%A9%EF%BC%9F"><span class="toc-number">1.4.1.</span> <span class="toc-text">为什么危险？</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%AD%A3%E7%A1%AE%E5%81%9A%E6%B3%95%EF%BC%9A%E8%87%AA%E5%AE%9A%E4%B9%89-ForkJoinPool"><span class="toc-number">1.4.2.</span> <span class="toc-text">正确做法：自定义 ForkJoinPool</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%87%B4%E5%91%BD%E9%99%B7%E9%98%B1%E4%BA%8C%EF%BC%9AforEach-%E9%A1%BA%E5%BA%8F%E4%B8%8E%E5%89%AF%E4%BD%9C%E7%94%A8"><span class="toc-number">1.5.</span> <span class="toc-text">四、致命陷阱二：forEach 顺序与副作用</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%80%A7%E8%83%BD%E5%AE%9E%E6%B5%8B%EF%BC%9A%E5%B9%B6%E8%A1%8C%E6%B5%81%E5%88%B0%E5%BA%95%E5%BF%AB%E4%B8%8D%E5%BF%AB%EF%BC%9F"><span class="toc-number">1.6.</span> <span class="toc-text">五、性能实测：并行流到底快不快？</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%BD%B1%E5%93%8D%E6%80%A7%E8%83%BD%E7%9A%84%E5%85%B6%E4%BB%96%E7%BB%86%E8%8A%82"><span class="toc-number">1.6.1.</span> <span class="toc-text">影响性能的其他细节</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Spliterator%EF%BC%9A%E5%B9%B6%E8%A1%8C%E6%B5%81%E7%9A%84%E6%8B%86%E5%88%86%E5%BA%95%E5%BA%A7"><span class="toc-number">1.7.</span> <span class="toc-text">六、Spliterator：并行流的拆分底座</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%B9%B6%E8%A1%8C%E6%B5%81%E6%98%AF%E3%80%8C%E5%8F%AF%E5%A4%8D%E7%94%A8%E7%9A%84%E3%80%8D%EF%BC%8C%E4%BD%86%E5%8A%A1%E5%BF%85%E6%B3%A8%E6%84%8F%E7%8A%B6%E6%80%81"><span class="toc-number">1.8.</span> <span class="toc-text">七、并行流是「可复用的」，但务必注意状态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、生产实践清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/search-system-architecture-design/" title="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析">【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析</a><time datetime="2026-10-12T00:40:00.000Z" title="发表于 2026-10-12 08:40:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/advertising-system-architecture-design/" title="【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析">【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析</a><time datetime="2026-10-12T00:30:00.000Z" title="发表于 2026-10-12 08:30:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/recommendation-system-architecture-design/" title="【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析">【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析</a><time datetime="2026-10-12T00:20:00.000Z" title="发表于 2026-10-12 08:20:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/nexus-maven-dependency-governance-deep-practice/" title="【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描">【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描</a><time datetime="2026-10-12T00:10:00.000Z" title="发表于 2026-10-12 08:10:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/" title="【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱">【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱</a><time datetime="2026-10-12T00:00:00.000Z" title="发表于 2026-10-12 08:00:00">2026-10-12</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

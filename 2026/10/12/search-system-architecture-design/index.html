@@ -1,0 +1,581 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析面试官：设计一个站内搜索系统，你怎么做？很多同学的答案是：「上 Elasticsearch，把数据同步进去，match 查一下就行」。 这个回答能撑过 5 分钟。接下来的追问就挡不住了：  数据怎么进 ES？全量 + 增量怎么保证一致？ 用户搜「怎么退换货」搜不到「退货流程」怎么办？（同义词&#x2F;语义） 搜「华为手机」为">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/12/search-system-architecture-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析面试官：设计一个站内搜索系统，你怎么做？很多同学的答案是：「上 Elasticsearch，把数据同步进去，match 查一下就行」。 这个回答能撑过 5 分钟。接下来的追问就挡不住了：  数据怎么进 ES？全量 + 增量怎么保证一致？ 用户搜「怎么退换货」搜不到「退货流程」怎么办？（同义词&#x2F;语义） 搜「华为手机」为">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-12T00:40:00.000Z">
+<meta property="article:modified_time" content="2026-10-12T00:04:31.483Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="搜索引擎">
+<meta property="article:tag" content="架构设计">
+<meta property="article:tag" content="系统设计">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析",
+  "url": "https://jiweidong.github.io/2026/10/12/search-system-architecture-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-12T00:40:00.000Z",
+  "dateModified": "2026-10-12T00:04:31.483Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/12/search-system-architecture-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">757</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">847</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">232</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-12T00:40:00.000Z" title="发表于 2026-10-12 08:40:00">2026-10-12</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-12T00:04:31.483Z" title="更新于 2026-10-12 08:04:31">2026-10-12</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><i class="fas fa-angle-right post-meta-separator"></i><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析"><a href="#【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析" class="headerlink" title="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析"></a>【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析</h1><h2 id="面试官：设计一个站内搜索系统，你怎么做？"><a href="#面试官：设计一个站内搜索系统，你怎么做？" class="headerlink" title="面试官：设计一个站内搜索系统，你怎么做？"></a>面试官：设计一个站内搜索系统，你怎么做？</h2><p>很多同学的答案是：「上 Elasticsearch，把数据同步进去，<code>match</code> 查一下就行」。</p>
+<p>这个回答能撑过 5 分钟。接下来的追问就挡不住了：</p>
+<ul>
+<li>数据怎么进 ES？全量 + 增量怎么保证一致？</li>
+<li>用户搜「怎么退换货」搜不到「退货流程」怎么办？（同义词&#x2F;语义）</li>
+<li>搜「华为手机」为什么不该召回「华为平板」？（意图与相关性）</li>
+<li>排序凭什么把 A 排在前？相关性怎么定义、怎么评估？</li>
+<li>大促流量涨 10 倍怎么办？重建索引时线上不能停怎么办？</li>
+</ul>
+<p>搜索系统是**「数据 + 检索 + 排序 + 工程」**的复合体。这篇文章按「索引 → 查询理解 → 召回 → 排序 → 工程化」五段主线讲透。</p>
+<hr>
+<h2 id="一、整体架构"><a href="#一、整体架构" class="headerlink" title="一、整体架构"></a>一、整体架构</h2><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line">                      ┌──────────────────────────────┐</span><br><span class="line">用户查询 ───────────►  │        搜索网关 (Gate)        │</span><br><span class="line">                      │  鉴权/限流/AB/超时/降级        │</span><br><span class="line">                      └──────────────┬───────────────┘</span><br><span class="line">                                     ▼</span><br><span class="line">┌────────────────────────────────────────────────────────────┐</span><br><span class="line">│ 1. 查询理解 (Query Understanding)                           │</span><br><span class="line">│    分词 → 纠错 → 同义词 → 归一化 → 意图识别 → Query 改写     │</span><br><span class="line">└───────────────────────────┬────────────────────────────────┘</span><br><span class="line">                            ▼</span><br><span class="line">┌────────────────────────────────────────────────────────────┐</span><br><span class="line">│ 2. 召回 (Recall)                                            │</span><br><span class="line">│    倒排召回 + 向量召回 + 个性化召回 + 规则召回 → 去重/融合    │</span><br><span class="line">└───────────────────────────┬────────────────────────────────┘</span><br><span class="line">                            ▼</span><br><span class="line">┌────────────────────────────────────────────────────────────┐</span><br><span class="line">│ 3. 粗排 → 4. 精排 (LTR 学习排序 + 个性化)                    │</span><br><span class="line">└───────────────────────────┬────────────────────────────────┘</span><br><span class="line">                            ▼</span><br><span class="line">┌────────────────────────────────────────────────────────────┐</span><br><span class="line">│ 5. 重排：去重/打散/业务规则/多样性                           │</span><br><span class="line">└───────────────────────────┬────────────────────────────────┘</span><br><span class="line">                            ▼</span><br><span class="line">                         返回结果</span><br><span class="line">                            ▲</span><br><span class="line">          ┌─────────────────┴──────────────────┐</span><br><span class="line">          │  离线索引构建    实时索引增量         │</span><br><span class="line">          │  全量重建(天级)   Binlog/MQ(秒级)    │</span><br><span class="line">          └────────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、索引构建：一致性与实时性"><a href="#二、索引构建：一致性与实时性" class="headerlink" title="二、索引构建：一致性与实时性"></a>二、索引构建：一致性与实时性</h2><p>搜索系统的「数据从哪来、怎么进索引」是最容易被低估的部分，也是面试中区分度高的话题。</p>
+<h3 id="数据链路"><a href="#数据链路" class="headerlink" title="数据链路"></a>数据链路</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">业务库 MySQL</span><br><span class="line">    │</span><br><span class="line">    ├─(1) 全量：定时任务 / 数据导出 ──► 离线数仓 ──► 批量建索引</span><br><span class="line">    │</span><br><span class="line">    └─(2) 增量：Binlog(Canal) ──► Kafka ──► 索引构建消费者 ──► ES</span><br><span class="line">                  ▲</span><br><span class="line">                  └─ 双写 / 业务 MQ 消息（可靠消息）</span><br></pre></td></tr></table></figure>
+
+<p><strong>三种同步方式对比</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>原理</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>双写</td>
+<td>业务代码同时写 DB 和 ES</td>
+<td>简单</td>
+<td>耦合业务、一致性差、失败难补偿</td>
+</tr>
+<tr>
+<td>Binlog 订阅（Canal）</td>
+<td>解析 MySQL Binlog</td>
+<td>无侵入、可靠</td>
+<td>与 DB 结构耦合、有延迟</td>
+</tr>
+<tr>
+<td>业务 MQ</td>
+<td>业务发消息，消费者写 ES</td>
+<td>解耦、灵活</td>
+<td>需要业务改造、可能丢消息</td>
+</tr>
+</tbody></table>
+<p><strong>推荐方案</strong>：<strong>MySQL Binlog（Canal）为主 + 全量重建兜底 + 对账校验</strong>。</p>
+<h3 id="全量重建：如何做到不停机"><a href="#全量重建：如何做到不停机" class="headerlink" title="全量重建：如何做到不停机"></a>全量重建：如何做到不停机</h3><p>搜索索引的字段、分词器、Mapping 变更往往需要<strong>重建索引</strong>。直接删了重建会导致线上不可用。正确姿势是<strong>别名切换（Alias + Reindex）</strong>：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">1. 新建索引 products_v2，写入全量数据</span><br><span class="line">2. 双写：增量数据同时写 v1 和 v2（或用 Binlog 补差）</span><br><span class="line">3. 校验：对比 v1 和 v2 的文档数、抽样结果</span><br><span class="line">4. 切换别名：products -&gt; products_v2（原子操作）</span><br><span class="line">5. 观察一段时间后删除 v1</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 别名切换：一次请求原子完成</span></span><br><span class="line">POST /_aliases</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;actions&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span></span><br><span class="line">    <span class="punctuation">&#123;</span> <span class="attr">&quot;remove&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;products_v1&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;alias&quot;</span><span class="punctuation">:</span> <span class="string">&quot;products&quot;</span> <span class="punctuation">&#125;</span> <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="punctuation">&#123;</span> <span class="attr">&quot;add&quot;</span><span class="punctuation">:</span>    <span class="punctuation">&#123;</span> <span class="attr">&quot;index&quot;</span><span class="punctuation">:</span> <span class="string">&quot;products_v2&quot;</span><span class="punctuation">,</span> <span class="attr">&quot;alias&quot;</span><span class="punctuation">:</span> <span class="string">&quot;products&quot;</span> <span class="punctuation">&#125;</span> <span class="punctuation">&#125;</span></span><br><span class="line">  <span class="punctuation">]</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>要点</strong>：读请求永远走<strong>别名</strong>，索引名不写死在代码里。</p>
+<h3 id="增量一致性与延迟"><a href="#增量一致性与延迟" class="headerlink" title="增量一致性与延迟"></a>增量一致性与延迟</h3><ul>
+<li><strong>近实时（NRT）</strong>：ES 默认 <code>refresh_interval=1s</code>，写入后最多 1 秒可搜到；</li>
+<li><strong>写后读一致性</strong>：用户刚发布的商品立刻搜索不到，体验很差。解决：写入时带上 refresh 或<strong>结果合并</strong>（把「用户自己的最新数据」手动合并进搜索结果）；</li>
+<li><strong>乱序问题</strong>：Kafka 消费可能乱序（更新和删除交叠），要用<strong>版本号 &#x2F; 时间戳</strong>做条件更新，丢弃旧版本：</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 条件更新：只有新版本才覆盖（用 ES 的 version / script 实现）</span></span><br><span class="line"><span class="keyword">if</span> (incomingVersion &lt;= existingVersion) &#123;</span><br><span class="line">    <span class="keyword">return</span>;   <span class="comment">// 丢弃过期消息</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><strong>删除</strong>：物理删除 vs 逻辑删除（软删标记 + 查询过滤），搜索场景常用<strong>软删 + 定期物理清理</strong>，便于回滚。</li>
+</ul>
+<hr>
+<h2 id="三、查询理解：把「人话」变成「检索式」"><a href="#三、查询理解：把「人话」变成「检索式」" class="headerlink" title="三、查询理解：把「人话」变成「检索式」"></a>三、查询理解：把「人话」变成「检索式」</h2><p>这是搜索系统<strong>最体现工程智慧</strong>的一层，也是和「直接用 ES」的最大差距。</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">用户输入: &quot;华为手机 5000左右 拍照好的&quot;</span><br><span class="line">   │</span><br><span class="line">   ├─ 分词:      [华为手机] [5000] [左右] [拍照] [好]</span><br><span class="line">   ├─ 纠错:      &quot;华为手几&quot; → &quot;华为手机&quot;</span><br><span class="line">   ├─ 同义词:    &quot;移动电话&quot; → &quot;手机&quot;，&quot;退换货&quot; → &quot;退货|换货&quot;</span><br><span class="line">   ├─ 归一化:    尺寸/单位/大小写/繁简/全半角</span><br><span class="line">   ├─ 意图识别:  品类=手机, 价格区间=[4000,6000], 属性=拍照好</span><br><span class="line">   └─ Query 改写: 华为 AND (手机 OR 智能手机) AND 价格:[4000 TO 6000]</span><br></pre></td></tr></table></figure>
+
+<h3 id="分词"><a href="#分词" class="headerlink" title="分词"></a>分词</h3><p>中文分词是搜索的基础。工程上常用：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>词典分词（IK）</td>
+<td>基于词典 + 规则，可控、可干预，主流</td>
+</tr>
+<tr>
+<td>新词发现</td>
+<td>从日志挖掘未登录词，定期更新词典</td>
+</tr>
+<tr>
+<td>自定义词典</td>
+<td>品牌、型号、行业术语必须人工维护</td>
+</tr>
+</tbody></table>
+<p><strong>关键实践</strong>：搜索分词与索引分词必须使用<strong>同一套词典和分词器</strong>，否则「索引时分出的词」和「查询时分出的词」对不上，召回率会崩。这也是 <code>elasticsearch-chinese-analyzer-ik</code> 里反复强调的点。</p>
+<h3 id="纠错（Spell-Correction）"><a href="#纠错（Spell-Correction）" class="headerlink" title="纠错（Spell Correction）"></a>纠错（Spell Correction）</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">&quot;平果手机&quot; → &quot;苹果手机&quot;</span><br><span class="line">&quot;华维&quot;     → &quot;华为&quot;</span><br></pre></td></tr></table></figure>
+
+<p>工程实现：</p>
+<ol>
+<li><strong>词典 + 编辑距离</strong>：对查询词做 1~2 个编辑距离的候选生成，按词频&#x2F;热度排序；</li>
+<li><strong>拼音纠错</strong>：同音字混淆（平果&#x2F;苹果）用拼音索引召回；</li>
+<li><strong>N-gram 模型</strong>：统计相邻字共现概率；</li>
+<li><strong>日志挖掘</strong>：从「零结果查询」中挖掘高频错别字。</li>
+</ol>
+<p><strong>重要原则</strong>：纠错宁可<strong>少纠</strong>也不<strong>错纠</strong>。错纠会直接毁掉用户意图。通常设置高阈值，且只对高频词纠错。</p>
+<h3 id="同义词与查询扩展"><a href="#同义词与查询扩展" class="headerlink" title="同义词与查询扩展"></a>同义词与查询扩展</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">退换货 → [退货, 换货]</span><br><span class="line">手机   → [智能手机, cellphone]</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><strong>索引期扩展</strong> vs <strong>查询期扩展</strong>：查询期扩展更灵活、可动态调整；索引期扩展会放大索引体积。</li>
+<li><strong>双向同义词</strong> vs <strong>单向</strong>：<code>华为 → 华为技术</code> 单向即可；<code>手机 ↔ 智能手机</code> 双向。</li>
+<li><strong>权重控制</strong>：扩展词权重应低于原词，避免噪声召回。</li>
+</ul>
+<h3 id="意图识别"><a href="#意图识别" class="headerlink" title="意图识别"></a>意图识别</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">&quot;华为mate60&quot;     → 实体/商品意图</span><br><span class="line">&quot;怎么退货&quot;       → 问答/教程意图</span><br><span class="line">&quot;华为 vs 小米&quot;   → 对比意图</span><br><span class="line">&quot;附近的充电宝&quot;   → 本地/位置意图</span><br></pre></td></tr></table></figure>
+
+<p>意图决定了<strong>召回哪些数据源</strong>（商品库 &#x2F; 文章库 &#x2F; FAQ 库）和<strong>用哪套排序策略</strong>。工程上常用规则 + 轻量分类模型。</p>
+<hr>
+<h2 id="四、召回：多路并行"><a href="#四、召回：多路并行" class="headerlink" title="四、召回：多路并行"></a>四、召回：多路并行</h2><p>召回的目标是<strong>在保证相关性的前提下，尽可能不遗漏</strong>。常见通路：</p>
+<table>
+<thead>
+<tr>
+<th>召回通路</th>
+<th>实现</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>倒排召回</td>
+<td>ES&#x2F;Lucene 倒排索引，BM25 打分</td>
+<td>精确匹配、关键词</td>
+</tr>
+<tr>
+<td>向量召回</td>
+<td>双塔 embedding + ANN（HNSW）</td>
+<td>语义匹配、模糊意图</td>
+</tr>
+<tr>
+<td>短语&#x2F;精确召回</td>
+<td><code>match_phrase</code>、<code>term</code></td>
+<td>品牌&#x2F;型号精确匹配</td>
+</tr>
+<tr>
+<td>类目&#x2F;标签召回</td>
+<td>结构化过滤</td>
+<td>意图明确的查询</td>
+</tr>
+<tr>
+<td>个性化召回</td>
+<td>用户历史行为</td>
+<td>有画像的用户</td>
+</tr>
+<tr>
+<td>规则召回</td>
+<td>运营干预（置顶、屏蔽）</td>
+<td>兜底&#x2F;干预</td>
+</tr>
+</tbody></table>
+<h3 id="多路融合"><a href="#多路融合" class="headerlink" title="多路融合"></a>多路融合</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> List&lt;Doc&gt; <span class="title function_">recall</span><span class="params">(QueryQuery q)</span> &#123;</span><br><span class="line">    List&lt;CompletableFuture&lt;List&lt;Doc&gt;&gt;&gt; fs = List.of(</span><br><span class="line">        async(() -&gt; invertedRecall(q), executor),</span><br><span class="line">        async(() -&gt; vectorRecall(q), executor),</span><br><span class="line">        async(() -&gt; categoryRecall(q), executor)</span><br><span class="line">    );</span><br><span class="line">    <span class="keyword">return</span> fs.stream()</span><br><span class="line">            .map(CompletableFuture::join)</span><br><span class="line">            .flatMap(List::stream)</span><br><span class="line">            <span class="comment">// 加权融合：同一 doc 来自多路则分数累加</span></span><br><span class="line">            .collect(Collectors.toMap(Doc::getId, d -&gt; d,</span><br><span class="line">                     (a, b) -&gt; a.mergeScore(b)))</span><br><span class="line">            .values().stream()</span><br><span class="line">            .sorted(Comparator.comparingDouble(Doc::getScore).reversed())</span><br><span class="line">            .limit(<span class="number">500</span>)</span><br><span class="line">            .collect(Collectors.toList());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>要点</strong>：</p>
+<ul>
+<li><strong>每路独立超时与降级</strong>，单路失败不影响整体；</li>
+<li><strong>融合策略</strong>：分数归一化后加权（RRF 倒数排名融合也很常用）；</li>
+<li><strong>去重</strong>：同一文档多路命中要合并分数而非重复。</li>
+</ul>
+<h3 id="相关性：BM25-与向量检索的取舍"><a href="#相关性：BM25-与向量检索的取舍" class="headerlink" title="相关性：BM25 与向量检索的取舍"></a>相关性：BM25 与向量检索的取舍</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>BM25（倒排）</th>
+<th>向量检索</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>匹配方式</td>
+<td>词面匹配</td>
+<td>语义匹配</td>
+</tr>
+<tr>
+<td>可解释性</td>
+<td>高</td>
+<td>低</td>
+</tr>
+<tr>
+<td>精确匹配</td>
+<td>强（型号、品牌）</td>
+<td>弱</td>
+</tr>
+<tr>
+<td>同义&#x2F;语义</td>
+<td>弱（需同义词）</td>
+<td>强</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>极高</td>
+<td>依赖 ANN 索引</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>无需训练</td>
+<td>需训练 embedding</td>
+</tr>
+</tbody></table>
+<p><strong>实践结论</strong>：<strong>两者融合</strong>（hybrid search）。精确类查询（品牌型号）以倒排为主，模糊语义查询以向量为主，用加权或 LTR 统一融合。</p>
+<hr>
+<h2 id="五、排序：从-BM25-到学习排序（LTR）"><a href="#五、排序：从-BM25-到学习排序（LTR）" class="headerlink" title="五、排序：从 BM25 到学习排序（LTR）"></a>五、排序：从 BM25 到学习排序（LTR）</h2><h3 id="打分演进"><a href="#打分演进" class="headerlink" title="打分演进"></a>打分演进</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">第一代：TF-IDF / BM25（纯文本相关性）</span><br><span class="line">第二代：BM25 + 业务特征（销量、评分、时效）线性加权</span><br><span class="line">第三代：LTR（Learning to Rank）机器学习排序</span><br><span class="line">第四代：个性化 + 多目标（相关性 × 转化 × 体验）</span><br></pre></td></tr></table></figure>
+
+<h3 id="BM25-公式直觉"><a href="#BM25-公式直觉" class="headerlink" title="BM25 公式直觉"></a>BM25 公式直觉</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">score(q, d) = Σ IDF(term) × [ tf × (k1+1) ] / [ tf + k1 × (1 - b + b × |d|/avgdl) ]</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>IDF</code>：词越稀有，权重越大；</li>
+<li><code>tf</code>：词频，但<strong>有饱和</strong>（出现 100 次不会比 10 次重要 10 倍）；</li>
+<li><code>b</code>：文档长度归一化强度。</li>
+</ul>
+<h3 id="LTR-三要素"><a href="#LTR-三要素" class="headerlink" title="LTR 三要素"></a>LTR 三要素</h3><table>
+<thead>
+<tr>
+<th>要素</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>特征</td>
+<td>文本相关性、query-doc 匹配、doc 质量（销量&#x2F;评分&#x2F;时效）、用户特征、上下文</td>
+</tr>
+<tr>
+<td>标签</td>
+<td>点击、转化、停留时长，或人工相关性标注（0-3 分）</td>
+</tr>
+<tr>
+<td>模型</td>
+<td>Pointwise &#x2F; Pairwise（RankNet）&#x2F; Listwise（LambdaMART、LambdaRank）</td>
+</tr>
+</tbody></table>
+<p><strong>LambdaMART</strong> 是最经典的 LTR 算法，直接优化 NDCG；工程上用 LightGBM 就能训练。</p>
+<h3 id="相关性评估指标"><a href="#相关性评估指标" class="headerlink" title="相关性评估指标"></a>相关性评估指标</h3><table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>NDCG@K</strong></td>
+<td>归一化折损累计增益，考虑位置权重，最常用</td>
+</tr>
+<tr>
+<td><strong>MAP</strong></td>
+<td>平均精度均值</td>
+</tr>
+<tr>
+<td><strong>MRR</strong></td>
+<td>第一个相关结果排名的倒数</td>
+</tr>
+<tr>
+<td><strong>P@K &#x2F; R@K</strong></td>
+<td>Top-K 准确率&#x2F;召回率</td>
+</tr>
+<tr>
+<td><strong>零结果率</strong></td>
+<td>无结果查询占比（体验核心指标）</td>
+</tr>
+<tr>
+<td><strong>点击率&#x2F;转化率</strong></td>
+<td>线上真实效果</td>
+</tr>
+</tbody></table>
+<p><strong>离线 + 在线双评估</strong>：离线指标提升不代表线上提升（离线偏差），必须 AB 实验验证。</p>
+<h3 id="个性化"><a href="#个性化" class="headerlink" title="个性化"></a>个性化</h3><p>在相关性基础上叠加个性化：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">final_score = relevance_score</span><br><span class="line">            + w1 * user_preference(doc)</span><br><span class="line">            + w2 * personalization_boost</span><br></pre></td></tr></table></figure>
+
+<p>工程要点：</p>
+<ul>
+<li><strong>不能过度个性化</strong>：个性化权重过大会导致「搜索结果和用户已有认知不符」，反而伤害体验；</li>
+<li><strong>探索与利用</strong>：新用户无画像时用全局热门 + 快速试探；</li>
+<li><strong>多样性</strong>：同一品牌&#x2F;类目不要占满首页（打散）。</li>
+</ul>
+<hr>
+<h2 id="六、性能与工程化"><a href="#六、性能与工程化" class="headerlink" title="六、性能与工程化"></a>六、性能与工程化</h2><h3 id="缓存体系"><a href="#缓存体系" class="headerlink" title="缓存体系"></a>缓存体系</h3><p>搜索是典型的「读多写少、查询重复率高」场景，缓存收益极高。</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>内容</th>
+<th>命中率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CDN&#x2F;接入层</td>
+<td>静态资源</td>
+<td>—</td>
+</tr>
+<tr>
+<td>网关&#x2F;本地缓存</td>
+<td>热门 query 结果</td>
+<td>中高</td>
+</tr>
+<tr>
+<td>分布式缓存（Redis）</td>
+<td>query → docId 列表</td>
+<td>高</td>
+</tr>
+<tr>
+<td>结果缓存</td>
+<td>完整结果（含排序）</td>
+<td>高</td>
+</tr>
+<tr>
+<td>索引缓存</td>
+<td>OS Page Cache &#x2F; ES 文件缓存</td>
+<td>极高</td>
+</tr>
+</tbody></table>
+<p><strong>多级缓存关键点</strong>：<strong>缓存 docId 而不是完整文档</strong>——用 id 回表能保证文档内容更新后立即可见，避免「搜索列表是新的、点进去是旧的」。参考 <code>caffeine-multi-level-cache-practice</code>。</p>
+<h3 id="分片与扩容"><a href="#分片与扩容" class="headerlink" title="分片与扩容"></a>分片与扩容</h3><ul>
+<li><strong>索引分片数在创建时确定，不能改</strong>（只能重建），所以<strong>分片数要留足余量</strong>（参考 <code>elasticsearch-shard-strategy-scaling</code>）；</li>
+<li><strong>副本数</strong>决定读吞吐与容灾；</li>
+<li><strong>冷热分离</strong>：热点索引放 SSD 节点，历史数据放冷节点（ILM 生命周期管理）；</li>
+<li><strong>读写分离</strong>：大批量写入走独立节点，避免影响查询。</li>
+</ul>
+<h3 id="大促治理"><a href="#大促治理" class="headerlink" title="大促治理"></a>大促治理</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">1. 容量评估：按峰值 QPS × 冗余系数准备机器</span><br><span class="line">2. 预热：提前把热门 query 跑一遍，warming 缓存</span><br><span class="line">3. 限流：网关层按用户/接口维度限流</span><br><span class="line">4. 降级：关掉向量召回、个性化、LTR 精排，退化为纯 BM25</span><br><span class="line">5. 兜底：返回运营配置的固定内容</span><br></pre></td></tr></table></figure>
+
+<p><strong>降级必须提前演练</strong>，不能等到大促当天才第一次按下开关。</p>
+<h3 id="可观测性"><a href="#可观测性" class="headerlink" title="可观测性"></a>可观测性</h3><table>
+<thead>
+<tr>
+<th>类型</th>
+<th>指标</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>系统</td>
+<td>QPS、P99、错误率、各阶段耗时、ES 慢查询</td>
+</tr>
+<tr>
+<td>业务</td>
+<td>零结果率、点击率、转化率、Top1 点击率</td>
+</tr>
+<tr>
+<td>质量</td>
+<td>NDCG 抽样、相关性人工抽检</td>
+</tr>
+<tr>
+<td>数据</td>
+<td>索引文档数、同步延迟、同步失败数</td>
+</tr>
+</tbody></table>
+<p><strong>搜索日志是宝库</strong>：零结果查询、低点击查询、高频查询都是优化相关性和挖掘需求的输入。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：ES 和搜索引擎的关系？</strong></p>
+<p>ES 是<strong>检索引擎</strong>，提供倒排索引和基础打分。完整的搜索系统还需要<strong>查询理解、多路召回、LTR 排序、个性化、缓存、降级</strong>——这些 ES 不负责，需要你在上层自研。</p>
+<p><strong>Q2：怎么保证数据一致性？</strong></p>
+<p>Binlog 增量同步 + 全量重建兜底 + 版本号条件更新（丢弃乱序旧消息）+ 定时对账。写入后延迟（NRT）通常 1 秒内可接受。</p>
+<p><strong>Q3：重建索引怎么不停机？</strong></p>
+<p>别名（Alias）+ 双写 + 数据校验 + 原子切换。读永远走别名，索引名不写死。</p>
+<p><strong>Q4：相关性怎么优化？</strong></p>
+<p>三步：① 查询理解（分词&#x2F;同义词&#x2F;纠错）提升召回；② 引入业务特征做线性加权；③ 升级到 LTR（LambdaMART），用日志和人工标注训练，NDCG 评估，AB 验证。</p>
+<p><strong>Q5：搜不到结果怎么办？</strong></p>
+<p>兜底策略：同义词扩展 → 分词粒度调整（细粒度&#x2F;字粒度）→ 向量召回 → 类目推荐 → 热门推荐 → 「猜你想搜」。目标是把「零结果率」压到极致。</p>
+<p><strong>Q6：搜索和推荐的区别？</strong></p>
+<p>搜索是<strong>主动的、query 驱动的</strong>，核心是「相关性」（准确满足意图）；推荐是<strong>被动的、无 query 的</strong>，核心是「兴趣匹配」。搜索相关性错了用户会立刻流失，所以对精确性要求更高。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>搜索系统的五层结构：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">查询理解 ─► 召回 ─► 粗排 ─► 精排(LTR) ─► 重排 ─► 返回</span><br><span class="line">   │          │        │         │         │</span><br><span class="line">分词/纠错   倒排+向量  轻量模型  LambdaMART 去重/打散</span><br><span class="line">同义/意图   多路融合   特征工程  个性化     业务规则</span><br><span class="line">   │                                                   ▲</span><br><span class="line">   └───────────── 索引构建：全量 + Binlog 增量 ──────────┘</span><br><span class="line">                  （别名切换实现不停机重建）</span><br></pre></td></tr></table></figure>
+
+<p>作为 Java 后端工程师，设计搜索系统时你要抓住四个工程关键点：</p>
+<ol>
+<li><strong>索引一致性</strong>：全量 + 增量 + 对账，别名切换实现零停机重建；</li>
+<li><strong>查询理解</strong>：分词器统一、同义词与纠错宁可少不可错；</li>
+<li><strong>多路召回 + LTR</strong>：混合检索，离线 NDCG + 在线 AB 双评估；</li>
+<li><strong>缓存与降级</strong>：缓存 docId 而非文档，大促前预热 + 演练降级。</li>
+</ol>
+<p>「会用 ES」是入门，「能设计一个相关性可控、数据一致、能扛大促的搜索平台」才是面试官真正想听的答案。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/12/search-system-architecture-design/">https://jiweidong.github.io/2026/10/12/search-system-architecture-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/%E6%90%9C%E7%B4%A2%E5%BC%95%E6%93%8E/">搜索引擎</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/10/12/advertising-system-architecture-design/" title="【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析面试官：设计一个广告投放系统，你怎么做？广告系统和推荐系统长得很像——都是「在海量候选里选出若干个展现」——但它有三个本质不同：  广告是花钱的：每一次曝光都要精确扣费，涉及资金，一致性要求极高； 广告有约束：预算、排期、定向、频控，任何一个约束都必须严格满足； 广告是对抗的：广告主有动机作弊（刷量），流量方有动机刷收入，必须有反作弊体系。  一句话总结广告系统的核心矛盾：  在 100ms 内，从百万级广告中选出「满足所有约束、平台收益最大、用户体验可接受」的几条广告，并且扣费一分不差。  这篇文章按「检索 → 排序 → 计费 → 反作弊」四段主线，把广告系统的架构讲透。  一、广告系统的角色与核心概念先厘清几个必考概念：    概念 含义    DSP 需求方平台，广告主&#x2F;代理商投放广告的系统   SSP 供给方平台，媒体方管理广告位与流量的系统   ADX 广告交易平台，撮合买（DSP）卖（SSP）   RTB 实时竞价，每次曝光实时出价   CPM &#x2F; CPC &#x2F; CPA...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/12/recommendation-system-architecture-design/" title="【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-12</div><div class="info-item-2">【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析面试官：如果让你设计一个推荐系统，你会怎么架构？很多人对推荐系统的第一反应是「算法问题」，于是开始背协同过滤、双塔模型、Transformer……但面试官真正想考的，是一个 Java 后端工程师能不能把算法模型工程化成一个高可用、低延迟、可迭代的系统。 推荐系统的本质是一个漏斗（funnel）：从千万级物品里，用越来越复杂的模型，逐层筛到几十个最终展示结果。系统设计的核心矛盾是：  候选集越大，效果越好；但延迟预算只有 100~200ms。  这篇文章按「分层漏斗 + 工程实现」两条线，把推荐系统的架构讲透。算法只讲「工程上必须知道的接口」，重点放在架构、存储、缓存、降级和一致性上。  一、整体架构：四阶段漏斗1234567891011121314151617181920212223242526               ┌──────────────────────────────────────────────┐ 用户请求       │                推荐服务（Gate）         ...</div></div></div></a><a class="pagination-related" href="/2026/10/12/advertising-system-architecture-design/" title="【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-12</div><div class="info-item-2">【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析面试官：设计一个广告投放系统，你怎么做？广告系统和推荐系统长得很像——都是「在海量候选里选出若干个展现」——但它有三个本质不同：  广告是花钱的：每一次曝光都要精确扣费，涉及资金，一致性要求极高； 广告有约束：预算、排期、定向、频控，任何一个约束都必须严格满足； 广告是对抗的：广告主有动机作弊（刷量），流量方有动机刷收入，必须有反作弊体系。  一句话总结广告系统的核心矛盾：  在 100ms 内，从百万级广告中选出「满足所有约束、平台收益最大、用户体验可接受」的几条广告，并且扣费一分不差。  这篇文章按「检索 → 排序 → 计费 → 反作弊」四段主线，把广告系统的架构讲透。  一、广告系统的角色与核心概念先厘清几个必考概念：    概念 含义    DSP 需求方平台，广告主&#x2F;代理商投放广告的系统   SSP 供给方平台，媒体方管理广告位与流量的系统   ADX 广告交易平台，撮合买（DSP）卖（SSP）   RTB 实时竞价，每次曝光实时出价   CPM &#x2F; CPC &#x2F; CPA...</div></div></div></a><a class="pagination-related" href="/2026/08/18/short-url-system-design/" title="【系统设计】短链接系统架构设计：从发号器到跳转的完整方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案</div></div><div class="info-2"><div class="info-item-1">【系统设计】短链接系统架构设计：从发号器到跳转的完整方案面试官：设计一个短链接系统，说下你的思路？短链接是系统设计面试的”经典题库题”（和秒杀、支付、消息推送并列）。它麻雀虽小五脏俱全：发号算法、存储设计、缓存、高并发跳转、数据统计全都涉及。而且它真实存在于你身边的每个场景——微博分享、营销短信、二维码里那一串 t.cn/xxxxx。 本文给出一个可以直接”背”进面试的完整设计方案。  一、需求分析功能需求 生成：输入长链接，返回短链接（如 https://s.dg.com/Ab3xY9）； 跳转：访问短链接，302 重定向到长链接； 统计：每个短链接的访问次数、来源、时间分布（加分项）； 管理：可自定义短码、可设置过期时间（加分项）。  非功能需求（关键！） 高并发：跳转是读多写少，QPS 可能极高（营销活动时秒级上万）； 高可用：跳转失败 &#x3D; 用户进不了页面，可用性要求 99.99%； 低延迟：跳转链路要快，缓存命中率要足够高。  容量估算（背下来，面试很加分） 每天新增短链接 1000 万 → 每年约 36.5 亿条； 短码长度：用 62 进制（a-zA-Z0-9...</div></div></div></a><a class="pagination-related" href="/2026/06/20/api-rate-limiting-strategies-practice/" title="API限流策略与算法全解析（令牌桶&#x2F;漏桶&#x2F;滑动窗口）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-20</div><div class="info-item-2">API限流策略与算法全解析（令牌桶&#x2F;漏桶&#x2F;滑动窗口）</div></div><div class="info-2"><div class="info-item-1">API限流策略与算法全解析（令牌桶&#x2F;漏桶&#x2F;滑动窗口）在微服务架构中，限流是保障系统稳定性的第一道防线。无论是应对突发流量、防止恶意攻击，还是保障后端服务的公平使用，合理的限流策略都是系统设计的核心课题。本文将深入对比四种主流限流算法，并提供基于Java的生产级实现。 一、为什么需要限流？1.1 限流与熔断的关系   策略 目的 触发条件 影响范围 恢复方式    限流 控制流量速率 超过阈值 当前请求 速率降低后自动恢复   熔断 保护被调用方 错误率&#x2F;延迟超限 后续请求 半开探测恢复   降级 提供降级服务 资源不足 特定功能 手动或自动恢复   隔离 资源隔离 流量高峰 线程池&#x2F;信号量 依赖隔离机制   1.2 常见限流场景1234567891011121314151617// 1. API接口限流 — 控制每秒请求数@RateLimiter(name = &quot;order-api&quot;, fallbackMethod = &quot;fallback&quot;)@PostMapping(&quot;/orders&quo...</div></div></div></a><a class="pagination-related" href="/2026/10/01/elasticsearch-nested-object-mapping-deep-dive/" title="【Elasticsearch 进阶】Nested 与 Object 类型深度解析：对象数组扁平化陷阱、nested 查询原理与选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-01</div><div class="info-item-2">【Elasticsearch 进阶】Nested 与 Object 类型深度解析：对象数组扁平化陷阱、nested 查询原理与选型</div></div><div class="info-2"><div class="info-item-1">【Elasticsearch 进阶】Nested 与 Object 类型深度解析：对象数组扁平化陷阱、nested 查询原理与选型面试官：ES 里存对象数组，为什么查询结果总是不对？如果面试官问出这句话，说明他踩过坑。而正确回答这个问题，需要同时理解 Lucene 的倒排索引本质 和 ES 的文档模型。 先看一个经典反例： 1234567&#123;  &quot;goods_id&quot;: 1001,  &quot;sku&quot;: [    &#123; &quot;color&quot;: &quot;red&quot;,  &quot;size&quot;: &quot;L&quot; &#125;,    &#123; &quot;color&quot;: &quot;blue&quot;, &quot;size&quot;: &quot;S&quot; &#125;  ]&#125;  查询”红色且 L 码”： 12345678910&#123;  &quot;query&quot;: &#123;    &quot;bool&quot;: &#123;   ...</div></div></div></a><a class="pagination-related" href="/2026/09/10/elasticsearch-bm25-scoring-deep-dive/" title="【ES 原理】Elasticsearch 相关性评分深度解析：从 TF-IDF 到 BM25 与 Function Score 排序实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-10</div><div class="info-item-2">【ES 原理】Elasticsearch 相关性评分深度解析：从 TF-IDF 到 BM25 与 Function Score 排序实战</div></div><div class="info-2"><div class="info-item-1">【ES 原理】Elasticsearch 相关性评分深度解析：从 TF-IDF 到 BM25 与 Function Score 排序实战面试官：ES 默认按什么排序？”相关度”到底是怎么算出来的？用 ES 做搜索，match 查询不指定 sort 时，结果按 _score 降序返回。这个 _score 就是相关性评分。面试官一旦问”ES 为什么相关、怎么算分、能不能干预排序”，背后就是一套完整的检索模型知识：TF-IDF → BM25 → 查询时加权（boosting）→ Function Score。 本文从 Lucene 经典 TF-IDF 讲起，拆解 ES 5.0+ 默认的 BM25 算法公式，再给出生产中干预排序的完整实战。 一、先理解三个核心概念   概念 含义 直觉    TF（词频） 词在文档中出现次数 出现越多越相关   IDF（逆文档频率） 词在多少文档中出现 越稀有的词越有区分度   文档长度归一化 文档越长，相同词频”含金量”越低 短文档命中更难得   任何现代相关性算法，本质都是在平衡这三者，再叠加字段权重与查询权重。 二、Lucene 的经典 TF-ID...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">757</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">847</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">232</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E6%90%9C%E7%B4%A2%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E7%B4%A2%E5%BC%95%E6%9E%84%E5%BB%BA%E3%80%81%E6%9F%A5%E8%AF%A2%E7%90%86%E8%A7%A3%E3%80%81%E5%8F%AC%E5%9B%9E%E6%8E%92%E5%BA%8F%E4%B8%8E%E4%B8%AA%E6%80%A7%E5%8C%96%E5%85%A8%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E8%AE%BE%E8%AE%A1%E4%B8%80%E4%B8%AA%E7%AB%99%E5%86%85%E6%90%9C%E7%B4%A2%E7%B3%BB%E7%BB%9F%EF%BC%8C%E4%BD%A0%E6%80%8E%E4%B9%88%E5%81%9A%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：设计一个站内搜索系统，你怎么做？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E6%95%B4%E4%BD%93%E6%9E%B6%E6%9E%84"><span class="toc-number">1.2.</span> <span class="toc-text">一、整体架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%B4%A2%E5%BC%95%E6%9E%84%E5%BB%BA%EF%BC%9A%E4%B8%80%E8%87%B4%E6%80%A7%E4%B8%8E%E5%AE%9E%E6%97%B6%E6%80%A7"><span class="toc-number">1.3.</span> <span class="toc-text">二、索引构建：一致性与实时性</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%95%B0%E6%8D%AE%E9%93%BE%E8%B7%AF"><span class="toc-number">1.3.1.</span> <span class="toc-text">数据链路</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%85%A8%E9%87%8F%E9%87%8D%E5%BB%BA%EF%BC%9A%E5%A6%82%E4%BD%95%E5%81%9A%E5%88%B0%E4%B8%8D%E5%81%9C%E6%9C%BA"><span class="toc-number">1.3.2.</span> <span class="toc-text">全量重建：如何做到不停机</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%A2%9E%E9%87%8F%E4%B8%80%E8%87%B4%E6%80%A7%E4%B8%8E%E5%BB%B6%E8%BF%9F"><span class="toc-number">1.3.3.</span> <span class="toc-text">增量一致性与延迟</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%9F%A5%E8%AF%A2%E7%90%86%E8%A7%A3%EF%BC%9A%E6%8A%8A%E3%80%8C%E4%BA%BA%E8%AF%9D%E3%80%8D%E5%8F%98%E6%88%90%E3%80%8C%E6%A3%80%E7%B4%A2%E5%BC%8F%E3%80%8D"><span class="toc-number">1.4.</span> <span class="toc-text">三、查询理解：把「人话」变成「检索式」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%88%86%E8%AF%8D"><span class="toc-number">1.4.1.</span> <span class="toc-text">分词</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BA%A0%E9%94%99%EF%BC%88Spell-Correction%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">纠错（Spell Correction）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%90%8C%E4%B9%89%E8%AF%8D%E4%B8%8E%E6%9F%A5%E8%AF%A2%E6%89%A9%E5%B1%95"><span class="toc-number">1.4.3.</span> <span class="toc-text">同义词与查询扩展</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%84%8F%E5%9B%BE%E8%AF%86%E5%88%AB"><span class="toc-number">1.4.4.</span> <span class="toc-text">意图识别</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%8F%AC%E5%9B%9E%EF%BC%9A%E5%A4%9A%E8%B7%AF%E5%B9%B6%E8%A1%8C"><span class="toc-number">1.5.</span> <span class="toc-text">四、召回：多路并行</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%A4%9A%E8%B7%AF%E8%9E%8D%E5%90%88"><span class="toc-number">1.5.1.</span> <span class="toc-text">多路融合</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%9B%B8%E5%85%B3%E6%80%A7%EF%BC%9ABM25-%E4%B8%8E%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2%E7%9A%84%E5%8F%96%E8%88%8D"><span class="toc-number">1.5.2.</span> <span class="toc-text">相关性：BM25 与向量检索的取舍</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8E%92%E5%BA%8F%EF%BC%9A%E4%BB%8E-BM25-%E5%88%B0%E5%AD%A6%E4%B9%A0%E6%8E%92%E5%BA%8F%EF%BC%88LTR%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、排序：从 BM25 到学习排序（LTR）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%89%93%E5%88%86%E6%BC%94%E8%BF%9B"><span class="toc-number">1.6.1.</span> <span class="toc-text">打分演进</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#BM25-%E5%85%AC%E5%BC%8F%E7%9B%B4%E8%A7%89"><span class="toc-number">1.6.2.</span> <span class="toc-text">BM25 公式直觉</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#LTR-%E4%B8%89%E8%A6%81%E7%B4%A0"><span class="toc-number">1.6.3.</span> <span class="toc-text">LTR 三要素</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%9B%B8%E5%85%B3%E6%80%A7%E8%AF%84%E4%BC%B0%E6%8C%87%E6%A0%87"><span class="toc-number">1.6.4.</span> <span class="toc-text">相关性评估指标</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%AA%E6%80%A7%E5%8C%96"><span class="toc-number">1.6.5.</span> <span class="toc-text">个性化</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%80%A7%E8%83%BD%E4%B8%8E%E5%B7%A5%E7%A8%8B%E5%8C%96"><span class="toc-number">1.7.</span> <span class="toc-text">六、性能与工程化</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BC%93%E5%AD%98%E4%BD%93%E7%B3%BB"><span class="toc-number">1.7.1.</span> <span class="toc-text">缓存体系</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%88%86%E7%89%87%E4%B8%8E%E6%89%A9%E5%AE%B9"><span class="toc-number">1.7.2.</span> <span class="toc-text">分片与扩容</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%A4%A7%E4%BF%83%E6%B2%BB%E7%90%86"><span class="toc-number">1.7.3.</span> <span class="toc-text">大促治理</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7"><span class="toc-number">1.7.4.</span> <span class="toc-text">可观测性</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/search-system-architecture-design/" title="【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析">【系统设计】搜索系统架构设计：索引构建、查询理解、召回排序与个性化全解析</a><time datetime="2026-10-12T00:40:00.000Z" title="发表于 2026-10-12 08:40:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/advertising-system-architecture-design/" title="【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析">【系统设计】广告系统架构设计：广告检索、竞价排序、计费扣费与反作弊全解析</a><time datetime="2026-10-12T00:30:00.000Z" title="发表于 2026-10-12 08:30:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/recommendation-system-architecture-design/" title="【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析">【系统设计】推荐系统架构设计：召回、粗排、精排、重排与实时特征全解析</a><time datetime="2026-10-12T00:20:00.000Z" title="发表于 2026-10-12 08:20:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/nexus-maven-dependency-governance-deep-practice/" title="【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描">【工程实战】Nexus 私服与 Maven 依赖治理深度实战：从私服搭建到依赖冲突与安全扫描</a><time datetime="2026-10-12T00:10:00.000Z" title="发表于 2026-10-12 08:10:00">2026-10-12</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/12/java-parallel-stream-forkjoinpool-deep-dive/" title="【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱">【Java 并发】并行流（Parallel Stream）深度解析：ForkJoinPool 公共池、工作窃取与性能陷阱</a><time datetime="2026-10-12T00:00:00.000Z" title="发表于 2026-10-12 08:00:00">2026-10-12</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
