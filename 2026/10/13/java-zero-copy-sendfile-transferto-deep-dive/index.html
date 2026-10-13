@@ -1,0 +1,390 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo前言几乎所有高性能中间件的源码里，你都会看到一个反复出现的词：零拷贝（Zero-Copy）。Kafka 号称单机百万级吞吐、Netty 号称百万连接、RocketMQ 号称高吞吐，背后都离不开零拷贝。 但很多 Java 工程师对它的理解停留在「少了一次拷贝」这句正确的废话上。面试官追问一句">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka&#x2F;Netty 中的落地">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo前言几乎所有高性能中间件的源码里，你都会看到一个反复出现的词：零拷贝（Zero-Copy）。Kafka 号称单机百万级吞吐、Netty 号称百万连接、RocketMQ 号称高吞吐，背后都离不开零拷贝。 但很多 Java 工程师对它的理解停留在「少了一次拷贝」这句正确的废话上。面试官追问一句">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-13T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-13T00:01:53.941Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Kafka">
+<meta property="article:tag" content="NIO">
+<meta property="article:tag" content="Netty">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="零拷贝">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地",
+  "url": "https://jiweidong.github.io/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-13T00:00:00.000Z",
+  "dateModified": "2026-10-13T00:01:53.941Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">762</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">856</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">235</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-13T00:00:00.000Z" title="发表于 2026-10-13 08:00:00">2026-10-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-13T00:01:53.941Z" title="更新于 2026-10-13 08:01:53">2026-10-13</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-%E6%B7%B1%E6%8C%96/">Java 深挖</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-性能】零拷贝深度解析：sendfile、mmap-与-FileChannel-transferTo"><a href="#【Java-性能】零拷贝深度解析：sendfile、mmap-与-FileChannel-transferTo" class="headerlink" title="【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo"></a>【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>几乎所有高性能中间件的源码里，你都会看到一个反复出现的词：<strong>零拷贝（Zero-Copy）</strong>。Kafka 号称单机百万级吞吐、Netty 号称百万连接、RocketMQ 号称高吞吐，背后都离不开零拷贝。</p>
+<p>但很多 Java 工程师对它的理解停留在「少了一次拷贝」这句正确的废话上。面试官追问一句就会露馅：</p>
+<ul>
+<li>零拷贝到底省掉的是哪几次拷贝？CPU 拷贝还是 DMA 拷贝？</li>
+<li><code>FileChannel.transferTo</code> 底层用的是 <code>sendfile</code> 还是别的？为什么它可能退化成普通读写？</li>
+<li><code>mmap</code> 和 <code>sendfile</code> 都叫零拷贝，它们的区别是什么？各自适合什么场景？</li>
+<li>Kafka 的 <code>FileRecords</code>、<code>TransportLayer</code> 为什么不用 <code>transferTo</code> 全程？为什么还要有 <code>MappedByteBuffer</code>？</li>
+</ul>
+<p>这篇文章从操作系统 I&#x2F;O 路径讲起，把零拷贝的三种实现方式掰开揉碎，最后落到 Java 代码与中间件源码，并补充面试高频追问与生产踩坑。</p>
+<hr>
+<h2 id="一、先搞清楚：一次普通文件发送，数据到底搬了几次？"><a href="#一、先搞清楚：一次普通文件发送，数据到底搬了几次？" class="headerlink" title="一、先搞清楚：一次普通文件发送，数据到底搬了几次？"></a>一、先搞清楚：一次普通文件发送，数据到底搬了几次？</h2><p>假设我们要把一个文件通过 Socket 发给客户端，最朴素的 Java 代码是：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">byte</span>[] buf = <span class="keyword">new</span> <span class="title class_">byte</span>[<span class="number">8192</span>];</span><br><span class="line"><span class="type">int</span> len;</span><br><span class="line"><span class="keyword">while</span> ((len = in.read(buf)) != -<span class="number">1</span>) &#123;</span><br><span class="line">    out.write(buf, <span class="number">0</span>, len);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这背后，操作系统实际发生了 <strong>4 次上下文切换 + 4 次数据拷贝</strong>：</p>
+<ol>
+<li><code>read()</code>：用户态 → 内核态切换；DMA 把磁盘数据拷到<strong>内核缓冲区（Page Cache）</strong>；CPU 再把内核缓冲区拷到<strong>用户缓冲区</strong>。</li>
+<li><code>write()</code>：用户缓冲区数据 CPU 拷贝到<strong>内核 Socket 缓冲区</strong>；DMA 再把 Socket 缓冲区拷到<strong>网卡</strong>。</li>
+</ol>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">磁盘 --DMA--&gt; 内核页缓存 --CPU--&gt; 用户缓冲区 --CPU--&gt; Socket 缓冲区 --DMA--&gt; 网卡</span><br><span class="line">               (拷贝1)            (拷贝2)            (拷贝3)           (拷贝4)</span><br></pre></td></tr></table></figure>
+
+<p><strong>问题在于拷贝 2 和拷贝 3 完全是多余的</strong>：数据在用户态只是「路过」，应用并没有真正加工它。零拷贝要消除的，正是这两次 CPU 拷贝以及其中的上下文切换。</p>
+<blockquote>
+<p>严格来说，零拷贝不是「零次拷贝」，而是<strong>消除 CPU 参与的数据拷贝</strong>，DMA 拷贝依然存在（那是硬件干的，不占用 CPU）。</p>
+</blockquote>
+<hr>
+<h2 id="二、四种零拷贝技术对比"><a href="#二、四种零拷贝技术对比" class="headerlink" title="二、四种零拷贝技术对比"></a>二、四种零拷贝技术对比</h2><table>
+<thead>
+<tr>
+<th>技术</th>
+<th>系统调用</th>
+<th>CPU 拷贝次数</th>
+<th>上下文切换</th>
+<th>能否修改数据</th>
+<th>典型应用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>传统 read&#x2F;write</td>
+<td><code>read</code>+<code>write</code></td>
+<td>2</td>
+<td>4</td>
+<td>能</td>
+<td>小文件、需加工</td>
+</tr>
+<tr>
+<td><code>mmap</code>+<code>write</code></td>
+<td><code>mmap</code>+<code>write</code></td>
+<td>1</td>
+<td>4</td>
+<td>能</td>
+<td>Kafka 索引、RocketMQ</td>
+</tr>
+<tr>
+<td><code>sendfile</code></td>
+<td><code>sendfile</code></td>
+<td>0（+1 若带用户缓冲）</td>
+<td>2</td>
+<td>不能</td>
+<td>Kafka 日志段发送</td>
+</tr>
+<tr>
+<td><code>splice</code> &#x2F; <code>sendfile(DMA gather)</code></td>
+<td><code>splice</code></td>
+<td>0</td>
+<td>2</td>
+<td>不能</td>
+<td>Nginx、代理转发</td>
+</tr>
+</tbody></table>
+<p>关键结论：</p>
+<ul>
+<li><strong><code>mmap</code></strong> 把内核页缓存直接映射到用户地址空间，<strong>省掉了「内核→用户」这一次拷贝</strong>，但用户态仍然要把数据 write 到 Socket，所以还有 1 次 CPU 拷贝。</li>
+<li><strong><code>sendfile</code>（Linux 2.4+ 配合 DMA gather scatter）</strong> 真正做到了数据不经过用户态：直接从页缓存进 Socket 缓冲区，网卡 DMA 直接 gather 页缓存。<strong>0 次 CPU 拷贝、2 次上下文切换</strong>（一次 <code>sendfile</code> 调用）。</li>
+<li><code>sendfile</code> 的致命限制：<strong>数据在传输过程中不能被修改</strong>，因为你根本没有拿到用户态指针。</li>
+</ul>
+<hr>
+<h2 id="三、Java-里的零拷贝-API"><a href="#三、Java-里的零拷贝-API" class="headerlink" title="三、Java 里的零拷贝 API"></a>三、Java 里的零拷贝 API</h2><p>Java NIO 提供了三个入口，注意它们<strong>都不是纯 Java 实现，而是 JNI 调用系统调用</strong>。</p>
+<h3 id="3-1-FileChannel-transferTo-transferFrom"><a href="#3-1-FileChannel-transferTo-transferFrom" class="headerlink" title="3.1 FileChannel.transferTo &#x2F; transferFrom"></a>3.1 FileChannel.transferTo &#x2F; transferFrom</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TransferToDemo</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">sendFile</span><span class="params">(SocketChannel socketChannel, File file)</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">        <span class="keyword">try</span> (<span class="type">FileChannel</span> <span class="variable">fileChannel</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">FileInputStream</span>(file).getChannel()) &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">position</span> <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line">            <span class="type">long</span> <span class="variable">size</span> <span class="operator">=</span> fileChannel.size();</span><br><span class="line">            <span class="keyword">while</span> (position &lt; size) &#123;</span><br><span class="line">                <span class="comment">// 返回本次实际传输的字节数，可能小于请求量</span></span><br><span class="line">                <span class="type">long</span> <span class="variable">transferred</span> <span class="operator">=</span> fileChannel.transferTo(position, size - position, socketChannel);</span><br><span class="line">                <span class="keyword">if</span> (transferred &lt;= <span class="number">0</span>) &#123;</span><br><span class="line">                    <span class="keyword">break</span>;</span><br><span class="line">                &#125;</span><br><span class="line">                position += transferred;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>三个必须知道的坑：</strong></p>
+<ol>
+<li><strong>必须循环传输</strong>。<code>transferTo</code> 单次能传多少取决于内核 <code>SO_SNDBUF</code>、网卡 gather 上限。JDK 文档明确写了「可能传输少于请求的字节数」。单次调用就返回是新手最常犯的错。</li>
+<li><strong>可能退化为普通拷贝</strong>。Linux 上 <code>transferTo</code> 会优先尝试 <code>sendfile</code>；如果目标不是 SocketChannel 或者内核不支持，会 fallback 到 <code>mmap</code> + <code>write</code>，甚至退化成用户态拷贝。也就是说，<strong>它并不保证零拷贝</strong>。</li>
+<li><strong>文件 &gt;2GB 的问题</strong>。旧版本在高位偏移场景下有坑，虽然现代 JDK 已修复，但跨平台（尤其 Windows）行为不一致，生产上要注意。</li>
+</ol>
+<h3 id="3-2-MappedByteBuffer（mmap）"><a href="#3-2-MappedByteBuffer（mmap）" class="headerlink" title="3.2 MappedByteBuffer（mmap）"></a>3.2 MappedByteBuffer（mmap）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">MmapDemo</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="type">byte</span>[] readHead(File file, <span class="type">int</span> length) <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">        <span class="keyword">try</span> (<span class="type">RandomAccessFile</span> <span class="variable">raf</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">RandomAccessFile</span>(file, <span class="string">&quot;r&quot;</span>);</span><br><span class="line">             <span class="type">FileChannel</span> <span class="variable">channel</span> <span class="operator">=</span> raf.getChannel()) &#123;</span><br><span class="line">            <span class="type">MappedByteBuffer</span> <span class="variable">buffer</span> <span class="operator">=</span> channel.map(</span><br><span class="line">                    FileChannel.MapMode.READ_ONLY, <span class="number">0</span>, length);</span><br><span class="line">            <span class="type">byte</span>[] data = <span class="keyword">new</span> <span class="title class_">byte</span>[length];</span><br><span class="line">            buffer.get(data);</span><br><span class="line">            <span class="keyword">return</span> data;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>MappedByteBuffer</code> 底层就是 <code>mmap</code>。它的优势：</p>
+<ul>
+<li>读大文件时避免了「内核→用户」拷贝；</li>
+<li>支持随机访问，天然适合索引文件（Kafka 的 <code>.index</code>、<code>.timeindex</code> 就是 mmap）。</li>
+</ul>
+<p>它的坑：</p>
+<ul>
+<li><strong>内存回收不受 GC 控制</strong>。<code>MappedByteBuffer</code> 的释放依赖 <code>Cleaner</code>（虚引用 + <code>Unsafe.invokeCleaner</code>），只有在 GC 回收对应 DirectByteBuffer 对象时才 unmap。这也是为什么「删不掉的文件」在 Windows 上屡见不鲜。</li>
+<li>想手动释放，得反射调用 <code>sun.misc.Unsafe#invokeCleaner</code>，或者换用 <code>FileChannel#unmap</code>（JDK 14+ 才有公开 API 的等价能力，实际上 <code>FileChannelImpl.unmap</code> 仍是内部方法）。JDK 22+ 可通过 <code>Arena</code>&#x2F;FFM API 更干净地管理。</li>
+<li><code>mmap</code> 会触发<strong>缺页中断</strong>，且无法利用 <code>madvise(MADV_SEQUENTIAL)</code> 之外的优化，随机访问大量小页时性能不一定比直接读好。</li>
+</ul>
+<h3 id="3-3-DirectByteBuffer-SocketChannel"><a href="#3-3-DirectByteBuffer-SocketChannel" class="headerlink" title="3.3 DirectByteBuffer + SocketChannel"></a>3.3 DirectByteBuffer + SocketChannel</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">ByteBuffer</span> <span class="variable">direct</span> <span class="operator">=</span> ByteBuffer.allocateDirect(<span class="number">64</span> * <span class="number">1024</span>);</span><br><span class="line"><span class="comment">// 读取后写入，数据在堆外，避免了一次「堆内→堆外」的拷贝</span></span><br></pre></td></tr></table></figure>
+
+<p>堆外内存在 Socket 写入时<strong>天然是零拷贝的一部分</strong>：因为内核需要的就是一块连续的本地内存，堆内数组必须先拷到堆外临时缓冲。这就是 Netty 大量使用 <code>ByteBuf.allocateDirect()</code> 的原因。</p>
+<hr>
+<h2 id="四、中间件源码里的零拷贝"><a href="#四、中间件源码里的零拷贝" class="headerlink" title="四、中间件源码里的零拷贝"></a>四、中间件源码里的零拷贝</h2><h3 id="4-1-Kafka：不止-sendfile"><a href="#4-1-Kafka：不止-sendfile" class="headerlink" title="4.1 Kafka：不止 sendfile"></a>4.1 Kafka：不止 sendfile</h3><p>Kafka 的 <code>FileRecords.writeTo</code> 是零拷贝落地的经典：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">long</span> <span class="title function_">writeTo</span><span class="params">(GatheringByteChannel channel, <span class="type">long</span> offset, <span class="type">int</span> length)</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">    <span class="keyword">if</span> (channel <span class="keyword">instanceof</span> TransportLayer) &#123;</span><br><span class="line">        <span class="comment">// 走 TransportLayer -&gt; 最终 socketChannel.transferTo，即 sendfile</span></span><br><span class="line">        <span class="keyword">return</span> ((TransportLayer) channel).write(channelBuffer, offset, length);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 退化为 mmap + 普通写</span></span><br><span class="line">    ...</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>为什么 Kafka 不用全程 <code>transferTo</code>？</p>
+<ol>
+<li><strong>消息格式转换（down-conversion）</strong>：老版本 consumer 需要 v0&#x2F;v1 消息格式，Broker 必须把数据读到用户态转换，此时零拷贝失效。</li>
+<li><strong>SSL&#x2F;TLS</strong>：加密必须在用户态做，<code>transferTo</code> 无法加密，TLS 场景自动退化为普通写。<strong>这是生产上「开了 TLS 吞吐掉一半」的根本原因之一</strong>。</li>
+<li><strong>多副本 + 分层索引</strong>：<code>transferTo</code> 只能发连续文件区域，而 Kafka 一次请求可能要发多个 segment。</li>
+</ol>
+<p>Kafka 的<strong>旁路设计</strong>也很值得学：索引文件用 <code>mmap</code>（随机访问、小块），日志数据文件用 <code>sendfile</code>（顺序大块）。<strong>用对场景，而不是迷信一种技术。</strong></p>
+<h3 id="4-2-Netty：CompositeByteBuf-与-FileRegion"><a href="#4-2-Netty：CompositeByteBuf-与-FileRegion" class="headerlink" title="4.2 Netty：CompositeByteBuf 与 FileRegion"></a>4.2 Netty：CompositeByteBuf 与 FileRegion</h3><p>Netty 的零拷贝概念更宽泛，包含三类：</p>
+<ol>
+<li><strong>用户态零拷贝</strong>：<code>CompositeByteBuf</code> 把多个 <code>ByteBuf</code> 逻辑拼成一个，避免合并时拷贝；<code>slice()</code>&#x2F;<code>duplicate()</code> 共享底层内存；<code>Unpooled.wrappedBuffer()</code>。</li>
+<li><strong>内核态零拷贝</strong>：<code>DefaultFileRegion</code> 封装 <code>FileChannel.transferTo</code>，做文件发送。</li>
+<li><strong>堆外内存</strong>：<code>PooledByteBufAllocator</code> + <code>PlatformDependent</code> 直接分配。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Netty 文件发送：底层即 sendfile</span></span><br><span class="line"><span class="type">FileRegion</span> <span class="variable">region</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">DefaultFileRegion</span>(<span class="keyword">new</span> <span class="title class_">FileInputStream</span>(file).getChannel(), <span class="number">0</span>, file.length());</span><br><span class="line">ctx.writeAndFlush(region);</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意 Netty 的 <code>FileRegion</code> 与 <code>ChunkedWriteHandler</code> 二选一</strong>：如果你在 pipeline 里加了 SSL handler，<code>FileRegion</code> 无法被加密，必须用 <code>ChunkedWriteHandler</code> + 用户态读，否则会直接报错或数据错乱。</p>
+<h3 id="4-3-RocketMQ-Nginx"><a href="#4-3-RocketMQ-Nginx" class="headerlink" title="4.3 RocketMQ &#x2F; Nginx"></a>4.3 RocketMQ &#x2F; Nginx</h3><ul>
+<li>RocketMQ 用 <code>MappedByteBuffer</code> 做 CommitLog 的读写，配合 <code>mlock</code>（<code>TransientStorePool</code> 预映射 + 锁页）减少缺页中断。</li>
+<li>Nginx 的 <code>sendfile on;</code> 一行配置就是开零拷贝；配合 <code>tcp_nopush</code>&#x2F;<code>tcp_nodelay</code> 做延迟与吞吐的取舍。</li>
+</ul>
+<hr>
+<h2 id="五、生产踩坑清单"><a href="#五、生产踩坑清单" class="headerlink" title="五、生产踩坑清单"></a>五、生产踩坑清单</h2><ol>
+<li><strong><code>transferTo</code> 不循环 → 大文件传输截断。</strong> 一定要 <code>while</code> 到 <code>position == size</code>。</li>
+<li><strong>开了 TLS 还指望零拷贝 → 性能不及预期。</strong> 加密必须零拷贝之外的路径，提前做容量规划。</li>
+<li><strong><code>MappedByteBuffer</code> 文件删不掉 &#x2F; 磁盘空间不释放。</strong> 用 <code>Cleaner</code> 或进程退出，别在长生命周期对象里持有映射。</li>
+<li><strong><code>allocateDirect</code> 太多 → 堆外内存 OOM。</strong> 堆外不受 <code>-Xmx</code> 限制，需要用 <code>-XX:MaxDirectMemorySize</code> 限制，并用 NMT 监控。</li>
+<li><strong>mmap 大文件触发 OOM-Killer。</strong> 页缓存计入进程 RSS，容器里映射几百 GB 文件很容易被 cgroup 干掉。</li>
+<li><strong><code>transferTo</code> 到阻塞的 SocketChannel 可能「卡住」</strong>：它会等待、甚至返回 0 或抛中断，需要非阻塞 + 事件循环配合（Netty 正是这么做的）。</li>
+</ol>
+<hr>
+<h2 id="六、面试高频追问"><a href="#六、面试高频追问" class="headerlink" title="六、面试高频追问"></a>六、面试高频追问</h2><p><strong>Q1：零拷贝是「零次拷贝」吗？</strong><br>不是。零拷贝指消除 CPU 参与的数据拷贝，DMA 拷贝依然存在。<code>sendfile</code> 在支持 DMA gather 的网卡上是 0 次 CPU 拷贝。</p>
+<p><strong>Q2：mmap 和 sendfile 的区别？</strong><br><code>mmap</code> 把页缓存映射进用户空间，用户可读可改，但有 1 次 CPU 拷贝（写到 Socket 时）；<code>sendfile</code> 完全不经过用户态，0 次 CPU 拷贝，但数据不可改。选型上：需要加工&#x2F;随机访问用 mmap，纯转发用 sendfile。</p>
+<p><strong>Q3：为什么 Kafka 消费慢的时候，Broker 的页缓存会涨？</strong><br><code>sendfile</code> 把文件页缓存直接送给网卡前，会先驻留在 Page Cache。消费者跟不上时，Page Cache 会持续堆积，最终触发脏页回写与内存压力——这是典型的「零拷贝把内存压力转移到了内核」现象。</p>
+<p><strong>Q4：Java 里怎么手动释放 MappedByteBuffer？</strong><br>依赖 <code>Cleaner</code>（基于虚引用 + <code>Unsafe.invokeCleaner</code>）在 GC 时释放；也可以反射调用 <code>sun.misc.Unsafe</code>，或 JDK 22+ 用 FFM <code>Arena</code>。生产更推荐「短生命周期 + 及时丢弃引用」的用法。</p>
+<hr>
+<h2 id="七、总结"><a href="#七、总结" class="headerlink" title="七、总结"></a>七、总结</h2><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐方案</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>静态文件&#x2F;日志纯转发</td>
+<td><code>sendfile</code>（<code>transferTo</code>）</td>
+<td>0 次 CPU 拷贝，2 次切换</td>
+</tr>
+<tr>
+<td>需要读取加工再发送</td>
+<td><code>mmap</code> + 普通写</td>
+<td>可读可改，省一次拷贝</td>
+</tr>
+<tr>
+<td>随机访问索引文件</td>
+<td><code>MappedByteBuffer</code></td>
+<td>无需 read 系统调用</td>
+</tr>
+<tr>
+<td>高频小包网络发送</td>
+<td>堆外 <code>DirectByteBuffer</code> + Netty pool</td>
+<td>避免堆内外拷贝与 GC</td>
+</tr>
+<tr>
+<td>加密&#x2F;压缩后再发送</td>
+<td>普通流式读写</td>
+<td>零拷贝无法参与计算</td>
+</tr>
+</tbody></table>
+<p>零拷贝的本质是「<strong>认清数据链路，把不必要的拷贝砍掉</strong>」。理解它，你才能真正看懂 Kafka 的吞吐数字、Netty 的线程模型，以及为什么一开 TLS 性能就跳水。面试时把「4 次拷贝、4 次切换 → 0 次 CPU 拷贝、2 次切换」这条链路和 <code>transferTo</code> 的三个坑讲清楚，基本就能秒杀大部分候选人。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/">https://jiweidong.github.io/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Kafka/">Kafka</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/Netty/">Netty</a><a class="post-meta__tags" href="/tags/NIO/">NIO</a><a class="post-meta__tags" href="/tags/%E9%9B%B6%E6%8B%B7%E8%B4%9D/">零拷贝</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/10/13/java-llm-streaming-sse-webflux-deep-practice/" title="【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析</div></div><div class="info-2"><div class="info-item-1">【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析前言ChatGPT 之后，「打字机效果」成了大模型应用的标配。从体验上讲，用户等 10 秒看到一个完整答案，和 300ms 就看到第一个字、10 秒逐字吐完，感受天差地别 —— 首 Token 延迟（TTFT）比总耗时更影响体感。 但流式输出并不是「加个 stream: true」那么简单。Java 后端落地时会撞上一连串工程问题：  用 SseEmitter 还是 WebFlux 的 Flux&lt;ServerSentEvent&gt;？虚拟线程出来后选型变了吗？ Nginx &#x2F; 网关一开代理，怎么「流」着流着就变成一次性返回了？ 大模型连接超时、前端断线、用户点「停止生成」，服务端怎么感知并释放资源？ 流式场景下怎么做 Token 统计、计费、审计、限流？ SSE 断线能不能续传？Last-Event-ID 到底怎么用？  这篇文章一次讲清。  二、SSE 协议：为什么大模型选它而不是 WebSocketSSE（Server-Sent Events）...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/13/java-io-nio/" title="Java IO 与 NIO 详解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">Java IO 与 NIO 详解</div></div><div class="info-2"><div class="info-item-1">一、前言Java 的 I&#x2F;O（Input&#x2F;Output）体系是每个 Java 开发者都必须掌握的核心知识。从传统 BIO（Blocking I&#x2F;O）到 NIO（Non-blocking I&#x2F;O），再到 AIO（Asynchronous I&#x2F;O），Java 的 I&#x2F;O 模型经历了多次演进。本文将深入剖析 Java IO 的核心概念、设计模式演进、底层原理及最佳实践。   二、BIO：传统阻塞 I&#x2F;O2.1 流的概念Java 1.0 引入的 IO 体系基于流（Stream） 模型。流是一组有序的数据序列，按方向分为：  输入流：从数据源（文件、网络、内存等）读取数据到程序 输出流：将程序中的数据写出到目标  2.2 字节流与字符流字节流（Byte Stream）InputStream 和 OutputStream 是所有字节流的抽象基类，以 8 位字节为单位处理数据。 123456789// 文件复制 - 字节流方式try (FileInputStream fis = new FileInputStream(&qu...</div></div></div></a><a class="pagination-related" href="/2026/07/07/java-readwritelock-stampedlock-deep-dive/" title="【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-07</div><div class="info-item-2">【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路</div></div><div class="info-2"><div class="info-item-1">【并发编程】ReadWriteLock 与 StampedLock 深度解析：并发读写的锁优化之路从读写分离说起在高并发场景中，”读多写少”是一个非常典型的数据访问模式。比如缓存系统、配置中心、黑名单校验——读操作远远多于写操作。 如果我们一刀切地用 synchronized 或 ReentrantLock 来保护共享资源，所有线程无论是读还是写都必须串行执行，这对读操作密集的场景来说无疑是巨大的性能浪费。 核心思想很简单：多个读操作之间并不互斥，它们可以同时进行；只有写-写、读-写之间才需要互斥。这就是读写锁（ReadWriteLock）的设计出发点。 Java 提供了两种读写锁实现：  ReentrantReadWriteLock — 经典的读写锁，JDK 5 引入 StampedLock — JDK 8 引入，更进一步支持乐观读，性能更优  本文将从源码层面深入分析二者的实现原理、适用场景与性能对比。  一、ReentrantReadWriteLock 源码深入分析1.1 核心设计：一个状态位，两种模式ReentrantReadWriteLock 依赖 AQS（Abstra...</div></div></div></a><a class="pagination-related" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</div></div><div class="info-2"><div class="info-item-1">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践引言：为什么需要 Kafka Connect？很多团队接 Kafka 的方式是”写个消费者程序，把数据从 Topic 搬到数据库”。一个系统这么干没问题，当系统多起来：订单数据进 ES、埋点数据进 HDFS、MySQL 变更同步到 Redis……每个需求写一个消费程序，就要重复处理：  分区分配与 Rebalance 位移提交与 Exactly-Once 语义 断线重连、重试、死信 连接管理、线程池、资源释放  Kafka Connect 的价值就是把”搬数据”这件事框架化：你只需要写（或直接复用现成的）Source&#x2F;Sink Connector，框架帮你搞定分布式执行、容错、偏移量管理、负载均衡。本文从架构原理到生产落地，带你把 Kafka Connect 用明白。 一、核心架构：三个角色 + 两类组件1.1 三个运行时角色   角色 说明    Worker 运行 Connector 和 Task 的 JVM 进程。分 Standalone（单机）和 Distributed（集群）两种模式 ...</div></div></div></a><a class="pagination-related" href="/2026/06/30/jit-compilation-optimization-deep-dive/" title="JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-30</div><div class="info-item-2">JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除</div></div><div class="info-2"><div class="info-item-1">JVM JIT 编译优化深度解析：方法内联、逃逸分析与锁消除面试官：你的代码为什么越跑越快？说说 JIT 的编译优化很多 Java 开发者都会遇到一个现象：同样的代码，刚启动时很慢，跑一会儿就快了。这背后的魔法就是 JIT（Just-In-Time）即时编译。 本文将从字节码到机器码，深入解析 JIT 编译器的三大核心优化：方法内联、逃逸分析、锁消除。 一、JIT 编译器概述1.1 从解释执行到编译执行Java 代码的执行经历了三个阶段： 1234源代码 (.java) → 字节码 (.class) → 机器码                      ↓              解释器逐行执行（慢）              或 JIT 编译为机器码（快）   解释执行：启动快，但每条指令都要翻译 编译执行：将热点代码编译为本地机器码，直接执行  1.2 Client Compiler vs Server CompilerHotSpot JVM 内置了两种 JIT 编译器：    特性 C1 (Client) C2 (Server)    编译速度 快 慢   优化程度 基本...</div></div></div></a><a class="pagination-related" href="/2026/07/07/java-bitwise-bitset-deep-dive/" title="【Java进阶】Java 位运算与 BitSet 实战：从源码到性能优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-07</div><div class="info-item-2">【Java进阶】Java 位运算与 BitSet 实战：从源码到性能优化</div></div><div class="info-2"><div class="info-item-1">【Java进阶】Java 位运算与 BitSet 实战：从源码到性能优化为什么位运算值得认真学？很多 Java 开发者日常 CRUD 很少用到位运算，觉得它只是面试点缀。但事实上，位运算在高性能编程、权限控制、状态压缩、网络协议解析、布隆过滤器等场景中扮演着不可替代的角色。 一个典型对比： 12345678// 传统做法：4个 boolean 字段boolean flag1, flag2, flag3, flag4;  // 占用 4 字节// 位运算做法：一个 int 搞定int flags = 0;                          // 占用 4 字节，可以存 32 个标志位flags |= 1 &lt;&lt; 0;   // 设置第 1 位flags |= 1 &lt;&lt; 3;   // 设置第 4 位boolean has3 = (flags &amp; (1 &lt;&lt; 2)) != 0;  // 检查第 3 位  位运算为什么快？ 因为 CPU 对位操作是原生支持的，一个时钟周期就能完成，比乘除法快几十倍，比分支跳转更没有预测开销。 本...</div></div></div></a><a class="pagination-related" href="/2026/06/29/java-serialization-mechanism-comparison/" title="Java 序列化机制全面对比：Native、Kryo、ProtoBuf 与 JSON 序列化选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-29</div><div class="info-item-2">Java 序列化机制全面对比：Native、Kryo、ProtoBuf 与 JSON 序列化选型</div></div><div class="info-2"><div class="info-item-1">Java 序列化机制全面对比：Native、Kryo、ProtoBuf 与 JSON 序列化选型面试官：说一下 Java 序列化与反序列化的原理？序列化（Serialization）是将 Java 对象转换成字节序列的过程，反序列化（Deserialization）是反向重建对象的过程。 核心接口1234// Serializable 只是一个标记接口public interface Serializable &#123;    // 没有任何方法&#125;  当一个类实现了 Serializable，JVM 在序列化时会自动遍历对象图（包括所有引用的对象），将这个对象及其依赖全部写入字节流。 序列化 ID：serialVersionUID123456public class User implements Serializable &#123;    private static final long serialVersionUID = 1L; // 必须显式指定！    private String name;    private int age;    // ...&...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">762</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">856</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">235</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-%E6%80%A7%E8%83%BD%E3%80%91%E9%9B%B6%E6%8B%B7%E8%B4%9D%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9Asendfile%E3%80%81mmap-%E4%B8%8E-FileChannel-transferTo"><span class="toc-number">1.</span> <span class="toc-text">【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%9E%E6%B8%85%E6%A5%9A%EF%BC%9A%E4%B8%80%E6%AC%A1%E6%99%AE%E9%80%9A%E6%96%87%E4%BB%B6%E5%8F%91%E9%80%81%EF%BC%8C%E6%95%B0%E6%8D%AE%E5%88%B0%E5%BA%95%E6%90%AC%E4%BA%86%E5%87%A0%E6%AC%A1%EF%BC%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搞清楚：一次普通文件发送，数据到底搬了几次？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%9B%9B%E7%A7%8D%E9%9B%B6%E6%8B%B7%E8%B4%9D%E6%8A%80%E6%9C%AF%E5%AF%B9%E6%AF%94"><span class="toc-number">1.3.</span> <span class="toc-text">二、四种零拷贝技术对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Java-%E9%87%8C%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D-API"><span class="toc-number">1.4.</span> <span class="toc-text">三、Java 里的零拷贝 API</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-FileChannel-transferTo-transferFrom"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 FileChannel.transferTo &#x2F; transferFrom</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-MappedByteBuffer%EF%BC%88mmap%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 MappedByteBuffer（mmap）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-DirectByteBuffer-SocketChannel"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 DirectByteBuffer + SocketChannel</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E4%B8%AD%E9%97%B4%E4%BB%B6%E6%BA%90%E7%A0%81%E9%87%8C%E7%9A%84%E9%9B%B6%E6%8B%B7%E8%B4%9D"><span class="toc-number">1.5.</span> <span class="toc-text">四、中间件源码里的零拷贝</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-Kafka%EF%BC%9A%E4%B8%8D%E6%AD%A2-sendfile"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 Kafka：不止 sendfile</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-Netty%EF%BC%9ACompositeByteBuf-%E4%B8%8E-FileRegion"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 Netty：CompositeByteBuf 与 FileRegion</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-RocketMQ-Nginx"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 RocketMQ &#x2F; Nginx</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%94%9F%E4%BA%A7%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.6.</span> <span class="toc-text">五、生产踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/13/ai-application-engineer-learning-roadmap/" title="【AI 转型】AI 应用开发工程师学习路线全景：从 Java 后端到 Agent 开发者的 6 个阶段">【AI 转型】AI 应用开发工程师学习路线全景：从 Java 后端到 Agent 开发者的 6 个阶段</a><time datetime="2026-10-13T00:00:00.000Z" title="发表于 2026-10-13 08:00:00">2026-10-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/13/java-api-testing-wiremock-restassured-deep-practice/" title="【Java 工程】接口测试深度实战：WireMock 服务虚拟化与 REST Assured 断言体系">【Java 工程】接口测试深度实战：WireMock 服务虚拟化与 REST Assured 断言体系</a><time datetime="2026-10-13T00:00:00.000Z" title="发表于 2026-10-13 08:00:00">2026-10-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/13/java-crac-checkpoint-restore-fast-startup-deep-dive/" title="【JVM 前沿】CRaC 检查点与恢复深度解析：Java 应用毫秒级启动加速原理与实践">【JVM 前沿】CRaC 检查点与恢复深度解析：Java 应用毫秒级启动加速原理与实践</a><time datetime="2026-10-13T00:00:00.000Z" title="发表于 2026-10-13 08:00:00">2026-10-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/13/java-llm-streaming-sse-webflux-deep-practice/" title="【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析">【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析</a><time datetime="2026-10-13T00:00:00.000Z" title="发表于 2026-10-13 08:00:00">2026-10-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/" title="【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地">【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka/Netty 中的落地</a><time datetime="2026-10-13T00:00:00.000Z" title="发表于 2026-10-13 08:00:00">2026-10-13</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
