@@ -1,0 +1,538 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界前言EVAL 大概是 Redis 里被滥用最多的命令之一。限流、扣库存、分布式锁续期、幂等校验，全都往里塞一段 Lua。短期很爽，长期很痛：  脚本字符串散落在几十个 Java 类里，改一行要发版； 没有版本概念，线上到底跑的是哪一版脚本说不清； SCRIPT FLUSH 之后所有 EVALSHA">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/18/redis-functions-server-side-scripting-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界前言EVAL 大概是 Redis 里被滥用最多的命令之一。限流、扣库存、分布式锁续期、幂等校验，全都往里塞一段 Lua。短期很爽，长期很痛：  脚本字符串散落在几十个 Java 类里，改一行要发版； 没有版本概念，线上到底跑的是哪一版脚本说不清； SCRIPT FLUSH 之后所有 EVALSHA">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-18T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-10-18T00:02:42.159Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Lua">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="分布式">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界",
+  "url": "https://jiweidong.github.io/2026/10/18/redis-functions-server-side-scripting-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-18T00:10:00.000Z",
+  "dateModified": "2026-10-18T00:02:42.159Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/18/redis-functions-server-side-scripting-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">787</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">878</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">239</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-18T00:10:00.000Z" title="发表于 2026-10-18 08:10:00">2026-10-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-18T00:02:42.159Z" title="更新于 2026-10-18 08:02:42">2026-10-18</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-%E6%B7%B1%E6%8C%96/">Java 深挖</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-实战】Redis-Functions-深度实战：服务端函数、Lua-脚本治理与原子性边界"><a href="#【Redis-实战】Redis-Functions-深度实战：服务端函数、Lua-脚本治理与原子性边界" class="headerlink" title="【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界"></a>【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p><code>EVAL</code> 大概是 Redis 里被滥用最多的命令之一。限流、扣库存、分布式锁续期、幂等校验，全都往里塞一段 Lua。短期很爽，长期很痛：</p>
+<ul>
+<li>脚本字符串散落在几十个 Java 类里，改一行要发版；</li>
+<li>没有版本概念，线上到底跑的是哪一版脚本说不清；</li>
+<li><code>SCRIPT FLUSH</code> 之后所有 <code>EVALSHA</code> 报 <code>NOSCRIPT</code>，流量一冲就雪崩；</li>
+<li>没有统一的权限边界，谁都能 <code>EVAL</code> 一段死循环把实例拖垮；</li>
+<li>集群模式下 key 跨 slot 直接报 <code>CROSSSLOT</code>。</li>
+</ul>
+<p>Redis 7.0 引入的 <strong>Functions（服务端函数）</strong> 就是来收拾这个烂摊子的：脚本变成「库（library）」，有名字、有版本、持久化、可复制、可管理，客户端只负责 <code>FCALL</code> 调用。</p>
+<p>这篇文章讲清楚三件事：<strong>Functions 的模型与生命周期</strong>、<strong>Java 侧怎么落地</strong>、<strong>原子性与集群边界在哪</strong>。最后给一份「Lua → Functions」的迁移清单和面试追问。</p>
+<hr>
+<h2 id="一、从-EVAL-到-FCALL：模型变化"><a href="#一、从-EVAL-到-FCALL：模型变化" class="headerlink" title="一、从 EVAL 到 FCALL：模型变化"></a>一、从 EVAL 到 FCALL：模型变化</h2><h3 id="1-1-EVAL-的问题"><a href="#1-1-EVAL-的问题" class="headerlink" title="1.1 EVAL 的问题"></a>1.1 EVAL 的问题</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 典型写法：脚本内嵌在 Java 代码里</span></span><br><span class="line"><span class="type">String</span> <span class="variable">script</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">    if redis.call(&#x27;EXISTS&#x27;, KEYS[1]) == 1 then</span></span><br><span class="line"><span class="string">        return 0</span></span><br><span class="line"><span class="string">    end</span></span><br><span class="line"><span class="string">    redis.call(&#x27;SET&#x27;, KEYS[1], ARGV[1], &#x27;PX&#x27;, ARGV[2])</span></span><br><span class="line"><span class="string">    return 1</span></span><br><span class="line"><span class="string">    &quot;&quot;&quot;</span>;</span><br><span class="line">redisTemplate.execute(<span class="keyword">new</span> <span class="title class_">DefaultRedisScript</span>&lt;&gt;(script, Long.class), keys, args);</span><br></pre></td></tr></table></figure>
+
+<p>问题清单：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>表现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>脚本无独立生命周期</td>
+<td><code>SCRIPT FLUSH</code>、主从切换、实例迁移后缓存失效</td>
+</tr>
+<tr>
+<td>无版本管理</td>
+<td>改脚本靠发版，回滚靠 Git</td>
+</tr>
+<tr>
+<td>无统一审计</td>
+<td>不知道谁在什么时候执行了什么脚本</td>
+</tr>
+<tr>
+<td>无法复用</td>
+<td>相同逻辑在多个服务里复制粘贴</td>
+</tr>
+<tr>
+<td>调试困难</td>
+<td>只能靠 <code>redis.log</code> 和返回值猜</td>
+</tr>
+</tbody></table>
+<p><code>EVALSHA</code> 稍好一点（只传 SHA1），但依然要客户端自己处理 <code>NOSCRIPT</code> 回退。</p>
+<h3 id="1-2-Functions-的模型"><a href="#1-2-Functions-的模型" class="headerlink" title="1.2 Functions 的模型"></a>1.2 Functions 的模型</h3><p>Functions 把脚本组织成<strong>库</strong>，库加载到 Redis 后常驻，并可被复制到副本、写入 AOF&#x2F;RDB。</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line">#!lua name=ratelimit</span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> <span class="function"><span class="keyword">function</span> <span class="title">sliding_window</span><span class="params">(keys, args)</span></span></span><br><span class="line">    <span class="keyword">local</span> key = keys[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">local</span> now = <span class="built_in">tonumber</span>(args[<span class="number">1</span>])</span><br><span class="line">    <span class="keyword">local</span> window = <span class="built_in">tonumber</span>(args[<span class="number">2</span>])</span><br><span class="line">    <span class="keyword">local</span> limit = <span class="built_in">tonumber</span>(args[<span class="number">3</span>])</span><br><span class="line"></span><br><span class="line">    redis.call(<span class="string">&#x27;ZREMRANGEBYSCORE&#x27;</span>, key, <span class="number">0</span>, now - window)</span><br><span class="line">    <span class="keyword">local</span> count = redis.call(<span class="string">&#x27;ZCARD&#x27;</span>, key)</span><br><span class="line">    <span class="keyword">if</span> count &gt;= limit <span class="keyword">then</span></span><br><span class="line">        <span class="keyword">return</span> <span class="number">0</span></span><br><span class="line">    <span class="keyword">end</span></span><br><span class="line">    redis.call(<span class="string">&#x27;ZADD&#x27;</span>, key, now, now .. <span class="string">&#x27;-&#x27;</span> .. <span class="built_in">math</span>.<span class="built_in">random</span>())</span><br><span class="line">    redis.call(<span class="string">&#x27;PEXPIRE&#x27;</span>, key, window)</span><br><span class="line">    <span class="keyword">return</span> <span class="number">1</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"></span><br><span class="line">redis.register_function&#123;</span><br><span class="line">    function_name = <span class="string">&#x27;sliding_window&#x27;</span>,</span><br><span class="line">    callback = sliding_window,</span><br><span class="line">    flags = &#123; <span class="string">&#x27;no-writes&#x27;</span> &#125;,   <span class="comment">-- 注意：这里其实有写，下面会讲为什么不能这么写</span></span><br><span class="line">    description = <span class="string">&#x27;滑动窗口限流&#x27;</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>客户端调用：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">FCALL ratelimit sliding_window 1 rate:user:1001 1710000000000 60000 100</span><br></pre></td></tr></table></figure>
+
+<p>和 EVAL 的对比：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>EVAL &#x2F; EVALSHA</th>
+<th>Functions</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>存储</td>
+<td>脚本缓存（易失）</td>
+<td>库常驻 + 持久化</td>
+</tr>
+<tr>
+<td>版本</td>
+<td>无</td>
+<td>库名 + 可 <code>FUNCTION LIST</code> 查看</td>
+</tr>
+<tr>
+<td>复制</td>
+<td>脚本不复制</td>
+<td>库随复制传播</td>
+</tr>
+<tr>
+<td>集群</td>
+<td>手动保证同 slot</td>
+<td>keyspec 声明，路由更清晰</td>
+</tr>
+<tr>
+<td>管理</td>
+<td><code>SCRIPT KILL</code></td>
+<td><code>FUNCTION LIST/STATS/DUMP/RESTORE/FLUSH/KILL</code></td>
+</tr>
+<tr>
+<td>调用</td>
+<td><code>EVAL</code>&#x2F;<code>EVALSHA</code></td>
+<td><code>FCALL</code>&#x2F;<code>FCALL_RO</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>注意：Functions <strong>不是</strong> Lua 的替代品，它还是 Lua 5.1 引擎（Redis 7.0），只是把「脚本」升级成了「可管理的一等公民」。</p>
+</blockquote>
+<hr>
+<h2 id="二、库的定义规则与生命周期"><a href="#二、库的定义规则与生命周期" class="headerlink" title="二、库的定义规则与生命周期"></a>二、库的定义规则与生命周期</h2><h3 id="2-1-库的强制约定"><a href="#2-1-库的强制约定" class="headerlink" title="2.1 库的强制约定"></a>2.1 库的强制约定</h3><p>一个库必须满足：</p>
+<ol>
+<li>第一行是 <code>#!lua name=&lt;libname&gt;</code> 的 shebang；</li>
+<li>库名全局唯一，重复加载会报 <code>ERR Library &#39;xxx&#39; already exists</code>；</li>
+<li>库内通过 <code>redis.register_function</code> 注册一个或多个函数；</li>
+<li>函数名在<strong>整个实例</strong>内唯一（不是库内唯一）。</li>
+</ol>
+<p>加载：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">FUNCTION LOAD <span class="string">&quot;#!lua name=ratelimit</span></span><br><span class="line"><span class="string">local function sliding_window(keys, args) ... end</span></span><br><span class="line"><span class="string">redis.register_function(&#x27;sliding_window&#x27;, sliding_window)</span></span><br><span class="line"><span class="string">&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p><code>FUNCTION LOAD REPLACE</code> 用于覆盖同名库（这是发布新版本的入口）。</p>
+<h3 id="2-2-生命周期"><a href="#2-2-生命周期" class="headerlink" title="2.2 生命周期"></a>2.2 生命周期</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">FUNCTION LOAD  →  库进入内存  →  随 RDB/AOF 持久化</span><br><span class="line">                      ↓</span><br><span class="line">              FUNCTION LIST / STATS 可观测</span><br><span class="line">                      ↓</span><br><span class="line">        FUNCTION DUMP → 二进制快照 → FUNCTION RESTORE 到其他实例</span><br><span class="line">                      ↓</span><br><span class="line">              FUNCTION FLUSH [ASYNC|SYNC] 卸载</span><br></pre></td></tr></table></figure>
+
+<p>关键行为：</p>
+<ul>
+<li><strong>持久化</strong>：库会写进 RDB（作为 payload）和 AOF（<code>FUNCTION LOAD</code> 命令），重启后自动恢复；</li>
+<li><strong>复制</strong>：主节点加载库后，会以命令形式传播给副本，副本无需单独加载；</li>
+<li><strong>主从切换</strong>：新主已有库（因为复制过），客户端不需要重新 <code>FUNCTION LOAD</code>；</li>
+<li><strong><code>FUNCTION FLUSH</code></strong>：卸载所有库，<strong>不可恢复</strong>（除非有 dump）。生产环境应禁止直接执行。</li>
+</ul>
+<h3 id="2-3-函数-flags-与-keyspec"><a href="#2-3-函数-flags-与-keyspec" class="headerlink" title="2.3 函数 flags 与 keyspec"></a>2.3 函数 flags 与 keyspec</h3><p><code>register_function</code> 的完整表形式：</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">redis.register_function&#123;</span><br><span class="line">    function_name = <span class="string">&#x27;deduct_stock&#x27;</span>,</span><br><span class="line">    callback = deduct_stock,</span><br><span class="line">    flags = &#123; <span class="string">&#x27;no-writes&#x27;</span> &#125;,          <span class="comment">-- 只读函数，可在副本执行</span></span><br><span class="line">    description = <span class="string">&#x27;原子扣减库存&#x27;</span>,</span><br><span class="line">    <span class="comment">-- Redis 7.2+ 支持 keyspec，声明 key 的位置</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>常用 flags：</p>
+<table>
+<thead>
+<tr>
+<th>flag</th>
+<th>含义</th>
+<th>使用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>no-writes</code></td>
+<td>函数不写数据</td>
+<td>只读查询，可路由到副本（<code>FCALL_RO</code>）</td>
+</tr>
+<tr>
+<td><code>allow-oom</code></td>
+<td>OOM 时仍允许执行</td>
+<td>需要清理内存的函数（慎用）</td>
+</tr>
+<tr>
+<td><code>allow-stale</code></td>
+<td>允许在数据过期（stale）副本执行</td>
+<td>只读、可容忍陈旧</td>
+</tr>
+<tr>
+<td><code>no-cluster</code></td>
+<td>禁止在集群模式执行</td>
+<td>依赖全局状态的函数</td>
+</tr>
+<tr>
+<td><code>allow-cross-slot-keys</code></td>
+<td>允许跨 slot key</td>
+<td><strong>极危险</strong>，破坏集群语义</td>
+</tr>
+</tbody></table>
+<p><code>keyspec</code>（Redis 7.2+）让 Redis 知道函数会访问哪些 key，用于集群路由和 ACL：</p>
+<figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">redis.register_function&#123;</span><br><span class="line">    function_name = <span class="string">&#x27;transfer&#x27;</span>,</span><br><span class="line">    callback = transfer,</span><br><span class="line">    flags = &#123; <span class="string">&#x27;no-writes&#x27;</span> &#125;,   <span class="comment">-- 示例，实际转账是写</span></span><br><span class="line">    description = <span class="string">&#x27;账户转账&#x27;</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>一个高频误解：<strong><code>no-writes</code> 不是「声明式优化」，而是硬约束</strong>。标了 <code>no-writes</code> 的函数里调用 <code>SET</code> 会直接报错。上面第一个示例里我故意写错，就是为了提醒这一点——限流函数有写操作，<strong>不能</strong>标 <code>no-writes</code>。</p>
+</blockquote>
+<hr>
+<h2 id="三、三个生产级函数实现"><a href="#三、三个生产级函数实现" class="headerlink" title="三、三个生产级函数实现"></a>三、三个生产级函数实现</h2><h3 id="3-1-原子扣减库存（防超卖）"><a href="#3-1-原子扣减库存（防超卖）" class="headerlink" title="3.1 原子扣减库存（防超卖）"></a>3.1 原子扣减库存（防超卖）</h3><figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line">#!lua name=inventory</span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> <span class="function"><span class="keyword">function</span> <span class="title">deduct</span><span class="params">(keys, args)</span></span></span><br><span class="line">    <span class="keyword">local</span> stockKey = keys[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">local</span> qty = <span class="built_in">tonumber</span>(args[<span class="number">1</span>])</span><br><span class="line">    <span class="keyword">if</span> qty &lt;= <span class="number">0</span> <span class="keyword">then</span></span><br><span class="line">        <span class="keyword">return</span> <span class="number">-2</span>                       <span class="comment">-- 参数非法</span></span><br><span class="line">    <span class="keyword">end</span></span><br><span class="line">    <span class="keyword">local</span> stock = <span class="built_in">tonumber</span>(redis.call(<span class="string">&#x27;GET&#x27;</span>, stockKey))</span><br><span class="line">    <span class="keyword">if</span> stock == <span class="literal">nil</span> <span class="keyword">then</span></span><br><span class="line">        <span class="keyword">return</span> <span class="number">-1</span>                       <span class="comment">-- 商品不存在</span></span><br><span class="line">    <span class="keyword">end</span></span><br><span class="line">    <span class="keyword">if</span> stock &lt; qty <span class="keyword">then</span></span><br><span class="line">        <span class="keyword">return</span> <span class="number">0</span>                        <span class="comment">-- 库存不足</span></span><br><span class="line">    <span class="keyword">end</span></span><br><span class="line">    redis.call(<span class="string">&#x27;DECRBY&#x27;</span>, stockKey, qty)</span><br><span class="line">    <span class="keyword">return</span> stock - qty                  <span class="comment">-- 返回剩余库存</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"></span><br><span class="line">redis.register_function&#123;</span><br><span class="line">    function_name = <span class="string">&#x27;deduct&#x27;</span>,</span><br><span class="line">    callback = deduct,</span><br><span class="line">    description = <span class="string">&#x27;原子扣减库存，返回剩余库存；0=不足，-1=不存在，-2=非法&#x27;</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>Java 调用：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">InventoryRepository</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> StringRedisTemplate redis;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> DeductResult <span class="title function_">deduct</span><span class="params">(String sku, <span class="type">int</span> qty)</span> &#123;</span><br><span class="line">        <span class="type">Long</span> <span class="variable">remain</span> <span class="operator">=</span> redis.execute((RedisCallback&lt;Long&gt;) conn -&gt;</span><br><span class="line">            conn.functionCall(</span><br><span class="line">                FunctionArgs.Builder.function(<span class="string">&quot;inventory&quot;</span>, <span class="string">&quot;deduct&quot;</span>)</span><br><span class="line">                    .keys(<span class="string">&quot;stock:&quot;</span> + sku)</span><br><span class="line">                    .arg(String.valueOf(qty))</span><br><span class="line">                    .build()</span><br><span class="line">            )</span><br><span class="line">        );</span><br><span class="line">        <span class="keyword">if</span> (remain == <span class="literal">null</span>) <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;fcall returned null&quot;</span>);</span><br><span class="line">        <span class="keyword">if</span> (remain == -<span class="number">1</span>) <span class="keyword">return</span> DeductResult.notFound();</span><br><span class="line">        <span class="keyword">if</span> (remain == -<span class="number">2</span>) <span class="keyword">return</span> DeductResult.badRequest();</span><br><span class="line">        <span class="keyword">if</span> (remain == <span class="number">0</span>)  <span class="keyword">return</span> DeductResult.soldOut();</span><br><span class="line">        <span class="keyword">return</span> DeductResult.success(remain);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>上面用的是 Spring Data Redis 3.x 的 <code>RedisConnection#functionCall</code>（底层封装 <code>FCALL</code>）。如果你的版本没有该方法，可以用 <code>LettuceConnection</code> 的 <code>fcall</code>，或直接 <code>redisTemplate.execute(connection -&gt; connection.execute(&quot;FCALL&quot;, ...))</code> 走原生命令。</p>
+</blockquote>
+<p>几个要点：</p>
+<ul>
+<li><strong>不要在函数里做多 key 操作</strong>（除非同 slot）。<code>stock:{sku1}</code> 和 <code>stock:{sku2}</code> 用 hash tag 保证同 slot。</li>
+<li><strong>返回码不要用字符串</strong>，用整数&#x2F;数组，解析成本和歧义都更低。</li>
+<li><strong>函数内不要 <code>KEYS</code> 扫描</strong>，Redis 单线程，一个 <code>KEYS *</code> 能把实例卡死。</li>
+</ul>
+<h3 id="3-2-幂等令牌（SetNX-过期）"><a href="#3-2-幂等令牌（SetNX-过期）" class="headerlink" title="3.2 幂等令牌（SetNX + 过期）"></a>3.2 幂等令牌（SetNX + 过期）</h3><figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line">#!lua name=idempotent</span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> <span class="function"><span class="keyword">function</span> <span class="title">acquire</span><span class="params">(keys, args)</span></span></span><br><span class="line">    <span class="keyword">local</span> key = keys[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">local</span> token = args[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">local</span> ttl = <span class="built_in">tonumber</span>(args[<span class="number">2</span>])</span><br><span class="line">    <span class="keyword">local</span> ok = redis.call(<span class="string">&#x27;SET&#x27;</span>, key, token, <span class="string">&#x27;NX&#x27;</span>, <span class="string">&#x27;PX&#x27;</span>, ttl)</span><br><span class="line">    <span class="keyword">if</span> ok <span class="keyword">then</span> <span class="keyword">return</span> <span class="number">1</span> <span class="keyword">else</span> <span class="keyword">return</span> <span class="number">0</span> <span class="keyword">end</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> <span class="function"><span class="keyword">function</span> <span class="title">release</span><span class="params">(keys, args)</span></span></span><br><span class="line">    <span class="keyword">local</span> key = keys[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">local</span> token = args[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">if</span> redis.call(<span class="string">&#x27;GET&#x27;</span>, key) == token <span class="keyword">then</span></span><br><span class="line">        <span class="keyword">return</span> redis.call(<span class="string">&#x27;DEL&#x27;</span>, key)</span><br><span class="line">    <span class="keyword">end</span></span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"></span><br><span class="line">redis.register_function(<span class="string">&#x27;acquire&#x27;</span>, acquire)</span><br><span class="line">redis.register_function(<span class="string">&#x27;release&#x27;</span>, release)</span><br></pre></td></tr></table></figure>
+
+<p>这个例子说明 Functions 的<strong>复用价值</strong>：<code>acquire</code>&#x2F;<code>release</code> 成对注册在同一个库里，多个服务共享同一套语义，不会出现「A 服务删锁没校验 token」的低级 bug。</p>
+<h3 id="3-3-滑动窗口限流（修正版）"><a href="#3-3-滑动窗口限流（修正版）" class="headerlink" title="3.3 滑动窗口限流（修正版）"></a>3.3 滑动窗口限流（修正版）</h3><figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line">#!lua name=ratelimit</span><br><span class="line"></span><br><span class="line"><span class="keyword">local</span> <span class="function"><span class="keyword">function</span> <span class="title">sliding_window</span><span class="params">(keys, args)</span></span></span><br><span class="line">    <span class="keyword">local</span> key = keys[<span class="number">1</span>]</span><br><span class="line">    <span class="keyword">local</span> now = <span class="built_in">tonumber</span>(args[<span class="number">1</span>])</span><br><span class="line">    <span class="keyword">local</span> window = <span class="built_in">tonumber</span>(args[<span class="number">2</span>])</span><br><span class="line">    <span class="keyword">local</span> limit = <span class="built_in">tonumber</span>(args[<span class="number">3</span>])</span><br><span class="line">    <span class="keyword">local</span> member = args[<span class="number">4</span>]</span><br><span class="line"></span><br><span class="line">    redis.call(<span class="string">&#x27;ZREMRANGEBYSCORE&#x27;</span>, key, <span class="number">0</span>, now - window)</span><br><span class="line">    <span class="keyword">if</span> redis.call(<span class="string">&#x27;ZCARD&#x27;</span>, key) &gt;= limit <span class="keyword">then</span></span><br><span class="line">        <span class="keyword">return</span> <span class="number">0</span></span><br><span class="line">    <span class="keyword">end</span></span><br><span class="line">    redis.call(<span class="string">&#x27;ZADD&#x27;</span>, key, now, member)</span><br><span class="line">    redis.call(<span class="string">&#x27;PEXPIRE&#x27;</span>, key, window)</span><br><span class="line">    <span class="keyword">return</span> <span class="number">1</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line"></span><br><span class="line">redis.register_function(<span class="string">&#x27;sliding_window&#x27;</span>, sliding_window)</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>不标 <code>no-writes</code>，因为它确实写。<code>member</code> 由客户端传入 UUID，避免同一毫秒内多个请求用相同 score 覆盖（<code>ZADD</code> 相同 member 是更新，不是新增）。</p>
+</blockquote>
+<hr>
+<h2 id="四、原子性边界：Functions-能保证什么，不能保证什么"><a href="#四、原子性边界：Functions-能保证什么，不能保证什么" class="headerlink" title="四、原子性边界：Functions 能保证什么，不能保证什么"></a>四、原子性边界：Functions 能保证什么，不能保证什么</h2><p>这是面试最爱问、生产最容易踩的部分。</p>
+<h3 id="4-1-能保证的"><a href="#4-1-能保证的" class="headerlink" title="4.1 能保证的"></a>4.1 能保证的</h3><ul>
+<li><strong>单命令级原子</strong>：函数执行期间，Redis 不会插入其他命令（单线程模型）。</li>
+<li><strong>全有或全无（对内存状态）</strong>：函数内多条写命令，要么都执行，要么在报错前已执行的保留（<strong>注意：Redis 不支持回滚</strong>）。</li>
+<li><strong>隔离性</strong>：函数执行期间没有其他客户端能看到中间状态。</li>
+</ul>
+<h3 id="4-2-不能保证的"><a href="#4-2-不能保证的" class="headerlink" title="4.2 不能保证的"></a>4.2 不能保证的</h3><table>
+<thead>
+<tr>
+<th>误解</th>
+<th>事实</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>「函数报错会自动回滚」</td>
+<td><strong>不会</strong>。Lua 脚本&#x2F;函数执行到一半报错，之前的写已生效</td>
+</tr>
+<tr>
+<td>「函数能保证跨实例原子」</td>
+<td>不能，只在单个 Redis 实例&#x2F;单 slot 内原子</td>
+</tr>
+<tr>
+<td>「函数能替代分布式事务」</td>
+<td>不能，跨服务、跨库的一致性仍需 Saga&#x2F;TCC</td>
+</tr>
+<tr>
+<td>「函数执行不会被中断」</td>
+<td>超过 <code>lua-time-limit</code>（默认 5s）会记录慢日志；只读函数可被 <code>FUNCTION KILL</code> 终止，写函数<strong>不能</strong>被杀</td>
+</tr>
+<tr>
+<td>「函数里可以随便 <code>sleep</code>」</td>
+<td>没有 <code>sleep</code>，<code>redis.call</code> 之外的阻塞会拖死整个实例</td>
+</tr>
+</tbody></table>
+<h3 id="4-3-超时治理"><a href="#4-3-超时治理" class="headerlink" title="4.3 超时治理"></a>4.3 超时治理</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"># redis.conf</span><br><span class="line">lua-time-limit 5000          # 5s，超过后 Redis 开始拒绝其他命令并记录日志</span><br><span class="line">busy-reply-threshold 5000    # 别名，两者等价</span><br></pre></td></tr></table></figure>
+
+<p>超过阈值后：</p>
+<ul>
+<li>Redis 返回 <code>BUSY Redis is busy running a script</code>；</li>
+<li>只有 <code>FUNCTION KILL</code>（只读函数）或 <code>SHUTDOWN NOSAVE</code> 能解；</li>
+<li><strong>写函数无法被 kill</strong>，只能等它跑完或重启——这是生产事故的经典形态。</li>
+</ul>
+<p>所以函数必须<strong>短小</strong>：O(1) 或 O(logN)，绝不循环大集合。</p>
+<hr>
+<h2 id="五、集群模式注意事项"><a href="#五、集群模式注意事项" class="headerlink" title="五、集群模式注意事项"></a>五、集群模式注意事项</h2><h3 id="5-1-同-slot-约束"><a href="#5-1-同-slot-约束" class="headerlink" title="5.1 同 slot 约束"></a>5.1 同 slot 约束</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 错误：两个 key 落在不同 slot</span></span><br><span class="line">FCALL transfer 2 account:1 account:2 100</span><br><span class="line"><span class="comment"># CROSSSLOT Keys in request don&#x27;t hash to the same slot</span></span><br></pre></td></tr></table></figure>
+
+<p>解决：用 hash tag。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">FCALL transfer 2 account:&#123;1001&#125; account:&#123;1001&#125;:vip 100</span><br></pre></td></tr></table></figure>
+
+<p><code>{1001}</code> 内的内容参与 hash，两个 key 落同一 slot。</p>
+<h3 id="5-2-库的传播"><a href="#5-2-库的传播" class="headerlink" title="5.2 库的传播"></a>5.2 库的传播</h3><ul>
+<li>集群模式下，<code>FUNCTION LOAD</code> 需要在<strong>每个 master</strong> 上执行（或用 <code>redis-cli --cluster call</code>）；</li>
+<li>副本通过复制获得库，不需要单独加载；</li>
+<li><code>FUNCTION LIST</code> 只显示当前节点，排查时要逐节点查。</li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">redis-cli --cluster call 10.0.0.1:6379 FUNCTION LIST</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-路由"><a href="#5-3-路由" class="headerlink" title="5.3 路由"></a>5.3 路由</h3><p><code>FCALL</code> 的第一个 key 决定路由节点。如果函数声明了 keyspec，客户端（如 Lettuce）可以自动路由；否则需要业务自己算 slot。</p>
+<hr>
+<h2 id="六、Java-客户端落地"><a href="#六、Java-客户端落地" class="headerlink" title="六、Java 客户端落地"></a>六、Java 客户端落地</h2><h3 id="6-1-Lettuce"><a href="#6-1-Lettuce" class="headerlink" title="6.1 Lettuce"></a>6.1 Lettuce</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">RedisClient</span> <span class="variable">client</span> <span class="operator">=</span> RedisClient.create(<span class="string">&quot;redis://localhost:6379&quot;</span>);</span><br><span class="line">StatefulRedisConnection&lt;String, String&gt; conn = client.connect();</span><br><span class="line">RedisCommands&lt;String, String&gt; cmd = conn.sync();</span><br><span class="line"></span><br><span class="line"><span class="comment">// 加载库（通常在启动时做一次）</span></span><br><span class="line"><span class="type">String</span> <span class="variable">lib</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">    #!lua name=demo</span></span><br><span class="line"><span class="string">    redis.register_function(&#x27;ping_fn&#x27;, function(keys, args)</span></span><br><span class="line"><span class="string">        return redis.call(&#x27;PING&#x27;)</span></span><br><span class="line"><span class="string">    end)</span></span><br><span class="line"><span class="string">    &quot;&quot;&quot;</span>;</span><br><span class="line">cmd.functionLoad(lib, <span class="literal">true</span>);   <span class="comment">// replace = true</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 调用</span></span><br><span class="line"><span class="type">Object</span> <span class="variable">result</span> <span class="operator">=</span> cmd.fcall(<span class="string">&quot;demo&quot;</span>, <span class="string">&quot;ping_fn&quot;</span>, <span class="keyword">new</span> <span class="title class_">String</span>[]&#123;&#125;, <span class="keyword">new</span> <span class="title class_">String</span>[]&#123;&#125;);</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-Spring-Data-Redis"><a href="#6-2-Spring-Data-Redis" class="headerlink" title="6.2 Spring Data Redis"></a>6.2 Spring Data Redis</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Configuration</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">RedisFunctionConfig</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Bean</span></span><br><span class="line">    <span class="keyword">public</span> ApplicationRunner <span class="title function_">loadFunctions</span><span class="params">(StringRedisTemplate redis)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> args -&gt; redis.execute((RedisCallback&lt;String&gt;) conn -&gt;</span><br><span class="line">            conn.functionLoad(RedisFunctionLibrary.of(<span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">                #!lua name=inventory</span></span><br><span class="line"><span class="string">                redis.register_function(&#x27;deduct&#x27;, function(keys, args)</span></span><br><span class="line"><span class="string">                    local stock = tonumber(redis.call(&#x27;GET&#x27;, KEYS[1]))</span></span><br><span class="line"><span class="string">                    local qty = tonumber(ARGV[1])</span></span><br><span class="line"><span class="string">                    if stock == nil or stock &lt; qty then return 0 end</span></span><br><span class="line"><span class="string">                    return redis.call(&#x27;DECRBY&#x27;, KEYS[1], qty)</span></span><br><span class="line"><span class="string">                end)</span></span><br><span class="line"><span class="string">                &quot;&quot;&quot;</span>), <span class="literal">true</span>)</span><br><span class="line">        );</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>启动加载的幂等性</strong>：用 <code>FUNCTION LOAD REPLACE</code> 而不是 <code>FUNCTION LOAD</code>，否则多实例同时启动会报 <code>Library already exists</code>。更好的是<strong>用配置中心控制版本</strong>，只在版本变化时加载。</p>
+<h3 id="6-3-版本管理实践"><a href="#6-3-版本管理实践" class="headerlink" title="6.3 版本管理实践"></a>6.3 版本管理实践</h3><p>推荐做法：</p>
+<ol>
+<li>库名带语义：<code>inventory</code>、<code>ratelimit</code>、<code>idempotent</code>，不要用 <code>lib1</code>；</li>
+<li>函数签名稳定：参数顺序、返回码一旦发布不要改，新增用新函数名；</li>
+<li>发布流程：<code>FUNCTION DUMP</code> 备份 → <code>FUNCTION LOAD REPLACE</code> → 灰度验证 → 全量；</li>
+<li>回滚：<code>FUNCTION RESTORE &lt;dump&gt; REPLACE</code> 或重新加载旧版本；</li>
+<li>监控：<code>FUNCTION STATS</code> 看调用次数、错误数、平均耗时。</li>
+</ol>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">FUNCTION STATS</span><br><span class="line"><span class="comment"># running_script: (empty)</span></span><br><span class="line"><span class="comment"># engines: &#123; LUA: &#123; libraries_count: 3, functions_count: 7 &#125; &#125;</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、迁移清单：从-Lua-到-Functions"><a href="#七、迁移清单：从-Lua-到-Functions" class="headerlink" title="七、迁移清单：从 Lua 到 Functions"></a>七、迁移清单：从 Lua 到 Functions</h2><table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>动作</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>盘点所有 <code>EVAL</code>&#x2F;<code>DefaultRedisScript</code></td>
+<td>按业务域归类</td>
+</tr>
+<tr>
+<td>2</td>
+<td>合并同类脚本为库</td>
+<td>一域一库，避免巨型库</td>
+</tr>
+<tr>
+<td>3</td>
+<td>明确每个函数的 key 与 flags</td>
+<td>只读的标 <code>no-writes</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>统一返回码</td>
+<td>整数优于字符串</td>
+</tr>
+<tr>
+<td>5</td>
+<td>改造客户端为 <code>FCALL</code></td>
+<td>保留 <code>EVAL</code> 兜底一个版本</td>
+</tr>
+<tr>
+<td>6</td>
+<td>加监控与告警</td>
+<td>调用量、错误率、P99</td>
+</tr>
+<tr>
+<td>7</td>
+<td>下线旧脚本</td>
+<td><code>SCRIPT FLUSH</code> 前确认无调用</td>
+</tr>
+</tbody></table>
+<p><strong>不要一次性全迁</strong>。建议先迁「读多写少、逻辑稳定」的函数（如限流、幂等），把扣库存这类强一致逻辑放在第二轮，配合双写对比。</p>
+<hr>
+<h2 id="八、踩坑记录"><a href="#八、踩坑记录" class="headerlink" title="八、踩坑记录"></a>八、踩坑记录</h2><p><strong>坑 1：标了 <code>no-writes</code> 却写了数据。</strong><br>运行时报 <code>ERR Write commands are not allowed from read-only scripts</code>。排查时先看 flags。</p>
+<p><strong>坑 2：函数里用了 <code>math.random()</code>。</strong><br>Lua 的随机数在 Redis 里是<strong>确定性</strong>的（相同 seed），多个副本执行会得到相同结果，看似没问题；但如果你把它当唯一 member，会覆盖。用客户端传入 UUID。</p>
+<p><strong>坑 3：<code>FUNCTION LOAD</code> 没加 REPLACE，滚动发布时一半实例失败。</strong><br>启动脚本要幂等。</p>
+<p><strong>坑 4：集群下只在单节点加载。</strong><br><code>FCALL</code> 路由到没加载库的节点，报 <code>ERR Function not found</code>。用 <code>--cluster call</code> 全量加载。</p>
+<p><strong>坑 5：函数执行 6s，Redis 进入 BUSY，所有业务超时。</strong><br>函数内不要做 O(N) 操作；<code>ZREMRANGEBYSCORE</code> 的范围要配合窗口大小控制基数。</p>
+<p><strong>坑 6：误执行 <code>FUNCTION FLUSH</code>。</strong><br>这是不可逆操作。生产环境应通过 ACL 禁止普通账号执行 <code>FUNCTION FLUSH</code>&#x2F;<code>FUNCTION RESTORE</code>。</p>
+<hr>
+<h2 id="九、面试追问"><a href="#九、面试追问" class="headerlink" title="九、面试追问"></a>九、面试追问</h2><p><strong>Q1：Redis Functions 和 Lua 脚本的本质区别？</strong><br>Lua 脚本是「一次性的代码片段」，靠 SHA1 缓存；Functions 是「持久化的库」，有名字、版本、复制与持久化语义，客户端通过 <code>FCALL</code> 按名调用。Functions 解决的是脚本的<strong>工程化治理</strong>问题，不是性能问题。</p>
+<p><strong>Q2：Functions 能保证原子性吗？能回滚吗？</strong><br>能保证「执行期间不被打断」的原子性（单线程），但<strong>不能回滚</strong>。函数中途报错，已执行的写命令保留。需要回滚语义只能靠业务补偿。</p>
+<p><strong>Q3：<code>no-writes</code> flag 的作用？</strong><br>声明函数只读。Redis 会拒绝函数内的写命令，并允许 <code>FCALL_RO</code> 在副本上执行。它是<strong>硬约束</strong>，不是提示。</p>
+<p><strong>Q4：集群模式下 Functions 有什么限制？</strong><br>① 库要在每个 master 加载；② 函数内所有 key 必须同 slot（用 hash tag）；③ <code>FCALL</code> 按第一个 key 路由；④ <code>allow-cross-slot-keys</code> 会破坏集群语义，不要用。</p>
+<p><strong>Q5：函数执行超时了怎么办？</strong><br>超过 <code>lua-time-limit</code> 后 Redis 返回 BUSY。只读函数可以 <code>FUNCTION KILL</code>；<strong>写函数不能被杀</strong>，只能等或重启。所以函数必须短小，禁止大范围扫描。</p>
+<p><strong>Q6：为什么不用 Redis 事务（MULTI&#x2F;EXEC）替代？</strong><br><code>MULTI/EXEC</code> 不能做条件判断（WATCH 是乐观锁，冲突要重试），也不支持「读-判断-写」的原子逻辑。Functions 可以在服务端做分支，这是核心差异。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>Redis Functions 的价值不在「更快」，而在「更可控」：</p>
+<ol>
+<li><strong>可管理</strong>：库名、版本、dump&#x2F;restore，告别散落的脚本文本；</li>
+<li><strong>可复制</strong>：随主从复制和持久化传播，不再担心 <code>SCRIPT FLUSH</code>；</li>
+<li><strong>可观测</strong>：<code>FUNCTION LIST/STATS</code> 提供调用维度的指标；</li>
+<li><strong>边界清晰</strong>：flags 和 keyspec 把「能做什么」显式声明出来。</li>
+</ol>
+<p>但它不是银弹：<strong>不能回滚、不能跨 slot、不能长耗时</strong>。把函数当成「Redis 内部的一段短小存储过程」，而不是「万能事务」，才是正确的用法。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/18/redis-functions-server-side-scripting-deep-practice/">https://jiweidong.github.io/2026/10/18/redis-functions-server-side-scripting-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F/">分布式</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/Lua/">Lua</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/18/java-llm-structured-output-json-schema-deep-practice/" title="【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试</div></div><div class="info-2"><div class="info-item-1">【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试前言「让大模型返回 JSON」是所有 AI 应用的第一道坎。你写了一行 prompt：请以 JSON 格式返回，测试时一切正常，上线后开始出现：  返回里带 &#96;&#96;&#96;json 代码块围栏，ObjectMapper 直接抛 JsonParseException； 字段名从 userName 变成 user_name，再变成 用户名； 数字字段返回 &quot;18&quot;（字符串），枚举返回 &quot;未知&quot;； 长文本被截断，JSON 少一个大括号； 模型很贴心地在 JSON 前后加了一句「好的，以下是结果：」。  这些问题的根因不是模型「不听话」，而是你把结构化约束寄托在了自然语言上。工程化的解法有三层：Schema 约束 → 强类型反序列化 → 校验与重试。缺一层，线上就一定会出问题。 这篇文章以 Java 技术栈为主线，讲清楚 JSON Schema 怎么写、Spring AI 与 LangChain4j 怎么落地、Jackson 怎么配、校验重试怎么做，最...</div></div></div></a><a class="pagination-related" href="/2026/10/18/jvm-deoptimization-recompile-deep-dive/" title="【JVM 底层】JIT 去优化（Deoptimization）深度解析：Uncommon Trap、OSR 与热点代码回退"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【JVM 底层】JIT 去优化（Deoptimization）深度解析：Uncommon Trap、OSR 与热点代码回退</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】JIT 去优化（Deoptimization）深度解析：Uncommon Trap、OSR 与热点代码回退前言提到 JIT，大部分人能说出「热点代码编译成机器码」「C1 快、C2 优化狠」「分层编译」。但很少有人关注 JIT 的反向过程：已经被编译成机器码的方法，会因为一个假设不成立，被打回解释执行。 这就是去优化（Deoptimization）。 它是 JVM 里最优雅也最容易被忽视的机制之一。理解它，你能解释很多「玄学」现象：  为什么服务刚启动时很快，跑了几小时反而慢了？ 为什么加了一个实现类，某个接口调用突然掉了 30% 性能？ 为什么 @SneakyThrows、动态代理、CGLIB 会让 C2 的优化失效？ 为什么 -XX:+PrintCompilation 里同一个方法被反复编译（made not entrant）？  这篇文章从分层编译讲到去优化触发条件、栈上替换过程、日志观察方法、代码实验、生产案例和调优参数，最后给出面试追问。内容偏底层，但每一节都对应一个可观测的现象。  一、背景：分层编译的五层结构HotSpot 的分层编译（Tiered C...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/16/delay-queue-solutions-deep-dive/" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</div></div><div class="info-2"><div class="info-item-1">延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。 一、什么是延迟队列？普通队列：生产者放入消息，消费者立即消费。延迟队列：消息进入队列后，等待指定时间才被消费者消费。 核心能力：“到点了才执行”。 典型业务场景：    场景 延迟时间 到期动作    订单超时未支付 30 分钟 关闭订单、释放库存   用户下单未评价 7 天 发送提醒   定时发布文章 自定义 自动上架   支付成功通知 5 秒 通知下游   分布式锁续期 30 秒 续期&#x2F;释放   失败重试 递增 重新投递   二、方案一：数据库轮询（最朴素，先被否定）用定时任务（XXL-Job &#x2F; Quart...</div></div></div></a><a class="pagination-related" href="/2026/08/06/redis-transaction-deep-dive/" title="【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比面试官：Redis 的事务和 MySQL 的事务有什么区别？Redis 事务能回滚吗？Redis 事务是面试中高频且容易答错的考点。很多人的第一反应是「Redis 事务就是一组命令的批量执行」，但面试官往往会在后面连续追问：「它能回滚吗？」「有隔离性吗？」「WATCH 是什么？」「为什么不建议用事务而用 Lua？」 这篇文章把 Redis 事务从命令到原理、从对比到实战彻底讲透。  一、Redis 事务的核心命令Redis 事务通过四个命令实现：MULTI、EXEC、DISCARD、WATCH。    命令 作用    MULTI 开启事务，标记事务开始   EXEC 执行事务队列中的所有命令   DISCARD 取消事务，清空命令队列   WATCH 监视一个或多个 key，事务执行前若被修改则事务被打断   基本用法123456789127.0.0.1:6379&gt; MULTIOK127.0.0.1:6379&gt; SET account:1001...</div></div></div></a><a class="pagination-related" href="/2026/10/10/redis-redlock-distributed-lock-deep-dive/" title="【分布式锁】Redis Redlock 红锁深度解析：时钟漂移、论战争议与 Fencing Token"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-10</div><div class="info-item-2">【分布式锁】Redis Redlock 红锁深度解析：时钟漂移、论战争议与 Fencing Token</div></div><div class="info-2"><div class="info-item-1">【分布式锁】Redis Redlock 红锁深度解析：时钟漂移、论战争议与 Fencing Token面试官：你说用 Redis 做分布式锁，那 Redis 主从切换时锁丢了怎么办？这是一个连环追问的经典开场。候选人一般会答：  “用 SetNX + 过期时间就行，Redisson 都封装好了。”  面试官接着问：  “主节点写入锁之后还没同步到从节点就宕机了，从节点升主，锁就消失了——这时候另一个线程也能拿到锁，临界区被两个线程同时进入。怎么办？”  如果这时候你只知道”Redisson 有看门狗自动续期”，那这个题就到这里了。能拉开差距的，是讲清楚 Redlock 怎么设计、以及它为什么至今仍有争议。  一、Redis 分布式锁的三个层次先建立全局视角，面试时按层次回答比直接抛 Redlock 更清晰：    层次 方案 单点故障 时钟依赖 锁丢失风险    L1 单实例 SetNX 有 是 主从切换丢锁   L2 哨兵&#x2F;主从 + 续期 有（切换窗口） 是 切换窗口内丢锁   L3 Redlock（多独立节点多数派） 无 强依赖 理论大幅降低，但不为零   L4 共...</div></div></div></a><a class="pagination-related" href="/2026/08/20/jedis-vs-lettuce-redis-client-comparison/" title="【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战</div></div><div class="info-2"><div class="info-item-1">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战面试官：你们项目里用的是 Jedis 还是 Lettuce？为什么？这是 Spring Boot 项目里最常被问到的问题之一。Spring Boot 2.x 默认集成 Lettuce，Spring Boot 1.x 默认 Jedis；Spring Data Redis 把两者都做了封装，很多人只是跟着默认走，却说不清两者的本质区别。 本文从线程模型、连接管理、源码实现、性能表现四个维度，把 Jedis 和 Lettuce 彻底讲透，最后给出生产环境选型建议。 一、先看本质：一个线程安全，一个线程不安全这是两者最核心、最根本的区别，其余所有差异几乎都由它衍生出来。 1.1 Jedis：非线程安全，必须配连接池Jedis 实例内部持有 Socket 连接，直接复用同一个 Jedis 实例执行并发命令，会出现响应错乱、数据交叉污染的问题。看源码： 1234567// Jedis 底层本质是对 redis.clients.jedis.Connection 的封装public class Co...</div></div></div></a><a class="pagination-related" href="/2026/10/06/red-packet-system-architecture-design/" title="【系统设计】高并发红包系统架构设计：拆分算法、并发扣减与资金一致性"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-06</div><div class="info-item-2">【系统设计】高并发红包系统架构设计：拆分算法、并发扣减与资金一致性</div></div><div class="info-2"><div class="info-item-1">【系统设计】高并发红包系统架构设计：拆分算法、并发扣减与资金一致性面试官：设计一个抢红包系统，要求不超发、不重复领、金额精确红包是面试里的”小而深”经典题。它看上去比秒杀简单，但把”拆分算法 + 并发扣减 + 资金一致性 + 超时退回”揉在一起，能问出十几层。 先把需求钉死：  一个群红包总金额 M 元，个数 N，每人只能领一次； 抢的瞬间会瞬时高并发（群里有人发消息，几百人同时点）； 金额精确到分，所有人领取之和必须恰好等于 M，不能多不能少； 未领完的红包 24 小时后自动退回。   一、先算容量，再谈方案假设峰值 QPS &#x3D; 10 万&#x2F;s（红包瞬时爆发完全可能）。  写操作：每个用户抢红包一次，即 10 万次扣减&#x2F;s； 读操作：查询红包剩余数量（列表页再引流过来更多）； 金额精度：必须用整数（分），禁用 double&#x2F;float。  结论：MySQL 扛不住这个写峰值，必须用 Redis 做前置扣减，MySQL 做最终账务落库。  二、核心难点：红包金额怎么拆这是红包题最独特的考点。总金额和个数确定后，怎么随机分配？ 1. 二倍均值法...</div></div></div></a><a class="pagination-related" href="/2026/08/30/distributed-split-brain-deep-dive/" title="【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-30</div><div class="info-item-2">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制</div></div><div class="info-2"><div class="info-item-1">【分布式系统】脑裂（Split Brain）问题深度解析：ZooKeeper、Redis Sentinel、Elasticsearch 与 MySQL 主从的防脑裂机制面试官：什么是脑裂？为什么分布式系统里最怕脑裂？脑裂（Split Brain） 是指一个集群因为网络分区（Network Partition），被切成了两个或多个「互相联系不上、但各自存活」的小团体，每个小团体都认为自己是集群的唯一主人，各自继续对外提供服务、各自做出决策。  用大白话说：一个大脑裂成了两个，两个「大脑」都觉得自己才是本体，于是开始各写各的账。  脑裂的可怕之处不在于「集群分开了」，而在于分开之后双方都在写数据，等网络恢复、双方重新合并时，数据已经互相矛盾，无法无损合并。 脑裂的两个经典危害场景   场景 危害    数据库主主 两个主库都接受写入，各自生成不同的 binlog，恢复后数据冲突，主键&#x2F;唯一键直接爆掉   分布式锁 两个节点都认为自己持有锁，同时进入临界区，秒杀超卖、重复扣款随之而来   配置中心 两个「主」各自修改配置，客户端读到互相矛盾的结果   选主系统 出现两个 Le...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">787</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">878</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">239</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E5%AE%9E%E6%88%98%E3%80%91Redis-Functions-%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9A%E6%9C%8D%E5%8A%A1%E7%AB%AF%E5%87%BD%E6%95%B0%E3%80%81Lua-%E8%84%9A%E6%9C%AC%E6%B2%BB%E7%90%86%E4%B8%8E%E5%8E%9F%E5%AD%90%E6%80%A7%E8%BE%B9%E7%95%8C"><span class="toc-number">1.</span> <span class="toc-text">【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%BB%8E-EVAL-%E5%88%B0-FCALL%EF%BC%9A%E6%A8%A1%E5%9E%8B%E5%8F%98%E5%8C%96"><span class="toc-number">1.2.</span> <span class="toc-text">一、从 EVAL 到 FCALL：模型变化</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-EVAL-%E7%9A%84%E9%97%AE%E9%A2%98"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 EVAL 的问题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-Functions-%E7%9A%84%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 Functions 的模型</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%BA%93%E7%9A%84%E5%AE%9A%E4%B9%89%E8%A7%84%E5%88%99%E4%B8%8E%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F"><span class="toc-number">1.3.</span> <span class="toc-text">二、库的定义规则与生命周期</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%BA%93%E7%9A%84%E5%BC%BA%E5%88%B6%E7%BA%A6%E5%AE%9A"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 库的强制约定</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 生命周期</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%87%BD%E6%95%B0-flags-%E4%B8%8E-keyspec"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 函数 flags 与 keyspec</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E4%B8%89%E4%B8%AA%E7%94%9F%E4%BA%A7%E7%BA%A7%E5%87%BD%E6%95%B0%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.4.</span> <span class="toc-text">三、三个生产级函数实现</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%8E%9F%E5%AD%90%E6%89%A3%E5%87%8F%E5%BA%93%E5%AD%98%EF%BC%88%E9%98%B2%E8%B6%85%E5%8D%96%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 原子扣减库存（防超卖）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%B9%82%E7%AD%89%E4%BB%A4%E7%89%8C%EF%BC%88SetNX-%E8%BF%87%E6%9C%9F%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 幂等令牌（SetNX + 过期）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E6%BB%91%E5%8A%A8%E7%AA%97%E5%8F%A3%E9%99%90%E6%B5%81%EF%BC%88%E4%BF%AE%E6%AD%A3%E7%89%88%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 滑动窗口限流（修正版）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%8E%9F%E5%AD%90%E6%80%A7%E8%BE%B9%E7%95%8C%EF%BC%9AFunctions-%E8%83%BD%E4%BF%9D%E8%AF%81%E4%BB%80%E4%B9%88%EF%BC%8C%E4%B8%8D%E8%83%BD%E4%BF%9D%E8%AF%81%E4%BB%80%E4%B9%88"><span class="toc-number">1.5.</span> <span class="toc-text">四、原子性边界：Functions 能保证什么，不能保证什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E8%83%BD%E4%BF%9D%E8%AF%81%E7%9A%84"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 能保证的</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E4%B8%8D%E8%83%BD%E4%BF%9D%E8%AF%81%E7%9A%84"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 不能保证的</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E8%B6%85%E6%97%B6%E6%B2%BB%E7%90%86"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 超时治理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E9%9B%86%E7%BE%A4%E6%A8%A1%E5%BC%8F%E6%B3%A8%E6%84%8F%E4%BA%8B%E9%A1%B9"><span class="toc-number">1.6.</span> <span class="toc-text">五、集群模式注意事项</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%90%8C-slot-%E7%BA%A6%E6%9D%9F"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 同 slot 约束</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%BA%93%E7%9A%84%E4%BC%A0%E6%92%AD"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 库的传播</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E8%B7%AF%E7%94%B1"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 路由</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E5%AE%A2%E6%88%B7%E7%AB%AF%E8%90%BD%E5%9C%B0"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 客户端落地</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-Lettuce"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 Lettuce</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-Spring-Data-Redis"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 Spring Data Redis</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E7%89%88%E6%9C%AC%E7%AE%A1%E7%90%86%E5%AE%9E%E8%B7%B5"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 版本管理实践</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E8%BF%81%E7%A7%BB%E6%B8%85%E5%8D%95%EF%BC%9A%E4%BB%8E-Lua-%E5%88%B0-Functions"><span class="toc-number">1.8.</span> <span class="toc-text">七、迁移清单：从 Lua 到 Functions</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E8%B8%A9%E5%9D%91%E8%AE%B0%E5%BD%95"><span class="toc-number">1.9.</span> <span class="toc-text">八、踩坑记录</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/18/java-developer-to-ai-engineer-transition-guide/" title="【AI 转型】Java 开发转 AI 应用开发指南：能力迁移、知识补齐与作品集">【AI 转型】Java 开发转 AI 应用开发指南：能力迁移、知识补齐与作品集</a><time datetime="2026-10-18T00:20:00.000Z" title="发表于 2026-10-18 08:20:00">2026-10-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/18/java-llm-structured-output-json-schema-deep-practice/" title="【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试">【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试</a><time datetime="2026-10-18T00:15:00.000Z" title="发表于 2026-10-18 08:15:00">2026-10-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/18/redis-functions-server-side-scripting-deep-practice/" title="【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界">【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界</a><time datetime="2026-10-18T00:10:00.000Z" title="发表于 2026-10-18 08:10:00">2026-10-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/18/jvm-deoptimization-recompile-deep-dive/" title="【JVM 底层】JIT 去优化（Deoptimization）深度解析：Uncommon Trap、OSR 与热点代码回退">【JVM 底层】JIT 去优化（Deoptimization）深度解析：Uncommon Trap、OSR 与热点代码回退</a><time datetime="2026-10-18T00:05:00.000Z" title="发表于 2026-10-18 08:05:00">2026-10-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/18/spring-webflux-backpressure-deep-dive/" title="【Java 响应式】WebFlux 背压深度解析：Reactive Streams 请求协议、onBackpressure 策略与 SSE 流式限速">【Java 响应式】WebFlux 背压深度解析：Reactive Streams 请求协议、onBackpressure 策略与 SSE 流式限速</a><time datetime="2026-10-18T00:00:00.000Z" title="发表于 2026-10-18 08:00:00">2026-10-18</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
