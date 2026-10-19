@@ -1,0 +1,462 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理前言Kafka 的经典架构是存算一体：Broker 既负责网络与协议处理，又负责把消息写到本地磁盘。这个设计非常优雅——顺序写、零拷贝、页缓存，让 Kafka 用三块普通磁盘就能扛住百万级 QPS。 但它也带来一个越来越难承受的代价：想多留几天数据，就必须多加磁盘；加磁盘就必须加 Brok">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/19/kafka-tiered-storage-remote-log-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理前言Kafka 的经典架构是存算一体：Broker 既负责网络与协议处理，又负责把消息写到本地磁盘。这个设计非常优雅——顺序写、零拷贝、页缓存，让 Kafka 用三块普通磁盘就能扛住百万级 QPS。 但它也带来一个越来越难承受的代价：想多留几天数据，就必须多加磁盘；加磁盘就必须加 Brok">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-19T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-10-19T00:02:26.255Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="KIP-405">
+<meta property="article:tag" content="Kafka">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="分层存储">
+<meta property="article:tag" content="架构设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理",
+  "url": "https://jiweidong.github.io/2026/10/19/kafka-tiered-storage-remote-log-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-19T00:10:00.000Z",
+  "dateModified": "2026-10-19T00:02:26.255Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/19/kafka-tiered-storage-remote-log-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">792</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">885</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">240</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-19T00:10:00.000Z" title="发表于 2026-10-19 08:10:00">2026-10-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-19T00:02:26.255Z" title="更新于 2026-10-19 08:02:26">2026-10-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Kafka-深挖】分层存储（Tiered-Storage）深度解析：KIP-405-架构、远端日志与容量治理"><a href="#【Kafka-深挖】分层存储（Tiered-Storage）深度解析：KIP-405-架构、远端日志与容量治理" class="headerlink" title="【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理"></a>【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>Kafka 的经典架构是<strong>存算一体</strong>：Broker 既负责网络与协议处理，又负责把消息写到本地磁盘。这个设计非常优雅——顺序写、零拷贝、页缓存，让 Kafka 用三块普通磁盘就能扛住百万级 QPS。</p>
+<p>但它也带来一个越来越难承受的代价：<strong>想多留几天数据，就必须多加磁盘；加磁盘就必须加 Broker；加了 Broker 又要迁移分区。</strong></p>
+<p>现实中的数据保留需求是这样的：</p>
+<table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>保留时长</th>
+<th>访问频率</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>实时风控&#x2F;告警</td>
+<td>7 天</td>
+<td>极高</td>
+</tr>
+<tr>
+<td>业务解耦</td>
+<td>3~7 天</td>
+<td>高</td>
+</tr>
+<tr>
+<td>数据回放&#x2F;重放</td>
+<td>30~180 天</td>
+<td>极低</td>
+</tr>
+<tr>
+<td>审计&#x2F;合规</td>
+<td>1~3 年</td>
+<td>几乎为零</td>
+</tr>
+</tbody></table>
+<p>用同一套高成本、高 IOPS 的本地 SSD 去存”几乎不会被读”的历史数据，是巨大的浪费。<strong>KIP-405（Tiered Storage，分层存储）</strong> 就是为了解决这个问题：把「热数据」留在 Broker 本地，「冷数据」卸载到廉价的对象存储（S3&#x2F;OSS&#x2F;HDFS），而<strong>消费者完全无感知</strong>。</p>
+<p>本文从架构、读写路径、配置、运维四个层面把它讲透。</p>
+<hr>
+<h2 id="一、核心思想：日志分段（Log-Segment）级别的冷热分离"><a href="#一、核心思想：日志分段（Log-Segment）级别的冷热分离" class="headerlink" title="一、核心思想：日志分段（Log Segment）级别的冷热分离"></a>一、核心思想：日志分段（Log Segment）级别的冷热分离</h2><p>Kafka 的日志本质是**分段（segment）**结构：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">topic-partition-0/</span><br><span class="line">  ├── 00000000000000000000.log        &lt;- 基础 offset 0</span><br><span class="line">  ├── 00000000000000000000.index</span><br><span class="line">  ├── 00000000000000000000.timeindex</span><br><span class="line">  ├── 00000000000000368570.log        &lt;- 基础 offset 368570</span><br><span class="line">  ├── 00000000000000368570.index</span><br><span class="line">  └── ...</span><br></pre></td></tr></table></figure>
+
+<p>分层存储的最小迁移单位就是 <strong>segment</strong>，而不是单条消息。这一点非常关键：</p>
+<ul>
+<li><strong>活跃 segment</strong>（正在写的）永远在本地</li>
+<li><strong>非活跃 segment</strong> 一旦满足条件（超过 <code>segment.ms</code> &#x2F; <code>segment.bytes</code> 滚动完成），就可以被上传到远端</li>
+<li>上传成功后，本地文件<strong>只保留一小段</strong>（<code>local.retention.ms</code> &#x2F; <code>local.retention.bytes</code>），其余删除</li>
+<li>读取时如果本地没有，Broker 自动从远端拉取</li>
+</ul>
+<p>所以它的语义是：<strong>“保留策略”和”存储介质”解耦了</strong>。你可以设置 <code>retention.ms=30 天</code>，但本地只留 2 小时的数据。</p>
+<hr>
+<h2 id="二、KIP-405-的四个核心组件"><a href="#二、KIP-405-的四个核心组件" class="headerlink" title="二、KIP-405 的四个核心组件"></a>二、KIP-405 的四个核心组件</h2><p>分层存储不是简单加个 “上传线程”，它的插件化设计包含四层抽象：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>全称</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>RemoteStorageManager</code> (RSM)</td>
+<td>远端存储管理器</td>
+<td>真正读写远端对象（put&#x2F;get&#x2F;delete）</td>
+</tr>
+<tr>
+<td><code>RemoteLogMetadataManager</code> (RLMM)</td>
+<td>远端日志元数据管理器</td>
+<td>记录”哪个 segment 在远端哪个位置”</td>
+</tr>
+<tr>
+<td><code>RemoteLogManager</code> (RLM)</td>
+<td>远端日志管理器</td>
+<td>Broker 内部调度器：上传、清理、拉取、复制</td>
+</tr>
+<tr>
+<td><code>RemoteLogMetadataCache</code></td>
+<td>元数据缓存</td>
+<td>本地缓存 RLMM 元数据，避免每次读都查远端</td>
+</tr>
+</tbody></table>
+<h3 id="2-1-RemoteStorageManager：只关心字节"><a href="#2-1-RemoteStorageManager：只关心字节" class="headerlink" title="2.1 RemoteStorageManager：只关心字节"></a>2.1 RemoteStorageManager：只关心字节</h3><p>RSM 的接口极简（简化版）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">RemoteStorageManager</span> <span class="keyword">extends</span> <span class="title class_">Configurable</span>, Closeable &#123;</span><br><span class="line">    <span class="keyword">void</span> <span class="title function_">copyLogSegmentData</span><span class="params">(RemoteLogSegmentMetadata metadata,</span></span><br><span class="line"><span class="params">                            LogSegmentData segmentData)</span> <span class="keyword">throws</span> IOException;</span><br><span class="line"></span><br><span class="line">    InputStream <span class="title function_">fetchLogSegment</span><span class="params">(RemoteLogSegmentMetadata metadata,</span></span><br><span class="line"><span class="params">                               <span class="type">int</span> startPosition)</span> <span class="keyword">throws</span> IOException;</span><br><span class="line"></span><br><span class="line">    Optional&lt;RemoteLogSegmentMetadata&gt; ... <span class="comment">// 元数据相关</span></span><br><span class="line">    <span class="keyword">void</span> <span class="title function_">deleteLogSegmentData</span><span class="params">(RemoteLogSegmentMetadata metadata)</span> <span class="keyword">throws</span> IOException;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>官方提供了 <code>kafka-storage-s3</code>（S3&#x2F;兼容 S3 的对象存储）实现，社区也有 HDFS、Azure Blob、GCS 的插件。<strong>对象存储的 key 布局</strong>大致是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">&#123;topic&#125;/&#123;partition&#125;/&#123;segment-base-offset&#125;-&#123;segment-last-offset&#125;/&#123;uuid&#125;.log</span><br><span class="line">&#123;topic&#125;/&#123;partition&#125;/&#123;...&#125;/index</span><br><span class="line">&#123;topic&#125;/&#123;partition&#125;/&#123;...&#125;/timeindex</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-2-RemoteLogMetadataManager：一致性是难点"><a href="#2-2-RemoteLogMetadataManager：一致性是难点" class="headerlink" title="2.2 RemoteLogMetadataManager：一致性是难点"></a>2.2 RemoteLogMetadataManager：一致性是难点</h3><p>RLMM 要回答一个问题：<strong>“offset 1000~2000 这段数据，现在在远端还是本地？在远端的哪个对象里？”</strong></p>
+<p>两种实现思路：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th>存储</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>TopicBasedRemoteLogMetadataManager</code></td>
+<td>内部 topic（<code>__remote_log_metadata</code>）</td>
+<td>复用 Kafka 自身复制机制，强一致</td>
+<td>增加内部 topic 负载</td>
+</tr>
+<tr>
+<td>自定义（如基于对象存储&#x2F;DB）</td>
+<td>外部系统</td>
+<td>不占 Kafka 资源</td>
+<td>需要自己保证一致性与高可用</td>
+</tr>
+</tbody></table>
+<p>官方默认是 <strong>topic-based</strong>：把 segment 元数据写到内部 compact topic，天然具备分区级顺序 + 副本容错。代价是<strong>每个 partition 的元数据变更都会产生一次内部 topic 写入</strong>，量大时要单独评估。</p>
+<h3 id="2-3-元数据的状态机"><a href="#2-3-元数据的状态机" class="headerlink" title="2.3 元数据的状态机"></a>2.3 元数据的状态机</h3><p>一个 segment 在生命周期里会经历：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">LOCAL_ONLY → COPY_SEGMENT_STARTED → COPY_SEGMENT_FINISHED → DELETE_SEGMENT_STARTED → DELETE_SEGMENT_FINISHED</span><br></pre></td></tr></table></figure>
+
+<p>任何一步失败都会重试，且<strong>上传是幂等的</strong>（同一个 segment 用同一个 UUID，重传覆盖）。这保证了 Broker 崩溃重启后能继续未完成的工作。</p>
+<hr>
+<h2 id="三、写路径：上传是怎么发生的"><a href="#三、写路径：上传是怎么发生的" class="headerlink" title="三、写路径：上传是怎么发生的"></a>三、写路径：上传是怎么发生的</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">1. 活跃 segment 达到 segment.ms / segment.bytes → 滚动为新 segment</span><br><span class="line">2. 旧 segment 变成&quot;非活跃&quot;，进入 RemoteLogManager 的待上传队列</span><br><span class="line">3. RLM 的复制线程读取本地 .log/.index/.timeindex</span><br><span class="line">4. 调用 RSM.copyLogSegmentData() 上传到对象存储（可并发、可分片）</span><br><span class="line">5. 上传成功后更新 RLMM 元数据（COPY_SEGMENT_FINISHED）</span><br><span class="line">6. 本地按 local.retention.ms 延迟删除</span><br></pre></td></tr></table></figure>
+
+<p>关键设计点：</p>
+<ul>
+<li><strong>上传不阻塞写入</strong>：写请求只碰活跃 segment，上传是纯后台任务</li>
+<li><strong>上传有配额</strong>：<code>remote.log.manager.task.interval.ms</code>、复制线程数、带宽限制，防止打满网卡</li>
+<li><strong>本地延迟删除</strong>：即使上传成功，本地也保留一段时间（<code>local.retention.ms</code> 默认跟 <code>retention.ms</code> 走，需要显式调小），给”刚上传就要读”的场景兜底</li>
+</ul>
+<hr>
+<h2 id="四、读路径：消费者完全无感知"><a href="#四、读路径：消费者完全无感知" class="headerlink" title="四、读路径：消费者完全无感知"></a>四、读路径：消费者完全无感知</h2><p>这是分层存储最漂亮的地方。消费者发 <code>Fetch(offset=1500000)</code>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">1. Broker 查本地日志，发现该 offset 所在 segment 已被删除</span><br><span class="line">2. 查 RemoteLogMetadataCache，找到对应的 RemoteLogSegmentMetadata</span><br><span class="line">3. 通过 RSM.fetchLogSegment() 从对象存储流式读取</span><br><span class="line">4. 解析后按正常 Fetch 响应返回</span><br></pre></td></tr></table></figure>
+
+<p>对客户端来说，<strong>协议、offset、消费位点语义完全不变</strong>。几个重要细节：</p>
+<ul>
+<li><strong>一次 Fetch 可能跨越本地段和远端段</strong>，Broker 会拼接返回</li>
+<li><strong>远端读取有单独的线程池</strong>（<code>remote.log.reader.threads</code>），避免拖慢本地读</li>
+<li><strong>有超时与降级</strong>：远端读超时（<code>remote.log.fetch.timeout.ms</code>）会返回错误，客户端重试</li>
+<li><strong>首次读远端有冷启动延迟</strong>（几十到几百毫秒），所以<strong>不要在分层存储上跑低延迟实时消费</strong></li>
+</ul>
+<blockquote>
+<p>生产经验：把”实时业务消费”和”历史回溯消费”用<strong>不同的 consumer group + 不同的 topic 副本</strong>分开，或者干脆用 MirrorMaker 把实时链路单独导一份，避免历史回溯把对象存储的延迟带进主链路。</p>
+</blockquote>
+<hr>
+<h2 id="五、关键配置与容量计算"><a href="#五、关键配置与容量计算" class="headerlink" title="五、关键配置与容量计算"></a>五、关键配置与容量计算</h2><h3 id="5-1-Broker-侧配置"><a href="#5-1-Broker-侧配置" class="headerlink" title="5.1 Broker 侧配置"></a>5.1 Broker 侧配置</h3><figure class="highlight properties"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 开启分层存储（Broker 级）</span></span><br><span class="line"><span class="attr">remote.log.storage.system.enable</span>=<span class="string">true</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 插件类</span></span><br><span class="line"><span class="attr">remote.log.storage.manager.class.name</span>=<span class="string">org.apache.kafka.server.log.remote.storage.S3RemoteStorageManager</span></span><br><span class="line"><span class="attr">remote.log.metadata.manager.class.name</span>=<span class="string">org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManager</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 本地保留（核心！不设等于没省空间）</span></span><br><span class="line"><span class="attr">local.retention.ms</span>=<span class="string">7200000          # 本地只留 2 小时</span></span><br><span class="line"><span class="attr">local.retention.bytes</span>=<span class="string">-1</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 上传调度</span></span><br><span class="line"><span class="attr">remote.log.manager.task.interval.ms</span>=<span class="string">30000</span></span><br><span class="line"><span class="attr">remote.log.manager.thread.pool.size</span>=<span class="string">10</span></span><br><span class="line"><span class="attr">remote.log.reader.threads</span>=<span class="string">8</span></span><br><span class="line"><span class="attr">remote.log.fetch.timeout.ms</span>=<span class="string">15000</span></span><br><span class="line"><span class="comment"></span></span><br><span class="line"><span class="comment"># 上传限流（按 Broker 出口带宽的 30% 估算）</span></span><br><span class="line"><span class="attr">remote.log.upload.throughput.limit</span>=<span class="string">104857600   # 100MB/s</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-Topic-侧配置"><a href="#5-2-Topic-侧配置" class="headerlink" title="5.2 Topic 侧配置"></a>5.2 Topic 侧配置</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">kafka-configs.sh --bootstrap-server localhost:9092 --alter \</span><br><span class="line">  --entity-type topics --entity-name order-events \</span><br><span class="line">  --add-config <span class="string">&#x27;remote.storage.enable=true,retention.ms=2592000000,local.retention.ms=3600000&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<p>注意：<strong><code>remote.storage.enable</code> 只能在 topic 创建时开启或从 false→true 变更，一旦开启不能关闭</strong>（Kafka 的限制）。所以灰度时务必选对 topic。</p>
+<h3 id="5-3-容量估算"><a href="#5-3-容量估算" class="headerlink" title="5.3 容量估算"></a>5.3 容量估算</h3><p>假设：</p>
+<ul>
+<li>峰值写入 200 MB&#x2F;s，平均 80 MB&#x2F;s</li>
+<li>保留 30 天</li>
+<li>副本数 3</li>
+</ul>
+<p>本地磁盘需求（分层后）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">本地 = 平均写入 × local.retention × 副本数 × 1.3(峰值缓冲)</span><br><span class="line">     = 80MB/s × 3600s × 3 × 1.3 ≈ 1.1 TB</span><br></pre></td></tr></table></figure>
+
+<p>不分层时：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">本地 = 80MB/s × 86400 × 30 × 3 × 1.3 ≈ 810 TB</span><br></pre></td></tr></table></figure>
+
+<p><strong>差了 700 多倍。</strong> 对象存储按 0.12 元&#x2F;GB&#x2F;月算，810TB ≈ 9.7 万&#x2F;月；分层后本地 1TB SSD + 远端 810TB 对象存储 ≈ 10 万&#x2F;月 + 少量 SSD 成本……这里的账要按实际单价算，但结论一致：<strong>冷数据放对象存储，单位成本能降一个数量级</strong>。</p>
+<blockquote>
+<p>别忘了算<strong>网络出口费</strong>和<strong>读放大</strong>：历史回溯消费如果很频繁，对象存储的 GET 费用和延迟都会成为新问题。</p>
+</blockquote>
+<hr>
+<h2 id="六、分层存储-vs-其他方案"><a href="#六、分层存储-vs-其他方案" class="headerlink" title="六、分层存储 vs 其他方案"></a>六、分层存储 vs 其他方案</h2><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>本地磁盘</th>
+<th>保留时长</th>
+<th>读延迟</th>
+<th>运维复杂度</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯本地（默认）</td>
+<td>大</td>
+<td>受磁盘限制</td>
+<td>极低</td>
+<td>低</td>
+<td>7 天内短期保留</td>
+</tr>
+<tr>
+<td>分层存储（KIP-405）</td>
+<td>小</td>
+<td>可达数年</td>
+<td>冷读 50~500ms</td>
+<td>中</td>
+<td>需要长保留 + 可接受冷读</td>
+</tr>
+<tr>
+<td>多集群 + MirrorMaker</td>
+<td>中</td>
+<td>受目标集群限制</td>
+<td>低</td>
+<td>高</td>
+<td>跨地域容灾</td>
+</tr>
+<tr>
+<td>落湖（Kafka → 对象存储&#x2F;湖表）</td>
+<td>小</td>
+<td>无限</td>
+<td>高（需查询引擎）</td>
+<td>中高</td>
+<td>分析型回放</td>
+</tr>
+<tr>
+<td>降副本 + 加盘</td>
+<td>大</td>
+<td>中</td>
+<td>低</td>
+<td>低</td>
+<td>预算充足、不想改造</td>
+</tr>
+</tbody></table>
+<p><strong>选型建议</strong>：</p>
+<ul>
+<li>只是”想省钱、数据 7 天内”→ 别上分层，先做压缩（<code>compression.type=zstd</code>）和降副本</li>
+<li>“要留 30~180 天做回放&#x2F;审计”→ 分层存储是最匹配的</li>
+<li>“要 SQL 查询&#x2F;联邦分析”→ 直接落湖（Iceberg&#x2F;Hudi），Kafka 只做管道</li>
+</ul>
+<hr>
+<h2 id="七、生产落地踩坑"><a href="#七、生产落地踩坑" class="headerlink" title="七、生产落地踩坑"></a>七、生产落地踩坑</h2><ol>
+<li><p><strong>忘了设 <code>local.retention.ms</code></strong><br>很多人开了 <code>remote.storage.enable=true</code> 就以为省空间了，结果本地保留策略还是 <code>retention.ms=30天</code>，磁盘一点没降。<strong>必须显式把 local 保留调小。</strong></p>
+</li>
+<li><p><strong>活跃 segment 永远不上传</strong><br>如果 topic 写入量很小，segment 一直不滚动（未达到 <code>segment.ms</code>），数据就一直留在本地。解决：把 <code>segment.ms</code> 调到 1 小时级别。</p>
+</li>
+<li><p><strong>压缩 topic（compact）的边界</strong><br>分层存储对 compact topic 的支持有额外约束（需要保证 key 的最新值不被错误清理）。生产上建议<strong>只对普通 delete 策略的 topic 开启</strong>，compact topic 谨慎评估。</p>
+</li>
+<li><p><strong>对象存储的”最终一致”陷阱</strong><br>部分 S3 兼容存储（尤其自建 MinIO 的早期版本）在 list&#x2F;head 上有延迟，导致上传成功但读不到。解决：优先用支持强一致的存储，或调大重试窗口。</p>
+</li>
+<li><p><strong>元数据 topic 成为瓶颈</strong><br><code>__remote_log_metadata</code> 的分区数默认较小，Topic 数量多、segment 滚动频繁时会出现写入排队。解决：提前扩容该 topic 分区（<code>remote.log.metadata.manager.topic.partitions</code>），并监控其 lag。</p>
+</li>
+<li><p><strong>冷读打爆对象存储 QPS</strong><br>历史回溯消费突然拉起几百个 consumer，每个都从远端拉，对象存储 QPS 打满。解决：远端读限流 + 回溯专用集群 + 客户端侧缓存。</p>
+</li>
+<li><p><strong>监控盲区</strong><br>必须监控：<code>RemoteLogManager</code> 上传失败数、上传延迟、本地待删除 segment 数、远端读超时率、对象存储 4xx&#x2F;5xx。<strong>没有这些指标，分层存储就是黑盒。</strong></p>
+</li>
+</ol>
+<hr>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：分层存储会影响消息顺序性吗？</strong><br>不会。segment 迁移是按 offset 连续段整体搬移，消费仍按 offset 顺序读；Broker 会保证跨本地&#x2F;远端的读取拼接是连续的。</p>
+<p><strong>Q2：为什么以 segment 为单位而不是单条消息？</strong><br>对象存储适合大对象批量写，单条消息上传会产生海量小对象和元数据，成本与延迟都不可接受。segment 天然是”批量 + 不可变”，完美匹配对象存储。</p>
+<p><strong>Q3：Broker 挂了，远端数据会丢吗？</strong><br>不会。远端数据本身有多副本（对象存储），元数据在内部 topic 有多副本。Broker 恢复后通过 RLMM 重建本地索引即可。</p>
+<p><strong>Q4：分层存储能替代灾备吗？</strong><br>不能。它解决的是<strong>存储成本与保留时长</strong>，不是<strong>可用性</strong>。跨 AZ&#x2F;跨地域容灾仍然需要多副本、MirrorMaker 或双集群。</p>
+<p><strong>Q5：怎么评估要不要上？</strong><br>三个数：① 冷数据占比（保留时长内，超过 7 天的数据量占比）；② 冷读频率（历史回溯 QPS）；③ 本地磁盘成本 &#x2F; 对象存储成本比。冷数据占比 &gt; 60% 且冷读低，就值得上。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>分层存储的本质是<strong>把 Kafka 从”存算一体”推进到”存算分离”的第一步</strong>：</p>
+<ul>
+<li><strong>segment 级迁移</strong>，客户端协议零改动</li>
+<li><strong>RSM + RLMM + RLM</strong> 三层插件化，可对接任意对象存储</li>
+<li><strong>本地保留与远端保留解耦</strong>，这是省钱的关键开关</li>
+<li>代价是<strong>冷读延迟</strong>和<strong>新的运维复杂度</strong>，必须配套监控与限流</li>
+</ul>
+<p>如果你的 Kafka 集群磁盘天天告警、又不敢删数据，分层存储几乎是唯一优雅的解法；但如果只是短期保留 + 高实时性，别为了架构而架构。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/19/kafka-tiered-storage-remote-log-deep-dive/">https://jiweidong.github.io/2026/10/19/kafka-tiered-storage-remote-log-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a><a class="post-meta__tags" href="/tags/Kafka/">Kafka</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B1%82%E5%AD%98%E5%82%A8/">分层存储</a><a class="post-meta__tags" href="/tags/KIP-405/">KIP-405</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/19/junit5-extension-model-test-engineering-deep-practice/" title="【Java 工程化】JUnit 5 扩展模型深度解析：Extension SPI、并行执行与测试工程化落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 工程化】JUnit 5 扩展模型深度解析：Extension SPI、并行执行与测试工程化落地</div></div><div class="info-2"><div class="info-item-1">【Java 工程化】JUnit 5 扩展模型深度解析：Extension SPI、并行执行与测试工程化落地前言大多数人用 JUnit 5 的姿势是这样的： 12345@Testvoid should_create_order() &#123;    Order order = service.create(new OrderCmd(&quot;SKU-1&quot;, 2));    assertEquals(2, order.getQuantity());&#125;  会写 @Test 和 assertEquals 就够了——直到你遇到这些问题：  每个集成测试都要重复 @SpringBootTest + 建库 + 清数据，能不能自动化？ 测试之间互相污染，单独跑通过、一起跑失败，为什么？ CI 上 3000 个测试跑 40 分钟，怎么并行又不冲突？ 想在每个测试前打印耗时、失败时自动截图&#x2F;抓日志，写基类还是用注解？  这些问题的答案都在 JUnit 5 的扩展模型（Extension Model） 里。JUnit 5 相对 JUnit 4 最大的架构升级，不是 @...</div></div></div></a><a class="pagination-related" href="/2026/10/19/inventory-center-system-architecture-design/" title="【系统设计】库存中心架构设计：多仓库存、预占释放、超卖防护与热点扣减"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】库存中心架构设计：多仓库存、预占释放、超卖防护与热点扣减</div></div><div class="info-2"><div class="info-item-1">【系统设计】库存中心架构设计：多仓库存、预占释放、超卖防护与热点扣减前言在电商、票务、SaaS 资源配额这些系统里，库存是最容易出现”看起来很简单、上线就出事”的模块。 很多人对库存的理解停留在一条 SQL： 1update stock set quantity = quantity - 1 where sku_id = ? and quantity &gt; 0;  这条 SQL 在单库单表、几百 QPS 的场景下没问题。但只要出现下面任意一种情况，它就会崩：  单个爆款 SKU 每秒几千次扣减（热点行） 一次下单要锁多个 SKU，部分成功部分失败（事务边界） 下单后 30 分钟未支付要归还库存（延时释放） 多仓发货，需要按收货地址选仓（多仓库存） 大促期间要临时把库存按渠道切分（渠道库存）  本文从领域模型出发，把库存中心拆成「模型 → 一致性语义 → 核心链路 → 热点治理 → 对账补偿」五层，给出可以直接落地的设计，以及 Java 侧的关键代码。  一、先建模：库存不是一个数字，而是一组状态初学者最容易犯的错误是把库存设计成 stock 单表的一个 quantity 字段...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/13/message-queue-kafka-rocketmq/" title="消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇</div></div><div class="info-2"><div class="info-item-1">消息队列（Kafka &#x2F; RocketMQ）面试跳槽篇一、消息队列基础1.1 四大核心作用消息队列（Message Queue，MQ）是分布式系统中不可或缺的中间件，它的核心价值体现在四个方面： 异步解耦：通过引入 MQ，上下游系统之间的直接依赖被打破。发送方只管发送消息，接收方自行消费，双方互不阻塞。例如订单系统创建订单后发送消息到 MQ，库存系统、积分系统各自订阅消费，即使某个系统临时不可用，也不会影响主流程。 流量削峰：秒杀、大促等场景下，瞬时流量可能达到正常值的几十倍。MQ 充当缓冲区，将海量请求暂存，下游系统按自身处理能力拉取消费，避免被流量冲垮。这就像水库在汛期蓄水、旱期放水一样平滑流量。 数据缓冲：当上下游处理能力不匹配时，MQ 作为缓冲层，允许生产者高速生产、消费者从容消费，实现最终一致性。 日志收集：Kafka 最初由 LinkedIn 开发时就是为了解决日志收集问题。大量日志通过 Kafka 聚合、分发，再交由 ELK 等系统处理。这是 MQ 在数据 pipeline 领域的经典应用。 1.2 消息模型点对点模型（P2P, Point-to-Poin...</div></div></div></a><a class="pagination-related" href="/2026/10/01/kafka-quota-throttling-deep-practice/" title="【Kafka 实战】配额与限流（Quota &amp; Throttling）深度解析：client.id&#x2F;user 配额、动态调整与 Broker 保护"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-01</div><div class="info-item-2">【Kafka 实战】配额与限流（Quota &amp; Throttling）深度解析：client.id&#x2F;user 配额、动态调整与 Broker 保护</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】配额与限流（Quota &amp; Throttling）深度解析：client.id&#x2F;user 配额、动态调整与 Broker 保护面试官：Kafka 集群被一个业务打爆了，你怎么防？这是道非常真实的场景题。答案通常有两层：  外层防御：入口限流、连接数控制、监控告警； 内层防御：Kafka 自身的配额机制（Quota）。  很多人只知道”可以在 server.properties 里配 quota.producer.default“，但说不清楚：配额是按什么维度划分的？超限之后 Kafka 是怎么”慢下来”的？为什么有时候配了配额还是被压垮？ 这篇文章把 Kafka 配额机制从概念到源码实现讲透。 一、为什么需要配额Kafka 是一个多租户的共享集群。同一个集群上，可能同时跑着：  日志采集（高吞吐、低价值）； 订单事件（低吞吐、高价值）； 数据同步（突发批量）。  如果没有隔离，一条”疯狂生产”的链路可以：  打满 broker 的网络带宽，导致其他 topic 的 fetch 超时； 撑爆 page cache，把热数据挤出，抬高所有消费者的...</div></div></div></a><a class="pagination-related" href="/2026/06/17/apache-pulsar-messaging-guide/" title="Apache Pulsar 消息队列：架构原理与 Kafka&#x2F;RabbitMQ 深度对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">Apache Pulsar 消息队列：架构原理与 Kafka&#x2F;RabbitMQ 深度对比</div></div><div class="info-2"><div class="info-item-1">Apache Pulsar 消息队列：架构原理与 Kafka&#x2F;RabbitMQ 深度对比一、消息队列市场格局消息队列是分布式系统的核心基础设施，当前主流产品各有侧重：    中间件 设计定位 数据模型 存储模型 适用场景    Apache Kafka 高吞吐流处理 分区日志（Topic&#x2F;Partition） 磁盘顺序写，本地存储 日志收集、流处理、事件溯源   RabbitMQ 可靠消息路由 AMQP Exchange&#x2F;Queue 内存+磁盘，本地存储 微服务异步通信、任务分发   Apache Pulsar 云原生消息流 统一 Producer&#x2F;Consumer + Reader 计算存储分离（BookKeeper） 混合工作负载、多租户海量分区   RocketMQ 金融级可靠消息 Topic&#x2F;Queue 磁盘顺序写，本地存储 电商交易、金融场景   Apache Pulsar 是近年来发展最快的消息平台，它以计算存储分离的架构，解决了 Kafka 在弹性扩展和高可用方面的短板。 二、Pulsar 架构深度解析2.1 计算存...</div></div></div></a><a class="pagination-related" href="/2026/07/23/spring-boot-kafka-deep-practice/" title="【Spring Boot 实战】Spring Boot 集成 Kafka 深度实战：从 @KafkaListener 到消息重试与死信"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-23</div><div class="info-item-2">【Spring Boot 实战】Spring Boot 集成 Kafka 深度实战：从 @KafkaListener 到消息重试与死信</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】Spring Boot 集成 Kafka 深度实战：从 @KafkaListener 到消息重试与死信一、为什么选择 Spring for Apache Kafka？在实际项目中，Kafka 是处理高吞吐量消息流的首选中间件。而 Spring for Apache Kafka（以下简称 Spring Kafka）为 Spring Boot 应用提供了开箱即用的 Kafka 集成，屏蔽了底层 Consumer&#x2F;Producer API 的复杂性，提供了声明式消费、消息转换、重试机制、事务消息等企业级特性。 核心优势对比：    特性 原生 Kafka Client Spring Kafka    声明式消费 ❌ 手动循环 poll ✅ @KafkaListener 注解   反序列化 手动处理 ✅ 自动类型转换 + MessageConverter   重试机制 需自行实现 ✅ @RetryableTopic &#x2F; SeekToCurrentErrorHandler   事务消息 需手动控制 ✅ @Transactional + K...</div></div></div></a><a class="pagination-related" href="/2026/09/27/rocketmq-delay-timer-message-deep-dive/" title="【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-27</div><div class="info-item-2">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息</div></div><div class="info-2"><div class="info-item-1">【消息队列】RocketMQ 延迟消息深度解析：从 18 个延迟级别到任意时间定时消息面试官：订单 30 分钟未支付自动关闭，你怎么实现？这是最经典的延迟消息场景题。候选人的答案通常有三种：  「用定时任务扫描订单表」； 「用 RabbitMQ 的死信队列 + TTL」； 「用 RocketMQ 的延迟消息，delayLevel=16」。  如果答第 3 种，我会继续追问：  「delayLevel=16 代表延迟多久？」 「为什么 RocketMQ 4.x 只有 18 个固定级别，不能任意时间？」 「延迟消息是存在哪里的？它和普通消息在存储上有什么区别？」 「如果我要延迟 2 小时，你会怎么写？」 「RocketMQ 5.x 的定时消息是怎么做到任意时间的？」  这一串问题下去，能完整答上来的候选人非常少。而这篇文章，就是把这串问题从头到尾讲清楚。  一、为什么需要延迟消息延迟消息（也叫定时消息）指：消息发送到 Broker 后，不立即投递给消费者，而是等待指定时间后才可见。 典型场景：    场景 延迟需求    订单超时未支付自动关闭 30 分钟   优惠券到期提醒 提前 ...</div></div></div></a><a class="pagination-related" href="/2026/06/19/debezium-kafka-cdc-practice/" title="Debezium + Kafka 实时数据同步架构实战：CDC 原理与最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-19</div><div class="info-item-2">Debezium + Kafka 实时数据同步架构实战：CDC 原理与最佳实践</div></div><div class="info-2"><div class="info-item-1">一、CDC 技术概述1.1 什么是 CDCCDC（Change Data Capture，变更数据捕获）是一种通过监听和捕获数据库中的数据变更（INSERT、UPDATE、DELETE），并将这些变更实时同步到其他系统的技术。它在现代数据架构中扮演着关键角色，广泛应用于：  实时数仓建设：将业务数据库的变更实时同步到数据仓库（如 ClickHouse、Doris） 缓存失效&#x2F;刷新：数据库变更后自动更新 Redis 缓存 搜索索引同步：增量更新 Elasticsearch 索引 跨机房数据同步：多活架构下的数据复制 微服务事件驱动：实现事务发件箱模式（Outbox Pattern）  1.2 CDC 方案对比   方案 实现原理 延迟 对源库影响 数据完整性 支持数据库 社区活跃度    基于查询的 CDC 定时轮询查询变更字段 秒级-分钟级 高（增加查询压力） 低（可能丢失或重复） 所有数据库 -   基于日志的 CDC - Canal MySQL Binlog 解析 毫秒级 极低 高 MySQL (MariaDB) 维护模式   基于日志的 CDC - Debeziu...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">792</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">885</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">240</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Kafka-%E6%B7%B1%E6%8C%96%E3%80%91%E5%88%86%E5%B1%82%E5%AD%98%E5%82%A8%EF%BC%88Tiered-Storage%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AKIP-405-%E6%9E%B6%E6%9E%84%E3%80%81%E8%BF%9C%E7%AB%AF%E6%97%A5%E5%BF%97%E4%B8%8E%E5%AE%B9%E9%87%8F%E6%B2%BB%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E6%A0%B8%E5%BF%83%E6%80%9D%E6%83%B3%EF%BC%9A%E6%97%A5%E5%BF%97%E5%88%86%E6%AE%B5%EF%BC%88Log-Segment%EF%BC%89%E7%BA%A7%E5%88%AB%E7%9A%84%E5%86%B7%E7%83%AD%E5%88%86%E7%A6%BB"><span class="toc-number">1.2.</span> <span class="toc-text">一、核心思想：日志分段（Log Segment）级别的冷热分离</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81KIP-405-%E7%9A%84%E5%9B%9B%E4%B8%AA%E6%A0%B8%E5%BF%83%E7%BB%84%E4%BB%B6"><span class="toc-number">1.3.</span> <span class="toc-text">二、KIP-405 的四个核心组件</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-RemoteStorageManager%EF%BC%9A%E5%8F%AA%E5%85%B3%E5%BF%83%E5%AD%97%E8%8A%82"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 RemoteStorageManager：只关心字节</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-RemoteLogMetadataManager%EF%BC%9A%E4%B8%80%E8%87%B4%E6%80%A7%E6%98%AF%E9%9A%BE%E7%82%B9"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 RemoteLogMetadataManager：一致性是难点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%85%83%E6%95%B0%E6%8D%AE%E7%9A%84%E7%8A%B6%E6%80%81%E6%9C%BA"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 元数据的状态机</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%86%99%E8%B7%AF%E5%BE%84%EF%BC%9A%E4%B8%8A%E4%BC%A0%E6%98%AF%E6%80%8E%E4%B9%88%E5%8F%91%E7%94%9F%E7%9A%84"><span class="toc-number">1.4.</span> <span class="toc-text">三、写路径：上传是怎么发生的</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%AF%BB%E8%B7%AF%E5%BE%84%EF%BC%9A%E6%B6%88%E8%B4%B9%E8%80%85%E5%AE%8C%E5%85%A8%E6%97%A0%E6%84%9F%E7%9F%A5"><span class="toc-number">1.5.</span> <span class="toc-text">四、读路径：消费者完全无感知</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%85%B3%E9%94%AE%E9%85%8D%E7%BD%AE%E4%B8%8E%E5%AE%B9%E9%87%8F%E8%AE%A1%E7%AE%97"><span class="toc-number">1.6.</span> <span class="toc-text">五、关键配置与容量计算</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-Broker-%E4%BE%A7%E9%85%8D%E7%BD%AE"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 Broker 侧配置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-Topic-%E4%BE%A7%E9%85%8D%E7%BD%AE"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 Topic 侧配置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E5%AE%B9%E9%87%8F%E4%BC%B0%E7%AE%97"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 容量估算</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%88%86%E5%B1%82%E5%AD%98%E5%82%A8-vs-%E5%85%B6%E4%BB%96%E6%96%B9%E6%A1%88"><span class="toc-number">1.7.</span> <span class="toc-text">六、分层存储 vs 其他方案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%94%9F%E4%BA%A7%E8%90%BD%E5%9C%B0%E8%B8%A9%E5%9D%91"><span class="toc-number">1.8.</span> <span class="toc-text">七、生产落地踩坑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/19/ai-application-engineer-interview-guide/" title="【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路">【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路</a><time datetime="2026-10-19T00:40:00.000Z" title="发表于 2026-10-19 08:40:00">2026-10-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/19/vector-database-selection-deep-dive/" title="【AI 基础】向量数据库选型深度对比：Milvus、Qdrant、pgvector 与 Elasticsearch（Java 客户端视角）">【AI 基础】向量数据库选型深度对比：Milvus、Qdrant、pgvector 与 Elasticsearch（Java 客户端视角）</a><time datetime="2026-10-19T00:30:00.000Z" title="发表于 2026-10-19 08:30:00">2026-10-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/19/junit5-extension-model-test-engineering-deep-practice/" title="【Java 工程化】JUnit 5 扩展模型深度解析：Extension SPI、并行执行与测试工程化落地">【Java 工程化】JUnit 5 扩展模型深度解析：Extension SPI、并行执行与测试工程化落地</a><time datetime="2026-10-19T00:20:00.000Z" title="发表于 2026-10-19 08:20:00">2026-10-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/19/kafka-tiered-storage-remote-log-deep-dive/" title="【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理">【Kafka 深挖】分层存储（Tiered Storage）深度解析：KIP-405 架构、远端日志与容量治理</a><time datetime="2026-10-19T00:10:00.000Z" title="发表于 2026-10-19 08:10:00">2026-10-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/19/inventory-center-system-architecture-design/" title="【系统设计】库存中心架构设计：多仓库存、预占释放、超卖防护与热点扣减">【系统设计】库存中心架构设计：多仓库存、预占释放、超卖防护与热点扣减</a><time datetime="2026-10-19T00:00:00.000Z" title="发表于 2026-10-19 08:00:00">2026-10-19</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
