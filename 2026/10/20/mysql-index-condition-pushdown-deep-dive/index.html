@@ -1,0 +1,468 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 实战】索引条件下推（ICP）深度解析前言先看一条真实慢查询。表结构（简化）： 12345678910111213141516CREATE TABLE &#96;order_item&#96; (  &#96;id&#96;         BIGINT PRIMARY KEY AUTO_INCREMENT,  &#96;user_id&#96;    BIGINT NOT NULL,  &#96;status&#96;     TINYINT N">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/20/mysql-index-condition-pushdown-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 实战】索引条件下推（ICP）深度解析前言先看一条真实慢查询。表结构（简化）： 12345678910111213141516CREATE TABLE &#96;order_item&#96; (  &#96;id&#96;         BIGINT PRIMARY KEY AUTO_INCREMENT,  &#96;user_id&#96;    BIGINT NOT NULL,  &#96;status&#96;     TINYINT N">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-20T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-10-20T00:01:18.078Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="ICP">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="SQL 优化">
+<meta property="article:tag" content="索引">
+<meta property="article:tag" content="索引条件下推">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理",
+  "url": "https://jiweidong.github.io/2026/10/20/mysql-index-condition-pushdown-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-20T00:10:00.000Z",
+  "dateModified": "2026-10-20T00:01:18.078Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/20/mysql-index-condition-pushdown-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">797</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">893</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">241</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-20T00:10:00.000Z" title="发表于 2026-10-20 08:10:00">2026-10-20</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-20T00:01:18.078Z" title="更新于 2026-10-20 08:01:18">2026-10-20</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-实战】索引条件下推（ICP）深度解析"><a href="#【MySQL-实战】索引条件下推（ICP）深度解析" class="headerlink" title="【MySQL 实战】索引条件下推（ICP）深度解析"></a>【MySQL 实战】索引条件下推（ICP）深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>先看一条真实慢查询。表结构（简化）：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE TABLE</span> `order_item` (</span><br><span class="line">  `id`         <span class="type">BIGINT</span> <span class="keyword">PRIMARY KEY</span> AUTO_INCREMENT,</span><br><span class="line">  `user_id`    <span class="type">BIGINT</span> <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `status`     TINYINT <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `sku_code`   <span class="type">VARCHAR</span>(<span class="number">32</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `remark`     <span class="type">VARCHAR</span>(<span class="number">255</span>) <span class="keyword">DEFAULT</span> <span class="keyword">NULL</span>,</span><br><span class="line">  `created_at` DATETIME <span class="keyword">NOT NULL</span>,</span><br><span class="line">  KEY `idx_user_status_sku` (`user_id`, `status`, `sku_code`)</span><br><span class="line">) ENGINE<span class="operator">=</span>InnoDB;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 慢查询：耗时 2.3s，扫描行数 18 万</span></span><br><span class="line"><span class="keyword">SELECT</span> id, sku_code, remark</span><br><span class="line"><span class="keyword">FROM</span> order_item</span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span></span><br><span class="line">  <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span></span><br><span class="line">  <span class="keyword">AND</span> sku_code <span class="keyword">LIKE</span> <span class="string">&#x27;%A01%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p><code>EXPLAIN</code> 显示：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">type=ref  key=idx_user_status_sku  rows=182340  Extra=Using index condition</span><br></pre></td></tr></table></figure>
+
+<p><code>Using index condition</code> 就是本文的主角：<strong>索引条件下推（Index Condition Pushdown，ICP）</strong>。它是 MySQL 5.6 引入、8.0 持续优化的一个优化器特性，也是面试里区分「会写 SQL」和「懂存储引擎」的经典分水岭。</p>
+<p>这篇文章从「没有 ICP 时会发生什么」讲起，把原理、生效条件、EXPLAIN 判读、失效场景和生产调优一次说清。</p>
+<hr>
+<h2 id="一、先搞懂：回表到底贵在哪"><a href="#一、先搞懂：回表到底贵在哪" class="headerlink" title="一、先搞懂：回表到底贵在哪"></a>一、先搞懂：回表到底贵在哪</h2><p>InnoDB 的索引是 <strong>B+ 树</strong>，分两类：</p>
+<ul>
+<li><strong>聚簇索引（主键索引）</strong>：叶子节点存的是<strong>整行数据</strong></li>
+<li><strong>二级索引（辅助索引）</strong>：叶子节点存的是<strong>索引列 + 主键值</strong></li>
+</ul>
+<p>所以通过二级索引查非索引列，必须走两步：</p>
+<ol>
+<li>在二级索引 B+ 树上定位到记录，拿到<strong>主键 id</strong></li>
+<li>拿 id 回到聚簇索引 B+ 树，取出完整行</li>
+</ol>
+<p>第 2 步就是<strong>回表</strong>。它的代价不只是「多一次 B+ 树查找」，更关键的是：</p>
+<ul>
+<li>回表是<strong>随机 IO</strong>（主键值不连续 → 目标页可能不在 buffer pool 里 → 触发磁盘读）</li>
+<li>每次回表都是一次<strong>页的定位 + 可能的磁盘 IO</strong></li>
+<li>一次磁盘随机读约 0.1ms，10 万次回表就是 10 秒</li>
+</ul>
+<p>这就是慢查询的根源。</p>
+<hr>
+<h2 id="二、没有-ICP-的时代：Server-层做过滤"><a href="#二、没有-ICP-的时代：Server-层做过滤" class="headerlink" title="二、没有 ICP 的时代：Server 层做过滤"></a>二、没有 ICP 的时代：Server 层做过滤</h2><p>MySQL 的架构分两层：<strong>Server 层</strong>（解析、优化、执行）和<strong>存储引擎层</strong>（InnoDB，负责索引和数据）。</p>
+<p>在 MySQL 5.6 之前，二级索引扫描的流程是这样的：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">Server 层                          InnoDB 层</span><br><span class="line">    │                                  │</span><br><span class="line">    │ 1. &quot;给我 user_id=10086 的所有行&quot;  │</span><br><span class="line">    ├─────────────────────────────────&gt;│</span><br><span class="line">    │                                  │ 2. 在 idx 上扫描，每命中一条</span><br><span class="line">    │                                  │ 3. 拿主键回表，读出整行</span><br><span class="line">    │ 4. 收到整行                       │</span><br><span class="line">    │&lt;─────────────────────────────────┤</span><br><span class="line">    │ 5. 在 Server 层判断 status=1      │</span><br><span class="line">    │    和 sku_code LIKE &#x27;%A01%&#x27;       │</span><br><span class="line">    │ 6. 不满足 → 丢弃                  │</span><br><span class="line">    └──────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>问题一目了然</strong>：<code>status</code> 和 <code>sku_code</code> 明明都在索引里，但过滤动作却发生在 Server 层。这意味着 InnoDB 把<strong>所有</strong> <code>user_id=10086</code> 的行（假设 18 万行）都回表读出来，交给 Server 层，Server 层再扔掉 99.9%。</p>
+<p><strong>回表 18 万次，只为了留下 100 行。</strong> 这就是浪费。</p>
+<hr>
+<h2 id="三、ICP-的核心思想：把过滤下推到引擎层"><a href="#三、ICP-的核心思想：把过滤下推到引擎层" class="headerlink" title="三、ICP 的核心思想：把过滤下推到引擎层"></a>三、ICP 的核心思想：把过滤下推到引擎层</h2><p>MySQL 5.6 的 ICP 做的事很简单：<strong>既然 <code>status</code> 和 <code>sku_code</code> 都在二级索引里，那就在二级索引上先过滤，只对通过过滤的记录回表。</strong></p>
+<p>改造后的流程：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">Server 层                          InnoDB 层</span><br><span class="line">    │                                  │</span><br><span class="line">    │ 1. &quot;给我 user_id=10086，          │</span><br><span class="line">    │     且 status=1，                 │</span><br><span class="line">    │     且 sku_code LIKE &#x27;%A01%&#x27;&quot;     │</span><br><span class="line">    ├─────────────────────────────────&gt;│</span><br><span class="line">    │                                  │ 2. 在 idx 上扫描 user_id=10086</span><br><span class="line">    │                                  │ 3. 对每条索引记录，先用</span><br><span class="line">    │                                  │    status / sku_code 判断</span><br><span class="line">    │                                  │ 4. 通过 → 回表读整行</span><br><span class="line">    │                                  │    不通过 → 直接跳过，不回表</span><br><span class="line">    │ 5. 收到少量整行                    │</span><br><span class="line">    │&lt;─────────────────────────────────┤</span><br><span class="line">    │ 6. 再判断无法下推的条件（如 remark）│</span><br><span class="line">    └──────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>效果</strong>：回表次数从 18 万降到 100 左右，整整快了两个数量级。</p>
+<p>用一张表总结三者的分工：</p>
+<table>
+<thead>
+<tr>
+<th>优化手段</th>
+<th>过滤发生在哪</th>
+<th>是否回表</th>
+<th>典型 Extra</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>无优化</td>
+<td>Server 层</td>
+<td><strong>每条都回表</strong></td>
+<td>无 &#x2F; <code>Using where</code></td>
+</tr>
+<tr>
+<td>ICP</td>
+<td>InnoDB 层（索引上）</td>
+<td>只对通过的行回表</td>
+<td><code>Using index condition</code></td>
+</tr>
+<tr>
+<td>覆盖索引</td>
+<td>不回表</td>
+<td><strong>完全不回表</strong></td>
+<td><code>Using index</code></td>
+</tr>
+</tbody></table>
+<blockquote>
+<p><strong>划重点</strong>：ICP 减少的是<strong>回表次数</strong>，不是索引扫描行数。B+ 树上该扫的 <code>user_id=10086</code> 的记录一条都没少扫，少的是「回聚簇索引取整行」这个昂贵动作。所以 <code>EXPLAIN</code> 的 <code>rows</code> 列<strong>不会因为 ICP 变小</strong>——这是面试的高频陷阱题。</p>
+</blockquote>
+<hr>
+<h2 id="四、动手验证：EXPLAIN-计数器"><a href="#四、动手验证：EXPLAIN-计数器" class="headerlink" title="四、动手验证：EXPLAIN + 计数器"></a>四、动手验证：EXPLAIN + 计数器</h2><h3 id="4-1-看-Extra"><a href="#4-1-看-Extra" class="headerlink" title="4.1 看 Extra"></a>4.1 看 <code>Extra</code></h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN FORMAT<span class="operator">=</span>JSON</span><br><span class="line"><span class="keyword">SELECT</span> id, sku_code, remark <span class="keyword">FROM</span> order_item</span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> sku_code <span class="keyword">LIKE</span> <span class="string">&#x27;%A01%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>关键看 <code>Extra</code>：</p>
+<ul>
+<li><code>Using index condition</code> → ICP 生效</li>
+<li><code>Using where</code> → 只在 Server 层过滤（可能 ICP 未生效）</li>
+<li><code>Using index</code> → 覆盖索引，压根没回表（比 ICP 更好）</li>
+</ul>
+<h3 id="4-2-看真实的回表次数"><a href="#4-2-看真实的回表次数" class="headerlink" title="4.2 看真实的回表次数"></a>4.2 看真实的回表次数</h3><p><code>EXPLAIN</code> 是估算，验证要看 <code>Handler_read_*</code> 状态变量：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">FLUSH STATUS;</span><br><span class="line"><span class="keyword">SELECT</span> id, sku_code, remark <span class="keyword">FROM</span> order_item</span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> sku_code <span class="keyword">LIKE</span> <span class="string">&#x27;%A01%&#x27;</span>;</span><br><span class="line"><span class="keyword">SHOW</span> SESSION STATUS <span class="keyword">LIKE</span> <span class="string">&#x27;Handler_read%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>关注三个值：</p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Handler_read_next</code></td>
+<td>沿索引链读下一条（顺序扫描索引）</td>
+</tr>
+<tr>
+<td><code>Handler_read_rnd_next</code></td>
+<td>全表&#x2F;全索引扫描读下一行</td>
+</tr>
+<tr>
+<td><code>Handler_read_key</code></td>
+<td>按索引键定位（≈ 回表次数）</td>
+</tr>
+</tbody></table>
+<p><strong>对比实验</strong>：先关闭 ICP，再打开，看 <code>Handler_read_key</code> 的变化。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> optimizer_switch <span class="operator">=</span> <span class="string">&#x27;index_condition_pushdown=off&#x27;</span>;</span><br><span class="line"><span class="comment">-- 执行 SQL，记录 Handler_read_key</span></span><br><span class="line"><span class="keyword">SET</span> optimizer_switch <span class="operator">=</span> <span class="string">&#x27;index_condition_pushdown=on&#x27;</span>;</span><br><span class="line"><span class="comment">-- 再执行，Handler_read_key 应大幅下降</span></span><br></pre></td></tr></table></figure>
+
+<p>这个实验在面试里讲出来，比背结论有说服力得多。</p>
+<hr>
+<h2 id="五、ICP-的生效条件（重点，容易踩坑）"><a href="#五、ICP-的生效条件（重点，容易踩坑）" class="headerlink" title="五、ICP 的生效条件（重点，容易踩坑）"></a>五、ICP 的生效条件（重点，容易踩坑）</h2><p>ICP 不是万能的，它有一串硬性前提。<strong>任何一条不满足，就退化成 Server 层过滤。</strong></p>
+<h3 id="5-1-必须走「二级索引的范围-等值扫描」"><a href="#5-1-必须走「二级索引的范围-等值扫描」" class="headerlink" title="5.1 必须走「二级索引的范围&#x2F;等值扫描」"></a>5.1 必须走「二级索引的范围&#x2F;等值扫描」</h3><p>ICP 只对<strong>通过索引访问表</strong>的路径生效。如果优化器选了全表扫描（<code>type=ALL</code>），没有索引可下推，自然没有 ICP。</p>
+<ul>
+<li><code>type=ref</code> &#x2F; <code>range</code> &#x2F; <code>eq_ref</code> → 可能生效</li>
+<li><code>type=index</code>（全索引扫描）→ 也可能生效</li>
+<li><code>type=ALL</code> → <strong>不可能</strong></li>
+</ul>
+<h3 id="5-2-条件涉及的列必须在索引里"><a href="#5-2-条件涉及的列必须在索引里" class="headerlink" title="5.2 条件涉及的列必须在索引里"></a>5.2 条件涉及的列必须在索引里</h3><p>这是最本质的一条。下推的前提是「引擎层能判断」，而引擎层能看到的只有索引里的列。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 索引 (user_id, status, sku_code)</span></span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> remark <span class="keyword">LIKE</span> <span class="string">&#x27;%x%&#x27;</span></span><br><span class="line"><span class="comment">-- remark 不在索引里 → 无法下推，只能回表后在 Server 层过滤</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-不能用「索引无法处理的操作」"><a href="#5-3-不能用「索引无法处理的操作」" class="headerlink" title="5.3 不能用「索引无法处理的操作」"></a>5.3 不能用「索引无法处理的操作」</h3><p>以下条件下推会失效，因为 InnoDB 在索引层没法求值：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>例子</th>
+<th>为什么失效</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>子查询</td>
+<td><code>WHERE sku_code IN (SELECT ...)</code></td>
+<td>需要 Server 层物化&#x2F;半连接</td>
+</tr>
+<tr>
+<td>存储函数</td>
+<td><code>WHERE my_func(sku_code) = 1</code></td>
+<td>函数在 Server 层注册</td>
+</tr>
+<tr>
+<td>全文索引</td>
+<td><code>MATCH(...) AGAINST(...)</code></td>
+<td>走的不是 B+ 树</td>
+</tr>
+<tr>
+<td>空间索引</td>
+<td><code>ST_Contains(...)</code></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>触发器&#x2F;虚拟列部分场景</td>
+<td>—</td>
+<td>依赖 Server 层计算</td>
+</tr>
+<tr>
+<td>参数化视图</td>
+<td>—</td>
+<td>视图展开时机问题</td>
+</tr>
+</tbody></table>
+<h3 id="5-4-前缀索引的例外"><a href="#5-4-前缀索引的例外" class="headerlink" title="5.4 前缀索引的例外"></a>5.4 前缀索引的例外</h3><p>如果你的索引是前缀索引：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">KEY idx_sku (`sku_code`(<span class="number">8</span>))</span><br></pre></td></tr></table></figure>
+
+<p>那么对于 <code>sku_code</code> 上<strong>超出前缀长度</strong>的条件，InnoDB 无法在索引里完整判断，只能在回表后由 Server 层验证。此时 ICP 部分生效（前缀内的部分），<code>Extra</code> 会显示 <code>Using index condition</code> 但效果打折。</p>
+<h3 id="5-5-主键上的条件不下推"><a href="#5-5-主键上的条件不下推" class="headerlink" title="5.5 主键上的条件不下推"></a>5.5 主键上的条件不下推</h3><p>聚簇索引的叶子节点就是整行，本来就要读整行，没有「少回表」的空间。所以对主键列的过滤不会产生 ICP。</p>
+<h3 id="5-6-LIKE-xxx-能不能下推？"><a href="#5-6-LIKE-xxx-能不能下推？" class="headerlink" title="5.6 LIKE &#39;%xxx%&#39; 能不能下推？"></a>5.6 <code>LIKE &#39;%xxx%&#39;</code> 能不能下推？</h3><p><strong>能</strong>。这是最容易误解的一条。</p>
+<p>很多人以为前置通配符的 <code>LIKE</code> 一定要回表后才过滤——那是<strong>索引定位</strong>层面的问题（无法用索引有序性做范围定位），不是<strong>过滤</strong>层面的问题。</p>
+<p>一旦 <code>user_id=10086</code> 已经定位到了扫描区间，接下来的每条记录都在内存里，InnoDB 完全可以顺手做一次 <code>sku_code LIKE &#39;%A01%&#39;</code> 的字符串匹配。<strong>定位难 ≠ 过滤难。</strong> 这正是 ICP 的价值所在：<strong>它把「无法用于定位的索引列」变成了「可用于过滤的索引列」。</strong></p>
+<p>这一点讲清楚，面试官基本会认为你真读懂了。</p>
+<hr>
+<h2 id="六、经典组合：ICP-覆盖索引"><a href="#六、经典组合：ICP-覆盖索引" class="headerlink" title="六、经典组合：ICP + 覆盖索引"></a>六、经典组合：ICP + 覆盖索引</h2><p>ICP 的最优解往往不是单独使用，而是和覆盖索引配合。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 需求 A：只要 sku_code</span></span><br><span class="line"><span class="keyword">SELECT</span> sku_code <span class="keyword">FROM</span> order_item</span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> sku_code <span class="keyword">LIKE</span> <span class="string">&#x27;%A01%&#x27;</span>;</span><br><span class="line"><span class="comment">-- Extra: Using index  ← 覆盖索引，零回表，最优</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 需求 B：还要 remark</span></span><br><span class="line"><span class="keyword">SELECT</span> sku_code, remark <span class="keyword">FROM</span> order_item</span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">AND</span> sku_code <span class="keyword">LIKE</span> <span class="string">&#x27;%A01%&#x27;</span>;</span><br><span class="line"><span class="comment">-- Extra: Using index condition  ← ICP，少量回表</span></span><br></pre></td></tr></table></figure>
+
+<p>如果需求 B 的量极大，可以考虑把 <code>remark</code> 也放进索引做成覆盖索引（代价是索引变大、写放大）。这是一个典型的<strong>空间换时间</strong>权衡，决策依据是：</p>
+<table>
+<thead>
+<tr>
+<th>判断维度</th>
+<th>倾向 ICP</th>
+<th>倾向覆盖索引</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>回表命中率</td>
+<td>高（过滤后剩很少）</td>
+<td>低（过滤后剩很多）</td>
+</tr>
+<tr>
+<td>索引膨胀敏感度</td>
+<td>低</td>
+<td>高</td>
+</tr>
+<tr>
+<td>写多读少</td>
+<td>✅</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>读多写少 + 高频查询</td>
+<td>一般</td>
+<td>✅</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="七、生产踩坑实录"><a href="#七、生产踩坑实录" class="headerlink" title="七、生产踩坑实录"></a>七、生产踩坑实录</h2><h3 id="坑-1：以为-rows-变小了就代表-ICP-生效"><a href="#坑-1：以为-rows-变小了就代表-ICP-生效" class="headerlink" title="坑 1：以为 rows 变小了就代表 ICP 生效"></a>坑 1：以为 <code>rows</code> 变小了就代表 ICP 生效</h3><p>前面说过，<code>rows</code> 是<strong>索引扫描行数的估算</strong>，ICP 不改变它。判断 ICP 只能看 <code>Extra</code> 和 <code>Handler_read_key</code>。</p>
+<h3 id="坑-2：联合索引顺序设计错误，导致-ICP-无从下推"><a href="#坑-2：联合索引顺序设计错误，导致-ICP-无从下推" class="headerlink" title="坑 2：联合索引顺序设计错误，导致 ICP 无从下推"></a>坑 2：联合索引顺序设计错误，导致 ICP 无从下推</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 索引 (status, user_id, sku_code)</span></span><br><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">1</span></span><br></pre></td></tr></table></figure>
+
+<p><code>user_id</code> 是第二个列，<code>status</code> 没给等值条件时无法用最左前缀定位；给定 <code>status=1</code> 后，<code>user_id</code> 才能被定位。如果查询里 <code>status</code> 是可选条件（有时传有时不传），索引顺序应该按<strong>选择性 + 使用频率</strong>排：<code>(user_id, status, sku_code)</code>。</p>
+<p><strong>原则</strong>：等值列在前、范围列在后；区分度高的列优先。ICP 只能补救「过滤」，补救不了「定位」。</p>
+<h3 id="坑-3：OR-条件打断-ICP"><a href="#坑-3：OR-条件打断-ICP" class="headerlink" title="坑 3：OR 条件打断 ICP"></a>坑 3：<code>OR</code> 条件打断 ICP</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> (status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">OR</span> status <span class="operator">=</span> <span class="number">2</span>)</span><br></pre></td></tr></table></figure>
+
+<p><code>OR</code> 在同一列上可能被优化成 <code>IN</code>，ICP 仍可生效；但如果是跨列 <code>OR</code>：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">AND</span> (status <span class="operator">=</span> <span class="number">1</span> <span class="keyword">OR</span> sku_code <span class="operator">=</span> <span class="string">&#x27;X&#x27;</span>)</span><br></pre></td></tr></table></figure>
+
+<p>优化器可能改走 <code>index_merge</code>，此时 ICP 失效。改写为 <code>UNION ALL</code> 通常更可控。</p>
+<h3 id="坑-4：字符集-排序规则不一致导致隐式转换"><a href="#坑-4：字符集-排序规则不一致导致隐式转换" class="headerlink" title="坑 4：字符集&#x2F;排序规则不一致导致隐式转换"></a>坑 4：字符集&#x2F;排序规则不一致导致隐式转换</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- sku_code 是 utf8mb4，参数传的是 utf8（或 Java 侧 setString 未指定）</span></span><br><span class="line"><span class="keyword">WHERE</span> sku_code <span class="operator">=</span> ?</span><br></pre></td></tr></table></figure>
+
+<p>隐式转换会让索引列「函数化」，索引失效，ICP 自然也没了。<strong>排查手段</strong>：<code>EXPLAIN</code> 看 <code>key</code> 是否为 NULL；<code>SHOW WARNINGS</code> 看是否有 <code>Cannot use ref access</code>。</p>
+<h3 id="坑-5：ICP-让-ORDER-BY-的-Using-filesort-更明显"><a href="#坑-5：ICP-让-ORDER-BY-的-Using-filesort-更明显" class="headerlink" title="坑 5：ICP 让 ORDER BY 的 Using filesort 更明显"></a>坑 5：ICP 让 <code>ORDER BY</code> 的 Using filesort 更明显</h3><p>ICP 减少回表后，返回的行变少，但如果 <code>ORDER BY</code> 的列不在索引前缀里，仍然要 filesort。这时候容易误判「加了索引没效果」。<strong>正确做法</strong>：把 <code>ORDER BY</code> 列纳入索引设计，让 <code>Extra</code> 出现 <code>Using index condition; Using where</code> 而不是 <code>Using filesort</code>。</p>
+<h3 id="坑-6：8-0-的「ICP-索引跳跃扫描」不是一回事"><a href="#坑-6：8-0-的「ICP-索引跳跃扫描」不是一回事" class="headerlink" title="坑 6：8.0 的「ICP + 索引跳跃扫描」不是一回事"></a>坑 6：8.0 的「ICP + 索引跳跃扫描」不是一回事</h3><p>MySQL 8.0.13 引入了 <strong>Skip Scan</strong>（索引跳跃扫描），针对「最左列区分度极低、未给最左列条件」的场景。它和 ICP 是两个独立特性，<code>Extra</code> 分别显示 <code>Using index for skip scan</code> 和 <code>Using index condition</code>。两者可以同时出现，但不要混为一谈。</p>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：ICP 减少了什么？没有减少什么？</strong></p>
+<p>减少的是<strong>回表次数</strong>（<code>Handler_read_key</code> 下降），进而减少随机 IO。<strong>没有减少</strong>索引扫描的记录数（<code>Handler_read_next</code> 不变、<code>EXPLAIN rows</code> 不变），也没有减少 B+ 树的遍历深度。所以 ICP 对「索引扫描本身就很慢」的场景（比如区分度极差的索引扫了几百万条）帮助有限。</p>
+<p><strong>Q2：为什么 ICP 只能下推索引列上的条件？</strong></p>
+<p>因为下推发生在 InnoDB 层，而 InnoDB 在这一步只持有二级索引记录（索引列 + 主键）。非索引列的值在聚簇索引里，要拿到就必须回表——那就失去意义了。<strong>这是「数据可见性」决定的能力边界。</strong></p>
+<p><strong>Q3：ICP 和覆盖索引（Using index）哪个更好？</strong></p>
+<p>覆盖索引更好，因为它<strong>完全不回表</strong>（0 次），而 ICP 仍有回表（只是变少）。但覆盖索引要求查询列全在索引里，索引会更宽、写放大会更严重。工程上常见的路径是：<strong>先靠 ICP 把回表压到可接受范围，只有确认瓶颈仍在回表且写压力不大时，才升级为覆盖索引。</strong></p>
+<p><strong>Q4：<code>LIKE &#39;%abc%&#39;</code> 一定索引失效吗？</strong></p>
+<p>要分两件事说：</p>
+<ul>
+<li><strong>定位</strong>：失效。前置通配符无法利用 B+ 树有序性，不能缩小扫描区间。</li>
+<li><strong>过滤</strong>：可以下推。一旦扫描区间由其他列（如 <code>user_id</code>）确定，<code>LIKE &#39;%abc%&#39;</code> 可以在索引层直接过滤，避免无效回表。</li>
+</ul>
+<p>所以准确说法是：<strong><code>LIKE &#39;%abc%&#39;</code> 不能用于「缩小扫描范围」，但可以用于「减少回表」。</strong></p>
+<p><strong>Q5：如何确认一条 SQL 到底用没用 ICP？</strong></p>
+<p>三步：</p>
+<ol>
+<li><code>EXPLAIN</code> 看 <code>Extra</code> 是否含 <code>Using index condition</code></li>
+<li><code>EXPLAIN FORMAT=JSON</code> 看 <code>attached_condition</code> 字段（ICP 的条件会出现在这里）</li>
+<li><code>FLUSH STATUS</code> + <code>SHOW SESSION STATUS LIKE &#39;Handler_read%&#39;</code>，对比开关 <code>optimizer_switch</code> 前后的 <code>Handler_read_key</code></li>
+</ol>
+<p><strong>Q6：ICP 会带来额外开销吗？</strong></p>
+<p>会。每扫描一条索引记录都要做一次条件求值（CPU 开销），如果条件下推后<strong>几乎全部通过</strong>（选择性很差），那么这次求值就是纯浪费。优化器会基于统计信息估算选择性，理论上可以选择不用 ICP，但 MySQL 的代价模型在这一块并不总是准——极端情况下可以用 <code>SET optimizer_switch=&#39;index_condition_pushdown=off&#39;</code> 做对照实验。</p>
+<hr>
+<h2 id="九、一张图总结"><a href="#九、一张图总结" class="headerlink" title="九、一张图总结"></a>九、一张图总结</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line">┌─────────────────────────┐</span><br><span class="line">│  Server 层               │</span><br><span class="line">│  解析 / 优化 / 结果组装    │</span><br><span class="line">└────────────┬────────────┘</span><br><span class="line">             │ ① 下推条件（索引列）</span><br><span class="line">┌────────────▼────────────┐</span><br><span class="line">│  InnoDB 层               │</span><br><span class="line">│  ┌───────────────────┐   │</span><br><span class="line">│  │ 二级索引 B+ 树      │   │</span><br><span class="line">│  │  user_id,status,  │   │</span><br><span class="line">│  │  sku_code         │   │</span><br><span class="line">│  │         ↓         │   │</span><br><span class="line">│  │  ② 索引层过滤      │   │</span><br><span class="line">│  │  （ICP 发生在这里） │   │</span><br><span class="line">│  └────────┬──────────┘   │</span><br><span class="line">│           │ ③ 只对通过的回表│</span><br><span class="line">│  ┌────────▼──────────┐   │</span><br><span class="line">│  │ 聚簇索引（整行）    │   │</span><br><span class="line">│  └───────────────────┘   │</span><br><span class="line">└─────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>记住三句话</strong>：</p>
+<ol>
+<li>ICP &#x3D; 把「能在索引里判断的条件」从 Server 层搬到 InnoDB 层，<strong>减少回表</strong>。</li>
+<li><code>Using index condition</code> 是标志，<code>Handler_read_key</code> 是证据。</li>
+<li>索引设计决定「扫多少」，ICP 决定「回表多少次」，覆盖索引决定「要不要回表」——<strong>三者是三个不同层次的优化，别混着用。</strong></li>
+</ol>
+<p>下一篇讲 MySQL 8.0 的<strong>索引跳跃扫描（Skip Scan）</strong> 和它的代价模型——为什么它在某些场景能把 <code>(a,b)</code> 索引当 <code>(b)</code> 索引用，又为什么经常「看起来生效但更慢」。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/20/mysql-index-condition-pushdown-deep-dive/">https://jiweidong.github.io/2026/10/20/mysql-index-condition-pushdown-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95/">索引</a><a class="post-meta__tags" href="/tags/ICP/">ICP</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95%E6%9D%A1%E4%BB%B6%E4%B8%8B%E6%8E%A8/">索引条件下推</a><a class="post-meta__tags" href="/tags/SQL-%E4%BC%98%E5%8C%96/">SQL 优化</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/20/jvm-escape-analysis-scalar-replacement-deep-dive/" title="【JVM 底层】逃逸分析与标量替换深度解析：对象真的都分配在堆上吗？"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【JVM 底层】逃逸分析与标量替换深度解析：对象真的都分配在堆上吗？</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】逃逸分析与标量替换深度解析前言「Java 对象都分配在堆上」——这句话在面试里说出口，通常会被追问一句：「一定吗？」 严格来说，Java 语言规范只说对象由 new 创建，从未规定必须在堆上分配。JVM 规范（JVMS）同样没有强制要求。HotSpot 的实际行为是：绝大多数对象在堆上，但有一部分对象会「消失」——既不在堆上，也不在任何地方。 让对象消失的技术，就是 逃逸分析（Escape Analysis），以及它衍生的 标量替换（Scalar Replacement）、栈上分配（Stack Allocation）、锁消除（Lock Elision）。 这三个优化是 JIT 里最「反直觉」的部分：它们不改变语义，却能让一段看起来在疯狂创建对象的代码，编译后一个对象都不创建。 这篇文章把判定算法、优化形态、验证方法、失效场景和生产踩坑讲透。  一、什么是「逃逸」逃逸分析要回答一个问题：这个对象的引用，会不会离开它被创建的方法或线程？ 按逃逸的程度分三档：    等级 名称 含义 能否优化    0 不逃逸（NoEscape） 对象只在方法内使用，引用不外传 ✅ 可...</div></div></div></a><a class="pagination-related" href="/2026/10/20/java-foreign-function-memory-api-deep-dive/" title="【Java 22+】外部函数与内存 API（FFM/Panama）深度解析：从 JNI 之痛到零拷贝调用 C"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 22+】外部函数与内存 API（FFM/Panama）深度解析：从 JNI 之痛到零拷贝调用 C</div></div><div class="info-2"><div class="info-item-1">【Java 22+】外部函数与内存 API（FFM&#x2F;Panama）深度解析前言只要你的 Java 程序需要「碰硬件」，就绕不开一个问题：怎么调用 C 库？ 过去的答案是 JNI。但写过 JNI 的人都懂那种痛：先写一个 native 方法声明，再跑 javac -h 生成头文件，然后用 C 写实现、编译成 .so，最后还要处理 System.loadLibrary 的路径问题。改一个参数类型，整条链路重来一遍；线上出现 SIGSEGV，堆栈里只有一行 Problematic frame: C  [libfoo.so+0x1234]，你连是哪个 Java 调用点都定位不到。 JDK 22 正式定稿的 FFM API（Foreign Function &amp; Memory API，项目 Panama） 彻底改写了这件事：纯 Java 代码直接调用本地函数、直接操作堆外内存，不需要写一行 C，不需要生成任何胶水代码。 这篇文章把 FFM 从设计动机、核心模型、可运行代码到生产踩坑，一次讲透。  一、JNI &#x2F; JNA &#x2F; FFM 三代方案对比在 FFM...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/15/mysql-back-to-table-covering-index-deep-dive/" title="【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战面试官：什么是回表？什么是覆盖索引？为什么 select * 和 select 指定字段性能差这么多？“回表”和”覆盖索引”是 MySQL 索引面试中最核心的两个概念，也是 SQL 优化的基本功。很多同学知道”要建联合索引、不要 select *”，但说不清背后的原理——为什么覆盖索引能避免回表？为什么联合索引能覆盖更多查询？ 本文从 InnoDB 索引结构出发，把回表、覆盖索引、索引下推（ICP）的关系一次讲透，最后给出可直接落地的优化 checklist。 一、先从 InnoDB 索引结构说起1.1 聚簇索引（Clustered Index）InnoDB 的表本身就是一棵 B+ 树，主键索引就是聚簇索引：  叶子节点直接存放整行数据（包括所有字段）； 每张表只有一个聚簇索引（通常是主键，没有主键就用第一个非空唯一索引，再没有就隐藏的 rowid）； 数据行按照主键顺序物理排列（逻辑顺序）。  123456789聚簇索引 B+ 树（主键 id）┌─────────┐│  根节点   │  ...</div></div></div></a><a class="pagination-related" href="/2026/08/21/mysql-filesort-sort-optimization-deep-dive/" title="【MySQL 优化】MySQL 排序优化深度解析：Using filesort 与索引排序的底层原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-21</div><div class="info-item-2">【MySQL 优化】MySQL 排序优化深度解析：Using filesort 与索引排序的底层原理</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】MySQL 排序优化深度解析：Using filesort 与索引排序的底层原理面试官：EXPLAIN 里出现 Using filesort，到底是不是”用到了磁盘文件”？先破除一个流传最广的误解：Using filesort 不等于”在磁盘文件上排序”。filesort 的意思是”MySQL 自己额外做了一次排序”（区别于直接利用索引的有序性），至于排序发生在内存还是磁盘，取决于排序数据量是否超过 sort_buffer_size。绝大多数情况下，filesort 在内存中就完成了。 那优化方向就很明确了：让 MySQL 别自己排序——直接用索引的有序性。这就是今天要讲的核心。 一、ORDER BY 的两种执行路径MySQL 处理 ORDER BY 只有两条路： 路径一：利用索引有序性（最优，无 filesort） B+ 树索引本身就是有序的，如果 ORDER BY 的字段恰好是索引列（且满足最左前缀、方向一致），MySQL 顺着索引扫描就能拿到有序结果，Extra 显示 Using index 或什么都不显示，零额外排序成本。 123456-- 联合索引 ...</div></div></div></a><a class="pagination-related" href="/2026/08/24/mysql-b-plus-tree-index-deep-dive/" title="【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-24</div><div class="info-item-2">【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现</div></div><div class="info-2"><div class="info-item-1">【MySQL 索引】B+ 树深度解析：从数据结构原理到 InnoDB 索引实现面试官：为什么 MySQL 的索引要用 B+ 树，而不是二叉树、红黑树或者哈希表？这是一道几乎必问的数据库面试题。要答好它，需要从”磁盘 IO 模型”这个底层约束出发，一层层推演。先给出结论：B+ 树是在”磁盘访问”场景下，读写性能、范围查询、稳定性三者综合最优的数据结构。 一、为什么不是这些结构？1. 为什么不选哈希索引？哈希索引查找单个 key 是 O(1)，无敌快，但有两个致命缺陷：  不支持范围查询：WHERE age &gt; 20 这种条件，哈希表只能全表扫描 不支持排序：哈希是无序的，ORDER BY 无从谈起  所以哈希索引只适合等值查询的特定场景（如 Memory 引擎、自适应哈希索引 AHI）。 2. 为什么不选二叉搜索树（BST）？最坏情况下 BST 会退化成链表（插入有序数据时），查找退化成 O(n)。就算平衡了（AVL&#x2F;红黑树），还有更大的问题——树太高。 假设数据量是 1000 万条，红黑树高度约 log₂(1000万) ≈ 24 层。每查一个节点就是一次磁盘 IO...</div></div></div></a><a class="pagination-related" href="/2026/06/11/mysql-index-optimization/" title="MySQL 索引原理与优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">MySQL 索引原理与优化实战</div></div><div class="info-2"><div class="info-item-1">前言索引是数据库性能调优中最基础也最核心的手段。一条 SQL 走不走索引、走什么索引，执行时间可能相差几个数量级。本文从底层存储结构讲起，结合实际案例，带你彻底掌握 MySQL 索引优化。  一、索引的底层数据结构1.1 为什么选择 B+ 树？MySQL InnoDB 存储引擎使用 B+ 树作为索引结构。对比其他数据结构：    数据结构 磁盘 I&#x2F;O 范围查询 有序性 适用场景    哈希表 O(1) ❌ 不支持 ❌ 等值查询   二叉树 O(log n) ✅ ✅ 内存中   B 树 O(log n) ❌ 较差 ✅ 磁盘存储   B+ 树 O(log n) ✅ 优秀 ✅ 磁盘存储（最优）   1.2 B+ 树的核心特征1234567            [50]          ↙     ↘     [20, 30]    [70, 90]   ↙   ↓   ↘    ↓    ↓    ↘[10,15][25][35] [60] [80] [95,100]  ↑  ↑   ↑   ↑   ↑    ↑     ↑  └─── 数据页链表 ──────────...</div></div></div></a><a class="pagination-related" href="/2026/10/16/mysql-interview-questions-summary/" title="【MySQL 面试】MySQL 高频面试题总结：索引、事务、锁、日志与主从复制 40 问"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-16</div><div class="info-item-2">【MySQL 面试】MySQL 高频面试题总结：索引、事务、锁、日志与主从复制 40 问</div></div><div class="info-2"><div class="info-item-1">【MySQL 面试】MySQL 高频面试题总结：索引、事务、锁、日志与主从复制 40 问前言MySQL 面试基本围绕一张 InnoDB 的图展开：B+ 树索引 → 事务与 MVCC → 锁 → redo&#x2F;undo&#x2F;binlog → 主从复制与高可用。很多人能背出”最左前缀”，却说不清”为什么会回表””为什么 RR 下也有幻读”。本文按这条主线把高频题串起来，每题都给追问 + 加分答法 + 可验证的实验。 一、索引：从 B+ 树到能落地的最优化Q1：为什么用 B+ 树而不是 B 树 &#x2F; 哈希 &#x2F; 红黑树？  相比 B 树：B+ 树非叶子节点只存 key，同样大小的页能容纳更多 key，树更矮，磁盘 IO 更少；且叶子节点用双向链表串起来，天然支持范围查询。 相比哈希：哈希不支持范围、排序，且哈希冲突。 相比红黑树：红黑树是二叉的，高度大，磁盘 IO 次数多。  Q2：聚簇索引和二级索引？回表是什么？ InnoDB 主键索引是聚簇索引，叶子节点直接存整行数据；二级索引叶子存的是主键值。用二级索引查非索引列时需要先拿到主键再回主键索引查——这就是...</div></div></div></a><a class="pagination-related" href="/2026/06/13/mysql-index-transaction/" title="MySQL 索引与事务详解（面试跳槽篇）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">MySQL 索引与事务详解（面试跳槽篇）</div></div><div class="info-2"><div class="info-item-1">MySQL 索引与事务详解（面试跳槽篇） 本文涵盖了 MySQL 面试中最高频的索引、事务、锁、日志、主从架构等核心知识点，结合大量 SQL 示例和原理图解，帮你从容应对面试。   一、索引1.1 索引数据结构选型MySQL InnoDB 选择 B+Tree 作为索引的底层数据结构。为什么不是其他结构？    数据结构 特点 为什么不选    二叉查找树 每个节点最多两个子节点 极端情况下退化为链表，树高太大   红黑树 自平衡二叉树 数据量大时树高依然很高（百万数据树高约 20）   B-Tree 多路平衡查找树，每个节点存数据 查询不稳定，范围查询需中序遍历   B+Tree 非叶子节点只存索引，叶子节点存数据且双向链表连接 ✅ 查询稳定、范围查询高效、磁盘 I&#x2F;O 少   B+Tree 的核心优势：  查询稳定：所有数据都在叶子节点，查询任何数据都走相同 I&#x2F;O 次数 范围查询高效：叶子节点用双向链表连接，直接遍历即可 磁盘 I&#x2F;O 少：非叶子节点只存索引（不存数据），能容纳更多 key，树高更矮 排序友好：叶子节点天然有序  1.2 B+Tr...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">797</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">893</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">241</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%AE%9E%E6%88%98%E3%80%91%E7%B4%A2%E5%BC%95%E6%9D%A1%E4%BB%B6%E4%B8%8B%E6%8E%A8%EF%BC%88ICP%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 实战】索引条件下推（ICP）深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%9E%E6%87%82%EF%BC%9A%E5%9B%9E%E8%A1%A8%E5%88%B0%E5%BA%95%E8%B4%B5%E5%9C%A8%E5%93%AA"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搞懂：回表到底贵在哪</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%B2%A1%E6%9C%89-ICP-%E7%9A%84%E6%97%B6%E4%BB%A3%EF%BC%9AServer-%E5%B1%82%E5%81%9A%E8%BF%87%E6%BB%A4"><span class="toc-number">1.3.</span> <span class="toc-text">二、没有 ICP 的时代：Server 层做过滤</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81ICP-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%80%9D%E6%83%B3%EF%BC%9A%E6%8A%8A%E8%BF%87%E6%BB%A4%E4%B8%8B%E6%8E%A8%E5%88%B0%E5%BC%95%E6%93%8E%E5%B1%82"><span class="toc-number">1.4.</span> <span class="toc-text">三、ICP 的核心思想：把过滤下推到引擎层</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%8A%A8%E6%89%8B%E9%AA%8C%E8%AF%81%EF%BC%9AEXPLAIN-%E8%AE%A1%E6%95%B0%E5%99%A8"><span class="toc-number">1.5.</span> <span class="toc-text">四、动手验证：EXPLAIN + 计数器</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E7%9C%8B-Extra"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 看 Extra</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E7%9C%8B%E7%9C%9F%E5%AE%9E%E7%9A%84%E5%9B%9E%E8%A1%A8%E6%AC%A1%E6%95%B0"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 看真实的回表次数</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81ICP-%E7%9A%84%E7%94%9F%E6%95%88%E6%9D%A1%E4%BB%B6%EF%BC%88%E9%87%8D%E7%82%B9%EF%BC%8C%E5%AE%B9%E6%98%93%E8%B8%A9%E5%9D%91%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、ICP 的生效条件（重点，容易踩坑）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%BF%85%E9%A1%BB%E8%B5%B0%E3%80%8C%E4%BA%8C%E7%BA%A7%E7%B4%A2%E5%BC%95%E7%9A%84%E8%8C%83%E5%9B%B4-%E7%AD%89%E5%80%BC%E6%89%AB%E6%8F%8F%E3%80%8D"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 必须走「二级索引的范围&#x2F;等值扫描」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E6%9D%A1%E4%BB%B6%E6%B6%89%E5%8F%8A%E7%9A%84%E5%88%97%E5%BF%85%E9%A1%BB%E5%9C%A8%E7%B4%A2%E5%BC%95%E9%87%8C"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 条件涉及的列必须在索引里</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E4%B8%8D%E8%83%BD%E7%94%A8%E3%80%8C%E7%B4%A2%E5%BC%95%E6%97%A0%E6%B3%95%E5%A4%84%E7%90%86%E7%9A%84%E6%93%8D%E4%BD%9C%E3%80%8D"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 不能用「索引无法处理的操作」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E5%89%8D%E7%BC%80%E7%B4%A2%E5%BC%95%E7%9A%84%E4%BE%8B%E5%A4%96"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 前缀索引的例外</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-5-%E4%B8%BB%E9%94%AE%E4%B8%8A%E7%9A%84%E6%9D%A1%E4%BB%B6%E4%B8%8D%E4%B8%8B%E6%8E%A8"><span class="toc-number">1.6.5.</span> <span class="toc-text">5.5 主键上的条件不下推</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-6-LIKE-xxx-%E8%83%BD%E4%B8%8D%E8%83%BD%E4%B8%8B%E6%8E%A8%EF%BC%9F"><span class="toc-number">1.6.6.</span> <span class="toc-text">5.6 LIKE &#39;%xxx%&#39; 能不能下推？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E7%BB%8F%E5%85%B8%E7%BB%84%E5%90%88%EF%BC%9AICP-%E8%A6%86%E7%9B%96%E7%B4%A2%E5%BC%95"><span class="toc-number">1.7.</span> <span class="toc-text">六、经典组合：ICP + 覆盖索引</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%94%9F%E4%BA%A7%E8%B8%A9%E5%9D%91%E5%AE%9E%E5%BD%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、生产踩坑实录</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-1%EF%BC%9A%E4%BB%A5%E4%B8%BA-rows-%E5%8F%98%E5%B0%8F%E4%BA%86%E5%B0%B1%E4%BB%A3%E8%A1%A8-ICP-%E7%94%9F%E6%95%88"><span class="toc-number">1.8.1.</span> <span class="toc-text">坑 1：以为 rows 变小了就代表 ICP 生效</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-2%EF%BC%9A%E8%81%94%E5%90%88%E7%B4%A2%E5%BC%95%E9%A1%BA%E5%BA%8F%E8%AE%BE%E8%AE%A1%E9%94%99%E8%AF%AF%EF%BC%8C%E5%AF%BC%E8%87%B4-ICP-%E6%97%A0%E4%BB%8E%E4%B8%8B%E6%8E%A8"><span class="toc-number">1.8.2.</span> <span class="toc-text">坑 2：联合索引顺序设计错误，导致 ICP 无从下推</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-3%EF%BC%9AOR-%E6%9D%A1%E4%BB%B6%E6%89%93%E6%96%AD-ICP"><span class="toc-number">1.8.3.</span> <span class="toc-text">坑 3：OR 条件打断 ICP</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-4%EF%BC%9A%E5%AD%97%E7%AC%A6%E9%9B%86-%E6%8E%92%E5%BA%8F%E8%A7%84%E5%88%99%E4%B8%8D%E4%B8%80%E8%87%B4%E5%AF%BC%E8%87%B4%E9%9A%90%E5%BC%8F%E8%BD%AC%E6%8D%A2"><span class="toc-number">1.8.4.</span> <span class="toc-text">坑 4：字符集&#x2F;排序规则不一致导致隐式转换</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-5%EF%BC%9AICP-%E8%AE%A9-ORDER-BY-%E7%9A%84-Using-filesort-%E6%9B%B4%E6%98%8E%E6%98%BE"><span class="toc-number">1.8.5.</span> <span class="toc-text">坑 5：ICP 让 ORDER BY 的 Using filesort 更明显</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-6%EF%BC%9A8-0-%E7%9A%84%E3%80%8CICP-%E7%B4%A2%E5%BC%95%E8%B7%B3%E8%B7%83%E6%89%AB%E6%8F%8F%E3%80%8D%E4%B8%8D%E6%98%AF%E4%B8%80%E5%9B%9E%E4%BA%8B"><span class="toc-number">1.8.6.</span> <span class="toc-text">坑 6：8.0 的「ICP + 索引跳跃扫描」不是一回事</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E4%B8%80%E5%BC%A0%E5%9B%BE%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、一张图总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/20/multi-agent-collaboration-deep-dive/" title="【AI Agent】多智能体协作深度解析：角色分工、通信协议与冲突消解">【AI Agent】多智能体协作深度解析：角色分工、通信协议与冲突消解</a><time datetime="2026-10-20T00:40:00.000Z" title="发表于 2026-10-20 08:40:00">2026-10-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/20/java-llm-prompt-injection-defense-deep-practice/" title="【Java AI】Prompt 注入与越权防御深度实战：输入隔离、输出护栏与工具权限校验">【Java AI】Prompt 注入与越权防御深度实战：输入隔离、输出护栏与工具权限校验</a><time datetime="2026-10-20T00:30:00.000Z" title="发表于 2026-10-20 08:30:00">2026-10-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/20/jvm-escape-analysis-scalar-replacement-deep-dive/" title="【JVM 底层】逃逸分析与标量替换深度解析：对象真的都分配在堆上吗？">【JVM 底层】逃逸分析与标量替换深度解析：对象真的都分配在堆上吗？</a><time datetime="2026-10-20T00:20:00.000Z" title="发表于 2026-10-20 08:20:00">2026-10-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/20/mysql-index-condition-pushdown-deep-dive/" title="【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理">【MySQL 实战】索引条件下推（ICP）深度解析：回表次数从 10 万降到 100 的底层原理</a><time datetime="2026-10-20T00:10:00.000Z" title="发表于 2026-10-20 08:10:00">2026-10-20</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/20/java-foreign-function-memory-api-deep-dive/" title="【Java 22+】外部函数与内存 API（FFM/Panama）深度解析：从 JNI 之痛到零拷贝调用 C">【Java 22+】外部函数与内存 API（FFM/Panama）深度解析：从 JNI 之痛到零拷贝调用 C</a><time datetime="2026-10-20T00:00:00.000Z" title="发表于 2026-10-20 08:00:00">2026-10-20</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
