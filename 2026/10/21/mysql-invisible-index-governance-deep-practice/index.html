@@ -1,0 +1,404 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战前言「索引加得越多，查询越快」——这是我在面试里最常听到、也最想纠正的一句话。 索引不是免费的。每一个二级索引在写入路径上都要付出代价：  INSERT：每多一个索引，就多一次 B+ 树定位插入，多一份 redo&#x2F;undo； UPDATE：只要被索引的列发生变化，就要删除旧记录 + 插入新记录（delete-m">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/21/mysql-invisible-index-governance-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战前言「索引加得越多，查询越快」——这是我在面试里最常听到、也最想纠正的一句话。 索引不是免费的。每一个二级索引在写入路径上都要付出代价：  INSERT：每多一个索引，就多一次 B+ 树定位插入，多一份 redo&#x2F;undo； UPDATE：只要被索引的列发生变化，就要删除旧记录 + 插入新记录（delete-m">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-21T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-21T00:01:21.377Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="索引">
+<meta property="article:tag" content="运维">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证",
+  "url": "https://jiweidong.github.io/2026/10/21/mysql-invisible-index-governance-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-21T00:00:00.000Z",
+  "dateModified": "2026-10-21T00:01:21.377Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/21/mysql-invisible-index-governance-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">802</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">898</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-21T00:00:00.000Z" title="发表于 2026-10-21 08:00:00">2026-10-21</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-21T00:01:21.377Z" title="更新于 2026-10-21 08:01:21">2026-10-21</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-运维】不可见索引（Invisible-Index）与索引治理实战"><a href="#【MySQL-运维】不可见索引（Invisible-Index）与索引治理实战" class="headerlink" title="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战"></a>【MySQL 运维】不可见索引（Invisible Index）与索引治理实战</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>「索引加得越多，查询越快」——这是我在面试里最常听到、也最想纠正的一句话。</p>
+<p>索引不是免费的。每一个二级索引在写入路径上都要付出代价：</p>
+<ul>
+<li><strong>INSERT</strong>：每多一个索引，就多一次 B+ 树定位插入，多一份 redo&#x2F;undo；</li>
+<li><strong>UPDATE</strong>：只要被索引的列发生变化，就要删除旧记录 + 插入新记录（<strong>delete-mark + insert</strong>），而不是原地更新；</li>
+<li><strong>DELETE</strong>：所有索引都要打删除标记；</li>
+<li><strong>优化器</strong>：候选索引越多，<code>range</code> 评估的组合越多，执行计划越容易走偏；</li>
+<li><strong>存储</strong>：一个千万级表的二级索引，随随便便几十 GB。</li>
+</ul>
+<p>一个跑了三五年的业务库，<code>SHOW INDEX</code> 出来十几二十个索引是常态，其中至少三分之一是历史遗留：早期为了某个报表加的、某次慢查询临时加的、开发觉得「加了总没坏处」加的。问题是——<strong>你敢直接 <code>DROP INDEX</code> 吗？</strong></p>
+<p>不敢。因为线上没人能保证这个索引真的没人用。白天不敢动，晚上动了出问题没人背。于是索引越堆越多，写入越来越慢，形成死循环。</p>
+<p>MySQL 8.0 给的答案叫 <strong>不可见索引（Invisible Index）</strong>：先把索引「逻辑下线」，让优化器看不见它，但数据结构和写入成本还在；观察足够长时间确认无影响，再物理删除。这一篇就把这个能力讲透，并给出一套可落地的<strong>索引治理流水线</strong>（发现 → 评估 → 灰度 → 验证 → 清理），最后用 Java 写一个自动巡检任务。</p>
+<hr>
+<h2 id="一、不可见索引到底是什么"><a href="#一、不可见索引到底是什么" class="headerlink" title="一、不可见索引到底是什么"></a>一、不可见索引到底是什么</h2><p>MySQL 8.0.0 引入 <code>ALTER TABLE ... ALTER INDEX ... [VISIBLE | INVISIBLE]</code>。</p>
+<p>核心语义只有一句话：</p>
+<blockquote>
+<p><strong>不可见索引仍然存在、仍然维护、仍然消耗写入成本，但优化器在生成执行计划时默认不考虑它。</strong></p>
+</blockquote>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 创建时就设为不可见</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> t_order <span class="keyword">ADD</span> INDEX idx_user_ctime (user_id, create_time) INVISIBLE;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 已存在的索引切成不可见</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> t_order <span class="keyword">ALTER</span> INDEX idx_user_ctime INVISIBLE;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 再切回来</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> t_order <span class="keyword">ALTER</span> INDEX idx_user_ctime VISIBLE;</span><br></pre></td></tr></table></figure>
+
+<p>查看可见性：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, IS_VISIBLE</span><br><span class="line"><span class="keyword">FROM</span> information_schema.statistics</span><br><span class="line"><span class="keyword">WHERE</span> table_schema <span class="operator">=</span> <span class="string">&#x27;shop&#x27;</span> <span class="keyword">AND</span> table_name <span class="operator">=</span> <span class="string">&#x27;t_order&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p><code>IS_VISIBLE = NO</code> 就是不可见。</p>
+<h3 id="关键点：它和「删掉索引」的差别"><a href="#关键点：它和「删掉索引」的差别" class="headerlink" title="关键点：它和「删掉索引」的差别"></a>关键点：它和「删掉索引」的差别</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>设为 INVISIBLE</th>
+<th>DROP INDEX</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>优化器是否使用</td>
+<td>否（默认）</td>
+<td>否</td>
+</tr>
+<tr>
+<td>是否仍占磁盘</td>
+<td><strong>是</strong></td>
+<td>否</td>
+</tr>
+<tr>
+<td>是否仍有写入成本</td>
+<td><strong>是</strong></td>
+<td>否</td>
+</tr>
+<tr>
+<td>回滚成本</td>
+<td><code>ALTER INDEX ... VISIBLE</code>，秒级元数据操作</td>
+<td>需要重建索引，大表几十分钟到几小时</td>
+</tr>
+<tr>
+<td>是否影响唯一性约束</td>
+<td>仍然生效</td>
+<td>约束消失</td>
+</tr>
+<tr>
+<td>是否影响外键</td>
+<td>仍然生效</td>
+<td>可能报错</td>
+</tr>
+</tbody></table>
+<p>所以 <strong>INVISIBLE 是「灰度下线」工具，不是「优化手段」</strong>。它的价值在于把「删索引」这个高风险动作拆成两步：先让它不参与执行计划，观察一周到一个月；确认没有慢查询、没有业务报警，再真正 <code>DROP</code>。</p>
+<blockquote>
+<p>面试里如果被问「不可见索引能提升性能吗」，正确回答是：<strong>不能</strong>。它不减少写入成本，只降低变更风险。真正提升性能的是删除冗余索引。</p>
+</blockquote>
+<hr>
+<h2 id="二、优化器是怎么「看不见」它的"><a href="#二、优化器是怎么「看不见」它的" class="headerlink" title="二、优化器是怎么「看不见」它的"></a>二、优化器是怎么「看不见」它的</h2><p>MySQL 8.0 的索引元数据存放在 <code>dd</code>（Data Dictionary）表空间的 <code>indexes</code> 私有表中，其中有一个 <code>is_visible</code> 字段。server 层在打开表时（<code>open_table</code> → <code>open_table_def</code>）会把索引的可见性加载到 <code>TABLE_SHARE</code> 的 <code>KEY</code> 结构里。</p>
+<p>优化器在 <code>JOIN::optimize</code> 阶段构造候选索引时，会跳过 <code>key_is_visible() == false</code> 的索引；<code>test_quick_select</code> 里的 range 分析同样过滤。</p>
+<p>有两个例外必须记住：</p>
+<ol>
+<li><strong>唯一约束仍然生效</strong>。哪怕索引不可见，插入重复值依然报 <code>Duplicate entry</code>。因为唯一性检查走的是存储引擎层的索引，不经过优化器。</li>
+<li><strong>可以被强制使用</strong>。会话级参数 <code>use_invisible_indexes</code> 打开后，优化器会把不可见索引当成正常索引：</li>
+</ol>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> SESSION optimizer_switch <span class="operator">=</span> <span class="string">&#x27;use_invisible_indexes=on&#x27;</span>;</span><br><span class="line"><span class="comment">-- 或者</span></span><br><span class="line"><span class="keyword">SET</span> SESSION use_invisible_indexes <span class="operator">=</span> <span class="keyword">ON</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这个开关非常有用：<strong>灰度期间如果发现某条 SQL 变慢，不用改 DDL，只要在这个会话里打开开关就能恢复原执行计划</strong>，用来做 A&#x2F;B 对比极其方便。</p>
+<p>还有一个坑：<code>FORCE INDEX (idx_xxx)</code> 指定了不可见索引时，MySQL 8.0 会直接报错：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">ERROR 1176 (42000): Key &#x27;idx_user_ctime&#x27; doesn&#x27;t exist in table &#x27;t_order&#x27;</span><br></pre></td></tr></table></figure>
+
+<p>报错信息说「不存在」，其实是「不可见」。这点在排查时容易误导人，尤其是在 MyBatis-Plus 的 <code>@TableIndex</code> 或者手写 <code>FORCE INDEX</code> 的项目里。</p>
+<hr>
+<h2 id="三、索引治理流水线：从「不敢删」到「敢删」"><a href="#三、索引治理流水线：从「不敢删」到「敢删」" class="headerlink" title="三、索引治理流水线：从「不敢删」到「敢删」"></a>三、索引治理流水线：从「不敢删」到「敢删」</h2><p>我把这套流程固化成 5 步，团队里跑了两年，清理掉了一个 2.3 亿行订单表的 7 个冗余索引，写入 TPS 提升约 18%。</p>
+<h3 id="Step-1：发现——三类候选索引"><a href="#Step-1：发现——三类候选索引" class="headerlink" title="Step 1：发现——三类候选索引"></a>Step 1：发现——三类候选索引</h3><p><strong>（1）从未被使用的索引</strong></p>
+<p><code>performance_schema.table_io_waits_summary_by_index_usage</code> 记录了每个索引的读次数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> OBJECT_SCHEMA, OBJECT_NAME, INDEX_NAME, COUNT_STAR</span><br><span class="line"><span class="keyword">FROM</span> performance_schema.table_io_waits_summary_by_index_usage</span><br><span class="line"><span class="keyword">WHERE</span> OBJECT_SCHEMA <span class="keyword">NOT</span> <span class="keyword">IN</span> (<span class="string">&#x27;mysql&#x27;</span>,<span class="string">&#x27;sys&#x27;</span>,<span class="string">&#x27;information_schema&#x27;</span>,<span class="string">&#x27;performance_schema&#x27;</span>)</span><br><span class="line">  <span class="keyword">AND</span> INDEX_NAME <span class="keyword">IS</span> <span class="keyword">NOT NULL</span></span><br><span class="line">  <span class="keyword">AND</span> INDEX_NAME <span class="operator">&lt;&gt;</span> <span class="string">&#x27;PRIMARY&#x27;</span></span><br><span class="line">  <span class="keyword">AND</span> COUNT_STAR <span class="operator">=</span> <span class="number">0</span></span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> OBJECT_SCHEMA, OBJECT_NAME;</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ 三个前置条件，缺一不可：</p>
+<ul>
+<li><code>performance_schema</code> 必须开启（<code>performance_schema=ON</code>），且 <code>performance_schema_max_table_instances</code> 不能太小，否则表被淘汰统计会失真；</li>
+<li>统计是<strong>自实例启动以来</strong>的累计值，刚重启过的库不要信；</li>
+<li>统计从 <code>setup_instruments</code> 里对应 instrument 打开之后才开始算。默认 <code>wait/io/table/sql/handler</code> 是开的，但如果你手动关过，数据就是假的。</li>
+</ul>
+<p><strong>（2）冗余索引</strong>（MySQL 8.0 的 <code>sys</code> 库直接给视图）</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> sys.schema_redundant_indexes;</span><br></pre></td></tr></table></figure>
+
+<p>判定逻辑是「前缀覆盖」：</p>
+<ul>
+<li><code>idx_a (a)</code> 与 <code>idx_ab (a, b)</code> → 前者冗余（<code>a</code> 是后者的最左前缀）；</li>
+<li><code>idx_a (a)</code> 与 <code>idx_a_id (a, id)</code> → 前者冗余（二级索引天然带主键）；</li>
+<li><code>idx_ab (a, b)</code> 与 <code>idx_ba (b, a)</code> → <strong>不冗余</strong>，是两棵不同的树；</li>
+<li><code>UNIQUE (a)</code> 与 <code>INDEX (a)</code> → 前者不能删（约束），后者冗余。</li>
+</ul>
+<p><code>sys.schema_redundant_indexes</code> 只做静态结构分析，<strong>不看你实际查询</strong>，所以它给出的是「候选」，不是「结论」。一个被标为冗余的索引，可能因为选择性更好而被优化器优先选择——删之前必须看 <code>EXPLAIN</code>。</p>
+<p><strong>（3）低选择性索引</strong></p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> TABLE_NAME, INDEX_NAME, COLUMN_NAME, <span class="keyword">CARDINALITY</span>,</span><br><span class="line">       (<span class="keyword">SELECT</span> TABLE_ROWS <span class="keyword">FROM</span> information_schema.tables t</span><br><span class="line">        <span class="keyword">WHERE</span> t.TABLE_SCHEMA <span class="operator">=</span> s.TABLE_SCHEMA <span class="keyword">AND</span> t.TABLE_NAME <span class="operator">=</span> s.TABLE_NAME) <span class="keyword">AS</span> table_rows,</span><br><span class="line">       ROUND(<span class="keyword">CARDINALITY</span> <span class="operator">/</span> <span class="built_in">NULLIF</span>((<span class="keyword">SELECT</span> TABLE_ROWS <span class="keyword">FROM</span> information_schema.tables t</span><br><span class="line">        <span class="keyword">WHERE</span> t.TABLE_SCHEMA <span class="operator">=</span> s.TABLE_SCHEMA <span class="keyword">AND</span> t.TABLE_NAME <span class="operator">=</span> s.TABLE_NAME), <span class="number">0</span>), <span class="number">6</span>) <span class="keyword">AS</span> selectivity</span><br><span class="line"><span class="keyword">FROM</span> information_schema.statistics s</span><br><span class="line"><span class="keyword">WHERE</span> TABLE_SCHEMA <span class="operator">=</span> <span class="string">&#x27;shop&#x27;</span> <span class="keyword">AND</span> TABLE_NAME <span class="operator">=</span> <span class="string">&#x27;t_order&#x27;</span></span><br><span class="line">  <span class="keyword">AND</span> SEQ_IN_INDEX <span class="operator">=</span> <span class="number">1</span>;</span><br></pre></td></tr></table></figure>
+
+<p>选择性低于 0.001（比如性别、状态位这种只有几个值的列）基本可以判死刑。注意 <code>CARDINALITY</code> 是<strong>采样估算值</strong>，InnoDB 的采样页数是 <code>innodb_stats_persistent_sample_pages</code>（默认 20），大表上偏差可能很大，必要时 <code>ANALYZE TABLE</code> 后再看。</p>
+<h3 id="Step-2：评估——三个必须回答的问题"><a href="#Step-2：评估——三个必须回答的问题" class="headerlink" title="Step 2：评估——三个必须回答的问题"></a>Step 2：评估——三个必须回答的问题</h3><ol>
+<li><strong>这条 SQL 走这个索引，性能差多少？</strong> 用 <code>EXPLAIN ANALYZE</code>（8.0.18+）看实际耗时，而不是只看 <code>type</code>：<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN ANALYZE <span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> t_order <span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">10086</span> <span class="keyword">ORDER</span> <span class="keyword">BY</span> create_time <span class="keyword">DESC</span> LIMIT <span class="number">20</span>;</span><br></pre></td></tr></table></figure></li>
+<li><strong>有没有 <code>FORCE INDEX</code> &#x2F; <code>USE INDEX</code> 引用它？</strong> 全库 grep 代码和 SQL 文件：<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">grep -rniE <span class="string">&quot;(force|use|ignore)\s+index\s*\(\s*idx_user_ctime&quot;</span> --include=<span class="string">&quot;*.xml&quot;</span> --include=<span class="string">&quot;*.java&quot;</span> --include=<span class="string">&quot;*.sql&quot;</span> .</span><br></pre></td></tr></table></figure></li>
+<li><strong>是不是唯一索引 &#x2F; 外键依赖 &#x2F; 覆盖索引？</strong> 这三个任一命中，直接排除，不做下线。</li>
+</ol>
+<h3 id="Step-3：灰度——先-INVISIBLE，观察一个完整业务周期"><a href="#Step-3：灰度——先-INVISIBLE，观察一个完整业务周期" class="headerlink" title="Step 3：灰度——先 INVISIBLE，观察一个完整业务周期"></a>Step 3：灰度——先 INVISIBLE，观察一个完整业务周期</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 建议在低峰期执行，8.0 的 ALTER INDEX VISIBLE/INVISIBLE 是 INPLACE + instant 级别，几乎瞬间完成</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> t_order <span class="keyword">ALTER</span> INDEX idx_user_ctime INVISIBLE;</span><br></pre></td></tr></table></figure>
+
+<p>观察期建议 <strong>≥ 2 周</strong>，且必须覆盖：</p>
+<ul>
+<li>一个完整的大促&#x2F;月末结算周期（业务 SQL 形态最全）；</li>
+<li>至少一次发版（新代码可能引入新查询）；</li>
+<li>一次主从切换或备份窗口（备份 SQL 也可能用到索引）。</li>
+</ul>
+<p>观察期内盯三个指标：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>采集方式</th>
+<th>报警阈值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>慢查询数量</td>
+<td><code>slow_query_log</code> + <code>pt-query-digest</code></td>
+<td>相对基线 +30%</td>
+</tr>
+<tr>
+<td>该表平均响应时间</td>
+<td>APM &#x2F; <code>performance_schema.events_statements_summary_by_digest</code></td>
+<td>P99 +20%</td>
+</tr>
+<tr>
+<td>InnoDB 行锁等待</td>
+<td><code>information_schema.innodb_trx</code> + <code>INNODB_LOCK_WAITS</code></td>
+<td>出现 &gt; 1s 等待</td>
+</tr>
+<tr>
+<td>全表扫描次数</td>
+<td><code>sys.statements_with_full_table_scans</code></td>
+<td>涉及该表的新增条目</td>
+</tr>
+</tbody></table>
+<h3 id="Step-4：验证——SQL-回归-执行计划对比"><a href="#Step-4：验证——SQL-回归-执行计划对比" class="headerlink" title="Step 4：验证——SQL 回归 + 执行计划对比"></a>Step 4：验证——SQL 回归 + 执行计划对比</h3><p>这一步是很多团队漏掉的。做法是：把该表相关的 Top 50 SQL 抓出来，在 shadow 库上做「可见 vs 不可见」两轮 <code>EXPLAIN ANALYZE</code>，输出对比报告。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 会话级强制使用不可见索引，做对照</span></span><br><span class="line"><span class="keyword">SET</span> SESSION use_invisible_indexes <span class="operator">=</span> <span class="keyword">ON</span>;</span><br><span class="line">EXPLAIN ANALYZE <span class="keyword">SELECT</span> ...;</span><br><span class="line"><span class="keyword">SET</span> SESSION use_invisible_indexes <span class="operator">=</span> OFF;</span><br><span class="line">EXPLAIN ANALYZE <span class="keyword">SELECT</span> ...;</span><br></pre></td></tr></table></figure>
+
+<p>如果两轮的实际耗时差异在 10% 以内，或者「不可见」这轮仍然走其他索引且不慢，就可以进入删除。</p>
+<h3 id="Step-5：清理——DROP，但留好回滚脚本"><a href="#Step-5：清理——DROP，但留好回滚脚本" class="headerlink" title="Step 5：清理——DROP，但留好回滚脚本"></a>Step 5：清理——DROP，但留好回滚脚本</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 删除前先记录索引定义，出问题能 30 秒重建</span></span><br><span class="line"><span class="keyword">SHOW</span> <span class="keyword">CREATE TABLE</span> t_order\G</span><br><span class="line"><span class="comment">-- 然后</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> t_order <span class="keyword">DROP</span> INDEX idx_user_ctime, ALGORITHM<span class="operator">=</span>INPLACE, LOCK<span class="operator">=</span><span class="keyword">NONE</span>;</span><br></pre></td></tr></table></figure>
+
+<p>大表上 <code>DROP INDEX</code> 在 8.0 是 INPLACE 的，但仍需重建 secondary index 的元数据，且会短暂持有 MDL。务必带上 <code>LOCK=NONE</code> 让它在拿不到锁时快速失败，而不是排队把整张表堵死（这一点和 MDL 雪崩是同源问题）。</p>
+<hr>
+<h2 id="四、Java-侧：写一个索引治理巡检任务"><a href="#四、Java-侧：写一个索引治理巡检任务" class="headerlink" title="四、Java 侧：写一个索引治理巡检任务"></a>四、Java 侧：写一个索引治理巡检任务</h2><p>治理不能靠人肉。下面这个 Spring Boot 定时任务每天凌晨跑一次，输出「疑似冗余 &#x2F; 从未使用 &#x2F; 低选择性」三类报告，推送到群里。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="meta">@RequiredArgsConstructor</span></span><br><span class="line"><span class="meta">@Slf4j</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">IndexGovernanceInspector</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> JdbcTemplate jdbcTemplate;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> AlertNotifier notifier;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 每天 03:10 执行，避开备份窗口 */</span></span><br><span class="line">    <span class="meta">@Scheduled(cron = &quot;0 10 3 * * ?&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">inspect</span><span class="params">()</span> &#123;</span><br><span class="line">        List&lt;IndexIssue&gt; issues = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line">        issues.addAll(findUnusedIndexes());</span><br><span class="line">        issues.addAll(findRedundantIndexes());</span><br><span class="line">        issues.addAll(findLowSelectivityIndexes());</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (issues.isEmpty()) &#123;</span><br><span class="line">            log.info(<span class="string">&quot;[index-governance] 本次巡检未发现可疑索引&quot;</span>);</span><br><span class="line">            <span class="keyword">return</span>;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="type">String</span> <span class="variable">report</span> <span class="operator">=</span> issues.stream()</span><br><span class="line">                .map(IndexIssue::format)</span><br><span class="line">                .collect(Collectors.joining(<span class="string">&quot;\n&quot;</span>));</span><br><span class="line">        log.warn(<span class="string">&quot;[index-governance] 发现 &#123;&#125; 个可疑索引:\n&#123;&#125;&quot;</span>, issues.size(), report);</span><br><span class="line">        notifier.send(<span class="string">&quot;MySQL 索引治理巡检&quot;</span>, report);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> List&lt;IndexIssue&gt; <span class="title function_">findUnusedIndexes</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">sql</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">            SELECT OBJECT_SCHEMA AS db, OBJECT_NAME AS tbl, INDEX_NAME AS idx</span></span><br><span class="line"><span class="string">            FROM performance_schema.table_io_waits_summary_by_index_usage</span></span><br><span class="line"><span class="string">            WHERE OBJECT_SCHEMA NOT IN (&#x27;mysql&#x27;,&#x27;sys&#x27;,&#x27;information_schema&#x27;,&#x27;performance_schema&#x27;)</span></span><br><span class="line"><span class="string">              AND INDEX_NAME IS NOT NULL</span></span><br><span class="line"><span class="string">              AND INDEX_NAME &lt;&gt; &#x27;PRIMARY&#x27;</span></span><br><span class="line"><span class="string">              AND COUNT_STAR = 0</span></span><br><span class="line"><span class="string">            &quot;&quot;&quot;</span>;</span><br><span class="line">        <span class="keyword">return</span> jdbcTemplate.query(sql, (rs, i) -&gt; <span class="keyword">new</span> <span class="title class_">IndexIssue</span>(</span><br><span class="line">                rs.getString(<span class="string">&quot;db&quot;</span>), rs.getString(<span class="string">&quot;tbl&quot;</span>), rs.getString(<span class="string">&quot;idx&quot;</span>),</span><br><span class="line">                <span class="string">&quot;UNUSED&quot;</span>, <span class="string">&quot;自实例启动以来读次数为 0&quot;</span>));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> List&lt;IndexIssue&gt; <span class="title function_">findRedundantIndexes</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">sql</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">            SELECT table_schema AS db, table_name AS tbl,</span></span><br><span class="line"><span class="string">                   redundant_index_name AS idx, dominant_index_name AS covered_by</span></span><br><span class="line"><span class="string">            FROM sys.schema_redundant_indexes</span></span><br><span class="line"><span class="string">            &quot;&quot;&quot;</span>;</span><br><span class="line">        <span class="keyword">return</span> jdbcTemplate.query(sql, (rs, i) -&gt; <span class="keyword">new</span> <span class="title class_">IndexIssue</span>(</span><br><span class="line">                rs.getString(<span class="string">&quot;db&quot;</span>), rs.getString(<span class="string">&quot;tbl&quot;</span>), rs.getString(<span class="string">&quot;idx&quot;</span>),</span><br><span class="line">                <span class="string">&quot;REDUNDANT&quot;</span>, <span class="string">&quot;被 &quot;</span> + rs.getString(<span class="string">&quot;covered_by&quot;</span>) + <span class="string">&quot; 前缀覆盖&quot;</span>));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> List&lt;IndexIssue&gt; <span class="title function_">findLowSelectivityIndexes</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">sql</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">            SELECT s.TABLE_SCHEMA AS db, s.TABLE_NAME AS tbl, s.INDEX_NAME AS idx,</span></span><br><span class="line"><span class="string">                   s.CARDINALITY AS card, t.TABLE_ROWS AS rows_cnt</span></span><br><span class="line"><span class="string">            FROM information_schema.statistics s</span></span><br><span class="line"><span class="string">            JOIN information_schema.tables t</span></span><br><span class="line"><span class="string">              ON t.TABLE_SCHEMA = s.TABLE_SCHEMA AND t.TABLE_NAME = s.TABLE_NAME</span></span><br><span class="line"><span class="string">            WHERE s.SEQ_IN_INDEX = 1</span></span><br><span class="line"><span class="string">              AND s.TABLE_SCHEMA NOT IN (&#x27;mysql&#x27;,&#x27;sys&#x27;,&#x27;information_schema&#x27;,&#x27;performance_schema&#x27;)</span></span><br><span class="line"><span class="string">              AND t.TABLE_ROWS &gt; 100000</span></span><br><span class="line"><span class="string">              AND s.CARDINALITY / NULLIF(t.TABLE_ROWS, 0) &lt; 0.001</span></span><br><span class="line"><span class="string">            &quot;&quot;&quot;</span>;</span><br><span class="line">        <span class="keyword">return</span> jdbcTemplate.query(sql, (rs, i) -&gt; <span class="keyword">new</span> <span class="title class_">IndexIssue</span>(</span><br><span class="line">                rs.getString(<span class="string">&quot;db&quot;</span>), rs.getString(<span class="string">&quot;tbl&quot;</span>), rs.getString(<span class="string">&quot;idx&quot;</span>),</span><br><span class="line">                <span class="string">&quot;LOW_SELECTIVITY&quot;</span>,</span><br><span class="line">                <span class="string">&quot;选择性 &quot;</span> + String.format(<span class="string">&quot;%.5f&quot;</span>, rs.getDouble(<span class="string">&quot;card&quot;</span>) / rs.getLong(<span class="string">&quot;rows_cnt&quot;</span>))</span><br><span class="line">                        + <span class="string">&quot;，表行数 &quot;</span> + rs.getLong(<span class="string">&quot;rows_cnt&quot;</span>)));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">IndexIssue</span><span class="params">(String db, String table, String index, String type, String reason)</span> &#123;</span><br><span class="line">        String <span class="title function_">format</span><span class="params">()</span> &#123;</span><br><span class="line">            <span class="keyword">return</span> <span class="string">&quot;• [%s] %s.%s.%s — %s&quot;</span>.formatted(type, db, table, index, reason);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>配套的 Flyway 迁移脚本模板（保留可回滚性）：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- V20261021_01__mark_idx_user_ctime_invisible.sql</span></span><br><span class="line"><span class="comment">-- 灰度下线：先不可见，观察 14 天</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> t_order <span class="keyword">ALTER</span> INDEX idx_user_ctime INVISIBLE;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- V20261021_02__drop_idx_user_ctime.sql（观察期结束后再执行）</span></span><br><span class="line"><span class="comment">-- ALTER TABLE t_order DROP INDEX idx_user_ctime, ALGORITHM=INPLACE, LOCK=NONE;</span></span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>用 Flyway&#x2F;Liquibase 管索引变更，比手工执行强的地方在于：<strong>变更有版本、有审计、能回滚、能在预发先跑一遍</strong>。生产环境的 DDL 一定要走这条路径。</p>
+</blockquote>
+<hr>
+<h2 id="五、五个真实踩过的坑"><a href="#五、五个真实踩过的坑" class="headerlink" title="五、五个真实踩过的坑"></a>五、五个真实踩过的坑</h2><p><strong>坑 1：以为不可见 &#x3D; 不占资源。</strong><br>一个同事把 5 个索引设成 INVISIBLE，然后说「写入应该快了吧」，结果 TPS 一点没变。因为写入路径完全没变。<strong>INVISIBLE 只影响优化器。</strong></p>
+<p><strong>坑 2：唯一索引设成不可见，线上插入开始报重复。</strong><br>这是预期行为，但很多人不知道。唯一性校验不走优化器，走的是存储引擎的唯一性检查。<strong>唯一索引不要拿来做灰度。</strong></p>
+<p><strong>坑 3：灰度期间 DBA 用 <code>FORCE INDEX</code> 的手工 SQL 全部报错。</strong><br>报错信息是 “Key doesn’t exist”，排查了半天才发现是 INVISIBLE。<strong>灰度前必须 grep 全量 SQL 脚本。</strong></p>
+<p><strong>坑 4：观察期太短，大促当天翻车。</strong><br>某次把一个 <code>(shop_id, status)</code> 索引下线，观察了 5 天没事。大促当天订单状态查询量涨了 20 倍，优化器退化成全表扫描，直接把从库打满。<strong>观察期必须覆盖业务峰值。</strong></p>
+<p><strong>坑 5：<code>DROP INDEX</code> 没加 <code>LOCK=NONE</code>，MDL 排队堵死全表。</strong><br><code>ALTER TABLE</code> 拿不到 MDL 会排队，而排队会阻塞后续所有对该表的请求，形成雪崩。加 <code>LOCK=NONE</code> 让它快速失败，再用 <code>pt-online-schema-change</code> 或业务低峰重试。</p>
+<hr>
+<h2 id="六、面试高频追问"><a href="#六、面试高频追问" class="headerlink" title="六、面试高频追问"></a>六、面试高频追问</h2><p><strong>Q1：不可见索引和 <code>IGNORE INDEX</code> 有什么区别？</strong><br><code>IGNORE INDEX</code> 是<strong>语句级提示</strong>，只对当前这条 SQL 生效，且优化器可以不完全遵守；不可见索引是<strong>元数据级</strong>的，对所有 SQL 默认生效，且持久化在数据字典里。前者用于临时规避，后者用于治理。</p>
+<p><strong>Q2：为什么 MySQL 不直接提供一个「删除索引前的 dry-run」？</strong><br>INVISIBLE 就是这个 dry-run。它的设计取舍是：宁可多占一点空间和写入成本，也要保证回滚是 O(1) 的元数据操作。这是一个典型的「用空间换变更安全」的工程决策。</p>
+<p><strong>Q3：<code>sys.schema_unused_indexes</code> 和 <code>performance_schema</code> 的统计，哪个更可信？</strong><br><code>sys.schema_unused_indexes</code> 本身就是对 <code>table_io_waits_summary_by_index_usage</code> 的封装，二者同源。真正影响可信度的是<strong>统计起点</strong>和<strong>表实例是否被淘汰</strong>。生产上我会额外开启 <code>innodb_monitor</code> 或直接用 APM 的 SQL 采样做交叉验证。</p>
+<p><strong>Q4：一个索引从来没被 <code>performance_schema</code> 记录，但业务说「肯定在用」，怎么判断？</strong><br>三种可能：(1) 那条 SQL 走的是覆盖索引但被记录到了别的索引；(2) 统计被重置过；(3) 业务用的是 <code>FORCE INDEX</code>。用 <code>EXPLAIN</code> + 慢查询日志交叉验证，别只信一个数据源。</p>
+<p><strong>Q5：大表删索引，怎么做到业务无感？</strong><br><code>ALGORITHM=INPLACE, LOCK=NONE</code> + 低峰执行 + 先 INVISIBLE 灰度 + 准备好重建脚本。四件套缺一不可。</p>
+<hr>
+<h2 id="七、总结"><a href="#七、总结" class="headerlink" title="七、总结"></a>七、总结</h2><ul>
+<li><strong>不可见索引不是性能优化手段，是变更风险管理手段</strong>。它把「删索引」从一次性高风险动作，变成「灰度 → 观察 → 验证 → 删除」的可控流程。</li>
+<li>索引治理的核心不是技术，是<strong>流程</strong>：有巡检、有指标、有观察期、有回滚脚本。</li>
+<li>三个数据源要交叉验证：<code>performance_schema</code>（使用情况）、<code>sys.schema_redundant_indexes</code>（结构冗余）、<code>information_schema.statistics</code>（选择性）。</li>
+<li>唯一索引、外键依赖索引、被 <code>FORCE INDEX</code> 引用的索引，<strong>不进灰度名单</strong>。</li>
+<li>大表 DDL 永远带 <code>LOCK=NONE</code>，永远走 Flyway 这类版本化工具。</li>
+</ul>
+<p>索引治理是个「做了没人夸，不做迟早炸」的活。但一个 2 亿行的表少 5 个冗余索引，写入延迟降 20%，这种收益是实打实落在每个用户身上的。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/21/mysql-invisible-index-governance-deep-practice/">https://jiweidong.github.io/2026/10/21/mysql-invisible-index-governance-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95/">索引</a><a class="post-meta__tags" href="/tags/%E8%BF%90%E7%BB%B4/">运维</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/21/kafka-consumer-offset-management-deep-dive/" title="【Kafka 实战】消费者位移（Offset）管理深度解析：自动提交陷阱、手动提交与重复消费治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Kafka 实战】消费者位移（Offset）管理深度解析：自动提交陷阱、手动提交与重复消费治理</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】消费者位移（Offset）管理深度解析前言线上 MQ 出的问题，九成不是「消息丢了」，而是「消息重复了」或者「消费卡住了」。这两件事的根，几乎都指向同一个地方——位移（Offset）。 先看两个真实工单： 工单 A：订单履约服务重启后，把 3 小时前的 2 万条发货消息又消费了一遍，导致重复发货。日志显示 enable.auto.commit=true，且消费逻辑里有 200ms 的 RPC 调用。 工单 B：某个 consumer group 的 lag 一直涨，但消费线程是活的、日志没报错。最后发现是某台机器的处理线程卡在一个没有超时的 HTTP 调用上，poll() 再也回不来，触发了 max.poll.interval.ms，rebalance 后它又拿回同一个分区，继续卡。 这两个案例都不是「Kafka 的 bug」，而是对位移语义理解不到位。这一篇把 offset 这件事从存储结构讲到代码实践：自动提交到底什么时候提交、手动提交怎么选、rebalance 时会发生什么、重复消费怎么治理、lag 怎么算才是对的。  一、Offset 到底存在哪1.1...</div></div></div></a><a class="pagination-related" href="/2026/10/20/multi-agent-collaboration-deep-dive/" title="【AI Agent】多智能体协作深度解析：角色分工、通信协议与冲突消解"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【AI Agent】多智能体协作深度解析：角色分工、通信协议与冲突消解</div></div><div class="info-2"><div class="info-item-1">【AI Agent】多智能体协作深度解析前言单智能体（Single Agent）在 2024 年被大量验证，也在 2025 年集体撞墙。原因很朴素： 一个 Agent 做不好所有事。 给它 30 个工具，它在选工具上就开始犯迷糊；给它 20 万 token 的上下文，它在中段开始遗忘；让它既做需求分析又写代码又做代码审查，它会用「写代码的心态」去做审查，自己批自己，永远通过。 于是多智能体（Multi-Agent System，MAS）成了自然演进方向：拆角色、分上下文、定协议、消冲突。 但多智能体不是免费的午餐。它带来 N² 的通信成本、错误放大效应、调试地狱。业界有个流传很广的判断：  大多数多智能体系统，用更简单的方案（单 Agent + 更好的工具）就能做得一样好，而且便宜 5 倍。  这篇文章不吹多智能体，而是讲清楚：什么时候该用、怎么设计、会踩什么坑。  一、先问清楚：为什么需要多智能体1.1 单智能体的三个硬瓶颈   瓶颈 表现 根因    上下文膨胀 任务做到一半开始「忘事」，重复之前的步骤 上下文窗口有限 + 注意力在长文本中段衰减（lost in the mi...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/01/mysql-index-failure-scenarios-guide/" title="【MySQL优化】索引失效场景全总结与优化实战：从 EXPLAIN 到 SQL 优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【MySQL优化】索引失效场景全总结与优化实战：从 EXPLAIN 到 SQL 优化</div></div><div class="info-2"><div class="info-item-1">【MySQL优化】索引失效场景全总结与优化实战：从 EXPLAIN 到 SQL 优化前言在工作中，我们经常会遇到这样的问题：明明建了索引，SQL 查询却依然慢如蜗牛。很大可能性是——索引失效了。 索引失效是 MySQL 性能优化中最常见的坑。本文将总结 12 种常见的索引失效场景，并为每种场景提供 SQL 示例和 EXPLAIN 分析，帮你彻底掌握索引优化的精髓。  一、准备工作先建一张示例表： 12345678910111213CREATE TABLE `employee` (  `id` INT PRIMARY KEY AUTO_INCREMENT,  `name` VARCHAR(50) NOT NULL,  `phone` VARCHAR(20) DEFAULT NULL,  `age` INT DEFAULT NULL,  `status` TINYINT DEFAULT NULL,  `department` VARCHAR(50) DEFAULT NULL,  `create_time` DATETIME DEFAULT NULL,  KEY `idx_name` ...</div></div></div></a><a class="pagination-related" href="/2026/08/15/mysql-back-to-table-covering-index-deep-dive/" title="【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战面试官：什么是回表？什么是覆盖索引？为什么 select * 和 select 指定字段性能差这么多？“回表”和”覆盖索引”是 MySQL 索引面试中最核心的两个概念，也是 SQL 优化的基本功。很多同学知道”要建联合索引、不要 select *”，但说不清背后的原理——为什么覆盖索引能避免回表？为什么联合索引能覆盖更多查询？ 本文从 InnoDB 索引结构出发，把回表、覆盖索引、索引下推（ICP）的关系一次讲透，最后给出可直接落地的优化 checklist。 一、先从 InnoDB 索引结构说起1.1 聚簇索引（Clustered Index）InnoDB 的表本身就是一棵 B+ 树，主键索引就是聚簇索引：  叶子节点直接存放整行数据（包括所有字段）； 每张表只有一个聚簇索引（通常是主键，没有主键就用第一个非空唯一索引，再没有就隐藏的 rowid）； 数据行按照主键顺序物理排列（逻辑顺序）。  123456789聚簇索引 B+ 树（主键 id）┌─────────┐│  根节点   │  ...</div></div></div></a><a class="pagination-related" href="/2026/09/07/mysql-table-fragmentation-optimize-rebuild/" title="【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-07</div><div class="info-item-2">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化一个线上事故：删除一半数据，表反而更慢了？某订单归档系统上线半年后，运维定期把 3 个月前的订单从 order 表 DELETE 掉。某天 DBA 发现：这张表明明只剩 2000 万行（高峰期 6000 万），但查询却越来越慢，磁盘占用还有 30GB 不降。 问题出在哪？答案就是表碎片（fragmentation）。DELETE 掉的行并没有真正释放空间，InnoDB 只是把它们标记为”可复用”，数据页里留下大量空洞；而频繁的随机更新又让索引页不断分裂，物理存储的连续性被破坏——InnoDB 不得不扫描大量”半空”的页来找到数据。 一、碎片是怎么产生的？三种来源1. DELETE 留下的空洞InnoDB 以 页（Page，默认 16KB） 为单位管理数据。DELETE 一行并不会立即把页里的空间归还给文件系统，而是在行记录上打删除标记，页内留下空洞。这些空洞只能被后续插入的、大小相近的行复用： 12-- 大量删除后，页内空间分布变成这样（示意）-- | 行1 | 空...</div></div></div></a><a class="pagination-related" href="/2026/06/11/mysql-index-optimization/" title="MySQL 索引原理与优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">MySQL 索引原理与优化实战</div></div><div class="info-2"><div class="info-item-1">前言索引是数据库性能调优中最基础也最核心的手段。一条 SQL 走不走索引、走什么索引，执行时间可能相差几个数量级。本文从底层存储结构讲起，结合实际案例，带你彻底掌握 MySQL 索引优化。  一、索引的底层数据结构1.1 为什么选择 B+ 树？MySQL InnoDB 存储引擎使用 B+ 树作为索引结构。对比其他数据结构：    数据结构 磁盘 I&#x2F;O 范围查询 有序性 适用场景    哈希表 O(1) ❌ 不支持 ❌ 等值查询   二叉树 O(log n) ✅ ✅ 内存中   B 树 O(log n) ❌ 较差 ✅ 磁盘存储   B+ 树 O(log n) ✅ 优秀 ✅ 磁盘存储（最优）   1.2 B+ 树的核心特征1234567            [50]          ↙     ↘     [20, 30]    [70, 90]   ↙   ↓   ↘    ↓    ↓    ↘[10,15][25][35] [60] [80] [95,100]  ↑  ↑   ↑   ↑   ↑    ↑     ↑  └─── 数据页链表 ──────────...</div></div></div></a><a class="pagination-related" href="/2026/06/13/mysql-index-transaction/" title="MySQL 索引与事务详解（面试跳槽篇）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">MySQL 索引与事务详解（面试跳槽篇）</div></div><div class="info-2"><div class="info-item-1">MySQL 索引与事务详解（面试跳槽篇） 本文涵盖了 MySQL 面试中最高频的索引、事务、锁、日志、主从架构等核心知识点，结合大量 SQL 示例和原理图解，帮你从容应对面试。   一、索引1.1 索引数据结构选型MySQL InnoDB 选择 B+Tree 作为索引的底层数据结构。为什么不是其他结构？    数据结构 特点 为什么不选    二叉查找树 每个节点最多两个子节点 极端情况下退化为链表，树高太大   红黑树 自平衡二叉树 数据量大时树高依然很高（百万数据树高约 20）   B-Tree 多路平衡查找树，每个节点存数据 查询不稳定，范围查询需中序遍历   B+Tree 非叶子节点只存索引，叶子节点存数据且双向链表连接 ✅ 查询稳定、范围查询高效、磁盘 I&#x2F;O 少   B+Tree 的核心优势：  查询稳定：所有数据都在叶子节点，查询任何数据都走相同 I&#x2F;O 次数 范围查询高效：叶子节点用双向链表连接，直接遍历即可 磁盘 I&#x2F;O 少：非叶子节点只存索引（不存数据），能容纳更多 key，树高更矮 排序友好：叶子节点天然有序  1.2 B+Tr...</div></div></div></a><a class="pagination-related" href="/2026/08/29/mysql-fulltext-index-ngram-deep-dive/" title="【MySQL 索引】MySQL 全文索引深度解析：FULLTEXT、ngram 分词与中文检索实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-29</div><div class="info-item-2">【MySQL 索引】MySQL 全文索引深度解析：FULLTEXT、ngram 分词与中文检索实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 索引】MySQL 全文索引深度解析：FULLTEXT、ngram 分词与中文检索实战面试官：业务里有个「标题+内容」的模糊搜索，LIKE &#39;%关键词%&#39; 已经慢到 3 秒了，你有哪几种优化思路？MySQL 自带的全文索引能不能用？搜索场景在中小项目里最常见的错误就是 LIKE &#39;%xx%&#39; 一把梭。数据量到百万级，全表扫描 + 回表，3 秒都算快的。这一篇我们把 FULLTEXT 全文索引 从原理到实战讲透：倒排索引结构、ngram 中文分词、与 LIKE&#x2F;ES 的选型边界。 一、为什么 LIKE ‘%xx%’ 走不了索引1.1 B+ 树索引的匹配规则B+ 树索引（见本站《B+ 树深度解析》）只支持前缀匹配：  LIKE &#39;abc%&#39; → 可以走索引（定位到 abc 起始区间） LIKE &#39;%abc&#39; &#x2F; LIKE &#39;%abc%&#39; → 不能走索引，因为不知道从哪个 key 开始扫描，只能全表扫 + 逐行判断  12SELECT * FROM article WHERE...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">802</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">898</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E8%BF%90%E7%BB%B4%E3%80%91%E4%B8%8D%E5%8F%AF%E8%A7%81%E7%B4%A2%E5%BC%95%EF%BC%88Invisible-Index%EF%BC%89%E4%B8%8E%E7%B4%A2%E5%BC%95%E6%B2%BB%E7%90%86%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%8D%E5%8F%AF%E8%A7%81%E7%B4%A2%E5%BC%95%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、不可见索引到底是什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%85%B3%E9%94%AE%E7%82%B9%EF%BC%9A%E5%AE%83%E5%92%8C%E3%80%8C%E5%88%A0%E6%8E%89%E7%B4%A2%E5%BC%95%E3%80%8D%E7%9A%84%E5%B7%AE%E5%88%AB"><span class="toc-number">1.2.1.</span> <span class="toc-text">关键点：它和「删掉索引」的差别</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%BC%98%E5%8C%96%E5%99%A8%E6%98%AF%E6%80%8E%E4%B9%88%E3%80%8C%E7%9C%8B%E4%B8%8D%E8%A7%81%E3%80%8D%E5%AE%83%E7%9A%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、优化器是怎么「看不见」它的</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E7%B4%A2%E5%BC%95%E6%B2%BB%E7%90%86%E6%B5%81%E6%B0%B4%E7%BA%BF%EF%BC%9A%E4%BB%8E%E3%80%8C%E4%B8%8D%E6%95%A2%E5%88%A0%E3%80%8D%E5%88%B0%E3%80%8C%E6%95%A2%E5%88%A0%E3%80%8D"><span class="toc-number">1.4.</span> <span class="toc-text">三、索引治理流水线：从「不敢删」到「敢删」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#Step-1%EF%BC%9A%E5%8F%91%E7%8E%B0%E2%80%94%E2%80%94%E4%B8%89%E7%B1%BB%E5%80%99%E9%80%89%E7%B4%A2%E5%BC%95"><span class="toc-number">1.4.1.</span> <span class="toc-text">Step 1：发现——三类候选索引</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Step-2%EF%BC%9A%E8%AF%84%E4%BC%B0%E2%80%94%E2%80%94%E4%B8%89%E4%B8%AA%E5%BF%85%E9%A1%BB%E5%9B%9E%E7%AD%94%E7%9A%84%E9%97%AE%E9%A2%98"><span class="toc-number">1.4.2.</span> <span class="toc-text">Step 2：评估——三个必须回答的问题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Step-3%EF%BC%9A%E7%81%B0%E5%BA%A6%E2%80%94%E2%80%94%E5%85%88-INVISIBLE%EF%BC%8C%E8%A7%82%E5%AF%9F%E4%B8%80%E4%B8%AA%E5%AE%8C%E6%95%B4%E4%B8%9A%E5%8A%A1%E5%91%A8%E6%9C%9F"><span class="toc-number">1.4.3.</span> <span class="toc-text">Step 3：灰度——先 INVISIBLE，观察一个完整业务周期</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Step-4%EF%BC%9A%E9%AA%8C%E8%AF%81%E2%80%94%E2%80%94SQL-%E5%9B%9E%E5%BD%92-%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92%E5%AF%B9%E6%AF%94"><span class="toc-number">1.4.4.</span> <span class="toc-text">Step 4：验证——SQL 回归 + 执行计划对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#Step-5%EF%BC%9A%E6%B8%85%E7%90%86%E2%80%94%E2%80%94DROP%EF%BC%8C%E4%BD%86%E7%95%99%E5%A5%BD%E5%9B%9E%E6%BB%9A%E8%84%9A%E6%9C%AC"><span class="toc-number">1.4.5.</span> <span class="toc-text">Step 5：清理——DROP，但留好回滚脚本</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Java-%E4%BE%A7%EF%BC%9A%E5%86%99%E4%B8%80%E4%B8%AA%E7%B4%A2%E5%BC%95%E6%B2%BB%E7%90%86%E5%B7%A1%E6%A3%80%E4%BB%BB%E5%8A%A1"><span class="toc-number">1.5.</span> <span class="toc-text">四、Java 侧：写一个索引治理巡检任务</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BA%94%E4%B8%AA%E7%9C%9F%E5%AE%9E%E8%B8%A9%E8%BF%87%E7%9A%84%E5%9D%91"><span class="toc-number">1.6.</span> <span class="toc-text">五、五个真实踩过的坑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.8.</span> <span class="toc-text">七、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/21/rag-evaluation-ragas-deep-practice/" title="【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证">【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证</a><time datetime="2026-10-21T00:40:00.000Z" title="发表于 2026-10-21 08:40:00">2026-10-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/21/java-llm-observability-tracing-cost-deep-practice/" title="【Java AI】大模型可观测性与成本治理深度实战：Trace、Token 账本与告警">【Java AI】大模型可观测性与成本治理深度实战：Trace、Token 账本与告警</a><time datetime="2026-10-21T00:30:00.000Z" title="发表于 2026-10-21 08:30:00">2026-10-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/21/spring-boot-hikaricp-connection-leak-deep-dive/" title="【Spring Boot 实战】连接池耗尽与连接泄漏排查：HikariCP 参数、堆栈定位与根因治理">【Spring Boot 实战】连接池耗尽与连接泄漏排查：HikariCP 参数、堆栈定位与根因治理</a><time datetime="2026-10-21T00:20:00.000Z" title="发表于 2026-10-21 08:20:00">2026-10-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/21/kafka-consumer-offset-management-deep-dive/" title="【Kafka 实战】消费者位移（Offset）管理深度解析：自动提交陷阱、手动提交与重复消费治理">【Kafka 实战】消费者位移（Offset）管理深度解析：自动提交陷阱、手动提交与重复消费治理</a><time datetime="2026-10-21T00:10:00.000Z" title="发表于 2026-10-21 08:10:00">2026-10-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/21/mysql-invisible-index-governance-deep-practice/" title="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证</a><time datetime="2026-10-21T00:00:00.000Z" title="发表于 2026-10-21 08:00:00">2026-10-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
