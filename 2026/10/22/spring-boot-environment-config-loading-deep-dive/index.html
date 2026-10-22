@@ -1,0 +1,479 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理前言“配置为什么不生效？”——这是 Spring Boot 项目里最高频的求助之一。典型版本有：  application.yml 里写了 server.port&#x3D;8080，命令行 --server.port&#x3D;9090 却没覆盖成功； 配置中心下发了新值，本地 applica">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/22/spring-boot-environment-config-loading-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理前言“配置为什么不生效？”——这是 Spring Boot 项目里最高频的求助之一。典型版本有：  application.yml 里写了 server.port&#x3D;8080，命令行 --server.port&#x3D;9090 却没覆盖成功； 配置中心下发了新值，本地 applica">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-22T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-10-22T00:01:39.701Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Environment">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Spring Boot">
+<meta property="article:tag" content="源码">
+<meta property="article:tag" content="配置中心">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理",
+  "url": "https://jiweidong.github.io/2026/10/22/spring-boot-environment-config-loading-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-22T00:20:00.000Z",
+  "dateModified": "2026-10-22T00:01:39.701Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/22/spring-boot-environment-config-loading-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">807</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">903</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-22T00:20:00.000Z" title="发表于 2026-10-22 08:20:00">2026-10-22</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-22T00:01:39.701Z" title="更新于 2026-10-22 08:01:39">2026-10-22</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-%E6%B7%B1%E6%8C%96/">Java 深挖</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Spring-Boot-源码】配置加载机制深度解析：Environment、PropertySource-顺序与多环境治理"><a href="#【Spring-Boot-源码】配置加载机制深度解析：Environment、PropertySource-顺序与多环境治理" class="headerlink" title="【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理"></a>【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>“配置为什么不生效？”——这是 Spring Boot 项目里最高频的求助之一。典型版本有：</p>
+<ul>
+<li><code>application.yml</code> 里写了 <code>server.port=8080</code>，命令行 <code>--server.port=9090</code> 却没覆盖成功；</li>
+<li>配置中心下发了新值，本地 <code>application.properties</code> 把它盖掉了；</li>
+<li><code>@Value(&quot;${xxx:default}&quot;)</code> 拿到了默认值，但配置明明存在；</li>
+<li>测试环境正常、生产环境取到 <code>null</code>，两边配置文件 diff 完全一样；</li>
+<li><code>@ConfigurationProperties</code> 校验不通过，报错信息却指不到是哪个源。</li>
+</ul>
+<p>这些问题的根因都指向同一件事：<strong>你不清楚 Spring 的配置是”多源叠加 + 有序覆盖”的，也不清楚覆盖规则由谁决定</strong>。</p>
+<p>本文从 <code>Environment</code> 抽象讲到 <code>ConfigDataEnvironmentPostProcessor</code> 的加载流程，再落到多环境治理与配置中心的工程实践。看完你应该能一眼定位”配置不生效”的根因。</p>
+<hr>
+<h2 id="一、核心抽象：Environment-与-PropertySource"><a href="#一、核心抽象：Environment-与-PropertySource" class="headerlink" title="一、核心抽象：Environment 与 PropertySource"></a>一、核心抽象：<code>Environment</code> 与 <code>PropertySource</code></h2><h3 id="1-1-三层结构"><a href="#1-1-三层结构" class="headerlink" title="1.1 三层结构"></a>1.1 三层结构</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">Environment（接口）</span><br><span class="line"> └─ ConfigurableEnvironment</span><br><span class="line">     ├─ MutablePropertySources   ← 有序的 PropertySource 列表（顺序即优先级）</span><br><span class="line">     │    ├─ commandLineArgs        (最高)</span><br><span class="line">     │    ├─ systemProperties</span><br><span class="line">     │    ├─ systemEnvironment</span><br><span class="line">     │    ├─ random</span><br><span class="line">     │    ├─ applicationConfig: [classpath:/application.yml]</span><br><span class="line">     │    ├─ applicationConfig: [file:./config/application.yml]</span><br><span class="line">     │    └─ defaultProperties      (最低)</span><br><span class="line">     └─ profiles（激活的 profile 集合）</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键认知：<code>MutablePropertySources</code> 是一个 <code>List</code>，不是 <code>Map</code>。</strong> 查询时从头到尾遍历，<strong>第一个命中的值就返回</strong>——所以”谁在前面谁赢”。这和很多人直觉里”多文件合并成一个 Map”完全不同。</p>
+<h3 id="1-2-PropertySource-有”来源类型”之分"><a href="#1-2-PropertySource-有”来源类型”之分" class="headerlink" title="1.2 PropertySource 有”来源类型”之分"></a>1.2 <code>PropertySource</code> 有”来源类型”之分</h3><p>Spring Boot 2.4 引入了 <code>PropertySource</code> 的 <code>origin</code> 概念（<code>OriginLookup</code>），让你能追溯”这个值到底来自哪个文件的第几行”：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Autowired</span></span><br><span class="line"><span class="keyword">private</span> ConfigurableEnvironment env;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">trace</span><span class="params">(String key)</span> &#123;</span><br><span class="line">    PropertySource&lt;?&gt; ps = env.getPropertySources().stream()</span><br><span class="line">        .filter(p -&gt; p.containsProperty(key))</span><br><span class="line">        .findFirst()</span><br><span class="line">        .orElse(<span class="literal">null</span>);</span><br><span class="line">    System.out.println(<span class="string">&quot;命中源: &quot;</span> + (ps == <span class="literal">null</span> ? <span class="string">&quot;none&quot;</span> : ps.getName()));</span><br><span class="line">    <span class="keyword">if</span> (ps <span class="keyword">instanceof</span> OriginLookup&lt;?&gt; lookup) &#123;</span><br><span class="line">        System.out.println(<span class="string">&quot;来源: &quot;</span> + lookup.getOrigin(key)); <span class="comment">// 文件:行号 或 URL</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这个能力在生产排障时价值极高——线上有个 <code>/actuator/env</code> 端点（需显式开启 <code>management.endpoint.env.show-values</code>），能看到每个 key 的命中源与覆盖链。</p>
+<h3 id="1-3-Value-vs-ConfigurationProperties-vs-Environment-getProperty"><a href="#1-3-Value-vs-ConfigurationProperties-vs-Environment-getProperty" class="headerlink" title="1.3 @Value vs @ConfigurationProperties vs Environment#getProperty"></a>1.3 <code>@Value</code> vs <code>@ConfigurationProperties</code> vs <code>Environment#getProperty</code></h3><table>
+<thead>
+<tr>
+<th>方式</th>
+<th>类型安全</th>
+<th>松散绑定</th>
+<th>校验</th>
+<th>动态刷新</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>@Value(&quot;${a.b}&quot;)</code></td>
+<td>否</td>
+<td>不支持</td>
+<td>否</td>
+<td>需 <code>@RefreshScope</code></td>
+<td>零散单个值</td>
+</tr>
+<tr>
+<td><code>@ConfigurationProperties</code></td>
+<td>是</td>
+<td>支持（kebab&#x2F;camel）</td>
+<td><code>@Validated</code></td>
+<td>需 <code>@RefreshScope</code> &#x2F; 重建</td>
+<td><strong>结构化配置（推荐）</strong></td>
+</tr>
+<tr>
+<td><code>env.getProperty(k)</code></td>
+<td>否</td>
+<td>不支持</td>
+<td>否</td>
+<td>天然支持</td>
+<td>动态 key、兜底逻辑</td>
+</tr>
+</tbody></table>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@ConfigurationProperties(prefix = &quot;app.llm&quot;)</span></span><br><span class="line"><span class="meta">@Validated</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">LlmProperties</span><span class="params">(</span></span><br><span class="line"><span class="params">    @NotBlank String baseUrl,</span></span><br><span class="line"><span class="params">    @NotBlank String apiKey,</span></span><br><span class="line"><span class="params">    @Min(1)</span> <span class="meta">@Max(128)</span> <span class="type">int</span> maxConcurrency,</span><br><span class="line">    Duration timeout,</span><br><span class="line">    Map&lt;String, ModelConfig&gt; models</span><br><span class="line">) &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ModelConfig</span><span class="params">(String model, @Min(1)</span> <span class="type">int</span> maxTokens) &#123; &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、加载流程：ConfigDataEnvironmentPostProcessor"><a href="#二、加载流程：ConfigDataEnvironmentPostProcessor" class="headerlink" title="二、加载流程：ConfigDataEnvironmentPostProcessor"></a>二、加载流程：<code>ConfigDataEnvironmentPostProcessor</code></h2><p>Spring Boot 2.4 重写了配置加载（<code>ConfigData</code> API），2.4 之前是 <code>ConfigFileApplicationListener</code>。现在的主线是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">SpringApplication.run()</span><br><span class="line"> └─ prepareEnvironment()</span><br><span class="line">     ├─ 创建/获取 Environment（ApplicationEnvironment）</span><br><span class="line">     ├─ 配置 propertySources（defaultProperties、commandLineArgs…）</span><br><span class="line">     ├─ 触发 ApplicationEnvironmentPreparedEvent</span><br><span class="line">     │    └─ EnvironmentPostProcessorApplicationListener</span><br><span class="line">     │         └─ ConfigDataEnvironmentPostProcessor.postProcessEnvironment()</span><br><span class="line">     │              ├─ 解析 config data 位置（classpath:/, file:./, file:./config/…）</span><br><span class="line">     │              ├─ 加载 application.yml / application-&#123;profile&#125;.yml</span><br><span class="line">     │              ├─ 处理 spring.config.import（配置中心入口）</span><br><span class="line">     │              └─ 绑定 + 校验 profile</span><br><span class="line">     └─ 绑定 ConfigurationProperties</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-1-默认搜索位置与优先级"><a href="#2-1-默认搜索位置与优先级" class="headerlink" title="2.1 默认搜索位置与优先级"></a>2.1 默认搜索位置与优先级</h3><p>Spring Boot 默认按<strong>从低到高</strong>的顺序加载（后来者覆盖前者）：</p>
+<table>
+<thead>
+<tr>
+<th>顺序（低→高）</th>
+<th>位置</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>classpath:/application.yml</code></td>
+<td>jar 内默认配置</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>classpath:/config/application.yml</code></td>
+<td>jar 内 config 目录</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>file:./application.yml</code></td>
+<td>工作目录</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>file:./config/application.yml</code></td>
+<td>工作目录 config</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>file:./config/*/application.yml</code></td>
+<td>config 子目录（2.4+）</td>
+</tr>
+</tbody></table>
+<p>同一位置下 <code>.properties</code> 优先于 <code>.yml</code>（准确说是<strong>后加载者优先</strong>，properties 在 yml 之后加载）。但<strong>profile 文件永远优先于非 profile 文件</strong>：<code>application-prod.yml</code> 覆盖 <code>application.yml</code>。</p>
+<h3 id="2-2-完整优先级链（低-→-高）"><a href="#2-2-完整优先级链（低-→-高）" class="headerlink" title="2.2 完整优先级链（低 → 高）"></a>2.2 完整优先级链（低 → 高）</h3><p>这是必须背下来的表，面试和排障都用得上：</p>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>来源</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>最低</td>
+<td><code>SpringApplication.setDefaultProperties()</code></td>
+</tr>
+<tr>
+<td>↓</td>
+<td><code>@PropertySource</code> 注解（注意：<strong>在 refresh 阶段才加入，且优先级低于 config data</strong>）</td>
+</tr>
+<tr>
+<td>↓</td>
+<td><code>application.yml</code> &#x2F; <code>application-{profile}.yml</code>（按上文位置顺序）</td>
+</tr>
+<tr>
+<td>↓</td>
+<td><code>RandomValuePropertySource</code>（<code>random.*</code>）</td>
+</tr>
+<tr>
+<td>↓</td>
+<td>操作系统环境变量</td>
+</tr>
+<tr>
+<td>↓</td>
+<td>Java System Properties（<code>-Dkey=value</code>）</td>
+</tr>
+<tr>
+<td>↓</td>
+<td>JNDI</td>
+</tr>
+<tr>
+<td>↓</td>
+<td><code>ServletContext</code> init params &#x2F; <code>ServletConfig</code> init params</td>
+</tr>
+<tr>
+<td>↓</td>
+<td><code>SPRING_APPLICATION_JSON</code></td>
+</tr>
+<tr>
+<td>↓</td>
+<td>命令行参数 <code>--key=value</code></td>
+</tr>
+<tr>
+<td>↓</td>
+<td>测试中的 <code>@TestPropertySource</code> &#x2F; <code>@SpringBootTest(properties=…)</code></td>
+</tr>
+<tr>
+<td>↓</td>
+<td><code>@DynamicPropertySource</code>（Testcontainers 场景）</td>
+</tr>
+<tr>
+<td>最高</td>
+<td>DevTools 全局设置（<code>~/.config/spring-boot/spring-boot-devtools.properties</code>）</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>⚠️ 一个高频误区：<strong><code>@PropertySource</code> 的优先级比 <code>application.yml</code> 低</strong>。所以你在 <code>@PropertySource(&quot;custom.properties&quot;)</code> 里写的 <code>server.port</code>，会被 <code>application.yml</code> 覆盖。要让它生效，必须用 <code>PropertySourceFactory</code> 手动插到前面：</p>
+</blockquote>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Configuration</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">HighPriorityConfig</span> <span class="keyword">implements</span> <span class="title class_">EnvironmentPostProcessor</span>, Ordered &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">postProcessEnvironment</span><span class="params">(ConfigurableEnvironment env, SpringApplication app)</span> &#123;</span><br><span class="line">        Map&lt;String, Object&gt; map = Map.of(<span class="string">&quot;custom.flag&quot;</span>, <span class="string">&quot;true&quot;</span>);</span><br><span class="line">        env.getPropertySources().addFirst(<span class="keyword">new</span> <span class="title class_">MapPropertySource</span>(<span class="string">&quot;customHigh&quot;</span>, map));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">int</span> <span class="title function_">getOrder</span><span class="params">()</span> &#123; <span class="keyword">return</span> Ordered.HIGHEST_PRECEDENCE + <span class="number">10</span>; &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>并在 <code>META-INF/spring.factories</code>（Boot 3 改用 <code>META-INF/spring/org.springframework.boot.env.EnvironmentPostProcessor.imports</code>）中注册。</p>
+<h3 id="2-3-占位符解析：-的坑"><a href="#2-3-占位符解析：-的坑" class="headerlink" title="2.3 占位符解析：${} 的坑"></a>2.3 占位符解析：<code>${}</code> 的坑</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">app:</span></span><br><span class="line">  <span class="attr">host:</span> <span class="string">api.example.com</span></span><br><span class="line">  <span class="attr">url:</span> <span class="string">https://$&#123;app.host&#125;/v1</span></span><br><span class="line">  <span class="attr">url2:</span> <span class="string">https://$&#123;app.host:localhost&#125;/v1</span>   <span class="comment"># 带默认值</span></span><br><span class="line">  <span class="attr">url3:</span> <span class="string">https://$&#123;UNKNOWN_KEY:$&#123;app.host&#125;&#125;/v1</span>  <span class="comment"># 嵌套默认值</span></span><br></pre></td></tr></table></figure>
+
+<p><code>PropertySourcesPlaceholderConfigurer</code>（或 Boot 的 <code>PropertySourcesPlaceholdersResolver</code>）在<strong>绑定阶段</strong>做解析。两个经典陷阱：</p>
+<ol>
+<li><strong>占位符不能跨源引用比自己优先级高的值</strong>，也<strong>不能自引用</strong>（同一个 key 引用自己会死循环或返回原串）。</li>
+<li><strong><code>@Value</code> 上占位符解析失败会启动失败</strong>，但 <code>@ConfigurationProperties</code> 里如果是 <code>String</code> 类型会保留原串 <code>${...}</code>（不报错），排查更难。</li>
+</ol>
+<h3 id="2-4-Profile-的正确用法"><a href="#2-4-Profile-的正确用法" class="headerlink" title="2.4 Profile 的正确用法"></a>2.4 Profile 的正确用法</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># application.yml</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">profiles:</span></span><br><span class="line">    <span class="attr">active:</span> <span class="string">$&#123;DEPLOY_ENV:dev&#125;</span></span><br><span class="line">  <span class="attr">config:</span></span><br><span class="line">    <span class="attr">import:</span></span><br><span class="line">      <span class="bullet">-</span> <span class="string">optional:classpath:common.yml</span></span><br><span class="line">      <span class="bullet">-</span> <span class="string">optional:nacos:$&#123;spring.application.name&#125;.yaml</span></span><br><span class="line"><span class="meta">---</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">config:</span></span><br><span class="line">    <span class="attr">activate:</span></span><br><span class="line">      <span class="attr">on-profile:</span> <span class="string">dev</span></span><br><span class="line"><span class="attr">logging:</span></span><br><span class="line">  <span class="attr">level:</span></span><br><span class="line">    <span class="attr">root:</span> <span class="string">info</span></span><br><span class="line"><span class="meta">---</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">config:</span></span><br><span class="line">    <span class="attr">activate:</span></span><br><span class="line">      <span class="attr">on-profile:</span> <span class="string">prod</span></span><br><span class="line"><span class="attr">logging:</span></span><br><span class="line">  <span class="attr">level:</span></span><br><span class="line">    <span class="attr">root:</span> <span class="string">warn</span></span><br></pre></td></tr></table></figure>
+
+<p>三个要点：</p>
+<ul>
+<li><strong><code>spring.config.import</code> 是配置中心的官方入口</strong>（Boot 2.4+），<code>optional:</code> 前缀表示”不存在也不报错”——不加 <code>optional:</code> 时配置拉不到会<strong>直接启动失败</strong>，这反而是生产上想要的行为。</li>
+<li><strong>多文档块（<code>---</code>）里 <code>on-profile</code> 才生效</strong>，别在老式 <code>spring.profiles</code> 里写多个值（Boot 2.4+ 已废弃该写法）。</li>
+<li><strong>profile 可以叠加</strong>：<code>spring.profiles.active=prod,metrics</code>，后激活的优先级更高（同名 key 后者胜）。</li>
+</ul>
+<hr>
+<h2 id="三、工程实践：配置治理四件事"><a href="#三、工程实践：配置治理四件事" class="headerlink" title="三、工程实践：配置治理四件事"></a>三、工程实践：配置治理四件事</h2><h3 id="3-1-配置分层：让”环境差异”最小化"><a href="#3-1-配置分层：让”环境差异”最小化" class="headerlink" title="3.1 配置分层：让”环境差异”最小化"></a>3.1 配置分层：让”环境差异”最小化</h3><p>反面教材：每个环境一份完整配置，diff 出来几百行，改一个数据库地址要同步 3 个文件。</p>
+<p>推荐分层：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">application.yml            # 与环境无关的默认值（连接池大小、超时、业务开关默认值）</span><br><span class="line">application-dev.yml        # 只写 dev 差异（本地地址、debug 日志）</span><br><span class="line">application-test.yml</span><br><span class="line">application-prod.yml       # 只写 prod 差异（集群地址、连接池放大）</span><br></pre></td></tr></table></figure>
+
+<p>原则：<strong>能进默认值的都进 <code>application.yml</code>，profile 文件只放”确实不同”的项</strong>。这样新增配置项时只改一处。</p>
+<h3 id="3-2-配置校验：启动即失败，别带病上线"><a href="#3-2-配置校验：启动即失败，别带病上线" class="headerlink" title="3.2 配置校验：启动即失败，别带病上线"></a>3.2 配置校验：启动即失败，别带病上线</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@ConfigurationProperties(prefix = &quot;app.payment&quot;)</span></span><br><span class="line"><span class="meta">@Validated</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">PaymentProperties</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@NotBlank(message = &quot;支付网关地址不能为空&quot;)</span></span><br><span class="line">    <span class="meta">@Pattern(regexp = &quot;^https?://.+&quot;, message = &quot;支付网关必须是 http(s) URL&quot;)</span></span><br><span class="line">    <span class="keyword">private</span> String gateway;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@NotNull</span></span><br><span class="line">    <span class="meta">@Positive</span></span><br><span class="line">    <span class="keyword">private</span> <span class="type">Duration</span> <span class="variable">timeout</span> <span class="operator">=</span> Duration.ofSeconds(<span class="number">3</span>);</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Min(1)</span> <span class="meta">@Max(100)</span></span><br><span class="line">    <span class="keyword">private</span> <span class="type">int</span> <span class="variable">maxRetry</span> <span class="operator">=</span> <span class="number">3</span>;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@AssertTrue(message = &quot;生产环境禁止开启 mock 模式&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">isMockAllowed</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> !<span class="string">&quot;prod&quot;</span>.equals(System.getProperty(<span class="string">&quot;deploy.env&quot;</span>)) || !mock;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// getters/setters...</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>配 <code>@AssertTrue</code> 做<strong>跨字段校验</strong>（如”启用 A 时必须配置 B”），这是 <code>@NotNull</code> 做不到的。校验失败时 Boot 抛出 <code>BindValidationException</code>，启动直接失败——比运行到支付环节才发现配置错了强一百倍。</p>
+<h3 id="3-3-敏感配置：不要明文进-Git"><a href="#3-3-敏感配置：不要明文进-Git" class="headerlink" title="3.3 敏感配置：不要明文进 Git"></a>3.3 敏感配置：不要明文进 Git</h3><p>三层防护：</p>
+<ol>
+<li><strong>加密存储</strong>：Jasypt 或配置中心自带加密（Nacos AES、Apollo 加密）；</li>
+<li><strong>环境变量注入</strong>：<code>SPRING_DATASOURCE_PASSWORD</code> 天然优先级高于配置文件；</li>
+<li><strong>K8s Secret 挂载</strong>：<code>spring.config.import=optional:configtree:/etc/app/secrets/</code>。</li>
+</ol>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">config:</span></span><br><span class="line">    <span class="attr">import:</span> <span class="string">optional:configtree:/etc/app/secrets/</span></span><br><span class="line">  <span class="attr">datasource:</span></span><br><span class="line">    <span class="attr">password:</span> <span class="string">$&#123;db-password&#125;</span>   <span class="comment"># 对应 /etc/app/secrets/db-password 文件内容</span></span><br></pre></td></tr></table></figure>
+
+<p><code>configtree</code> 这个特性用的人不多但极其实用：目录下每个文件名就是 key，文件内容就是 value，配合 K8s Secret volume 天然适配，不用手动拼环境变量。</p>
+<h3 id="3-4-动态刷新：-RefreshScope-的边界"><a href="#3-4-动态刷新：-RefreshScope-的边界" class="headerlink" title="3.4 动态刷新：@RefreshScope 的边界"></a>3.4 动态刷新：<code>@RefreshScope</code> 的边界</h3><p>配置中心推送后，配置能刷新的前提是 <strong>Bean 能被重建或字段能被重绑</strong>。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@RestController</span></span><br><span class="line"><span class="meta">@RefreshScope</span>   <span class="comment">// 刷新时销毁并重建该 Bean</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">FeatureController</span> &#123;</span><br><span class="line">    <span class="meta">@Value(&quot;$&#123;app.feature.new-ui:false&#125;&quot;)</span></span><br><span class="line">    <span class="keyword">private</span> <span class="type">boolean</span> newUi;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>坑点清单：</p>
+<table>
+<thead>
+<tr>
+<th>坑</th>
+<th>说明</th>
+<th>解法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>@ConfigurationProperties</code> 不自动刷新</td>
+<td>除非配了 <code>@RefreshScope</code> 或用了 <code>ConfigurationPropertiesRebinder</code></td>
+<td>加 <code>@RefreshScope</code> 或用 <code>Environment</code> 直读</td>
+</tr>
+<tr>
+<td><code>@RefreshScope</code> 与单例依赖冲突</td>
+<td>刷新后注入方仍持有旧引用</td>
+<td>用 <code>ObjectProvider</code> 延迟获取</td>
+</tr>
+<tr>
+<td>连接池&#x2F;线程池参数不生效</td>
+<td>已创建的连接不会因配置变化重建</td>
+<td>需要自定义 <code>@EventListener(EnvironmentChangeEvent)</code> 重建</td>
+</tr>
+<tr>
+<td>刷新时序</td>
+<td>多个 Bean 刷新非原子，可能读到半新半旧</td>
+<td>关键配置放同一前缀，一次性刷新</td>
+</tr>
+</tbody></table>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="meta">@Slf4j</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">PoolRebuilder</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@EventListener</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onEnvChange</span><span class="params">(EnvironmentChangeEvent event)</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (event.getKeys().stream().anyMatch(k -&gt; k.startsWith(<span class="string">&quot;app.pool.&quot;</span>))) &#123;</span><br><span class="line">            log.warn(<span class="string">&quot;连接池配置变更，开始重建: &#123;&#125;&quot;</span>, event.getKeys());</span><br><span class="line">            dataSourceRebuilder.rebuild();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="四、排查手册：配置不生效的-6-个根因"><a href="#四、排查手册：配置不生效的-6-个根因" class="headerlink" title="四、排查手册：配置不生效的 6 个根因"></a>四、排查手册：配置不生效的 6 个根因</h2><p>按命中率排序：</p>
+<p><strong>① 优先级更高的源覆盖了它。</strong><br>排查：<code>curl /actuator/env/app.foo</code>，看 <code>propertySources</code> 数组里谁在最前、<code>value</code> 是多少。</p>
+<p><strong>② 环境变量名转换规则搞错了。</strong><br><code>app.llm.api-key</code> 对应的环境变量是 <code>APP_LLM_APIKEY</code>（<strong>不是</strong> <code>APP_LLM_API_KEY</code>）。规则：转大写 + <code>.</code> 和 <code>-</code> 都删掉。这个坑在 Docker&#x2F;K8s 里极其常见。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 验证</span></span><br><span class="line">SPRING_APPLICATION_JSON=<span class="string">&#x27;&#123;&quot;app&quot;:&#123;&quot;llm&quot;:&#123;&quot;api-key&quot;:&quot;x&quot;&#125;&#125;&#125;&#x27;</span> java -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p><strong>③ profile 没激活，读的是默认文件。</strong><br>排查：启动日志搜 <code>The following 1 profile is active</code>，或 <code>/actuator/env</code> 看 <code>activeProfiles</code>。</p>
+<p><strong>④ <code>@PropertySource</code> 加载的文件被 config data 覆盖。</strong><br>见 2.2 的说明，改用 <code>EnvironmentPostProcessor</code>。</p>
+<p><strong>⑤ 占位符拼写&#x2F;嵌套错误。</strong><br><code>${app.host}</code> 写成 <code>${app_host}</code>，或者写成 <code>$app.host</code>（少了大括号），后者不会被解析，原样输出。</p>
+<p><strong>⑥ 配置文件根本没被加载到。</strong><br><code>spring.config.location</code> 一旦显式指定，<strong>默认位置全部失效</strong>（不是追加）。要追加必须用 <code>spring.config.additional-location</code>。这个区别踩过的人非常多。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 只读这个目录，classpath 下的 application.yml 不再加载</span></span><br><span class="line">java -jar app.jar --spring.config.location=file:/etc/app/</span><br><span class="line"><span class="comment"># 额外追加，默认位置仍生效</span></span><br><span class="line">java -jar app.jar --spring.config.additional-location=file:/etc/app/</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、面试高频追问"><a href="#五、面试高频追问" class="headerlink" title="五、面试高频追问"></a>五、面试高频追问</h2><p><strong>Q1：<code>application.yml</code> 和 <code>bootstrap.yml</code> 有什么区别？</strong></p>
+<p><code>bootstrap.yml</code> 是 Spring Cloud 早期（<code>bootstrap</code> 上下文）的机制，用于在<strong>主上下文创建前</strong>加载配置中心信息（因为连 Nacos 需要先知道地址）。Boot 2.4+ 和 Spring Cloud 2020+ 已废弃 bootstrap 上下文，改用 <code>spring.config.import=nacos:...</code>。新项目不要再引入 <code>spring-cloud-starter-bootstrap</code>。</p>
+<p><strong>Q2：<code>Environment</code> 和 <code>@Value</code> 的关系？</strong></p>
+<p><code>@Value</code> 的解析由 <code>AutowiredAnnotationBeanPostProcessor</code> 配合 <code>PropertySourcesPlaceholderConfigurer</code> 完成，最终查的就是 <code>Environment</code> 里的 <code>PropertySources</code>。所以 <code>Environment</code> 是数据源，<code>@Value</code> 只是语法糖。</p>
+<p><strong>Q3：为什么 <code>@ConfigurationProperties</code> 支持松散绑定而 <code>@Value</code> 不支持？</strong></p>
+<p><code>@ConfigurationProperties</code> 走 <code>Binder</code>，内部用 <code>ConfigurationPropertyName</code> 做规范化（忽略大小写、<code>-</code>、<code>_</code>），所以 <code>app.llm.api-key</code>、<code>app.llm.apiKey</code>、<code>APP_LLM_APIKEY</code> 都能绑。<code>@Value</code> 是纯字符串占位符解析，必须精确匹配 key。</p>
+<p><strong>Q4：配置能注入到静态字段吗？</strong></p>
+<p>不能。静态字段在类初始化时赋值，早于 Spring 的依赖注入。常见变通：<code>@PostConstruct</code> 里赋值给静态变量，或用 setter 注入，或干脆改成实例字段。</p>
+<p><strong>Q5：多模块项目里，子模块的 <code>application.yml</code> 会被加载吗？</strong></p>
+<p>不会。只有 <strong>classpath 根目录 &#x2F; config 目录</strong>下的 <code>application.yml</code> 会被加载。多个 jar 都有 <code>application.yml</code> 时，<strong>只有一个会生效</strong>（取决于 classpath 顺序，通常是先加载的胜出&#x2F;或者报错）。正确做法：子模块用 <code>@PropertySource</code> 或独立的 <code>xxx.properties</code> + <code>spring.config.import</code>。</p>
+<p><strong>Q6：如何在不重启的情况下验证配置是否被正确读取？</strong></p>
+<p>Spring Boot 3 可以开 <code>management.endpoint.env.show-values=always</code>（2.x 是 <code>management.endpoint.env.enabled=true</code>），然后 <code>GET /actuator/env/{key}</code> 拿到命中源和覆盖链；或者写一个 <code>ApplicationRunner</code> 启动时打印关键配置的 <code>OriginLookup</code> 结果。</p>
+<hr>
+<h2 id="六、总结"><a href="#六、总结" class="headerlink" title="六、总结"></a>六、总结</h2><p>一句话记住 Spring Boot 配置的本质：<strong>有序的 <code>PropertySource</code> 列表 + 第一个命中即返回</strong>。</p>
+<p>三个必须内化的结论：</p>
+<ol>
+<li><strong>优先级不是”配置文件 &gt; 代码”，而是”外部化 &gt; 内部”</strong>。命令行、环境变量、配置中心永远赢过打死的 jar 内配置——这正是云原生”同一镜像多环境部署”的基础。</li>
+<li><strong><code>@PropertySource</code> 优先级低于 config data</strong>，需要高优先级必须用 <code>EnvironmentPostProcessor</code>。</li>
+<li><strong>配置要校验、要能追溯、要能刷新</strong>。生产的配置治理水平，直接决定了故障的平均恢复时间。</li>
+</ol>
+<p>配置问题之所以难查，是因为它是”静默失败”——不报错、不告警，只是行为不对。把这张优先级表背下来、把 <code>/actuator/env</code> 用熟，你就能把这类问题的定位时间从两小时压到两分钟。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/22/spring-boot-environment-config-loading-deep-dive/">https://jiweidong.github.io/2026/10/22/spring-boot-environment-config-loading-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%BA%90%E7%A0%81/">源码</a><a class="post-meta__tags" href="/tags/Spring-Boot/">Spring Boot</a><a class="post-meta__tags" href="/tags/%E9%85%8D%E7%BD%AE%E4%B8%AD%E5%BF%83/">配置中心</a><a class="post-meta__tags" href="/tags/Environment/">Environment</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/22/kafka-consumer-multithread-concurrency-deep-dive/" title="【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理前言Kafka 消费者是单线程的——准确说，KafkaConsumer 实例不是线程安全的，一个 consumer 只能被一个线程使用。但业务侧的消息处理往往很慢（写库、调三方、跑模型），单线程处理能力很快成为瓶颈。 于是就有了”多线程消费”这个经典命题。但绝大多数团队在这件事上至少踩过一次坑，典型症状：  加了线程池，吞吐没上去，反而开始重复消费； 消费顺序乱了，同一个订单的”创建”跑在”支付”后面； commitSync 报了 CommitFailedException，日志里一堆”offset commit failed”； 扩容实例后，分区没重新分配，新实例空转； 出现了”消息处理成功但位点丢了”导致的重复处理，下游没做幂等 → 数据翻倍。  本文把 Kafka 多线程消费的四种模型、顺序性代价、位点提交的确定性规则讲透，并给出可直接落地的代码骨架。  一、先明确约束：为什么不能共享 Consumer1234// ❌ 绝对错误：多线程共享同一个 consumerKafkaConsumer&lt;St...</div></div></div></a><a class="pagination-related" href="/2026/10/22/spring-application-event-listener-deep-dive/" title="【Spring 实战】Spring 事件驱动机制深度解析：ApplicationEvent、@EventListener 与事务事件落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Spring 实战】Spring 事件驱动机制深度解析：ApplicationEvent、@EventListener 与事务事件落地</div></div><div class="info-2"><div class="info-item-1">【Spring 实战】Spring 事件驱动机制深度解析：ApplicationEvent、@EventListener 与事务事件落地前言业务代码写久了，你一定见过这样的场景：用户注册成功后要发欢迎邮件、送优惠券、写操作日志、同步到数仓、通知推荐系统更新画像。如果全塞在一个 register() 方法里，这个方法会从 30 行长到 300 行，而且每加一个下游就要改一次注册逻辑——典型的开闭原则事故现场。 解法大家都知道：解耦。但在 Spring 体系里，解耦有三种常见手段，很多人分不清边界：    手段 耦合度 是否跨进程 事务一致性 典型场景    方法内直接调用 强耦合（编译期依赖） 否 同事务 强一致的核心主流程   Spring 事件（ApplicationEvent） 弱耦合（运行期按类型派发） 否 可控（可绑定事务阶段） 同 JVM 内的业务副作用   MQ（Kafka&#x2F;RocketMQ） 完全解耦 是 最终一致 跨服务、需要削峰&#x2F;重试   本文只讲中间那条——Spring 事件机制。很多人以为它就是个”观察者模式的小玩具”，实际上它在 Spr...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/11/spring-boot-auto-configuration-deep-dive/" title="【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-11</div><div class="info-item-2">【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 源码】自动装配原理深度解析：从 @SpringBootApplication 到自定义 Starter面试官：Spring Boot 为什么”开箱即用”？说说自动装配的原理这是 Spring Boot 面试中出场率最高的题目，没有之一。很多人能背出 @SpringBootApplication 由三个注解组成，但被追问到「AutoConfiguration.imports 文件是什么时候被加载的」「@ConditionalOnMissingBean 的判定时机」时就卡壳了。 本文从源码层面把自动装配这条链路完整走一遍，并手把手写一个自定义 Starter，彻底根治这个面试死角。   一、自动装配的入口：@SpringBootApplication123456789101112@Target(ElementType.TYPE)@Retention(RetentionPolicy.RUNTIME)@Documented@Inherited@SpringBootConfiguration   // 本质是 @Configuration@EnableAutoCo...</div></div></div></a><a class="pagination-related" href="/2026/07/01/spring-boot-refresh-source-analysis/" title="【Spring 源码】Spring Boot 容器刷新源码解析：从 run() 到 refresh() 全流程"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【Spring 源码】Spring Boot 容器刷新源码解析：从 run() 到 refresh() 全流程</div></div><div class="info-2"><div class="info-item-1">【Spring 源码】Spring Boot 容器刷新源码解析：从 run() 到 refresh() 全流程前言「Spring Boot 启动时发生了什么？」——这是面试中最高频的问题之一。很多人的回答止步于「@SpringBootApplication 和自动配置」。但实际上，Spring Boot 的启动流程远不止这些，它的核心是 ApplicationContext 的刷新（refresh）过程。 本文将从 SpringApplication.run() 入口出发，逐层解剖到 AbstractApplicationContext.refresh()，带你走完 Spring Boot 启动的全流程。  一、入口：SpringApplication.run()123456@SpringBootApplicationpublic class Application &#123;    public static void main(String[] args) &#123;        SpringApplication.run(Application.class, args...</div></div></div></a><a class="pagination-related" href="/2026/10/21/spring-boot-hikaricp-connection-leak-deep-dive/" title="【Spring Boot 实战】连接池耗尽与连接泄漏排查：HikariCP 参数、堆栈定位与根因治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【Spring Boot 实战】连接池耗尽与连接泄漏排查：HikariCP 参数、堆栈定位与根因治理</div></div><div class="info-2"><div class="info-item-1">【Spring Boot 实战】连接池耗尽与连接泄漏排查前言这个报错，做过线上 Java 的人应该都见过： 1HikariPool-1 - Connection is not available, request timed out after 30000ms.  它出现的时候，通常伴随三个现象：  所有涉及数据库的接口全部卡住，30 秒后统一超时； 不涉及数据库的接口（纯缓存、纯计算）正常； 重启后立刻恢复，但过几小时又复发。  很多人的第一反应是「连接池太小，调大 maximumPoolSize」。这个操作有 50% 的概率让问题更严重——因为如果是连接泄漏，调大池子只是把爆炸时间往后推，同时把数据库的连接数打满，从应用故障升级成数据库故障。 这一篇把连接池耗尽这件事拆开讲：连接的生命周期、HikariCP 的核心参数怎么算、泄漏的六种典型根因、以及一套从指标到代码的定位方法。  一、一条连接的完整生命周期1.1 从 getConnection() 到 close()12345678910111213业务代码 dataSource.getConnection()   ↓Hik...</div></div></div></a><a class="pagination-related" href="/2026/08/06/scheduledthreadpoolexecutor-deep-dive/" title="【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理</div></div><div class="info-2"><div class="info-item-1">【并发编程】ScheduledThreadPoolExecutor 源码深度解析：DelayedWorkQueue 与定时任务原理面试官：说说 JDK 里的定时任务调度是怎么实现的？一提到定时任务，很多人的第一反应是 Timer 或者 Spring 的 @Scheduled。但面试官真正想听到的，是 ScheduledThreadPoolExecutor（以下简称 STPE）——JDK 定时调度的正统实现。 被追问下去就是灵魂三连：  Timer 有什么缺陷？为什么现在都用 STPE？ scheduleAtFixedRate 和 scheduleWithFixedDelay 到底差在哪？ STPE 底层用什么数据结构存任务？延迟任务是怎么”到点触发”的？ 为什么 STPE 的 execute() 永远只创建一个线程？核心线程数会被”清零”吗？  本文结合 JDK 8 源码，把 STPE 和它的秘密武器 DelayedWorkQueue 彻底拆开。   一、Timer 的四大缺陷（面试必答）   缺陷 说明    单线程串行 一个任务执行时间过长，会阻塞后续所有任务   异常中断 ...</div></div></div></a><a class="pagination-related" href="/2026/08/11/mybatis-execution-flow-source-deep-dive/" title="【MyBatis 源码】核心执行流程深度解析：从 SqlSession 到四大组件的协作"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-11</div><div class="info-item-2">【MyBatis 源码】核心执行流程深度解析：从 SqlSession 到四大组件的协作</div></div><div class="info-2"><div class="info-item-1">【MyBatis 源码】核心执行流程深度解析：从 SqlSession 到四大组件的协作面试官：一条 selectById 从调用到返回，MyBatis 内部都经历了什么？很多人天天用 MyBatis，却说不清 sqlSession.selectOne(&quot;user.selectById&quot;, 1) 背后发生了什么。MyBatis 的执行链路非常清晰：SqlSession → Executor → StatementHandler → ParameterHandler &#x2F; ResultSetHandler，中间穿插 TypeHandler 和缓存。 本文从 selectOne 开始逐层拆解源码，把这条链路彻底讲透。   一、整体架构与四大组件   组件 职责 接口关键方法    SqlSession 门面，对外提供 CRUD API selectOne &#x2F; insert &#x2F; update &#x2F; delete   Executor 执行器，负责缓存、事务、SQL 分发 query &#x2F; update &#x2F; com...</div></div></div></a><a class="pagination-related" href="/2026/08/09/adapter-pattern-deep-dive/" title="【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-09</div><div class="info-item-2">【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter</div></div><div class="info-2"><div class="info-item-1">【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter面试官：适配器模式和装饰器模式有什么区别？Spring MVC 里的 HandlerAdapter 是适配器吗？适配器模式（Adapter Pattern）是最「接地气」的设计模式——它解决的就是日常开发里最常见的痛点：接口不兼容。充电器转接头、插座转换器、读卡器，全都是适配器。 但面试官不会满足于「转接头」的比喻，他更想听你讲：适配器模式有哪两种实现方式？适配器、装饰器、代理三个模式的区分？以及 Spring MVC 的 HandlerAdapter 为什么是适配器模式最经典的框架级应用。 一、适配器模式的核心思想1.1 问题场景12345678910你的系统里有一个「统一支付接口」：    interface Payment &#123; void pay(double amount); &#125;但第三方微信支付 SDK 提供的接口是：    class WechatPaySDK &#123; void wechatPay(double amount, String appId...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">807</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">903</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Spring-Boot-%E6%BA%90%E7%A0%81%E3%80%91%E9%85%8D%E7%BD%AE%E5%8A%A0%E8%BD%BD%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AEnvironment%E3%80%81PropertySource-%E9%A1%BA%E5%BA%8F%E4%B8%8E%E5%A4%9A%E7%8E%AF%E5%A2%83%E6%B2%BB%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E6%A0%B8%E5%BF%83%E6%8A%BD%E8%B1%A1%EF%BC%9AEnvironment-%E4%B8%8E-PropertySource"><span class="toc-number">1.2.</span> <span class="toc-text">一、核心抽象：Environment 与 PropertySource</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E4%B8%89%E5%B1%82%E7%BB%93%E6%9E%84"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 三层结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-PropertySource-%E6%9C%89%E2%80%9D%E6%9D%A5%E6%BA%90%E7%B1%BB%E5%9E%8B%E2%80%9D%E4%B9%8B%E5%88%86"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 PropertySource 有”来源类型”之分</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-Value-vs-ConfigurationProperties-vs-Environment-getProperty"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 @Value vs @ConfigurationProperties vs Environment#getProperty</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%8A%A0%E8%BD%BD%E6%B5%81%E7%A8%8B%EF%BC%9AConfigDataEnvironmentPostProcessor"><span class="toc-number">1.3.</span> <span class="toc-text">二、加载流程：ConfigDataEnvironmentPostProcessor</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E9%BB%98%E8%AE%A4%E6%90%9C%E7%B4%A2%E4%BD%8D%E7%BD%AE%E4%B8%8E%E4%BC%98%E5%85%88%E7%BA%A7"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 默认搜索位置与优先级</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%AE%8C%E6%95%B4%E4%BC%98%E5%85%88%E7%BA%A7%E9%93%BE%EF%BC%88%E4%BD%8E-%E2%86%92-%E9%AB%98%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 完整优先级链（低 → 高）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E5%8D%A0%E4%BD%8D%E7%AC%A6%E8%A7%A3%E6%9E%90%EF%BC%9A-%E7%9A%84%E5%9D%91"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 占位符解析：${} 的坑</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-Profile-%E7%9A%84%E6%AD%A3%E7%A1%AE%E7%94%A8%E6%B3%95"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 Profile 的正确用法</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%B7%A5%E7%A8%8B%E5%AE%9E%E8%B7%B5%EF%BC%9A%E9%85%8D%E7%BD%AE%E6%B2%BB%E7%90%86%E5%9B%9B%E4%BB%B6%E4%BA%8B"><span class="toc-number">1.4.</span> <span class="toc-text">三、工程实践：配置治理四件事</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E9%85%8D%E7%BD%AE%E5%88%86%E5%B1%82%EF%BC%9A%E8%AE%A9%E2%80%9D%E7%8E%AF%E5%A2%83%E5%B7%AE%E5%BC%82%E2%80%9D%E6%9C%80%E5%B0%8F%E5%8C%96"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 配置分层：让”环境差异”最小化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E9%85%8D%E7%BD%AE%E6%A0%A1%E9%AA%8C%EF%BC%9A%E5%90%AF%E5%8A%A8%E5%8D%B3%E5%A4%B1%E8%B4%A5%EF%BC%8C%E5%88%AB%E5%B8%A6%E7%97%85%E4%B8%8A%E7%BA%BF"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 配置校验：启动即失败，别带病上线</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E6%95%8F%E6%84%9F%E9%85%8D%E7%BD%AE%EF%BC%9A%E4%B8%8D%E8%A6%81%E6%98%8E%E6%96%87%E8%BF%9B-Git"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 敏感配置：不要明文进 Git</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%8A%A8%E6%80%81%E5%88%B7%E6%96%B0%EF%BC%9A-RefreshScope-%E7%9A%84%E8%BE%B9%E7%95%8C"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 动态刷新：@RefreshScope 的边界</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%8E%92%E6%9F%A5%E6%89%8B%E5%86%8C%EF%BC%9A%E9%85%8D%E7%BD%AE%E4%B8%8D%E7%94%9F%E6%95%88%E7%9A%84-6-%E4%B8%AA%E6%A0%B9%E5%9B%A0"><span class="toc-number">1.5.</span> <span class="toc-text">四、排查手册：配置不生效的 6 个根因</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.6.</span> <span class="toc-text">五、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.7.</span> <span class="toc-text">六、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/22/ai-coding-assistant-system-design/" title="【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路">【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路</a><time datetime="2026-10-22T00:50:00.000Z" title="发表于 2026-10-22 08:50:00">2026-10-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/22/spring-ai-multi-model-llm-gateway-deep-practice/" title="【Java AI】Spring AI 多模型接入与 LLM 网关实战：路由、降级与配额">【Java AI】Spring AI 多模型接入与 LLM 网关实战：路由、降级与配额</a><time datetime="2026-10-22T00:40:00.000Z" title="发表于 2026-10-22 08:40:00">2026-10-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/22/kafka-consumer-multithread-concurrency-deep-dive/" title="【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理">【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理</a><time datetime="2026-10-22T00:30:00.000Z" title="发表于 2026-10-22 08:30:00">2026-10-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/22/spring-boot-environment-config-loading-deep-dive/" title="【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理">【Spring Boot 源码】配置加载机制深度解析：Environment、PropertySource 顺序与多环境治理</a><time datetime="2026-10-22T00:20:00.000Z" title="发表于 2026-10-22 08:20:00">2026-10-22</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/22/spring-application-event-listener-deep-dive/" title="【Spring 实战】Spring 事件驱动机制深度解析：ApplicationEvent、@EventListener 与事务事件落地">【Spring 实战】Spring 事件驱动机制深度解析：ApplicationEvent、@EventListener 与事务事件落地</a><time datetime="2026-10-22T00:10:00.000Z" title="发表于 2026-10-22 08:10:00">2026-10-22</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
