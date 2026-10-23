@@ -1,0 +1,777 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理前言做 AI 应用上线后，第二个账单周期通常会让人清醒一下。 一个中等规模的企业知识库问答：日活 2000，人均 15 次对话，每次对话 2.5 轮，平均输入 1800 token、输出 400 token。按某主流模型每百万 token 输入 2 元、输出 8 元粗算： 123日 token &#x3D; 2000 × 15 × 2.5">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/23/java-llm-cache-semantic-cache-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理前言做 AI 应用上线后，第二个账单周期通常会让人清醒一下。 一个中等规模的企业知识库问答：日活 2000，人均 15 次对话，每次对话 2.5 轮，平均输入 1800 token、输出 400 token。按某主流模型每百万 token 输入 2 元、输出 8 元粗算： 123日 token &#x3D; 2000 × 15 × 2.5">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-23T00:30:00.000Z">
+<meta property="article:modified_time" content="2026-10-23T00:03:10.005Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="AI">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Spring AI">
+<meta property="article:tag" content="向量检索">
+<meta property="article:tag" content="成本优化">
+<meta property="article:tag" content="缓存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理",
+  "url": "https://jiweidong.github.io/2026/10/23/java-llm-cache-semantic-cache-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-23T00:30:00.000Z",
+  "dateModified": "2026-10-23T00:03:10.005Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/23/java-llm-cache-semantic-cache-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">812</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">909</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-23T00:30:00.000Z" title="发表于 2026-10-23 08:30:00">2026-10-23</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-23T00:03:10.005Z" title="更新于 2026-10-23 08:03:10">2026-10-23</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/AI-%E5%B7%A5%E7%A8%8B/">AI 工程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理"><a href="#【Java-AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理" class="headerlink" title="【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理"></a>【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>做 AI 应用上线后，第二个账单周期通常会让人清醒一下。</p>
+<p>一个中等规模的企业知识库问答：日活 2000，人均 15 次对话，每次对话 2.5 轮，平均输入 1800 token、输出 400 token。按某主流模型每百万 token 输入 2 元、输出 8 元粗算：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">日 token = 2000 × 15 × 2.5 × (1800 + 400) = 165,000,000</span><br><span class="line">日成本 ≈ 165 × (2 × 0.82 + 8 × 0.18) ≈ 165 × 3.08 ≈ 508 元</span><br><span class="line">月成本 ≈ 1.5 万元</span><br></pre></td></tr></table></figure>
+
+<p>而真实流量里，<strong>重复或近似重复的请求占比通常在 25%–60%</strong>：</p>
+<ul>
+<li>「怎么开发票」被 300 个人问过；</li>
+<li>「你们的退款政策是什么」被换着花样问了 50 遍；</li>
+<li>前端在同一秒内对同一个按钮发了两次请求；</li>
+<li>Agent 的同一个子步骤在重试时又算了一遍。</li>
+</ul>
+<p>这些流量全都在重复买同样的 token。缓存是 AI 应用里<strong>ROI 最高的一项优化</strong>，没有之一。</p>
+<p>但这套缓存和 Redis 缓存商品详情完全不是一回事：<strong>LLM 的输出是非确定性的，输入是自然语言，等价关系是「语义等价」而不是「字节相等」</strong>。这篇文章讲清三层缓存、精确缓存的 key 设计、语义缓存的阈值调优、Spring AI 落地代码，以及命中率治理。</p>
+<hr>
+<h2 id="一、先分层：LLM-缓存有三个完全不同的位置"><a href="#一、先分层：LLM-缓存有三个完全不同的位置" class="headerlink" title="一、先分层：LLM 缓存有三个完全不同的位置"></a>一、先分层：LLM 缓存有三个完全不同的位置</h2><p>很多人一上来就写「向量相似度缓存」，其实漏掉了最省钱的那一层。</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>位置</th>
+<th>命中条件</th>
+<th>节省</th>
+<th>可控性</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>L1 Provider Prompt Cache</td>
+<td>模型厂商侧</td>
+<td>请求<strong>前缀</strong>完全一致</td>
+<td>输入 token 费用 50%–90%</td>
+<td>低（受厂商策略约束）</td>
+</tr>
+<tr>
+<td>L2 精确缓存</td>
+<td>应用侧</td>
+<td>全量请求参数 hash 相等</td>
+<td>100%（不调用模型）</td>
+<td>高</td>
+</tr>
+<tr>
+<td>L3 语义缓存</td>
+<td>应用侧</td>
+<td>语义相似度 ≥ 阈值</td>
+<td>100%（不调用模型）</td>
+<td>中（有误命中风险）</td>
+</tr>
+</tbody></table>
+<h3 id="1-1-L1：Provider-侧前缀缓存"><a href="#1-1-L1：Provider-侧前缀缓存" class="headerlink" title="1.1 L1：Provider 侧前缀缓存"></a>1.1 L1：Provider 侧前缀缓存</h3><p>主流厂商都做了「相同前缀复用 KV Cache」的功能：</p>
+<ul>
+<li>请求的前 N 个 token 与之前某次请求完全一致，就直接复用那段的注意力 KV，跳过重复 prefill；</li>
+<li>命中部分通常按原价的 10%–50% 计费，且<strong>显著降低首 token 延迟（TTFT）</strong>。</li>
+</ul>
+<p>工程上的关键动作只有一条：<strong>把稳定内容放在最前面，把变化内容放在最后</strong>。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">❌ 差的结构（每次都变，永远命中不了）</span><br><span class="line">[用户问题] + [系统提示词] + [知识库片段]</span><br><span class="line"></span><br><span class="line">✅ 好的结构（前缀稳定）</span><br><span class="line">[系统提示词（固定）] + [工具定义（固定）] + [知识库片段（相对稳定）] + [用户问题（变化）]</span><br></pre></td></tr></table></figure>
+
+<p>这条规则还有个副作用：<strong>它和「把最相关的上下文放最后」的提示工程技巧是冲突的</strong>。工程上要权衡——如果前缀缓存能省 50% 输入成本，通常值得把检索片段前置、问题后置，再用明确的指令告诉模型「最后一段是用户问题」。</p>
+<h3 id="1-2-L2-L3：应用侧缓存，才是本文重点"><a href="#1-2-L2-L3：应用侧缓存，才是本文重点" class="headerlink" title="1.2 L2&#x2F;L3：应用侧缓存，才是本文重点"></a>1.2 L2&#x2F;L3：应用侧缓存，才是本文重点</h3><p>先给结论性的架构：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">请求</span><br><span class="line"> │</span><br><span class="line"> ├─► L2 精确缓存（Caffeine，key = 规范化参数 hash）</span><br><span class="line"> │      命中 ─► 返回（&lt;1ms）</span><br><span class="line"> │</span><br><span class="line"> ├─► L3 语义缓存（向量检索 + 阈值判定）</span><br><span class="line"> │      命中 ─► 返回（10–50ms）</span><br><span class="line"> │</span><br><span class="line"> └─► 调用 LLM ─► 写回 L2 + L3</span><br></pre></td></tr></table></figure>
+
+<p><code>L2</code> 挡「完全重复」，<code>L3</code> 挡「换个说法」，<code>LLM</code> 兜底。下面逐个拆。</p>
+<hr>
+<h2 id="二、L2-精确缓存：key-设计决定成败"><a href="#二、L2-精确缓存：key-设计决定成败" class="headerlink" title="二、L2 精确缓存：key 设计决定成败"></a>二、L2 精确缓存：key 设计决定成败</h2><h3 id="2-1-一个「少写一个字段」导致的事故"><a href="#2-1-一个「少写一个字段」导致的事故" class="headerlink" title="2.1 一个「少写一个字段」导致的事故"></a>2.1 一个「少写一个字段」导致的事故</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 只 hash 了 prompt</span></span><br><span class="line"><span class="type">String</span> <span class="variable">key</span> <span class="operator">=</span> DigestUtils.md5Hex(prompt);</span><br></pre></td></tr></table></figure>
+
+<p>后果：同一个 prompt 在 <code>temperature=0</code> 和 <code>temperature=1.2</code> 下命中同一个缓存；切换了 <code>model</code> 也命中；不同租户的知识库混在一起。上线第二天就出现了「A 公司看到 B 公司答案」的越权事故。</p>
+<p><strong>正确的 key 必须包含所有影响输出的因素：</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">LlmCacheKey</span><span class="params">(</span></span><br><span class="line"><span class="params">        String tenantId,        // 租户/空间，隔离的第一要素</span></span><br><span class="line"><span class="params">        String model,           // 模型标识（含版本）</span></span><br><span class="line"><span class="params">        <span class="type">double</span> temperature,</span></span><br><span class="line"><span class="params">        <span class="type">double</span> topP,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> maxTokens,</span></span><br><span class="line"><span class="params">        String systemPromptHash,</span></span><br><span class="line"><span class="params">        String userPromptHash,</span></span><br><span class="line"><span class="params">        String toolsHash,       // 工具定义变了，输出会变</span></span><br><span class="line"><span class="params">        String contextHash,     // 检索到的知识片段</span></span><br><span class="line"><span class="params">        String promptVersion    // 提示词模板版本号</span></span><br><span class="line"><span class="params">)</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">fingerprint</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">raw</span> <span class="operator">=</span> String.join(<span class="string">&quot;|&quot;</span>,</span><br><span class="line">                tenantId, model,</span><br><span class="line">                String.format(<span class="string">&quot;%.2f&quot;</span>, temperature), String.format(<span class="string">&quot;%.2f&quot;</span>, topP),</span><br><span class="line">                String.valueOf(maxTokens),</span><br><span class="line">                systemPromptHash, userPromptHash, toolsHash, contextHash, promptVersion);</span><br><span class="line">        <span class="keyword">return</span> DigestUtils.sha256Hex(raw);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-2-哪些字段必须进-key，哪些不能进"><a href="#2-2-哪些字段必须进-key，哪些不能进" class="headerlink" title="2.2 哪些字段必须进 key，哪些不能进"></a>2.2 哪些字段必须进 key，哪些不能进</h3><table>
+<thead>
+<tr>
+<th>字段</th>
+<th>是否入 key</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>model</code></td>
+<td>✅</td>
+<td>换模型输出必然不同</td>
+</tr>
+<tr>
+<td><code>temperature</code> &#x2F; <code>topP</code></td>
+<td>✅</td>
+<td>采样参数不同，分布不同</td>
+</tr>
+<tr>
+<td><code>maxTokens</code></td>
+<td>✅</td>
+<td>影响截断</td>
+</tr>
+<tr>
+<td><code>system prompt</code></td>
+<td>✅</td>
+<td>人格与约束变了</td>
+</tr>
+<tr>
+<td><code>tools</code> 定义</td>
+<td>✅</td>
+<td>工具集变化影响工具调用决策</td>
+</tr>
+<tr>
+<td>检索到的 context</td>
+<td>✅</td>
+<td>这是 RAG 的核心变量</td>
+</tr>
+<tr>
+<td><code>tenantId</code> &#x2F; <code>userId</code></td>
+<td>✅</td>
+<td>安全隔离，<strong>必须</strong></td>
+</tr>
+<tr>
+<td>时间戳 &#x2F; traceId</td>
+<td>❌</td>
+<td>会击穿缓存</td>
+</tr>
+<tr>
+<td><code>requestId</code></td>
+<td>❌</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>用户昵称等展示字段</td>
+<td>❌</td>
+<td>与语义无关</td>
+</tr>
+</tbody></table>
+<p><strong>判据只有一条</strong>：这个字段变了，模型的输出<strong>应该</strong>变吗？会变就入 key，不会变就别入。</p>
+<h3 id="2-3-prompt-规范化"><a href="#2-3-prompt-规范化" class="headerlink" title="2.3 prompt 规范化"></a>2.3 prompt 规范化</h3><p>即便是精确缓存，用户输入也常带噪声：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> String <span class="title function_">normalize</span><span class="params">(String prompt)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> prompt</span><br><span class="line">            .strip()                              <span class="comment">// 去首尾空白</span></span><br><span class="line">            .replaceAll(<span class="string">&quot;\\s+&quot;</span>, <span class="string">&quot; &quot;</span>)              <span class="comment">// 压缩连续空白</span></span><br><span class="line">            .replaceAll(<span class="string">&quot;[\\u200B-\\u200D\\uFEFF]&quot;</span>, <span class="string">&quot;&quot;</span>)  <span class="comment">// 去零宽字符</span></span><br><span class="line">            .toLowerCase(Locale.ROOT);            <span class="comment">// 英文大小写归一（中文无影响）</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意 <code>toLowerCase</code> 对某些语言不安全（土耳其语 <code>I</code>），中文场景没问题，多语言场景要谨慎或跳过这一步。</p>
+<h3 id="2-4-Caffeine-落地"><a href="#2-4-Caffeine-落地" class="headerlink" title="2.4 Caffeine 落地"></a>2.4 Caffeine 落地</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Configuration</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">LlmCacheConfig</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Bean</span></span><br><span class="line">    <span class="keyword">public</span> Cache&lt;String, LlmResponse&gt; <span class="title function_">exactLlmCache</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> Caffeine.newBuilder()</span><br><span class="line">                .maximumWeight(<span class="number">200_000_000</span>)                    <span class="comment">// 约 200MB</span></span><br><span class="line">                .weigher((String k, LlmResponse v) -&gt;</span><br><span class="line">                        v.content().length() * <span class="number">2</span> + k.length() * <span class="number">2</span> + <span class="number">64</span>)</span><br><span class="line">                .expireAfterWrite(Duration.ofHours(<span class="number">6</span>))         <span class="comment">// 业务决定的新鲜度</span></span><br><span class="line">                .expireAfterAccess(Duration.ofHours(<span class="number">2</span>))        <span class="comment">// 冷数据先淘汰</span></span><br><span class="line">                .recordStats()                                 <span class="comment">// 必开，用于命中率观测</span></span><br><span class="line">                .build();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么用 <code>maximumWeight</code> 而不是 <code>maximumSize</code>？</strong> 因为 LLM 响应长度差异巨大（100 字到 8000 字），按条数限制会导致内存占用不可预测（取决于命中什么）。按字节权重算才稳。</p>
+<h3 id="2-5-多实例怎么办"><a href="#2-5-多实例怎么办" class="headerlink" title="2.5 多实例怎么办"></a>2.5 多实例怎么办</h3><p>Caffeine 是进程内缓存，10 个 Pod 就有 10 份缓存，命中率被稀释。</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>命中率</th>
+<th>延迟</th>
+<th>一致性</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯本地 Caffeine</td>
+<td>低（1&#x2F;N）</td>
+<td>&lt;1ms</td>
+<td>最终（各自淘汰）</td>
+<td>高频热点、允许不一致</td>
+</tr>
+<tr>
+<td>纯 Redis</td>
+<td>高（全局）</td>
+<td>1–3ms</td>
+<td>强</td>
+<td>默认选择</td>
+</tr>
+<tr>
+<td>本地 + Redis 二级</td>
+<td>最高</td>
+<td>&lt;1ms（热）&#x2F; 2ms（温）</td>
+<td>最终</td>
+<td><strong>推荐</strong></td>
+</tr>
+<tr>
+<td>Redis + 一致性 hash</td>
+<td>高</td>
+<td>1–2ms</td>
+<td>强</td>
+<td>大 key 场景</td>
+</tr>
+</tbody></table>
+<p>二级缓存的写法：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> Optional&lt;LlmResponse&gt; <span class="title function_">get</span><span class="params">(String key)</span> &#123;</span><br><span class="line">    <span class="type">LlmResponse</span> <span class="variable">local</span> <span class="operator">=</span> localCache.getIfPresent(key);</span><br><span class="line">    <span class="keyword">if</span> (local != <span class="literal">null</span>) &#123;</span><br><span class="line">        metrics.counter(<span class="string">&quot;llm.cache.hit&quot;</span>, <span class="string">&quot;layer&quot;</span>, <span class="string">&quot;local&quot;</span>).increment();</span><br><span class="line">        <span class="keyword">return</span> Optional.of(local);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="type">String</span> <span class="variable">json</span> <span class="operator">=</span> redis.opsForValue().get(<span class="string">&quot;llm:&quot;</span> + key);</span><br><span class="line">    <span class="keyword">if</span> (json != <span class="literal">null</span>) &#123;</span><br><span class="line">        <span class="type">LlmResponse</span> <span class="variable">remote</span> <span class="operator">=</span> objectMapper.readValue(json, LlmResponse.class);</span><br><span class="line">        localCache.put(key, remote);                       <span class="comment">// 回填本地</span></span><br><span class="line">        metrics.counter(<span class="string">&quot;llm.cache.hit&quot;</span>, <span class="string">&quot;layer&quot;</span>, <span class="string">&quot;redis&quot;</span>).increment();</span><br><span class="line">        <span class="keyword">return</span> Optional.of(remote);</span><br><span class="line">    &#125;</span><br><span class="line">    metrics.counter(<span class="string">&quot;llm.cache.miss&quot;</span>).increment();</span><br><span class="line">    <span class="keyword">return</span> Optional.empty();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、L3-语义缓存：真正省钱，也真正危险"><a href="#三、L3-语义缓存：真正省钱，也真正危险" class="headerlink" title="三、L3 语义缓存：真正省钱，也真正危险"></a>三、L3 语义缓存：真正省钱，也真正危险</h2><p>精确缓存只能挡「一字不差」的重复。但用户会说：</p>
+<ul>
+<li>「怎么开发票」</li>
+<li>「发票怎么开」</li>
+<li>「我要开票，流程是啥」</li>
+<li>「invoice 怎么弄」（中英混输）</li>
+</ul>
+<p>四条请求，精确缓存命中率 0，语义缓存命中率 100%。</p>
+<h3 id="3-1-基本流程"><a href="#3-1-基本流程" class="headerlink" title="3.1 基本流程"></a>3.1 基本流程</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">1. 请求到达 → embedding(userPrompt + context)</span><br><span class="line">2. 在向量库中检索 topK=3 的「历史 (query, answer) 对」</span><br><span class="line">3. 取最高相似度 s：</span><br><span class="line">   - s ≥ highThreshold(0.95)  → 直接返回</span><br><span class="line">   - mediumThreshold(0.88) ≤ s &lt; highThreshold → 二次校验（可选）</span><br><span class="line">   - s &lt; mediumThreshold → 视为未命中，调用 LLM</span><br><span class="line">4. 调用 LLM 后，把 (query, embedding, answer, metadata) 写入向量库</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-阈值是唯一的安全阀，也是最难调的部分"><a href="#3-2-阈值是唯一的安全阀，也是最难调的部分" class="headerlink" title="3.2 阈值是唯一的安全阀，也是最难调的部分"></a>3.2 阈值是唯一的安全阀，也是最难调的部分</h3><p>不同 embedding 模型的相似度分布完全不同，<strong>没有通用阈值</strong>。必须用真实数据标定：</p>
+<table>
+<thead>
+<tr>
+<th>Embedding 模型</th>
+<th>典型「同义」相似度</th>
+<th>典型「不同义」相似度</th>
+<th>建议起始阈值</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>text-embedding-3-small</td>
+<td>0.90–0.96</td>
+<td>0.60–0.85</td>
+<td>0.93</td>
+</tr>
+<tr>
+<td>text-embedding-3-large</td>
+<td>0.88–0.95</td>
+<td>0.55–0.82</td>
+<td>0.91</td>
+</tr>
+<tr>
+<td>bge-m3</td>
+<td>0.92–0.98</td>
+<td>0.65–0.88</td>
+<td>0.95</td>
+</tr>
+<tr>
+<td>某些中文小模型</td>
+<td>0.85–0.99</td>
+<td>0.70–0.95</td>
+<td><strong>不可用</strong>（分布重叠太严重）</td>
+</tr>
+</tbody></table>
+<p><strong>标定方法</strong>（务必做，30 分钟就能完成）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 用 200 条真实 query 构造成对标注：同义对 100 对，非同义对 100 对</span></span><br><span class="line">List&lt;Double&gt; posScores = ...;   <span class="comment">// 同义对的相似度</span></span><br><span class="line">List&lt;Double&gt; negScores = ...;   <span class="comment">// 非同义对的相似度</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 找使 F1 最大的阈值</span></span><br><span class="line"><span class="type">double</span> <span class="variable">best</span> <span class="operator">=</span> <span class="number">0</span>, bestF1 = <span class="number">0</span>;</span><br><span class="line"><span class="keyword">for</span> (<span class="type">double</span> <span class="variable">t</span> <span class="operator">=</span> <span class="number">0.80</span>; t &lt;= <span class="number">0.99</span>; t += <span class="number">0.005</span>) &#123;</span><br><span class="line">    <span class="type">long</span> <span class="variable">tp</span> <span class="operator">=</span> posScores.stream().filter(s -&gt; s &gt;= t).count();</span><br><span class="line">    <span class="type">long</span> <span class="variable">fp</span> <span class="operator">=</span> negScores.stream().filter(s -&gt; s &gt;= t).count();</span><br><span class="line">    <span class="type">double</span> <span class="variable">precision</span> <span class="operator">=</span> tp / (<span class="type">double</span>) Math.max(<span class="number">1</span>, tp + fp);</span><br><span class="line">    <span class="type">double</span> <span class="variable">recall</span> <span class="operator">=</span> tp / (<span class="type">double</span>) posScores.size();</span><br><span class="line">    <span class="type">double</span> <span class="variable">f1</span> <span class="operator">=</span> <span class="number">2</span> * precision * recall / Math.max(<span class="number">1e-9</span>, precision + recall);</span><br><span class="line">    <span class="keyword">if</span> (f1 &gt; bestF1) &#123; bestF1 = f1; best = t; &#125;</span><br><span class="line">&#125;</span><br><span class="line">log.info(<span class="string">&quot;最佳阈值=&#123;&#125;, F1=&#123;&#125;&quot;</span>, best, bestF1);</span><br></pre></td></tr></table></figure>
+
+<p><strong>经验值</strong>：精确率优先于召回率。因为误命中的代价（给用户错误答案、甚至泄露他人数据）远大于未命中的代价（多花一次 token）。所以阈值应该取「高精确率」那一侧，宁可少命中。</p>
+<h3 id="3-3-二次校验：用便宜模型守门"><a href="#3-3-二次校验：用便宜模型守门" class="headerlink" title="3.3 二次校验：用便宜模型守门"></a>3.3 二次校验：用便宜模型守门</h3><p>高相似度不等于答案可复用。中间地带可以用小模型做一次判定：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="type">boolean</span> <span class="title function_">isSameIntent</span><span class="params">(String q1, String q2)</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">prompt</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">            判断下面两个用户问题是否在问同一件事，只回答 YES 或 NO。</span></span><br><span class="line"><span class="string">            问题A：%s</span></span><br><span class="line"><span class="string">            问题B：%s</span></span><br><span class="line"><span class="string">            &quot;&quot;&quot;</span>.formatted(q1, q2);</span><br><span class="line"></span><br><span class="line">    <span class="type">String</span> <span class="variable">r</span> <span class="operator">=</span> chatClient.prompt(prompt)</span><br><span class="line">            .options(ChatOptions.builder().model(<span class="string">&quot;small-cheap-model&quot;</span>).temperature(<span class="number">0.0</span>).build())</span><br><span class="line">            .call().content();</span><br><span class="line">    <span class="keyword">return</span> <span class="string">&quot;YES&quot;</span>.equalsIgnoreCase(r == <span class="literal">null</span> ? <span class="string">&quot;&quot;</span> : r.strip());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>成本对比：小模型判定约 50 token，主模型回答约 2000 token。<strong>用 2.5% 的成本换一次准确率提升，非常划算。</strong></p>
+<h3 id="3-4-哪些内容绝对不能进语义缓存"><a href="#3-4-哪些内容绝对不能进语义缓存" class="headerlink" title="3.4 哪些内容绝对不能进语义缓存"></a>3.4 哪些内容绝对不能进语义缓存</h3><p>这是很多团队踩过的坑，列成清单：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>含用户个人数据的回答（订单、账单、病历）</td>
+<td>语义相似 ≠ 同一用户，直接导致数据泄露</td>
+</tr>
+<tr>
+<td>依赖实时状态的回答（库存、余额、股价）</td>
+<td>缓存几秒后就过期，且无法感知变更</td>
+</tr>
+<tr>
+<td>高风险决策（风控、审批、医疗建议）</td>
+<td>误命中的代价不可接受</td>
+</tr>
+<tr>
+<td>多轮对话中的指代性回答（「那它呢？」）</td>
+<td>脱离上下文后语义完全变了</td>
+</tr>
+<tr>
+<td>带时间敏感指令的回答（「今天」「现在」）</td>
+<td>跨天复用会给出过期信息</td>
+</tr>
+</tbody></table>
+<p><strong>实践原则：只缓存「知识型、静态、非个性化」的回答。</strong> 在代码里用一个显式的判定函数拦住，而不是靠调用方自觉：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">isCacheable</span><span class="params">(LlmRequest req)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (req.containsPii()) <span class="keyword">return</span> <span class="literal">false</span>;               <span class="comment">// PII 检测</span></span><br><span class="line">    <span class="keyword">if</span> (req.isPersonalized()) <span class="keyword">return</span> <span class="literal">false</span>;            <span class="comment">// 带 userId 的个性化</span></span><br><span class="line">    <span class="keyword">if</span> (req.hasTimeSensitiveWords()) <span class="keyword">return</span> <span class="literal">false</span>;     <span class="comment">// 今天/现在/最新</span></span><br><span class="line">    <span class="keyword">if</span> (req.temperature() &gt; <span class="number">0.3</span>) <span class="keyword">return</span> <span class="literal">false</span>;         <span class="comment">// 高温度本就要多样性</span></span><br><span class="line">    <span class="keyword">return</span> <span class="keyword">switch</span> (req.scene()) &#123;</span><br><span class="line">        <span class="keyword">case</span> FAQ, DOC_QA, PRODUCT_SPEC -&gt; <span class="literal">true</span>;        <span class="comment">// 白名单</span></span><br><span class="line">        <span class="keyword">case</span> ORDER, BILLING, RISK, MEDICAL -&gt; <span class="literal">false</span>;   <span class="comment">// 黑名单</span></span><br><span class="line">    &#125;;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>白名单比黑名单可靠</strong>。黑名单永远列不全。</p>
+<hr>
+<h2 id="四、Spring-AI-落地：一个完整的语义缓存实现"><a href="#四、Spring-AI-落地：一个完整的语义缓存实现" class="headerlink" title="四、Spring AI 落地：一个完整的语义缓存实现"></a>四、Spring AI 落地：一个完整的语义缓存实现</h2><p>Spring AI 提供了 <code>VectorStore</code> 抽象和 <code>EmbeddingModel</code>，可以直接拼出语义缓存。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br><span class="line">65</span><br><span class="line">66</span><br><span class="line">67</span><br><span class="line">68</span><br><span class="line">69</span><br><span class="line">70</span><br><span class="line">71</span><br><span class="line">72</span><br><span class="line">73</span><br><span class="line">74</span><br><span class="line">75</span><br><span class="line">76</span><br><span class="line">77</span><br><span class="line">78</span><br><span class="line">79</span><br><span class="line">80</span><br><span class="line">81</span><br><span class="line">82</span><br><span class="line">83</span><br><span class="line">84</span><br><span class="line">85</span><br><span class="line">86</span><br><span class="line">87</span><br><span class="line">88</span><br><span class="line">89</span><br><span class="line">90</span><br><span class="line">91</span><br><span class="line">92</span><br><span class="line">93</span><br><span class="line">94</span><br><span class="line">95</span><br><span class="line">96</span><br><span class="line">97</span><br><span class="line">98</span><br><span class="line">99</span><br><span class="line">100</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SemanticCache</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Logger</span> <span class="variable">log</span> <span class="operator">=</span> LoggerFactory.getLogger(SemanticCache.class);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> VectorStore vectorStore;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> EmbeddingModel embeddingModel;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Cache&lt;String, CachedAnswer&gt; exactCache;   <span class="comment">// L2</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> SemanticCacheProperties props;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> MeterRegistry meterRegistry;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">SemanticCache</span><span class="params">(VectorStore vectorStore,</span></span><br><span class="line"><span class="params">                         EmbeddingModel embeddingModel,</span></span><br><span class="line"><span class="params">                         Cache&lt;String, CachedAnswer&gt; exactCache,</span></span><br><span class="line"><span class="params">                         SemanticCacheProperties props,</span></span><br><span class="line"><span class="params">                         MeterRegistry meterRegistry)</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.vectorStore = vectorStore;</span><br><span class="line">        <span class="built_in">this</span>.embeddingModel = embeddingModel;</span><br><span class="line">        <span class="built_in">this</span>.exactCache = exactCache;</span><br><span class="line">        <span class="built_in">this</span>.props = props;</span><br><span class="line">        <span class="built_in">this</span>.meterRegistry = meterRegistry;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 查询：先精确，再语义 */</span></span><br><span class="line">    <span class="keyword">public</span> Optional&lt;CachedAnswer&gt; <span class="title function_">lookup</span><span class="params">(LlmCacheKey key, String normalizedQuery, String tenantId)</span> &#123;</span><br><span class="line">        <span class="comment">// L2</span></span><br><span class="line">        <span class="type">CachedAnswer</span> <span class="variable">local</span> <span class="operator">=</span> exactCache.getIfPresent(key.fingerprint());</span><br><span class="line">        <span class="keyword">if</span> (local != <span class="literal">null</span>) &#123;</span><br><span class="line">            meterRegistry.counter(<span class="string">&quot;llm.cache.hit&quot;</span>, <span class="string">&quot;layer&quot;</span>, <span class="string">&quot;exact&quot;</span>).increment();</span><br><span class="line">            <span class="keyword">return</span> Optional.of(local);</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// L3</span></span><br><span class="line">        <span class="type">SearchRequest</span> <span class="variable">req</span> <span class="operator">=</span> SearchRequest.builder()</span><br><span class="line">                .query(normalizedQuery)</span><br><span class="line">                .topK(props.getTopK())                       <span class="comment">// 3</span></span><br><span class="line">                .similarityThreshold(props.getThreshold())   <span class="comment">// 0.93</span></span><br><span class="line">                .filterExpression(<span class="string">&quot;tenantId == &#x27;&quot;</span> + tenantId + <span class="string">&quot;&#x27; AND scene == &#x27;FAQ&#x27;&quot;</span>)</span><br><span class="line">                .build();</span><br><span class="line"></span><br><span class="line">        List&lt;Document&gt; hits = vectorStore.similaritySearch(req);</span><br><span class="line">        <span class="keyword">if</span> (hits == <span class="literal">null</span> || hits.isEmpty()) &#123;</span><br><span class="line">            meterRegistry.counter(<span class="string">&quot;llm.cache.hit&quot;</span>, <span class="string">&quot;layer&quot;</span>, <span class="string">&quot;semantic&quot;</span>).increment(<span class="number">0</span>);</span><br><span class="line">            <span class="keyword">return</span> Optional.empty();</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="type">Document</span> <span class="variable">best</span> <span class="operator">=</span> hits.get(<span class="number">0</span>);</span><br><span class="line">        <span class="type">double</span> <span class="variable">score</span> <span class="operator">=</span> best.getScore() == <span class="literal">null</span> ? <span class="number">0</span> : best.getScore();</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 中间地带：二次校验</span></span><br><span class="line">        <span class="keyword">if</span> (score &lt; props.getHighThreshold() &amp;&amp; !props.isSkipVerify()) &#123;</span><br><span class="line">            <span class="type">String</span> <span class="variable">cachedQuery</span> <span class="operator">=</span> best.getMetadata().get(<span class="string">&quot;query&quot;</span>).toString();</span><br><span class="line">            <span class="keyword">if</span> (!isSameIntent(normalizedQuery, cachedQuery)) &#123;</span><br><span class="line">                meterRegistry.counter(<span class="string">&quot;llm.cache.reject&quot;</span>, <span class="string">&quot;reason&quot;</span>, <span class="string">&quot;intent_mismatch&quot;</span>).increment();</span><br><span class="line">                <span class="keyword">return</span> Optional.empty();</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="type">CachedAnswer</span> <span class="variable">answer</span> <span class="operator">=</span> CachedAnswer.builder()</span><br><span class="line">                .content(best.getText())</span><br><span class="line">                .sourceQuery(best.getMetadata().get(<span class="string">&quot;query&quot;</span>).toString())</span><br><span class="line">                .similarity(score)</span><br><span class="line">                .createdAt(Instant.parse(best.getMetadata().get(<span class="string">&quot;createdAt&quot;</span>).toString()))</span><br><span class="line">                .build();</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 校验 TTL（向量库通常不支持 TTL，必须自己判）</span></span><br><span class="line">        <span class="keyword">if</span> (answer.createdAt().plus(props.getTtl()).isBefore(Instant.now())) &#123;</span><br><span class="line">            meterRegistry.counter(<span class="string">&quot;llm.cache.reject&quot;</span>, <span class="string">&quot;reason&quot;</span>, <span class="string">&quot;expired&quot;</span>).increment();</span><br><span class="line">            <span class="keyword">return</span> Optional.empty();</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        meterRegistry.counter(<span class="string">&quot;llm.cache.hit&quot;</span>, <span class="string">&quot;layer&quot;</span>, <span class="string">&quot;semantic&quot;</span>).increment();</span><br><span class="line">        exactCache.put(key.fingerprint(), answer);</span><br><span class="line">        <span class="keyword">return</span> Optional.of(answer);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 写回：L2 + L3 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">store</span><span class="params">(LlmCacheKey key, String query, LlmResponse response, String tenantId, String scene)</span> &#123;</span><br><span class="line">        <span class="type">CachedAnswer</span> <span class="variable">answer</span> <span class="operator">=</span> CachedAnswer.builder()</span><br><span class="line">                .content(response.content())</span><br><span class="line">                .sourceQuery(query)</span><br><span class="line">                .similarity(<span class="number">1.0</span>)</span><br><span class="line">                .createdAt(Instant.now())</span><br><span class="line">                .build();</span><br><span class="line"></span><br><span class="line">        exactCache.put(key.fingerprint(), answer);</span><br><span class="line"></span><br><span class="line">        <span class="type">Document</span> <span class="variable">doc</span> <span class="operator">=</span> Document.builder()</span><br><span class="line">                .text(response.content())</span><br><span class="line">                .metadata(Map.of(</span><br><span class="line">                        <span class="string">&quot;query&quot;</span>, query,</span><br><span class="line">                        <span class="string">&quot;tenantId&quot;</span>, tenantId,</span><br><span class="line">                        <span class="string">&quot;scene&quot;</span>, scene,</span><br><span class="line">                        <span class="string">&quot;model&quot;</span>, key.model(),</span><br><span class="line">                        <span class="string">&quot;promptVersion&quot;</span>, key.promptVersion(),</span><br><span class="line">                        <span class="string">&quot;createdAt&quot;</span>, Instant.now().toString()))</span><br><span class="line">                .build();</span><br><span class="line">        vectorStore.add(List.of(doc));</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-1-关键配置"><a href="#4-1-关键配置" class="headerlink" title="4.1 关键配置"></a>4.1 关键配置</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">llm:</span></span><br><span class="line">  <span class="attr">cache:</span></span><br><span class="line">    <span class="attr">semantic:</span></span><br><span class="line">      <span class="attr">enabled:</span> <span class="literal">true</span></span><br><span class="line">      <span class="attr">top-k:</span> <span class="number">3</span></span><br><span class="line">      <span class="attr">threshold:</span> <span class="number">0.90</span>          <span class="comment"># 进入候选的最低相似度</span></span><br><span class="line">      <span class="attr">high-threshold:</span> <span class="number">0.95</span>     <span class="comment"># 高于此值直接返回，跳过二次校验</span></span><br><span class="line">      <span class="attr">ttl:</span> <span class="string">24h</span></span><br><span class="line">      <span class="attr">skip-verify:</span> <span class="literal">false</span></span><br><span class="line">      <span class="attr">max-entries:</span> <span class="number">50000</span>       <span class="comment"># 向量库条目上限，超了要淘汰</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-向量库条目膨胀怎么办"><a href="#4-2-向量库条目膨胀怎么办" class="headerlink" title="4.2 向量库条目膨胀怎么办"></a>4.2 向量库条目膨胀怎么办</h3><p>语义缓存会持续写入向量，一年后可能有几百万条，检索变慢、内存爆掉。三种治理手段：</p>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>做法</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>TTL 过滤</td>
+<td>查询时加 <code>createdAt &gt; now - 24h</code> 过滤条件</td>
+<td>简单有效，但索引仍会增长</td>
+</tr>
+<tr>
+<td>定期清理</td>
+<td>每日定时任务删除过期条目</td>
+<td>控制总量</td>
+</tr>
+<tr>
+<td>命中计数淘汰</td>
+<td>metadata 记 <code>hitCount</code>，定期删低频条目</td>
+<td>保留高价值条目</td>
+</tr>
+<tr>
+<td>分片 + 归档</td>
+<td>按月份分 collection</td>
+<td>降低单集合规模</td>
+</tr>
+</tbody></table>
+<p><strong>推荐组合</strong>：TTL 过滤（查询侧） + 每日定时清理（存储侧） + <code>hitCount</code> 淘汰（容量侧）。</p>
+<hr>
+<h2 id="五、命中率治理：把它当成一个可运营的指标"><a href="#五、命中率治理：把它当成一个可运营的指标" class="headerlink" title="五、命中率治理：把它当成一个可运营的指标"></a>五、命中率治理：把它当成一个可运营的指标</h2><p>缓存上线不是终点，是起点。没有度量就没有优化。</p>
+<h3 id="5-1-必须埋的指标"><a href="#5-1-必须埋的指标" class="headerlink" title="5.1 必须埋的指标"></a>5.1 必须埋的指标</h3><table>
+<thead>
+<tr>
+<th>指标</th>
+<th>类型</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>llm.cache.hit{layer}</code></td>
+<td>Counter</td>
+<td>分层命中率</td>
+</tr>
+<tr>
+<td><code>llm.cache.reject{reason}</code></td>
+<td>Counter</td>
+<td>未命中原因（intent_mismatch &#x2F; expired &#x2F; below_threshold）</td>
+</tr>
+<tr>
+<td><code>llm.cache.similarity</code></td>
+<td>Histogram</td>
+<td>相似度分布，用于调阈值</td>
+</tr>
+<tr>
+<td><code>llm.cache.size</code></td>
+<td>Gauge</td>
+<td>缓存条目数</td>
+</tr>
+<tr>
+<td><code>llm.cache.cost_saved</code></td>
+<td>Counter</td>
+<td>估算省下的 token 费用</td>
+</tr>
+<tr>
+<td><code>llm.cache.false_positive</code></td>
+<td>Counter</td>
+<td>人工反馈的误命中（关键！）</td>
+</tr>
+</tbody></table>
+<h3 id="5-2-命中率基准"><a href="#5-2-命中率基准" class="headerlink" title="5.2 命中率基准"></a>5.2 命中率基准</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>合理命中率</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>客服 FAQ</td>
+<td>40%–65%</td>
+<td>问题高度重复</td>
+</tr>
+<tr>
+<td>企业知识库问答</td>
+<td>25%–45%</td>
+<td>有一定长尾</td>
+</tr>
+<tr>
+<td>代码助手</td>
+<td>5%–15%</td>
+<td>上下文太独特</td>
+</tr>
+<tr>
+<td>Agent 工具调用</td>
+<td>10%–30%</td>
+<td>子步骤可复用</td>
+</tr>
+<tr>
+<td>创意写作</td>
+<td>&lt;5%</td>
+<td><strong>不建议开缓存</strong></td>
+</tr>
+</tbody></table>
+<p><strong>如果你的 FAQ 场景命中率低于 20%</strong>，先别调阈值，去查三件事：① key 里是不是混进了时间戳&#x2F;requestId；② 租户过滤是不是写错了导致跨租户查不到；③ 写入侧是不是压根没写。</p>
+<h3 id="5-3-缓存失效的三种触发"><a href="#5-3-缓存失效的三种触发" class="headerlink" title="5.3 缓存失效的三种触发"></a>5.3 缓存失效的三种触发</h3><table>
+<thead>
+<tr>
+<th>触发</th>
+<th>场景</th>
+<th>实现</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>TTL 到期</td>
+<td>通用兜底</td>
+<td><code>expireAfterWrite</code> + 向量库时间过滤</td>
+</tr>
+<tr>
+<td>版本号递增</td>
+<td>提示词&#x2F;模型&#x2F;知识库更新</td>
+<td>key 里带 <code>promptVersion</code>，版本变了自然全部失效</td>
+</tr>
+<tr>
+<td>主动清除</td>
+<td>发现错误答案</td>
+<td>按 <code>promptVersion</code> 或 <code>docId</code> 批量删除</td>
+</tr>
+</tbody></table>
+<p><strong>版本号是最好用的手段</strong>。改提示词时把 <code>promptVersion</code> 从 <code>v3</code> 提到 <code>v4</code>，老缓存自动全部失效，不需要写任何清理逻辑。</p>
+<h3 id="5-4-灰度策略"><a href="#5-4-灰度策略" class="headerlink" title="5.4 灰度策略"></a>5.4 灰度策略</h3><p>新缓存上线不要全量开：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">shouldUseCache</span><span class="params">(String userId)</span> &#123;</span><br><span class="line">    <span class="comment">// 按用户 ID hash 分桶，先放 5% 流量</span></span><br><span class="line">    <span class="type">int</span> <span class="variable">bucket</span> <span class="operator">=</span> Math.floorMod(userId.hashCode(), <span class="number">100</span>);</span><br><span class="line">    <span class="keyword">return</span> bucket &lt; grayPercent;    <span class="comment">// grayPercent 从配置中心动态调整</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>同时对比「开缓存组」和「关缓存组」的<strong>用户满意度&#x2F;点赞率</strong>，而不只是看成本。省了钱但答错了，是负收益。</p>
+<hr>
+<h2 id="六、成本收益测算（给老板看的表）"><a href="#六、成本收益测算（给老板看的表）" class="headerlink" title="六、成本收益测算（给老板看的表）"></a>六、成本收益测算（给老板看的表）</h2><p>假设月请求 100 万次，平均输入 1800 token、输出 400 token，单价输入 2 元&#x2F;M、输出 8 元&#x2F;M：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>命中率</th>
+<th>月成本</th>
+<th>相对节省</th>
+<th>平均延迟</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>无缓存</td>
+<td>0%</td>
+<td>5,600 元</td>
+<td>—</td>
+<td>2.8s</td>
+</tr>
+<tr>
+<td>仅 L1 前缀缓存</td>
+<td>60% 前缀命中（输入打 3 折）</td>
+<td>3,400 元</td>
+<td>39%</td>
+<td>2.1s</td>
+</tr>
+<tr>
+<td>L1 + L2 精确</td>
+<td>L2 25%</td>
+<td>2,550 元</td>
+<td>54%</td>
+<td>1.6s</td>
+</tr>
+<tr>
+<td>L1 + L2 + L3 语义</td>
+<td>L2 25% + L3 30%</td>
+<td>1,570 元</td>
+<td><strong>72%</strong></td>
+<td>1.1s</td>
+</tr>
+<tr>
+<td>上述 + 小模型路由</td>
+<td>追加 15% 走小模型</td>
+<td>1,150 元</td>
+<td><strong>79%</strong></td>
+<td>0.9s</td>
+</tr>
+</tbody></table>
+<p>（数字为量级示意，实际取决于业务分布。）</p>
+<p>注意最后一行的做法：<strong>缓存挡不住的请求，先给便宜模型试，置信度低再升级到大模型</strong>（级联&#x2F;路由）。这是缓存之外的第二大降本手段。</p>
+<hr>
+<h2 id="七、生产踩坑清单"><a href="#七、生产踩坑清单" class="headerlink" title="七、生产踩坑清单"></a>七、生产踩坑清单</h2><table>
+<thead>
+<tr>
+<th>坑</th>
+<th>现象</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>key 少字段</td>
+<td>换模型&#x2F;换租户仍命中</td>
+<td>key 覆盖所有影响输出的参数</td>
+</tr>
+<tr>
+<td>缓存 PII 回答</td>
+<td>用户 A 看到用户 B 的订单</td>
+<td>场景白名单 + PII 检测 + 租户隔离</td>
+</tr>
+<tr>
+<td>阈值过低</td>
+<td>答案「差不多但不对」</td>
+<td>提高阈值 + 二次校验</td>
+</tr>
+<tr>
+<td>阈值过高</td>
+<td>命中率 &lt;5%，白干</td>
+<td>用真实数据重新标定</td>
+</tr>
+<tr>
+<td>向量库无限增长</td>
+<td>检索从 20ms 涨到 800ms</td>
+<td>TTL 过滤 + 定时清理 + hitCount 淘汰</td>
+</tr>
+<tr>
+<td>缓存了实时数据</td>
+<td>库存显示错误</td>
+<td>实时场景禁用缓存</td>
+</tr>
+<tr>
+<td>无版本号</td>
+<td>改完提示词，老答案还在</td>
+<td>key 带 <code>promptVersion</code></td>
+</tr>
+<tr>
+<td>无命中率监控</td>
+<td>不知道有没有用</td>
+<td>埋点 + Dashboard</td>
+</tr>
+<tr>
+<td>缓存穿透</td>
+<td>恶意构造大量近似 query 打满向量库</td>
+<td>请求侧限流 + query 长度&#x2F;字符集校验</td>
+</tr>
+<tr>
+<td>缓存投毒</td>
+<td>攻击者构造 query 让答案被广泛复用</td>
+<td>写入侧内容审核 + 只缓存审核通过的答案</td>
+</tr>
+</tbody></table>
+<p>最后两条尤其重要：<strong>语义缓存是一个「放大器」</strong>。好的答案被放大是好事，错的答案（甚至是注入的恶意内容）被放大就是事故。写入前必须过内容安全审核。</p>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：语义缓存的相似度阈值怎么定？</strong><br>答：不能用默认值，必须用真实 query 做标注集（同义对&#x2F;非同义对各 100+ 条），扫描阈值区间算 P&#x2F;R&#x2F;F1，取精确率优先的工作点。不同 embedding 模型的分布不同，同一个阈值换模型就失效。工程上取「高精确率」侧，误命中代价远大于未命中。</p>
+<p><strong>Q2：为什么语义缓存不能缓存所有回答？</strong><br>答：语义相似不等于答案可复用。含个人数据、实时状态、高风险决策、指代性多轮回答的场景，误命中会造成数据泄露或错误决策。工程上用「场景白名单」而非黑名单来控制。</p>
+<p><strong>Q3：精确缓存的 key 里为什么要放 tools 定义？</strong><br>答：Function Calling 场景下，工具集决定了模型能做什么。同一个用户问题，工具集从 3 个变成 10 个，模型的选择和输出结构都会变。所以 tools 的 schema 必须参与 key 计算。</p>
+<p><strong>Q4：多实例部署下本地缓存命中率被稀释，怎么解决？</strong><br>答：三种方案——① 只用 Redis（全局命中但延迟 1–3ms）；② 本地 Caffeine + Redis 二级（热数据本地、温数据 Redis，推荐）；③ 按 key 做一致性 hash 路由到固定实例（命中率高但扩缩容时要迁移）。选型取决于 QPS 与延迟预算。</p>
+<p><strong>Q5：Provider 侧前缀缓存和应用侧缓存冲突吗？</strong><br>答：不冲突，是互补的。Provider 缓存省的是「同一前缀的 prefill 计算」，仍然要付部分 token 费用并产生输出；应用侧缓存直接不调用模型，成本为 0。两者叠加效果最好，但要注意前缀缓存要求「稳定内容前置」，而应用侧 key 要求「全量 hash」，二者不矛盾。</p>
+<p><strong>Q6：缓存会不会导致模型「永远学不到新东西」？</strong><br>答：会，所以才需要 TTL + 版本号 + 主动清除三件套。提示词迭代、知识库更新、模型升级都必须触发缓存失效。没有失效机制的缓存不是优化，是技术债。</p>
+<p><strong>Q7：为什么不用 Redis 的 <code>EXPIRE</code> 就完事了？</strong><br>答：Redis 可以用 TTL，但向量库（Milvus&#x2F;Qdrant&#x2F;pgvector）通常不支持按条 TTL。语义缓存的过期必须在应用层判断（metadata 里的 <code>createdAt</code>），并配合定时清理任务。这是两套不同的机制，不能混。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><table>
+<thead>
+<tr>
+<th>层次</th>
+<th>解决什么</th>
+<th>关键动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>L1 Provider 前缀缓存</td>
+<td>重复 prefill</td>
+<td>稳定内容前置，变化内容后置</td>
+</tr>
+<tr>
+<td>L2 精确缓存</td>
+<td>完全重复请求</td>
+<td>key 覆盖所有影响输出的参数 + 规范化 + 多级缓存</td>
+</tr>
+<tr>
+<td>L3 语义缓存</td>
+<td>换个说法的重复</td>
+<td>阈值标定 + 二次校验 + 场景白名单</td>
+</tr>
+<tr>
+<td>治理</td>
+<td>让它持续有效</td>
+<td>命中率埋点 + 版本号失效 + 向量库清理</td>
+</tr>
+</tbody></table>
+<p>三句话收尾：</p>
+<ol>
+<li><strong>缓存的收益不在「省了几次调用」，而在「省了多少钱、快了多少毫秒」，必须量化。</strong></li>
+<li><strong>语义缓存的安全边界比性能更重要</strong>——误命中一个回答，可能毁掉整个产品的信任。</li>
+<li><strong>先把 key 设计对，再谈语义缓存。</strong> 我见过太多团队，精确缓存的 key 里混着 <code>requestId</code>，命中率 0.3%，然后花两周调向量阈值。</li>
+</ol>
+<p>对 Java 团队来说，好消息是这套东西完全可以用熟悉的技术栈落地：Caffeine 做 L1、Redis 做 L2、Spring AI 的 <code>VectorStore</code> 做 L3、Micrometer 做观测。不需要引入 Python 生态，也不需要重写技术栈。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/23/java-llm-cache-semantic-cache-deep-practice/">https://jiweidong.github.io/2026/10/23/java-llm-cache-semantic-cache-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/AI/">AI</a><a class="post-meta__tags" href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/">向量检索</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a><a class="post-meta__tags" href="/tags/Spring-AI/">Spring AI</a><a class="post-meta__tags" href="/tags/%E6%88%90%E6%9C%AC%E4%BC%98%E5%8C%96/">成本优化</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/23/agent-workflow-orchestration-deep-dive/" title="【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入</div></div><div class="info-2"><div class="info-item-1">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入前言刚开始做 Agent，大家都是这么写的： 123456789while (!done) &#123;    response = llm.chat(messages, tools);    if (response.hasToolCalls()) &#123;        results = executeTools(response.toolCalls());        messages.addAll(results);    &#125; else &#123;        done = true;    &#125;&#125;  一个 while 循环，看起来很优雅。上线之后你会发现：  有的请求跑了 40 轮还没停，烧了 20 万 token； 第 3 步工具失败了，只能整条重跑； 用户等了 90 秒，产品经理要求「中间结果先展示」； 出了事故要复盘，但你不知道它当时到底走了哪条路径； 合规要求高风险操作必须人工确认，你没地方插这个「确认」。  这些问题不是 Prompt 能解决的，它们是...</div></div></div></a><a class="pagination-related" href="/2026/10/23/spring-aop-self-invocation-proxy-boundary-deep-dive/" title="【Spring 源码】Spring 代理自调用失效深度解析：@Transactional/@Async/@Cacheable/@Validated 的共同根因"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Spring 源码】Spring 代理自调用失效深度解析：@Transactional/@Async/@Cacheable/@Validated 的共同根因</div></div><div class="info-2"><div class="info-item-1">【Spring 源码】Spring 代理自调用失效深度解析前言面试里有一个问题，几乎能把候选人的 Spring 水平一刀切开：  「@Transactional 什么情况下会失效？」  绝大多数人背得出「同类方法内部调用会失效」。但再追一层：  「那 @Async 呢？@Cacheable 呢？@Validated 呢？为什么都一样失效？」  答不上来说明只是背了结论，没建立模型。这篇文章要做的事，是把这四个注解失效的同一个根因讲透，并给出六种可落地的解法与一套自动化检测手段。  一、一句话根因：注解不生效，因为方法根本没经过代理先看最经典的代码： 1234567891011121314@Servicepublic class OrderService &#123;    @Transactional(rollbackFor = Exception.class)    public void createOrder(OrderDTO dto) &#123;        orderMapper.insert(dto);        this.doSomething();    ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/21/rag-evaluation-ragas-deep-practice/" title="【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证</div></div><div class="info-2"><div class="info-item-1">【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证前言RAG 项目最容易出现的一种对话：  「我把 chunk size 从 512 调到 1024，感觉效果好多了。」「怎么个好法？」「我试了几个问题，回答更完整了。」  这不是评测，这是手感。手感的问题在于：  你试的 5 个问题，可能正好是 chunk&#x3D;1024 擅长的； 你没试到的那 200 个问题里，可能有一半变差了； 下周有人调了 embedding 模型，没人知道整体是变好还是变坏； 老板问「这个 RAG 准确率多少」，你答不上来。  RAG 是一个多阶段的管道：文档解析 → 切分 → 向量化 → 检索 → 重排 → 组装 prompt → 生成。任何一个环节的改动，都可能是「一类问题变好、另一类问题变坏」。没有评测集，你连「变没变」都不知道，更别说「哪变了」。 这一篇讲怎么把 RAG 评测做成工程：指标怎么定义、黄金集怎么建、RAGAS 的四个核心指标怎么算、怎么用 Java 落地、怎么接进 CI 做回归。Python 生态的 RAGAS 很好用，但生产系统是 Java 的，评测必须能...</div></div></div></a><a class="pagination-related" href="/2026/10/13/java-llm-streaming-sse-webflux-deep-practice/" title="【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-13</div><div class="info-item-2">【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析</div></div><div class="info-2"><div class="info-item-1">【Java AI】大模型流式输出深度实战：SSE、WebFlux 与 Spring AI Streaming 全解析前言ChatGPT 之后，「打字机效果」成了大模型应用的标配。从体验上讲，用户等 10 秒看到一个完整答案，和 300ms 就看到第一个字、10 秒逐字吐完，感受天差地别 —— 首 Token 延迟（TTFT）比总耗时更影响体感。 但流式输出并不是「加个 stream: true」那么简单。Java 后端落地时会撞上一连串工程问题：  用 SseEmitter 还是 WebFlux 的 Flux&lt;ServerSentEvent&gt;？虚拟线程出来后选型变了吗？ Nginx &#x2F; 网关一开代理，怎么「流」着流着就变成一次性返回了？ 大模型连接超时、前端断线、用户点「停止生成」，服务端怎么感知并释放资源？ 流式场景下怎么做 Token 统计、计费、审计、限流？ SSE 断线能不能续传？Last-Event-ID 到底怎么用？  这篇文章一次讲清。  二、SSE 协议：为什么大模型选它而不是 WebSocketSSE（Server-Sent Events）...</div></div></div></a><a class="pagination-related" href="/2026/10/21/java-llm-observability-tracing-cost-deep-practice/" title="【Java AI】大模型可观测性与成本治理深度实战：Trace、Token 账本与告警"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【Java AI】大模型可观测性与成本治理深度实战：Trace、Token 账本与告警</div></div><div class="info-2"><div class="info-item-1">【Java AI】大模型可观测性与成本治理深度实战前言传统后端服务的可观测性，我们花了十年才做明白：Metrics 看趋势、Logs 看细节、Traces 看链路。但把大模型接进系统之后，这三件套突然不够用了。 先看一个真实的排查场景。某天客服机器人的 P99 从 3 秒涨到 11 秒，报警响了。你打开 APM，看到一个 POST /api/chat 的 span，耗时 11 秒，状态 200。然后呢？没有然后了。 你不知道：  是检索慢，还是模型慢？ 模型慢是因为输入变长了（context 从 2k 涨到 12k），还是供应商在降速？ 这一轮调了几次工具？每次工具调用花了多久？ 这 11 秒的请求，花了多少钱？是哪个租户、哪个功能花的？ 是不是触发了重试，导致同一个问题被计费两次？  传统 APM 只能告诉你「这个 HTTP 接口慢」，它不知道 HTTP 里面还套着一个「LLM 调用」这个耗时又花钱的黑盒。 这一篇讲的就是怎么把大模型应用从黑盒变成白盒：指标体系怎么定、Trace 怎么埋、Token 账本怎么记、成本怎么降、告警怎么配。代码全部基于 Java &#x2F; Sp...</div></div></div></a><a class="pagination-related" href="/2026/10/16/java-llm-context-window-token-management-deep-practice/" title="【Java AI】上下文窗口与 Token 管理深度实战：截断、摘要压缩与 Token 计费核算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-16</div><div class="info-item-2">【Java AI】上下文窗口与 Token 管理深度实战：截断、摘要压缩与 Token 计费核算</div></div><div class="info-2"><div class="info-item-1">【Java AI】上下文窗口与 Token 管理深度实战：截断、摘要压缩与 Token 计费核算前言做 AI 应用，最容易被低估、又最先把人搞崩溃的，就是 Token 与上下文窗口管理。典型事故：多轮对话跑到第 20 轮突然 400 context_length_exceeded；RAG 塞了 30 个文档片段，成本一夜翻 5 倍；批量任务提示词把输入 token 撑爆，钱花了效果还差。 这篇文章用 Java 视角把这件事讲透：Token 到底怎么算、上下文窗口怎么逼近、五种压缩策略怎么选、Token 成本怎么在代码里核算，最后给一个可复用的 ContextWindowManager。 一、先搞懂 Token：它不是字符，也不是单词大模型按 BPE（Byte Pair Encoding） 切词，Token 是最小的计费与上下文单位。 经验估算（不同模型分词器不同，仅用于兜底）：    语言 大约多少个 token    英文 1 token ≈ 0.75 个单词 ≈ 4 个字符   中文 1 token ≈ 0.61.7 个汉字（常见 1 汉字 ≈ 12 token）   代码 ...</div></div></div></a><a class="pagination-related" href="/2026/10/15/spring-ai-rag-vectorstore-deep-practice/" title="【Java AI】Spring AI RAG 深度实战：VectorStore、ETL Pipeline 与检索增强落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-15</div><div class="info-item-2">【Java AI】Spring AI RAG 深度实战：VectorStore、ETL Pipeline 与检索增强落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】Spring AI RAG 深度实战：VectorStore、ETL Pipeline 与检索增强落地前言用 Java 落地 RAG，2024 年之前基本等于”自己拼装”：调 Embedding API、算余弦相似度、手撸召回逻辑。Spring AI 的价值在于，它把 RAG 拆成了几个可插拔的抽象——VectorStore、EmbeddingModel、DocumentReader/Transformer/Writer、Advisor——让 Java 工程师用 Spring 的惯用方式（依赖注入、自动配置、Advisor 链）把 RAG 拼起来。 本文是「Java × AI 工程落地」系列的一篇，聚焦三件事：  VectorStore 抽象：接口契约、检索参数（topK &#x2F; threshold &#x2F; filter）与后端选型； ETL Pipeline：文档读取、切分、元数据增强、入库； Advisor 与检索增强：从 QuestionAnswerAdvisor 到模块化的 RetrievalAugmentationAdvisor。   前置...</div></div></div></a><a class="pagination-related" href="/2026/10/18/java-llm-structured-output-json-schema-deep-practice/" title="【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试</div></div><div class="info-2"><div class="info-item-1">【Java AI】结构化输出深度实战：JSON Schema、强类型映射与校验重试前言「让大模型返回 JSON」是所有 AI 应用的第一道坎。你写了一行 prompt：请以 JSON 格式返回，测试时一切正常，上线后开始出现：  返回里带 &#96;&#96;&#96;json 代码块围栏，ObjectMapper 直接抛 JsonParseException； 字段名从 userName 变成 user_name，再变成 用户名； 数字字段返回 &quot;18&quot;（字符串），枚举返回 &quot;未知&quot;； 长文本被截断，JSON 少一个大括号； 模型很贴心地在 JSON 前后加了一句「好的，以下是结果：」。  这些问题的根因不是模型「不听话」，而是你把结构化约束寄托在了自然语言上。工程化的解法有三层：Schema 约束 → 强类型反序列化 → 校验与重试。缺一层，线上就一定会出问题。 这篇文章以 Java 技术栈为主线，讲清楚 JSON Schema 怎么写、Spring AI 与 LangChain4j 怎么落地、Jackson 怎么配、校验重试怎么做，最...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">812</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">909</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-AI%E3%80%91%E5%A4%A7%E6%A8%A1%E5%9E%8B%E7%BC%93%E5%AD%98%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9A%E7%B2%BE%E7%A1%AE%E7%BC%93%E5%AD%98%E3%80%81%E8%AF%AD%E4%B9%89%E7%BC%93%E5%AD%98%E4%B8%8E%E5%91%BD%E4%B8%AD%E7%8E%87%E6%B2%BB%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%88%86%E5%B1%82%EF%BC%9ALLM-%E7%BC%93%E5%AD%98%E6%9C%89%E4%B8%89%E4%B8%AA%E5%AE%8C%E5%85%A8%E4%B8%8D%E5%90%8C%E7%9A%84%E4%BD%8D%E7%BD%AE"><span class="toc-number">1.2.</span> <span class="toc-text">一、先分层：LLM 缓存有三个完全不同的位置</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-L1%EF%BC%9AProvider-%E4%BE%A7%E5%89%8D%E7%BC%80%E7%BC%93%E5%AD%98"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 L1：Provider 侧前缀缓存</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-L2-L3%EF%BC%9A%E5%BA%94%E7%94%A8%E4%BE%A7%E7%BC%93%E5%AD%98%EF%BC%8C%E6%89%8D%E6%98%AF%E6%9C%AC%E6%96%87%E9%87%8D%E7%82%B9"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 L2&#x2F;L3：应用侧缓存，才是本文重点</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81L2-%E7%B2%BE%E7%A1%AE%E7%BC%93%E5%AD%98%EF%BC%9Akey-%E8%AE%BE%E8%AE%A1%E5%86%B3%E5%AE%9A%E6%88%90%E8%B4%A5"><span class="toc-number">1.3.</span> <span class="toc-text">二、L2 精确缓存：key 设计决定成败</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%80%E4%B8%AA%E3%80%8C%E5%B0%91%E5%86%99%E4%B8%80%E4%B8%AA%E5%AD%97%E6%AE%B5%E3%80%8D%E5%AF%BC%E8%87%B4%E7%9A%84%E4%BA%8B%E6%95%85"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 一个「少写一个字段」导致的事故</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%93%AA%E4%BA%9B%E5%AD%97%E6%AE%B5%E5%BF%85%E9%A1%BB%E8%BF%9B-key%EF%BC%8C%E5%93%AA%E4%BA%9B%E4%B8%8D%E8%83%BD%E8%BF%9B"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 哪些字段必须进 key，哪些不能进</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-prompt-%E8%A7%84%E8%8C%83%E5%8C%96"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 prompt 规范化</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-Caffeine-%E8%90%BD%E5%9C%B0"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 Caffeine 落地</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-5-%E5%A4%9A%E5%AE%9E%E4%BE%8B%E6%80%8E%E4%B9%88%E5%8A%9E"><span class="toc-number">1.3.5.</span> <span class="toc-text">2.5 多实例怎么办</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81L3-%E8%AF%AD%E4%B9%89%E7%BC%93%E5%AD%98%EF%BC%9A%E7%9C%9F%E6%AD%A3%E7%9C%81%E9%92%B1%EF%BC%8C%E4%B9%9F%E7%9C%9F%E6%AD%A3%E5%8D%B1%E9%99%A9"><span class="toc-number">1.4.</span> <span class="toc-text">三、L3 语义缓存：真正省钱，也真正危险</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%9F%BA%E6%9C%AC%E6%B5%81%E7%A8%8B"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 基本流程</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E9%98%88%E5%80%BC%E6%98%AF%E5%94%AF%E4%B8%80%E7%9A%84%E5%AE%89%E5%85%A8%E9%98%80%EF%BC%8C%E4%B9%9F%E6%98%AF%E6%9C%80%E9%9A%BE%E8%B0%83%E7%9A%84%E9%83%A8%E5%88%86"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 阈值是唯一的安全阀，也是最难调的部分</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E4%BA%8C%E6%AC%A1%E6%A0%A1%E9%AA%8C%EF%BC%9A%E7%94%A8%E4%BE%BF%E5%AE%9C%E6%A8%A1%E5%9E%8B%E5%AE%88%E9%97%A8"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 二次校验：用便宜模型守门</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%93%AA%E4%BA%9B%E5%86%85%E5%AE%B9%E7%BB%9D%E5%AF%B9%E4%B8%8D%E8%83%BD%E8%BF%9B%E8%AF%AD%E4%B9%89%E7%BC%93%E5%AD%98"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 哪些内容绝对不能进语义缓存</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Spring-AI-%E8%90%BD%E5%9C%B0%EF%BC%9A%E4%B8%80%E4%B8%AA%E5%AE%8C%E6%95%B4%E7%9A%84%E8%AF%AD%E4%B9%89%E7%BC%93%E5%AD%98%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.5.</span> <span class="toc-text">四、Spring AI 落地：一个完整的语义缓存实现</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%85%B3%E9%94%AE%E9%85%8D%E7%BD%AE"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 关键配置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%90%91%E9%87%8F%E5%BA%93%E6%9D%A1%E7%9B%AE%E8%86%A8%E8%83%80%E6%80%8E%E4%B9%88%E5%8A%9E"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 向量库条目膨胀怎么办</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%91%BD%E4%B8%AD%E7%8E%87%E6%B2%BB%E7%90%86%EF%BC%9A%E6%8A%8A%E5%AE%83%E5%BD%93%E6%88%90%E4%B8%80%E4%B8%AA%E5%8F%AF%E8%BF%90%E8%90%A5%E7%9A%84%E6%8C%87%E6%A0%87"><span class="toc-number">1.6.</span> <span class="toc-text">五、命中率治理：把它当成一个可运营的指标</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%BF%85%E9%A1%BB%E5%9F%8B%E7%9A%84%E6%8C%87%E6%A0%87"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 必须埋的指标</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E5%91%BD%E4%B8%AD%E7%8E%87%E5%9F%BA%E5%87%86"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 命中率基准</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%BC%93%E5%AD%98%E5%A4%B1%E6%95%88%E7%9A%84%E4%B8%89%E7%A7%8D%E8%A7%A6%E5%8F%91"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 缓存失效的三种触发</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E7%81%B0%E5%BA%A6%E7%AD%96%E7%95%A5"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 灰度策略</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%88%90%E6%9C%AC%E6%94%B6%E7%9B%8A%E6%B5%8B%E7%AE%97%EF%BC%88%E7%BB%99%E8%80%81%E6%9D%BF%E7%9C%8B%E7%9A%84%E8%A1%A8%EF%BC%89"><span class="toc-number">1.7.</span> <span class="toc-text">六、成本收益测算（给老板看的表）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%94%9F%E4%BA%A7%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、生产踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/23/agent-workflow-orchestration-deep-dive/" title="【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入</a><time datetime="2026-10-23T00:40:00.000Z" title="发表于 2026-10-23 08:40:00">2026-10-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/23/java-llm-cache-semantic-cache-deep-practice/" title="【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理">【Java AI】大模型缓存深度实战：精确缓存、语义缓存与命中率治理</a><time datetime="2026-10-23T00:30:00.000Z" title="发表于 2026-10-23 08:30:00">2026-10-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/23/spring-aop-self-invocation-proxy-boundary-deep-dive/" title="【Spring 源码】Spring 代理自调用失效深度解析：@Transactional/@Async/@Cacheable/@Validated 的共同根因">【Spring 源码】Spring 代理自调用失效深度解析：@Transactional/@Async/@Cacheable/@Validated 的共同根因</a><time datetime="2026-10-23T00:20:00.000Z" title="发表于 2026-10-23 08:20:00">2026-10-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/23/java-http-connection-pool-timewait-governance-deep-practice/" title="【生产实战】HTTP 连接池与 keep-alive 治理深度实战：TIME_WAIT、连接复用与超时三件套">【生产实战】HTTP 连接池与 keep-alive 治理深度实战：TIME_WAIT、连接复用与超时三件套</a><time datetime="2026-10-23T00:10:00.000Z" title="发表于 2026-10-23 08:10:00">2026-10-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/23/java-string-templates-withdrawn-deep-dive/" title="【Java 前沿】String Templates 深度解析：从 JEP 430 到被撤回，一场关于字符串拼接的设计博弈">【Java 前沿】String Templates 深度解析：从 JEP 430 到被撤回，一场关于字符串拼接的设计博弈</a><time datetime="2026-10-23T00:00:00.000Z" title="发表于 2026-10-23 08:00:00">2026-10-23</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
