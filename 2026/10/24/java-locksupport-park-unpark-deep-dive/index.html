@@ -1,0 +1,468 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【并发底层】LockSupport 深度解析：park&#x2F;unpark 许可机制、伪唤醒与 AQS 基石前言写并发代码时，我们最常用的阻塞&#x2F;唤醒套路是 Object.wait() &#x2F; notify()。但它有三个绕不过去的硬伤：  必须在 synchronized 块内调用，否则直接 IllegalMonitorStateException； 必须成对有序：先 wait">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【并发底层】LockSupport 深度解析：park&#x2F;unpark 许可机制、伪唤醒与 AQS 基石">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/24/java-locksupport-park-unpark-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【并发底层】LockSupport 深度解析：park&#x2F;unpark 许可机制、伪唤醒与 AQS 基石前言写并发代码时，我们最常用的阻塞&#x2F;唤醒套路是 Object.wait() &#x2F; notify()。但它有三个绕不过去的硬伤：  必须在 synchronized 块内调用，否则直接 IllegalMonitorStateException； 必须成对有序：先 wait">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-24T00:05:00.000Z">
+<meta property="article:modified_time" content="2026-10-24T00:01:16.133Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="AQS">
+<meta property="article:tag" content="JUC">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="LockSupport">
+<meta property="article:tag" content="并发编程">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石",
+  "url": "https://jiweidong.github.io/2026/10/24/java-locksupport-park-unpark-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-24T00:05:00.000Z",
+  "dateModified": "2026-10-24T00:01:16.133Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/24/java-locksupport-park-unpark-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">817</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">918</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-24T00:05:00.000Z" title="发表于 2026-10-24 08:05:00">2026-10-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-24T00:01:16.133Z" title="更新于 2026-10-24 08:01:16">2026-10-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-%E6%B7%B1%E6%8C%96/">Java 深挖</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【并发底层】LockSupport-深度解析：park-unpark-许可机制、伪唤醒与-AQS-基石"><a href="#【并发底层】LockSupport-深度解析：park-unpark-许可机制、伪唤醒与-AQS-基石" class="headerlink" title="【并发底层】LockSupport 深度解析：park&#x2F;unpark 许可机制、伪唤醒与 AQS 基石"></a>【并发底层】LockSupport 深度解析：park&#x2F;unpark 许可机制、伪唤醒与 AQS 基石</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>写并发代码时，我们最常用的阻塞&#x2F;唤醒套路是 <code>Object.wait()</code> &#x2F; <code>notify()</code>。但它有三个绕不过去的硬伤：</p>
+<ol>
+<li><strong>必须在 <code>synchronized</code> 块内调用</strong>，否则直接 <code>IllegalMonitorStateException</code>；</li>
+<li><strong>必须成对有序</strong>：先 <code>wait</code> 后 <code>notify</code>，如果 <code>notify</code> 抢在 <code>wait</code> 之前执行，信号就丢了，等待线程永远挂住；</li>
+<li><strong>只能唤醒「某个随机等待者」或「全部」</strong>，没法精确唤醒指定线程。</li>
+</ol>
+<p><code>java.util.concurrent.locks.LockSupport</code> 就是 JDK 给并发库作者准备的底层原语：<strong>不需要锁、不要求顺序、可以精确唤醒某个线程</strong>。它是 <code>AQS</code>（<code>AbstractQueuedSynchronizer</code>）的基石，<code>ReentrantLock</code>、<code>CountDownLatch</code>、<code>Semaphore</code>、<code>FutureTask</code>、<code>SynchronousQueue</code>、<code>ThreadPoolExecutor</code> 的 worker 阻塞，底层全是 <code>LockSupport.park()</code>。</p>
+<p>很多人对它的理解停留在「park 是阻塞，unpark 是唤醒」，但真正的坑都在<strong>许可（permit）语义</strong>、<strong>伪唤醒</strong>、<strong>中断</strong>和<strong>残留许可</strong>上。这篇文章把它讲透，最后手写一个基于 <code>LockSupport</code> 的简易锁和生产者消费者。</p>
+<hr>
+<h2 id="一、LockSupport-到底是什么"><a href="#一、LockSupport-到底是什么" class="headerlink" title="一、LockSupport 到底是什么"></a>一、LockSupport 到底是什么</h2><p><code>LockSupport</code> 是一个门面类，核心只有两个 native 方法（通过 <code>Unsafe</code> 暴露）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">park</span><span class="params">()</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">unpark</span><span class="params">(Thread thread)</span>;</span><br></pre></td></tr></table></figure>
+
+<p>另外还有带 blocker、带超时的变体：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">park</span><span class="params">(Object blocker)</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">parkNanos</span><span class="params">(<span class="type">long</span> nanos)</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">parkNanos</span><span class="params">(Object blocker, <span class="type">long</span> nanos)</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">parkUntil</span><span class="params">(<span class="type">long</span> deadline)</span>;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">parkUntil</span><span class="params">(Object blocker, <span class="type">long</span> deadline)</span>;</span><br></pre></td></tr></table></figure>
+
+<p>它们最终都调用到 JVM 的 <code>Parker</code> 对象：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 简化后的 HotSpot 逻辑</span></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">Parker</span> : <span class="keyword">public</span> os::PlatformParker &#123;</span><br><span class="line">  <span class="keyword">volatile</span> <span class="type">int</span> _counter;   <span class="comment">// 就是那个&quot;许可&quot;</span></span><br><span class="line">  <span class="comment">// park: counter &gt; 0 ? counter = 0 : 阻塞</span></span><br><span class="line">  <span class="comment">// unpark: counter = 1（不是我 park 就通知）</span></span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p><strong>每个 Java 线程都持有一个 <code>Parker</code> 实例</strong>，所以 park&#x2F;unpark 是「线程私有」的，天然不需要全局锁。</p>
+<hr>
+<h2 id="二、许可（permit）语义：一个容量为-1-的信号量"><a href="#二、许可（permit）语义：一个容量为-1-的信号量" class="headerlink" title="二、许可（permit）语义：一个容量为 1 的信号量"></a>二、许可（permit）语义：一个容量为 1 的信号量</h2><p>这是理解 <code>LockSupport</code> 的唯一关键：</p>
+<blockquote>
+<p><strong><code>LockSupport</code> 内部维护一个二元信号量，许可最多只有 1 个。<code>unpark</code> 是「发放许可」，<code>park</code> 是「消耗许可」。</strong></p>
+</blockquote>
+<p>规则只有四条：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>当前许可</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>park()</code></td>
+<td>1</td>
+<td><strong>立即返回</strong>，许可清零</td>
+</tr>
+<tr>
+<td><code>park()</code></td>
+<td>0</td>
+<td>阻塞，直到被 unpark &#x2F; 中断 &#x2F; 伪唤醒</td>
+</tr>
+<tr>
+<td><code>unpark(t)</code></td>
+<td>0</td>
+<td>许可置 1，若 t 在 park 中则唤醒</td>
+</tr>
+<tr>
+<td><code>unpark(t)</code></td>
+<td>1</td>
+<td>保持不变（<strong>不会累加</strong>）</td>
+</tr>
+</tbody></table>
+<p>由此推出两个非常重要的结论：</p>
+<h3 id="结论-1：park-和-unpark-没有顺序要求"><a href="#结论-1：park-和-unpark-没有顺序要求" class="headerlink" title="结论 1：park 和 unpark 没有顺序要求"></a>结论 1：park 和 unpark 没有顺序要求</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Thread</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">    LockSupport.park();          <span class="comment">// 此时许可已经是 1</span></span><br><span class="line">    System.out.println(<span class="string">&quot;继续执行&quot;</span>);</span><br><span class="line">&#125;);</span><br><span class="line">t.start();</span><br><span class="line"></span><br><span class="line"><span class="comment">// 先 unpark，后 park —— 完全合法</span></span><br><span class="line">LockSupport.unpark(t);</span><br><span class="line">Thread.sleep(<span class="number">1000</span>);</span><br></pre></td></tr></table></figure>
+
+<p>即使 <code>unpark</code> 在 <code>park</code> 之前执行，<code>park</code> 也会立刻返回。这正好补上了 <code>wait/notify</code> 的「信号丢失」问题。</p>
+<h3 id="结论-2：许可不累加，连续-unpark-只算一次"><a href="#结论-2：许可不累加，连续-unpark-只算一次" class="headerlink" title="结论 2：许可不累加，连续 unpark 只算一次"></a>结论 2：许可不累加，连续 unpark 只算一次</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">LockSupport.unpark(t);</span><br><span class="line">LockSupport.unpark(t);</span><br><span class="line">LockSupport.unpark(t);</span><br><span class="line">LockSupport.park();  <span class="comment">// 返回</span></span><br><span class="line">LockSupport.park();  <span class="comment">// 阻塞！因为许可最多 1 个</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>这个特性是线上面试题的重灾区</strong>：如果代码逻辑依赖「unpark 了 N 次就能 park 通过 N 次」，必然死锁。</p>
+<h3 id="结论-3：park-不释放任何锁"><a href="#结论-3：park-不释放任何锁" class="headerlink" title="结论 3：park 不释放任何锁"></a>结论 3：park 不释放任何锁</h3><p>这是新手最容易误解的一点：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">synchronized</span> (lock) &#123;</span><br><span class="line">    LockSupport.park();  <span class="comment">// 线程挂起，但 lock 依然被它持有！</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>Object.wait()</code> 会释放 monitor，<strong><code>park()</code> 不会释放任何锁</strong>。所以千万不能在持锁状态下随意 park，否则其他线程永远进不来，直接死锁。要「释放锁再等待」，必须用 <code>Condition.await()</code>（它在内部先释放锁再 park）。</p>
+<hr>
+<h2 id="三、和-wait-notify-的完整对比"><a href="#三、和-wait-notify-的完整对比" class="headerlink" title="三、和 wait&#x2F;notify 的完整对比"></a>三、和 wait&#x2F;notify 的完整对比</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th><code>Object.wait/notify</code></th>
+<th><code>LockSupport.park/unpark</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>是否需要在同步块内</td>
+<td><strong>必须</strong>（否则抛异常）</td>
+<td>不需要</td>
+</tr>
+<tr>
+<td>是否释放监视器锁</td>
+<td>是</td>
+<td><strong>否</strong></td>
+</tr>
+<tr>
+<td>顺序要求</td>
+<td>必须先 wait 后 notify</td>
+<td>无要求（许可可预存）</td>
+</tr>
+<tr>
+<td>唤醒粒度</td>
+<td>随机一个 &#x2F; 全部</td>
+<td><strong>指定线程</strong></td>
+</tr>
+<tr>
+<td>中断响应</td>
+<td>抛 <code>InterruptedException</code></td>
+<td><strong>不抛异常</strong>，返回后需自行检查中断标志</td>
+</tr>
+<tr>
+<td>伪唤醒</td>
+<td>存在</td>
+<td>存在（JVM 允许自发返回）</td>
+</tr>
+<tr>
+<td>超时支持</td>
+<td><code>wait(long)</code></td>
+<td><code>parkNanos</code> &#x2F; <code>parkUntil</code></td>
+</tr>
+<tr>
+<td>定位能力</td>
+<td>无</td>
+<td><code>blocker</code> 参数可出现在线程栈</td>
+</tr>
+<tr>
+<td>使用门槛</td>
+<td>语言级</td>
+<td>底层原语，不建议业务直接用</td>
+</tr>
+</tbody></table>
+<p>一句话总结：<strong>业务代码用 <code>Condition</code> &#x2F; <code>BlockingQueue</code>；框架代码用 <code>LockSupport</code>。</strong></p>
+<hr>
+<h2 id="四、伪唤醒（spurious-wakeup）：为什么必须写-while-循环"><a href="#四、伪唤醒（spurious-wakeup）：为什么必须写-while-循环" class="headerlink" title="四、伪唤醒（spurious wakeup）：为什么必须写 while 循环"></a>四、伪唤醒（spurious wakeup）：为什么必须写 while 循环</h2><p>JVM 规范明确允许 <code>park()</code> 在没有任何 <code>unpark</code>、没有中断的情况下「莫名其妙」返回。这不是 bug，而是为了兼容不同操作系统的底层实现（POSIX 的 <code>pthread_cond_wait</code> 同样允许）。</p>
+<p>所以<strong>任何 park 都必须放在条件循环里</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 错误：伪唤醒后条件还没满足就往下走了</span></span><br><span class="line">LockSupport.park();</span><br><span class="line">doSomething();</span><br><span class="line"></span><br><span class="line"><span class="comment">// ✅ 正确：醒来后重新检查条件</span></span><br><span class="line"><span class="keyword">while</span> (!conditionMet()) &#123;</span><br><span class="line">    LockSupport.park(<span class="built_in">this</span>);</span><br><span class="line">&#125;</span><br><span class="line">doSomething();</span><br></pre></td></tr></table></figure>
+
+<p><code>AQS</code> 的源码就是这么写的：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">final</span> <span class="type">boolean</span> <span class="title function_">acquireQueued</span><span class="params">(<span class="keyword">final</span> Node node, <span class="type">int</span> arg)</span> &#123;</span><br><span class="line">    <span class="type">boolean</span> <span class="variable">failed</span> <span class="operator">=</span> <span class="literal">true</span>;</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="type">boolean</span> <span class="variable">interrupted</span> <span class="operator">=</span> <span class="literal">false</span>;</span><br><span class="line">        <span class="keyword">for</span> (;;) &#123;</span><br><span class="line">            <span class="keyword">final</span> <span class="type">Node</span> <span class="variable">p</span> <span class="operator">=</span> node.predecessor();</span><br><span class="line">            <span class="keyword">if</span> (p == head &amp;&amp; tryAcquire(arg)) &#123;   <span class="comment">// 醒来先试一次</span></span><br><span class="line">                setHead(node);</span><br><span class="line">                p.next = <span class="literal">null</span>;</span><br><span class="line">                failed = <span class="literal">false</span>;</span><br><span class="line">                <span class="keyword">return</span> interrupted;</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="keyword">if</span> (shouldParkAfterFailedAcquire(p, node) &amp;&amp;</span><br><span class="line">                parkAndCheckInterrupt())          <span class="comment">// 里面就是 LockSupport.park(this)</span></span><br><span class="line">                interrupted = <span class="literal">true</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (failed) cancelAcquire(node);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意 <code>for (;;)</code> 这个自旋：<strong>每次被唤醒都要重新竞争一次，抢不到就继续 park</strong>。这就是「循环 + 条件」的标准范式。</p>
+<hr>
+<h2 id="五、中断语义：不抛异常，但会「吃掉」标志位"><a href="#五、中断语义：不抛异常，但会「吃掉」标志位" class="headerlink" title="五、中断语义：不抛异常，但会「吃掉」标志位"></a>五、中断语义：不抛异常，但会「吃掉」标志位</h2><p><code>park()</code> 被中断时<strong>不会抛 <code>InterruptedException</code></strong>，它会直接返回，并且<strong>清除线程的中断标志</strong>。这意味着如果你不检查，中断信号就静默丢失了。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Thread</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(() -&gt; &#123;</span><br><span class="line">    <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">        LockSupport.park();</span><br><span class="line">        <span class="comment">// 关键：必须自己判断中断</span></span><br><span class="line">        <span class="keyword">if</span> (Thread.interrupted()) &#123;      <span class="comment">// 注意：interrupted() 会清除标志</span></span><br><span class="line">            System.out.println(<span class="string">&quot;收到中断，退出&quot;</span>);</span><br><span class="line">            <span class="keyword">break</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;);</span><br></pre></td></tr></table></figure>
+
+<p><code>AQS</code> 的做法是把中断「记下来」，等拿到锁之后再补上：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="keyword">final</span> <span class="type">boolean</span> <span class="title function_">parkAndCheckInterrupt</span><span class="params">()</span> &#123;</span><br><span class="line">    LockSupport.park(<span class="built_in">this</span>);</span><br><span class="line">    <span class="keyword">return</span> Thread.interrupted();   <span class="comment">// 清除并返回，交给上层记录</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// acquireQueued 返回后</span></span><br><span class="line"><span class="keyword">if</span> (interrupted) Thread.currentThread().interrupt();  <span class="comment">// 恢复中断标志</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>这是并发框架的标准套路：内部用标志位记录，返回给调用方之前再恢复，不吞掉中断。</strong></p>
+<p>对比一下三种阻塞方式的中断行为：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>中断表现</th>
+<th>中断标志</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Thread.sleep</code></td>
+<td>抛 <code>InterruptedException</code></td>
+<td>清除</td>
+</tr>
+<tr>
+<td><code>Object.wait</code></td>
+<td>抛 <code>InterruptedException</code></td>
+<td>清除</td>
+</tr>
+<tr>
+<td><code>LockSupport.park</code></td>
+<td><strong>正常返回</strong></td>
+<td><strong>清除</strong></td>
+</tr>
+<tr>
+<td><code>LockSupport.park</code> + 显式检查</td>
+<td>正常返回</td>
+<td>需手动恢复</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="六、blocker-参数：别小看这个诊断利器"><a href="#六、blocker-参数：别小看这个诊断利器" class="headerlink" title="六、blocker 参数：别小看这个诊断利器"></a>六、blocker 参数：别小看这个诊断利器</h2><p><code>park(Object blocker)</code> 的唯一作用是<strong>让 jstack &#x2F; Arthas 的线程栈变得可读</strong>。</p>
+<p>不传 blocker：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">&quot;pool-1-thread-3&quot; #23 waiting on condition [0x00007f...]</span><br><span class="line">   java.lang.Thread.State: WAITING (parking)</span><br><span class="line">        at sun.misc.Unsafe.park(Native Method)</span><br><span class="line">        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)</span><br><span class="line">        at com.example.Worker.run(Worker.java:42)</span><br></pre></td></tr></table></figure>
+
+<p>传 blocker：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">&quot;pool-1-thread-3&quot; #23 waiting on condition [0x00007f...]</span><br><span class="line">   java.lang.Thread.State: WAITING (parking)</span><br><span class="line">        at sun.misc.Unsafe.park(Native Method)</span><br><span class="line">        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:194)</span><br><span class="line">        - parking to wait for  &lt;0x000000076b5c8a10&gt; (a java.util.concurrent.locks.ReentrantLock$NonfairSync)</span><br><span class="line">        at com.example.Worker.run(Worker.java:42)</span><br></pre></td></tr></table></figure>
+
+<p>多出来的 <code>parking to wait for &lt;地址&gt; (a 具体类型)</code> 直接告诉你「它在等谁」。线上排查线程全部 park 住的问题时，这一行能省半小时。</p>
+<p><strong>实践建议</strong>：自己写同步组件时，<code>park(this)</code> 里的 <code>this</code> 就是那个同步器对象；<code>AQS</code> 内部统一用 <code>park(this)</code>，<code>this</code> 是 <code>Sync</code> 对象。</p>
+<hr>
+<h2 id="七、LockSupport-在-AQS-中的真实角色"><a href="#七、LockSupport-在-AQS-中的真实角色" class="headerlink" title="七、LockSupport 在 AQS 中的真实角色"></a>七、LockSupport 在 AQS 中的真实角色</h2><p><code>ReentrantLock</code> 加锁失败的路径，压缩后是这样的：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// AbstractQueuedSynchronizer.acquire</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">void</span> <span class="title function_">acquire</span><span class="params">(<span class="type">int</span> arg)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (!tryAcquire(arg) &amp;&amp;</span><br><span class="line">        acquireQueued(addWaiter(Node.EXCLUSIVE), arg))</span><br><span class="line">        selfInterrupt();</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 入队后</span></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">static</span> <span class="type">boolean</span> <span class="title function_">shouldParkAfterFailedAcquire</span><span class="params">(Node pred, Node node)</span> &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">ws</span> <span class="operator">=</span> pred.waitStatus;</span><br><span class="line">    <span class="keyword">if</span> (ws == Node.SIGNAL) <span class="keyword">return</span> <span class="literal">true</span>;          <span class="comment">// 前驱会唤醒我，可以安心 park</span></span><br><span class="line">    <span class="keyword">if</span> (ws &gt; <span class="number">0</span>) &#123;                                <span class="comment">// 前驱已取消，往前找</span></span><br><span class="line">        <span class="keyword">do</span> &#123;</span><br><span class="line">            node.prev = pred = pred.prev;</span><br><span class="line">        &#125; <span class="keyword">while</span> (pred.waitStatus &gt; <span class="number">0</span>);</span><br><span class="line">        pred.next = node;</span><br><span class="line">    &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">        compareAndSetWaitStatus(pred, ws, Node.SIGNAL);  <span class="comment">// 告诉前驱：记得叫我</span></span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>解锁时：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="type">boolean</span> <span class="title function_">release</span><span class="params">(<span class="type">int</span> arg)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (tryRelease(arg)) &#123;</span><br><span class="line">        <span class="type">Node</span> <span class="variable">h</span> <span class="operator">=</span> head;</span><br><span class="line">        <span class="keyword">if</span> (h != <span class="literal">null</span> &amp;&amp; h.waitStatus != <span class="number">0</span>)</span><br><span class="line">            unparkSuccessor(h);   <span class="comment">// 里面调用 LockSupport.unpark(s.thread)</span></span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>设计精髓</strong>：<code>SIGNAL</code> 状态是「契约」——前驱节点承诺释放时会唤醒后继。所以 park 之前必须先 CAS 把前驱置为 <code>SIGNAL</code>，否则可能出现「我刚决定 park，你正好释放并检查到我不需要唤醒」的丢失唤醒问题。</p>
+<p>这也是为什么 <code>shouldParkAfterFailedAcquire</code> 第一次返回 <code>false</code>（只设置状态），<strong>第二次循环才返回 <code>true</code> 真正 park</strong>。这个「多自旋一次」的设计经常被面试官拿出来问。</p>
+<hr>
+<h2 id="八、手写一个基于-LockSupport-的简易锁"><a href="#八、手写一个基于-LockSupport-的简易锁" class="headerlink" title="八、手写一个基于 LockSupport 的简易锁"></a>八、手写一个基于 LockSupport 的简易锁</h2><p>理解了许可语义，自己实现一个互斥锁就是十几行：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SimpleMutex</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> AtomicReference&lt;Thread&gt; owner = <span class="keyword">new</span> <span class="title class_">AtomicReference</span>&lt;&gt;();</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Queue&lt;Thread&gt; waiters = <span class="keyword">new</span> <span class="title class_">ConcurrentLinkedQueue</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">lock</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">Thread</span> <span class="variable">current</span> <span class="operator">=</span> Thread.currentThread();</span><br><span class="line">        <span class="comment">// 快速路径：CAS 抢锁</span></span><br><span class="line">        <span class="keyword">if</span> (owner.compareAndSet(<span class="literal">null</span>, current)) <span class="keyword">return</span>;</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 慢路径：入队 + 循环 park</span></span><br><span class="line">        waiters.add(current);</span><br><span class="line">        <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">            <span class="keyword">if</span> (owner.compareAndSet(<span class="literal">null</span>, current)) &#123;</span><br><span class="line">                waiters.remove(current);</span><br><span class="line">                <span class="keyword">return</span>;</span><br><span class="line">            &#125;</span><br><span class="line">            LockSupport.park(<span class="built_in">this</span>);   <span class="comment">// 允许伪唤醒，所以外层是 while</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">unlock</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (!owner.compareAndSet(Thread.currentThread(), <span class="literal">null</span>)) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalMonitorStateException</span>(<span class="string">&quot;未持有锁&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 唤醒一个等待者</span></span><br><span class="line">        <span class="type">Thread</span> <span class="variable">next</span> <span class="operator">=</span> waiters.peek();</span><br><span class="line">        <span class="keyword">if</span> (next != <span class="literal">null</span>) LockSupport.unpark(next);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>再看生产者消费者：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">LockSupportQueue</span>&lt;T&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Queue&lt;T&gt; queue = <span class="keyword">new</span> <span class="title class_">ArrayDeque</span>&lt;&gt;();</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">int</span> capacity;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Set&lt;Thread&gt; producers = ConcurrentHashMap.newKeySet();</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Set&lt;Thread&gt; consumers = ConcurrentHashMap.newKeySet();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">LockSupportQueue</span><span class="params">(<span class="type">int</span> capacity)</span> &#123; <span class="built_in">this</span>.capacity = capacity; &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">put</span><span class="params">(T item)</span> <span class="keyword">throws</span> InterruptedException &#123;</span><br><span class="line">        <span class="type">Thread</span> <span class="variable">self</span> <span class="operator">=</span> Thread.currentThread();</span><br><span class="line">        <span class="keyword">synchronized</span> (<span class="built_in">this</span>) &#123;</span><br><span class="line">            <span class="keyword">while</span> (queue.size() == capacity) &#123;</span><br><span class="line">                producers.add(self);</span><br><span class="line">                <span class="comment">// 注意：必须在 synchronized 之外 park，否则消费者进不来</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 正确写法见下方说明</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>上面的骨架暴露了一个真实的设计难点：<strong>用 <code>LockSupport</code> 做条件队列，必须自己管理「谁在等哪个条件」，而且不能持锁 park</strong>。这也是 <code>AQS</code> 要引入 <code>ConditionObject</code>（每个条件一条等待队列）的原因。</p>
+<p>一个更接近生产可用的写法是用「状态 + CAS + park」：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">BoundedBuffer</span>&lt;E&gt; &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Object[] items;</span><br><span class="line">    <span class="keyword">private</span> <span class="type">int</span> count, putIdx, takeIdx;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Set&lt;Thread&gt; notFullWaiters  = ConcurrentHashMap.newKeySet();</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Set&lt;Thread&gt; notEmptyWaiters = ConcurrentHashMap.newKeySet();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">BoundedBuffer</span><span class="params">(<span class="type">int</span> capacity)</span> &#123; items = <span class="keyword">new</span> <span class="title class_">Object</span>[capacity]; &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">put</span><span class="params">(E e)</span> <span class="keyword">throws</span> InterruptedException &#123;</span><br><span class="line">        <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">            <span class="keyword">if</span> (Thread.interrupted()) <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">InterruptedException</span>();</span><br><span class="line">            <span class="keyword">synchronized</span> (<span class="built_in">this</span>) &#123;</span><br><span class="line">                <span class="keyword">if</span> (count &lt; items.length) &#123;</span><br><span class="line">                    items[putIdx] = e;</span><br><span class="line">                    putIdx = (putIdx + <span class="number">1</span>) % items.length;</span><br><span class="line">                    count++;</span><br><span class="line">                    wakeOne(notEmptyWaiters);</span><br><span class="line">                    <span class="keyword">return</span>;</span><br><span class="line">                &#125;</span><br><span class="line">                notFullWaiters.add(Thread.currentThread());</span><br><span class="line">            &#125;</span><br><span class="line">            LockSupport.park(<span class="built_in">this</span>);          <span class="comment">// 锁已释放，可以安全 park</span></span><br><span class="line">            notFullWaiters.remove(Thread.currentThread());</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@SuppressWarnings(&quot;unchecked&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> E <span class="title function_">take</span><span class="params">()</span> <span class="keyword">throws</span> InterruptedException &#123;</span><br><span class="line">        <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">            <span class="keyword">if</span> (Thread.interrupted()) <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">InterruptedException</span>();</span><br><span class="line">            <span class="keyword">synchronized</span> (<span class="built_in">this</span>) &#123;</span><br><span class="line">                <span class="keyword">if</span> (count &gt; <span class="number">0</span>) &#123;</span><br><span class="line">                    <span class="type">E</span> <span class="variable">e</span> <span class="operator">=</span> (E) items[takeIdx];</span><br><span class="line">                    items[takeIdx] = <span class="literal">null</span>;</span><br><span class="line">                    takeIdx = (takeIdx + <span class="number">1</span>) % items.length;</span><br><span class="line">                    count--;</span><br><span class="line">                    wakeOne(notFullWaiters);</span><br><span class="line">                    <span class="keyword">return</span> e;</span><br><span class="line">                &#125;</span><br><span class="line">                notEmptyWaiters.add(Thread.currentThread());</span><br><span class="line">            &#125;</span><br><span class="line">            LockSupport.park(<span class="built_in">this</span>);</span><br><span class="line">            notEmptyWaiters.remove(Thread.currentThread());</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">void</span> <span class="title function_">wakeOne</span><span class="params">(Set&lt;Thread&gt; waiters)</span> &#123;</span><br><span class="line">        <span class="keyword">for</span> (Thread t : waiters) &#123;</span><br><span class="line">            <span class="keyword">if</span> (waiters.remove(t)) &#123; LockSupport.unpark(t); <span class="keyword">return</span>; &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意这里的三个细节，都是面试常考点：</p>
+<ol>
+<li><strong><code>park</code> 放在 <code>synchronized</code> 块外面</strong>——否则消费者拿不到锁，永远唤不醒它；</li>
+<li><strong>入队后、park 前有窗口期</strong>：可能在释放锁到 park 之间被 <code>unpark</code>，此时许可已存下，<code>park</code> 立即返回，不会丢信号——这正是 <code>LockSupport</code> 相比 <code>wait/notify</code> 的优势；</li>
+<li><strong>醒来自动 <code>remove</code></strong>，避免集合无限增长。</li>
+</ol>
+<hr>
+<h2 id="九、生产踩坑清单"><a href="#九、生产踩坑清单" class="headerlink" title="九、生产踩坑清单"></a>九、生产踩坑清单</h2><h3 id="坑-1：线程池里残留许可导致「假唤醒」"><a href="#坑-1：线程池里残留许可导致「假唤醒」" class="headerlink" title="坑 1：线程池里残留许可导致「假唤醒」"></a>坑 1：线程池里残留许可导致「假唤醒」</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 提交任务前先 unpark 一下（比如为了&quot;预热&quot;）</span></span><br><span class="line">LockSupport.unpark(workerThread);</span><br></pre></td></tr></table></figure>
+
+<p>如果这个 <code>unpark</code> 发生在线程归还到池子之后、下一次 <code>park</code> 之前，许可就被「存」在这个线程上了。等它下次执行任务 park 时，直接穿透。表象是「偶发空转 &#x2F; 条件没满足就执行」，极难排查。</p>
+<p><strong>规则：unpark 只能用于「我明确知道你正在等，或即将等这个条件」的场景。</strong></p>
+<h3 id="坑-2：把-park-当-sleep-用"><a href="#坑-2：把-park-当-sleep-用" class="headerlink" title="坑 2：把 park 当 sleep 用"></a>坑 2：把 park 当 sleep 用</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">LockSupport.parkNanos(TimeUnit.SECONDS.toNanos(<span class="number">1</span>));  <span class="comment">// 以为等于 sleep(1)</span></span><br></pre></td></tr></table></figure>
+
+<p>差别在于：任何 <code>unpark</code> 都会让它提前返回。如果这个线程被别人误 unpark，你的「定时」就废了。定时请用 <code>Thread.sleep</code> 或 <code>ScheduledExecutorService</code>。</p>
+<h3 id="坑-3：忘记循环判断，伪唤醒导致数据错乱"><a href="#坑-3：忘记循环判断，伪唤醒导致数据错乱" class="headerlink" title="坑 3：忘记循环判断，伪唤醒导致数据错乱"></a>坑 3：忘记循环判断，伪唤醒导致数据错乱</h3><p>前面讲过，不再重复。<strong>看到 <code>park()</code> 不在 <code>while</code> 里，就可以判定是 bug。</strong></p>
+<h3 id="坑-4：park-在-synchronized-内导致死锁"><a href="#坑-4：park-在-synchronized-内导致死锁" class="headerlink" title="坑 4：park 在 synchronized 内导致死锁"></a>坑 4：park 在 <code>synchronized</code> 内导致死锁</h3><p><code>park</code> 不释放 monitor。要「等条件」必须用 <code>Condition.await()</code> 或自己保证 park 时无锁。</p>
+<h3 id="坑-5：中断被吞"><a href="#坑-5：中断被吞" class="headerlink" title="坑 5：中断被吞"></a>坑 5：中断被吞</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">LockSupport.park();</span><br><span class="line"><span class="comment">// 没有检查 Thread.interrupted()</span></span><br><span class="line"><span class="keyword">continue</span>;   <span class="comment">// 线程无法响应 shutdown</span></span><br></pre></td></tr></table></figure>
+
+<p>线上表现为 <strong><code>kill -15</code> 之后应用关不掉、优雅停机卡住</strong>。因为你的循环永远不退出。</p>
+<h3 id="坑-6：以为-unpark-能唤醒「正在-sleep-的线程」"><a href="#坑-6：以为-unpark-能唤醒「正在-sleep-的线程」" class="headerlink" title="坑 6：以为 unpark 能唤醒「正在 sleep 的线程」"></a>坑 6：以为 unpark 能唤醒「正在 sleep 的线程」</h3><p><code>unpark</code> 只影响 <code>Parker</code> 的许可，对 <code>Thread.sleep</code>、<code>wait</code>、IO 阻塞<strong>无效</strong>。想打断它们只能用 <code>interrupt()</code>。</p>
+<hr>
+<h2 id="十、面试常见追问"><a href="#十、面试常见追问" class="headerlink" title="十、面试常见追问"></a>十、面试常见追问</h2><p><strong>Q1：<code>LockSupport.park()</code> 和 <code>Thread.sleep()</code> 的区别？</strong></p>
+<ul>
+<li>park 可以被 <code>unpark</code> 唤醒，sleep 不能；</li>
+<li>park 响应中断但不抛异常，sleep 抛 <code>InterruptedException</code>；</li>
+<li>park 不释放锁，sleep 也不释放锁（两者相同）；</li>
+<li>park 是「等待某个条件」，sleep 是「等一段时间」，语义不同；</li>
+<li>park 底层是 <code>Parker</code> + 条件变量，sleep 走的是 <code>os::sleep</code>。</li>
+</ul>
+<p><strong>Q2：为什么 AQS 用 <code>LockSupport</code> 而不是 <code>wait/notify</code>？</strong></p>
+<ul>
+<li><code>wait/notify</code> 要求持有 monitor，而 AQS 本身要替代 <code>synchronized</code>，不能反向依赖；</li>
+<li><code>notify</code> 只能随机唤醒，AQS 需要唤醒<strong>队首后继</strong>这个特定节点；</li>
+<li><code>wait/notify</code> 有信号丢失窗口，AQS 的入队&#x2F;park 之间必须无窗口；</li>
+<li><code>park(blocker)</code> 能在线程栈上打印等待对象，便于诊断。</li>
+</ul>
+<p><strong>Q3：<code>unpark</code> 一个还没启动的线程会怎样？</strong></p>
+<p>许可会存在该线程的 <code>Parker</code> 上，等它第一次 <code>park</code> 时立即返回。<strong>不会报错，但通常说明你的时序设计有问题。</strong></p>
+<p><strong>Q4：<code>park</code> 会不会释放 CPU？</strong></p>
+<p>会。线程进入 <code>WAITING (parking)</code>，不占 CPU。但它不会让出锁。</p>
+<p><strong>Q5：<code>parkNanos</code> 的超时精度如何？</strong></p>
+<p>依赖 OS 的条件变量超时（Linux 上是 <code>pthread_cond_timedwait</code>），毫秒级，且受调度影响。不要用它做精确定时。</p>
+<p><strong>Q6：<code>LockSupport</code> 能替代 <code>Condition</code> 吗？</strong></p>
+<p>能但不该。<code>Condition</code> 帮你管理了「条件队列 + 锁释放 + 精确唤醒 + 中断语义 + 超时」，<code>LockSupport</code> 这些全要自己写，且极易出错。业务代码没有任何理由直接用 <code>LockSupport</code>。</p>
+<hr>
+<h2 id="十一、总结"><a href="#十一、总结" class="headerlink" title="十一、总结"></a>十一、总结</h2><p>把 <code>LockSupport</code> 浓缩成一张图：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">unpark(t)  ──→ 许可 = 1（最多 1） ──→ park() 立即返回并清零</span><br><span class="line">                    │</span><br><span class="line">                    └─ 线程在 park 中？唤醒它</span><br><span class="line">park()   ──→ 许可 = 0？阻塞，直到 unpark / 中断 / 伪唤醒</span><br></pre></td></tr></table></figure>
+
+<p>记住四句话：</p>
+<ol>
+<li><strong>许可是二元的，不累加</strong>；</li>
+<li><strong>park 必须写在 while 条件循环里</strong>；</li>
+<li><strong>park 不释放锁，持锁 park 必死锁</strong>；</li>
+<li><strong>中断不抛异常，必须自己检查并恢复标志</strong>。</li>
+</ol>
+<p>再往上一层看：<code>LockSupport</code> 是「线程级阻塞原语」，<code>AQS</code> 是「基于它的队列化同步框架」，<code>ReentrantLock</code> &#x2F; <code>Semaphore</code> &#x2F; <code>CountDownLatch</code> 是「面向业务的门面」。理解了这个分层，JUC 的源码就不再是玄学，而是一层层可以推导出来的设计。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/24/java-locksupport-park-unpark-deep-dive/">https://jiweidong.github.io/2026/10/24/java-locksupport-park-unpark-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/">并发编程</a><a class="post-meta__tags" href="/tags/JUC/">JUC</a><a class="post-meta__tags" href="/tags/AQS/">AQS</a><a class="post-meta__tags" href="/tags/LockSupport/">LockSupport</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/24/mybatis-typehandler-custom-mapping-deep-dive/" title="【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单</div></div><div class="info-2"><div class="info-item-1">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举&#x2F;JSON 映射与踩坑清单前言几乎每个用 MyBatis 的项目都会遇到这几件事：  枚举字段存进库成了 0/1/2 或者 ORDINAL 序号，产品改一次枚举顺序，历史数据全错位； 一个 List&lt;String&gt; 想直接存成 JSON 列，结果报 Cannot convert String to List； 手机号、身份证要加密落库，在 Service 层手动加解密，漏一个字段就是安全事故； 明明写了 typeHandler，就是不生效，日志里全是默认的 StringTypeHandler。  这些问题的共同答案是同一个东西：TypeHandler。它是 MyBatis 里「Java 类型 ↔ JDBC 类型」的唯一转换入口，但绝大多数人只在报错时才想起它。 这篇文章从它在 MyBatis 中的位置讲起，把 TypeHandlerRegistry 的查找链、自定义枚举&#x2F;JSON&#x2F;加密处理器的落地、Spring Boot 下的注册方式、以及 8 个高频踩坑一次...</div></div></div></a><a class="pagination-related" href="/2026/10/23/agent-workflow-orchestration-deep-dive/" title="【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入</div></div><div class="info-2"><div class="info-item-1">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入前言刚开始做 Agent，大家都是这么写的： 123456789while (!done) &#123;    response = llm.chat(messages, tools);    if (response.hasToolCalls()) &#123;        results = executeTools(response.toolCalls());        messages.addAll(results);    &#125; else &#123;        done = true;    &#125;&#125;  一个 while 循环，看起来很优雅。上线之后你会发现：  有的请求跑了 40 轮还没停，烧了 20 万 token； 第 3 步工具失败了，只能整条重跑； 用户等了 90 秒，产品经理要求「中间结果先展示」； 出了事故要复盘，但你不知道它当时到底走了哪条路径； 合规要求高风险操作必须人工确认，你没地方插这个「确认」。  这些问题不是 Prompt 能解决的，它们是...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/14/java-semaphore-countdownlatch-cyclicbarrier-deep-dive/" title="【并发编程】Java 同步器（Semaphore&#x2F;CountDownLatch&#x2F;CyclicBarrier）源码深度解析：从 AQS 到实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-14</div><div class="info-item-2">【并发编程】Java 同步器（Semaphore&#x2F;CountDownLatch&#x2F;CyclicBarrier）源码深度解析：从 AQS 到实战</div></div><div class="info-2"><div class="info-item-1">【并发编程】Java 同步器（Semaphore&#x2F;CountDownLatch&#x2F;CyclicBarrier）源码深度解析：从 AQS 到实战前言Java 并发包 (java.util.concurrent) 中除了 ThreadPoolExecutor、ConcurrentHashMap 这些大明星，还有一群低调但极为实用的同步器（Synchronizer）：  CountDownLatch — 让一个线程等待其他线程「倒计时」结束 CyclicBarrier — 让一组线程互相等待，到达屏障再一起出发 Semaphore — 控制同时访问资源的线程数量  这三个工具在面试中频率极高，但很多人只停留在「会用 API」的层面。今天我们从 AQS（AbstractQueuedSynchronizer） 源码层面把它们彻底讲透。    一、AQS：所有同步器的基石1.1 什么是 AQS？AQS（AbstractQueuedSynchronizer）是 Java 并发包的灵魂组件。ReentrantLock、CountDownLatch、Semaphore、Reent...</div></div></div></a><a class="pagination-related" href="/2026/06/09/Java%E5%B9%B6%E5%8F%91%E5%B8%B8%E8%A7%81%E9%9D%A2%E8%AF%95%E9%A2%98%E6%80%BB%E7%BB%93%EF%BC%88%E4%BA%8C%EF%BC%89%EF%BC%9AJUC%E8%BF%9B%E9%98%B6%E7%AF%87/" title="Java并发常见面试题总结（二）：JUC进阶篇"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-09</div><div class="info-item-2">Java并发常见面试题总结（二）：JUC进阶篇</div></div><div class="info-2"><div class="info-item-1">Java并发常见面试题总结（二）：JUC进阶篇一、AQS（AbstractQueuedSynchronizer）1. AQS 的核心原理是什么？AQS（AbstractQueuedSynchronizer）是 JUC 包的基石，ReentrantLock、CountDownLatch、Semaphore、ReentrantReadWriteLock 等同步器的底层实现都依赖 AQS。 核心思想： 如果请求的共享资源空闲，则将当前请求线程设为工作线程；否则将线程封装成一个 Node 节点 加入 CLH 队列，通过自旋 + CAS + LockSupport.park 阻塞等待。 AQS 的核心组成： 12345678AQS（AbstractQueuedSynchronizer）├── state（volatile int）        ← 同步状态，子类通过 getState/setState/compareAndSetState 操作├── CLH 队列（双向链表）           ← 等待获取锁的线程队列│   ├── Node.prev│   ├── Node.next...</div></div></div></a><a class="pagination-related" href="/2026/06/09/Java%E5%B9%B6%E5%8F%91%E5%B8%B8%E8%A7%81%E9%9D%A2%E8%AF%95%E9%A2%98%E6%80%BB%E7%BB%93%EF%BC%88%E4%B8%89%EF%BC%89%EF%BC%9A%E9%AB%98%E7%BA%A7%E7%AF%87/" title="Java并发常见面试题总结（三）：高级篇"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-09</div><div class="info-item-2">Java并发常见面试题总结（三）：高级篇</div></div><div class="info-2"><div class="info-item-1">Java并发常见面试题总结（三）：高级篇一、ConcurrentHashMap 源码分析1. JDK 7 与 JDK 8 的 ConcurrentHashMap 区别   对比维度 JDK 7 JDK 8    数据结构 Segment + HashEntry + 数组+链表 Node + 数组+链表+红黑树   锁粒度 Segment 分段锁（继承 ReentrantLock） synchronized + CAS（锁链表头节点）   并发度 固定 Segment 数组大小（默认16） 动态扩容，锁粒度更细   寻址 两次 Hash（找 Segment → 找 Entry） 一次 Hash 找到数组下标   查询性能 链表遍历 O(n) 链表 O(n) &#x2F; 红黑树 O(log n)   size() 方法 先乐观尝试，失败则加锁所有 Segment 通过 baseCount + CounterCell 累加（类似 LongAdder）   数据结构对比图： 1234567891011121314151617181920212223JDK 7:┌──────────┐│...</div></div></div></a><a class="pagination-related" href="/2026/10/08/java-jcstress-concurrency-correctness-testing-deep-practice/" title="【Java 并发】JCStress 并发正确性测试深度实战：@Actor 模型、JMM 可见性与冲突探测"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">【Java 并发】JCStress 并发正确性测试深度实战：@Actor 模型、JMM 可见性与冲突探测</div></div><div class="info-2"><div class="info-item-1">【Java 并发】JCStress 并发正确性测试深度实战：@Actor 模型、JMM 可见性与冲突探测面试官：你的单例 DCL 写法，真的没有并发问题吗？先看这段被封为教科书的代码： 1234567891011121314public class Singleton &#123;    private static volatile Singleton instance;   // 换成非 volatile 会怎样？    public static Singleton getInstance() &#123;        if (instance == null) &#123;            synchronized (Singleton.class) &#123;                if (instance == null) &#123;                    instance = new Singleton();                &#125;            &#125;        &#125;        ...</div></div></div></a><a class="pagination-related" href="/2026/07/02/java-concurrent-synchronizers-deep-dive/" title="【面试必备】Java 并发同步工具类深度解析：CountDownLatch、CyclicBarrier、Semaphore 与 Phaser"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【面试必备】Java 并发同步工具类深度解析：CountDownLatch、CyclicBarrier、Semaphore 与 Phaser</div></div><div class="info-2"><div class="info-item-1">【面试必备】Java 并发同步工具类深度解析：CountDownLatch、CyclicBarrier、Semaphore 与 Phaser引言在 Java 并发编程中，除了 synchronized、ReentrantLock 和 volatile 这些基础同步手段，java.util.concurrent 包还提供了一组强大的同步工具类。本文将深入剖析 CountDownLatch、CyclicBarrier、Semaphore 和 Phaser 四大同步器的核心原理、源码实现与典型应用场景。 一、CountDownLatch：倒计时门闩1.1 核心概念CountDownLatch 允许一个或多个线程等待，直到在其他线程中执行的一组操作完成。它像一个倒计时门闩——初始设置一个计数值，每当一个线程完成任务后调用 countDown() 使计数器减1，计数器归零时，等待的线程被唤醒。 1.2 典型应用场景场景一：主线程等待多个子线程完成初始化 1234567891011121314CountDownLatch latch = new CountDownLatch(3);// 启动...</div></div></div></a><a class="pagination-related" href="/2026/08/05/template-method-pattern-deep-dive/" title="【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-05</div><div class="info-item-2">【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用</div></div><div class="info-2"><div class="info-item-1">【设计模式】模板方法模式深度解析：从骨架方法到 Spring、AQS、MyBatis 框架级应用面试官：AQS 的源码你看过吗？为什么子类只需要重写 tryAcquire 几个方法就能实现各种锁？能回答上来的同学，基本都理解了模板方法模式（Template Method Pattern）。AQS 是模板方法模式在并发领域最经典的运用：父类把 acquire()、release() 的骨架流程写死，把 tryAcquire()、tryRelease() 这些”变化点”留给子类实现。本文从手写模板方法开始，拆解 AQS、Spring、MyBatis 中的框架级应用。   一、什么是模板方法模式定义：定义一个操作中的算法骨架，将一些步骤延迟到子类中实现。模板方法使得子类可以不改变算法结构的情况下，重新定义算法中的某些步骤。 核心角色：  AbstractClass（抽象类）：定义模板方法（骨架）和抽象步骤方法（钩子） ConcreteClass（具体子类）：实现步骤方法，不改变骨架  两个关键概念：  模板方法（Template Method）：定义流程骨架，通常用 final 修饰，...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">817</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">918</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E5%B9%B6%E5%8F%91%E5%BA%95%E5%B1%82%E3%80%91LockSupport-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9Apark-unpark-%E8%AE%B8%E5%8F%AF%E6%9C%BA%E5%88%B6%E3%80%81%E4%BC%AA%E5%94%A4%E9%86%92%E4%B8%8E-AQS-%E5%9F%BA%E7%9F%B3"><span class="toc-number">1.</span> <span class="toc-text">【并发底层】LockSupport 深度解析：park&#x2F;unpark 许可机制、伪唤醒与 AQS 基石</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81LockSupport-%E5%88%B0%E5%BA%95%E6%98%AF%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、LockSupport 到底是什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E8%AE%B8%E5%8F%AF%EF%BC%88permit%EF%BC%89%E8%AF%AD%E4%B9%89%EF%BC%9A%E4%B8%80%E4%B8%AA%E5%AE%B9%E9%87%8F%E4%B8%BA-1-%E7%9A%84%E4%BF%A1%E5%8F%B7%E9%87%8F"><span class="toc-number">1.3.</span> <span class="toc-text">二、许可（permit）语义：一个容量为 1 的信号量</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA-1%EF%BC%9Apark-%E5%92%8C-unpark-%E6%B2%A1%E6%9C%89%E9%A1%BA%E5%BA%8F%E8%A6%81%E6%B1%82"><span class="toc-number">1.3.1.</span> <span class="toc-text">结论 1：park 和 unpark 没有顺序要求</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA-2%EF%BC%9A%E8%AE%B8%E5%8F%AF%E4%B8%8D%E7%B4%AF%E5%8A%A0%EF%BC%8C%E8%BF%9E%E7%BB%AD-unpark-%E5%8F%AA%E7%AE%97%E4%B8%80%E6%AC%A1"><span class="toc-number">1.3.2.</span> <span class="toc-text">结论 2：许可不累加，连续 unpark 只算一次</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%BB%93%E8%AE%BA-3%EF%BC%9Apark-%E4%B8%8D%E9%87%8A%E6%94%BE%E4%BB%BB%E4%BD%95%E9%94%81"><span class="toc-number">1.3.3.</span> <span class="toc-text">结论 3：park 不释放任何锁</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%92%8C-wait-notify-%E7%9A%84%E5%AE%8C%E6%95%B4%E5%AF%B9%E6%AF%94"><span class="toc-number">1.4.</span> <span class="toc-text">三、和 wait&#x2F;notify 的完整对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E4%BC%AA%E5%94%A4%E9%86%92%EF%BC%88spurious-wakeup%EF%BC%89%EF%BC%9A%E4%B8%BA%E4%BB%80%E4%B9%88%E5%BF%85%E9%A1%BB%E5%86%99-while-%E5%BE%AA%E7%8E%AF"><span class="toc-number">1.5.</span> <span class="toc-text">四、伪唤醒（spurious wakeup）：为什么必须写 while 循环</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%B8%AD%E6%96%AD%E8%AF%AD%E4%B9%89%EF%BC%9A%E4%B8%8D%E6%8A%9B%E5%BC%82%E5%B8%B8%EF%BC%8C%E4%BD%86%E4%BC%9A%E3%80%8C%E5%90%83%E6%8E%89%E3%80%8D%E6%A0%87%E5%BF%97%E4%BD%8D"><span class="toc-number">1.6.</span> <span class="toc-text">五、中断语义：不抛异常，但会「吃掉」标志位</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81blocker-%E5%8F%82%E6%95%B0%EF%BC%9A%E5%88%AB%E5%B0%8F%E7%9C%8B%E8%BF%99%E4%B8%AA%E8%AF%8A%E6%96%AD%E5%88%A9%E5%99%A8"><span class="toc-number">1.7.</span> <span class="toc-text">六、blocker 参数：别小看这个诊断利器</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81LockSupport-%E5%9C%A8-AQS-%E4%B8%AD%E7%9A%84%E7%9C%9F%E5%AE%9E%E8%A7%92%E8%89%B2"><span class="toc-number">1.8.</span> <span class="toc-text">七、LockSupport 在 AQS 中的真实角色</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%89%8B%E5%86%99%E4%B8%80%E4%B8%AA%E5%9F%BA%E4%BA%8E-LockSupport-%E7%9A%84%E7%AE%80%E6%98%93%E9%94%81"><span class="toc-number">1.9.</span> <span class="toc-text">八、手写一个基于 LockSupport 的简易锁</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E7%94%9F%E4%BA%A7%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、生产踩坑清单</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-1%EF%BC%9A%E7%BA%BF%E7%A8%8B%E6%B1%A0%E9%87%8C%E6%AE%8B%E7%95%99%E8%AE%B8%E5%8F%AF%E5%AF%BC%E8%87%B4%E3%80%8C%E5%81%87%E5%94%A4%E9%86%92%E3%80%8D"><span class="toc-number">1.10.1.</span> <span class="toc-text">坑 1：线程池里残留许可导致「假唤醒」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-2%EF%BC%9A%E6%8A%8A-park-%E5%BD%93-sleep-%E7%94%A8"><span class="toc-number">1.10.2.</span> <span class="toc-text">坑 2：把 park 当 sleep 用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-3%EF%BC%9A%E5%BF%98%E8%AE%B0%E5%BE%AA%E7%8E%AF%E5%88%A4%E6%96%AD%EF%BC%8C%E4%BC%AA%E5%94%A4%E9%86%92%E5%AF%BC%E8%87%B4%E6%95%B0%E6%8D%AE%E9%94%99%E4%B9%B1"><span class="toc-number">1.10.3.</span> <span class="toc-text">坑 3：忘记循环判断，伪唤醒导致数据错乱</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-4%EF%BC%9Apark-%E5%9C%A8-synchronized-%E5%86%85%E5%AF%BC%E8%87%B4%E6%AD%BB%E9%94%81"><span class="toc-number">1.10.4.</span> <span class="toc-text">坑 4：park 在 synchronized 内导致死锁</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-5%EF%BC%9A%E4%B8%AD%E6%96%AD%E8%A2%AB%E5%90%9E"><span class="toc-number">1.10.5.</span> <span class="toc-text">坑 5：中断被吞</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-6%EF%BC%9A%E4%BB%A5%E4%B8%BA-unpark-%E8%83%BD%E5%94%A4%E9%86%92%E3%80%8C%E6%AD%A3%E5%9C%A8-sleep-%E7%9A%84%E7%BA%BF%E7%A8%8B%E3%80%8D"><span class="toc-number">1.10.6.</span> <span class="toc-text">坑 6：以为 unpark 能唤醒「正在 sleep 的线程」</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.11.</span> <span class="toc-text">十、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E4%B8%80%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.12.</span> <span class="toc-text">十一、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/enterprise-knowledge-base-rag-system-design/" title="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源">【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</a><time datetime="2026-10-24T00:25:00.000Z" title="发表于 2026-10-24 08:25:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/java-embedding-search-deep-practice/" title="【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新</a><time datetime="2026-10-24T00:20:00.000Z" title="发表于 2026-10-24 08:20:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/kafka-share-group-queue-consumption-deep-dive/" title="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理">【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</a><time datetime="2026-10-24T00:15:00.000Z" title="发表于 2026-10-24 08:15:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/mybatis-typehandler-custom-mapping-deep-dive/" title="【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单</a><time datetime="2026-10-24T00:10:00.000Z" title="发表于 2026-10-24 08:10:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/java-locksupport-park-unpark-deep-dive/" title="【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石">【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石</a><time datetime="2026-10-24T00:05:00.000Z" title="发表于 2026-10-24 08:05:00">2026-10-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

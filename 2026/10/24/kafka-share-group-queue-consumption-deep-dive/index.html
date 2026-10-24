@@ -1,0 +1,440 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理前言Kafka 的经典消费模型是「一个分区只能被同一个消费组内的一个消费者消费」。这个模型简单、有序、位移管理清晰，但也带来三个绕不过去的限制：  并发上限被分区数锁死。一个 topic 只有 12 个分区，就算你有 200 个消费者实例，也只有 12 个在干活，其余 188 个空转。 re">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/24/kafka-share-group-queue-consumption-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理前言Kafka 的经典消费模型是「一个分区只能被同一个消费组内的一个消费者消费」。这个模型简单、有序、位移管理清晰，但也带来三个绕不过去的限制：  并发上限被分区数锁死。一个 topic 只有 12 个分区，就算你有 200 个消费者实例，也只有 12 个在干活，其余 188 个空转。 re">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-24T00:15:00.000Z">
+<meta property="article:modified_time" content="2026-10-24T00:02:16.213Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="KIP-932">
+<meta property="article:tag" content="Kafka">
+<meta property="article:tag" content="消息队列">
+<meta property="article:tag" content="消费模型">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理",
+  "url": "https://jiweidong.github.io/2026/10/24/kafka-share-group-queue-consumption-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-24T00:15:00.000Z",
+  "dateModified": "2026-10-24T00:02:16.213Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/24/kafka-share-group-queue-consumption-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">817</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">918</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-24T00:15:00.000Z" title="发表于 2026-10-24 08:15:00">2026-10-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-24T00:02:16.213Z" title="更新于 2026-10-24 08:02:16">2026-10-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-%E6%B7%B1%E6%8C%96/">Java 深挖</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Kafka-4-x】共享组（Share-Group）深度解析：KIP-932-队列语义、协同消费与位移治理"><a href="#【Kafka-4-x】共享组（Share-Group）深度解析：KIP-932-队列语义、协同消费与位移治理" class="headerlink" title="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理"></a>【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>Kafka 的经典消费模型是「<strong>一个分区只能被同一个消费组内的一个消费者消费</strong>」。这个模型简单、有序、位移管理清晰，但也带来三个绕不过去的限制：</p>
+<ol>
+<li><strong>并发上限被分区数锁死</strong>。一个 topic 只有 12 个分区，就算你有 200 个消费者实例，也只有 12 个在干活，其余 188 个空转。</li>
+<li><strong>rebalance 代价高</strong>。扩容、缩容、实例抖动都会触发分区重新分配，期间整个组消费停摆（KIP-848 的新协议缓解了这一点，但没改变「分区独占」的本质）。</li>
+<li><strong>慢消息阻塞整条分区</strong>。一条消息处理 30 秒，后面 10 万条就得排队等——因为同一个分区同一时刻只能有一个消费者持有。</li>
+</ol>
+<p>对于「订单履约」「图片转码」「报表导出」这类<strong>任务型</strong>负载，我们真正想要的是<strong>队列语义</strong>：一条消息被一个 worker 拿走，处理完确认，其他人不要重复拿；处理超时自动重新投递。这正是 RabbitMQ &#x2F; SQS &#x2F; RocketMQ 的强项，而 Kafka 一直缺。</p>
+<p><strong>KIP-932（Queues for Kafka）</strong> 就是补这个缺口的：引入 <strong>Share Group（共享组）</strong>，让多个消费者<strong>协同消费同一批分区</strong>，以「单条记录」为单位做获取锁与确认。</p>
+<blockquote>
+<p>⚠️ 版本说明：共享组在 Kafka 4.0 以 Early Access 形式引入，后续版本持续完善（配置项与方法签名有调整）。本文讲的是<strong>模型与落地思路</strong>，示例代码基于 4.0 的 <code>KafkaShareConsumer</code> API，实际落地前请对照你所用版本的官方 JavaDoc。</p>
+</blockquote>
+<hr>
+<h2 id="一、核心概念：从「分区独占」到「记录级协作」"><a href="#一、核心概念：从「分区独占」到「记录级协作」" class="headerlink" title="一、核心概念：从「分区独占」到「记录级协作」"></a>一、核心概念：从「分区独占」到「记录级协作」</h2><h3 id="1-1-传统消费组"><a href="#1-1-传统消费组" class="headerlink" title="1.1 传统消费组"></a>1.1 传统消费组</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">Topic T (3 partitions)           Consumer Group G (2 consumers)</span><br><span class="line">┌──────────┐                     ┌─────────────┐</span><br><span class="line">│ P0 ──────┼────────────────────▶│ Consumer A  │  独占 P0、P1</span><br><span class="line">│ P1 ──────┼────────────────────▶│             │</span><br><span class="line">│ P2 ──────┼────────────────────▶│ Consumer B  │  独占 P2</span><br><span class="line">└──────────┘                     └─────────────┘</span><br></pre></td></tr></table></figure>
+
+<p>消费者对分区是<strong>排他</strong>的。位移（offset）是按「消费组 + 分区」提交的，粒度是<strong>分区级</strong>。</p>
+<h3 id="1-2-共享组"><a href="#1-2-共享组" class="headerlink" title="1.2 共享组"></a>1.2 共享组</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">Topic T (3 partitions)           Share Group SG (3 consumers)</span><br><span class="line">┌──────────┐                     ┌─────────────┐</span><br><span class="line">│ P0 ──────┼──┐                  │ Consumer A  │ 拿到 P0 的 record 0-9</span><br><span class="line">│ P1 ──────┼──┼──▶ 协作分发 ────▶│ Consumer B  │ 拿到 P0 的 record 10-19 + P2 的 5-9</span><br><span class="line">│ P2 ──────┼──┘                  │ Consumer C  │ 拿到 P1 的 record 20-29</span><br><span class="line">└──────────┘                     └─────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>三个关键变化：</strong></p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>传统消费组</th>
+<th>共享组</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>分配单位</td>
+<td>分区</td>
+<td><strong>记录（record）</strong></td>
+</tr>
+<tr>
+<td>分区归属</td>
+<td>排他</td>
+<td><strong>共享</strong></td>
+</tr>
+<tr>
+<td>确认粒度</td>
+<td>offset（分区级）</td>
+<td><strong>单条记录 ack</strong></td>
+</tr>
+<tr>
+<td>顺序性</td>
+<td>分区内有序</td>
+<td><strong>不保证</strong>（同一分区可能被多个消费者并发处理）</td>
+</tr>
+<tr>
+<td>并发上限</td>
+<td>分区数</td>
+<td><strong>消费者数</strong>（受 broker 负载与锁容量限制）</td>
+</tr>
+<tr>
+<td>失败重投</td>
+<td>靠位点回退 &#x2F; 手动 seek</td>
+<td><strong>锁超时自动重新投递</strong>，带 delivery count</td>
+</tr>
+</tbody></table>
+<h3 id="1-3-关键机制"><a href="#1-3-关键机制" class="headerlink" title="1.3 关键机制"></a>1.3 关键机制</h3><p><strong>① Acquisition Lock（获取锁）</strong></p>
+<p>消费者拿到一批记录时，broker 会为这些记录加一个<strong>有时限的锁</strong>（默认 30 秒量级，由 <code>group.share.record.lock.duration.ms</code> 一类的配置控制）。在锁有效期内，这些记录不会被分配给其他消费者。</p>
+<ul>
+<li>处理完了 → <code>acknowledge(record, ACCEPT)</code>，锁释放，记录标记为已消费；</li>
+<li>处理不完 → <code>acknowledge(record, RELEASE)</code>，立刻释放锁给其他人；</li>
+<li>明确失败 → <code>acknowledge(record, REJECT)</code>，记录进入「跳过」状态（不再重投，取决于配置）；</li>
+<li><strong>什么都不做</strong> → 锁超时，记录<strong>自动重新投递</strong>给其他消费者。</li>
+</ul>
+<p>这就是「至少一次」语义的天然实现，也意味着<strong>你的消费逻辑必须幂等</strong>。</p>
+<p><strong>② Delivery Count（投递次数）</strong></p>
+<p>每次记录被重新分配，它的投递次数 +1。达到上限（<code>group.share.max.delivery.count</code> 一类配置）后，记录会被归档到<strong>死信（DLQ）</strong>，避免一条毒消息无限循环。这是共享组相对传统消费组的一大进步——以前毒消息治理全靠自己写。</p>
+<p><strong>③ Share Session（共享会话）</strong></p>
+<p>共享组内部维护会话，用于跟踪「哪些消费者还活着、持有多少锁」。会话超时后，其持有的记录全部释放并重新分配。这比 rebalance 轻量得多：<strong>新成员加入不会触发全组重平衡</strong>，只是开始领取新记录。</p>
+<p><strong>④ 状态持久化</strong></p>
+<p>共享组的协作状态（每条记录的锁归属、投递次数、确认状态）持久化在内部 topic 中（<code>__share_group_state</code>）。这意味着 broker 重启后状态不丢，但也意味着<strong>共享组会带来额外的写入放大</strong>——这是它的成本。</p>
+<hr>
+<h2 id="二、状态机：一条记录的一生"><a href="#二、状态机：一条记录的一生" class="headerlink" title="二、状态机：一条记录的一生"></a>二、状态机：一条记录的一生</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">       ┌──────────┐</span><br><span class="line">       │ AVAILABLE│◀─────────────────┐</span><br><span class="line">       └────┬─────┘                  │</span><br><span class="line">            │ broker 分配给消费者      │ 锁超时 / RELEASE</span><br><span class="line">            ▼                        │</span><br><span class="line">       ┌──────────┐                  │</span><br><span class="line">       │ ACQUIRED │──────────────────┘</span><br><span class="line">       └────┬─────┘</span><br><span class="line">            │ acknowledge</span><br><span class="line">    ┌───────┼────────┐</span><br><span class="line">    ▼       ▼        ▼</span><br><span class="line"> ACCEPT  REJECT   (超时重投)</span><br><span class="line">    │       │</span><br><span class="line">    ▼       ▼</span><br><span class="line">┌──────┐ ┌──────┐</span><br><span class="line">│ 完成  │ │ 跳过  │   delivery count 超限 → DLQ</span><br><span class="line">└──────┘ └──────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意一个反直觉的点</strong>：共享组<strong>没有「分区位移提交」这个概念</strong>。它的进度是<strong>每条记录的状态</strong>，而不是一个数字。所以：</p>
+<ul>
+<li>你不能再靠 <code>consumer.position()</code> 判断进度；</li>
+<li>消费 lag 需要新的指标（未确认记录数），不能简单用 <code>log end offset - committed offset</code>；</li>
+<li>监控面板要重做，这是落地时最容易漏的一环。</li>
+</ul>
+<hr>
+<h2 id="三、Java-落地：KafkaShareConsumer"><a href="#三、Java-落地：KafkaShareConsumer" class="headerlink" title="三、Java 落地：KafkaShareConsumer"></a>三、Java 落地：KafkaShareConsumer</h2><h3 id="3-1-基础配置"><a href="#3-1-基础配置" class="headerlink" title="3.1 基础配置"></a>3.1 基础配置</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Properties</span> <span class="variable">props</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Properties</span>();</span><br><span class="line">props.put(<span class="string">&quot;bootstrap.servers&quot;</span>, <span class="string">&quot;kafka-1:9092,kafka-2:9092&quot;</span>);</span><br><span class="line">props.put(<span class="string">&quot;group.id&quot;</span>, <span class="string">&quot;order-fulfillment-share&quot;</span>);</span><br><span class="line">props.put(<span class="string">&quot;group.protocol&quot;</span>, <span class="string">&quot;share&quot;</span>);                     <span class="comment">// ← 关键：声明这是共享组</span></span><br><span class="line">props.put(<span class="string">&quot;key.deserializer&quot;</span>,   <span class="string">&quot;org.apache.kafka.common.serialization.StringDeserializer&quot;</span>);</span><br><span class="line">props.put(<span class="string">&quot;value.deserializer&quot;</span>, <span class="string">&quot;org.apache.kafka.common.serialization.StringDeserializer&quot;</span>);</span><br><span class="line">props.put(<span class="string">&quot;max.poll.records&quot;</span>, <span class="string">&quot;50&quot;</span>);                       <span class="comment">// 一次领取上限，直接影响锁压力</span></span><br><span class="line">props.put(<span class="string">&quot;share.acknowledgement.mode&quot;</span>, <span class="string">&quot;explicit&quot;</span>);       <span class="comment">// 显式 ack，生产必选</span></span><br><span class="line">props.put(<span class="string">&quot;group.share.record.lock.duration.ms&quot;</span>, <span class="string">&quot;60000&quot;</span>); <span class="comment">// 按 P99 处理时长放宽</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-消费循环"><a href="#3-2-消费循环" class="headerlink" title="3.2 消费循环"></a>3.2 消费循环</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">try</span> (KafkaShareConsumer&lt;String, String&gt; consumer = <span class="keyword">new</span> <span class="title class_">KafkaShareConsumer</span>&lt;&gt;(props)) &#123;</span><br><span class="line">    consumer.subscribe(List.of(<span class="string">&quot;order-events&quot;</span>));</span><br><span class="line"></span><br><span class="line">    <span class="keyword">while</span> (!Thread.currentThread().isInterrupted()) &#123;</span><br><span class="line">        ConsumerRecords&lt;String, String&gt; records = consumer.poll(Duration.ofMillis(<span class="number">500</span>));</span><br><span class="line">        <span class="keyword">if</span> (records.isEmpty()) <span class="keyword">continue</span>;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">for</span> (ConsumerRecord&lt;String, String&gt; record : records) &#123;</span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                handle(record);                                     <span class="comment">// 业务处理</span></span><br><span class="line">                consumer.acknowledge(record);                       <span class="comment">// 默认 ACCEPT</span></span><br><span class="line">            &#125; <span class="keyword">catch</span> (RetryableException e) &#123;</span><br><span class="line">                <span class="comment">// 可重试：立刻释放，让别人拿走，别占着锁</span></span><br><span class="line">                consumer.acknowledge(record, AcknowledgeType.RELEASE);</span><br><span class="line">            &#125; <span class="keyword">catch</span> (PoisonMessageException e) &#123;</span><br><span class="line">                <span class="comment">// 毒消息：直接拒绝，避免无限重投</span></span><br><span class="line">                log.error(<span class="string">&quot;毒消息 partition=&#123;&#125; offset=&#123;&#125;&quot;</span>, record.partition(), record.offset(), e);</span><br><span class="line">                consumer.acknowledge(record, AcknowledgeType.REJECT);</span><br><span class="line">            &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">                <span class="comment">// 未知异常：不 ack，等锁超时自动重投</span></span><br><span class="line">                log.error(<span class="string">&quot;处理失败，等待重投&quot;</span>, e);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// 批量确认模式下需要显式提交（explicit 模式下建议定期提交，减少往返）</span></span><br><span class="line">        consumer.commitSync();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>三个必须理解的行为：</strong></p>
+<ol>
+<li><strong>不 ack ≠ 失败</strong>。它只是「等锁超时」，会带来一次完整的锁等待延迟（默认几十秒），所以能明确表态就明确表态；</li>
+<li><strong><code>RELEASE</code> 会立刻让记录可被别人领取</strong>，适合「依赖的下游暂时不可用」这类场景；</li>
+<li><strong><code>REJECT</code> 不重投</strong>，务必只在确定是毒消息时使用，否则就是丢数据。</li>
+</ol>
+<h3 id="3-3-幂等：不是可选项"><a href="#3-3-幂等：不是可选项" class="headerlink" title="3.3 幂等：不是可选项"></a>3.3 幂等：不是可选项</h3><p>共享组天然「至少一次」，重复投递会在以下场景发生：</p>
+<ul>
+<li>处理成功但 ack 请求丢失（网络抖动）；</li>
+<li>处理时长超过锁时长，记录已被别人领走；</li>
+<li>消费者崩溃，会话超时后记录重投。</li>
+</ul>
+<p>所以消费逻辑必须幂等：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Transactional</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">handle</span><span class="params">(ConsumerRecord&lt;String, String&gt; record)</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">msgId</span> <span class="operator">=</span> record.headers().lastHeader(<span class="string">&quot;msg-id&quot;</span>) != <span class="literal">null</span></span><br><span class="line">            ? <span class="keyword">new</span> <span class="title class_">String</span>(record.headers().lastHeader(<span class="string">&quot;msg-id&quot;</span>).value(), StandardCharsets.UTF_8)</span><br><span class="line">            : record.topic() + <span class="string">&quot;-&quot;</span> + record.partition() + <span class="string">&quot;-&quot;</span> + record.offset();</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 唯一索引兜底：insert ignore / on duplicate key update</span></span><br><span class="line">    <span class="keyword">if</span> (!dedupRepository.tryMarkProcessed(msgId)) &#123;</span><br><span class="line">        log.info(<span class="string">&quot;重复消息，跳过: &#123;&#125;&quot;</span>, msgId);</span><br><span class="line">        <span class="keyword">return</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// 真正的业务</span></span><br><span class="line">    orderService.fulfill(record.value());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>推荐用「业务唯一键」而不是 offset 做幂等键</strong>——因为共享组下同一条消息可能在不同消费者上拿到同一个 offset，用 offset 做键是可行的，但业务唯一键更稳（能覆盖生产端重复发送）。</p>
+<hr>
+<h2 id="四、与传统消费组的完整对比"><a href="#四、与传统消费组的完整对比" class="headerlink" title="四、与传统消费组的完整对比"></a>四、与传统消费组的完整对比</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Consumer Group</th>
+<th>Share Group</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>语义</td>
+<td>流（stream）</td>
+<td>队列（queue）</td>
+</tr>
+<tr>
+<td>顺序</td>
+<td>分区内严格有序</td>
+<td>不保证</td>
+</tr>
+<tr>
+<td>并发扩展</td>
+<td>受分区数限制</td>
+<td>消费者数线性扩展</td>
+</tr>
+<tr>
+<td>扩缩容</td>
+<td>触发 rebalance</td>
+<td>增删成员，无全组重平衡</td>
+</tr>
+<tr>
+<td>失败处理</td>
+<td>位点回退 &#x2F; 阻塞后续消息</td>
+<td>单条重投，不阻塞其他消息</td>
+</tr>
+<tr>
+<td>毒消息</td>
+<td>自行实现 DLQ</td>
+<td>内置 delivery count + DLQ</td>
+</tr>
+<tr>
+<td>位移</td>
+<td>分区 offset</td>
+<td>记录级状态（无 offset 概念）</td>
+</tr>
+<tr>
+<td>监控</td>
+<td>lag &#x3D; LEO - committed</td>
+<td>未确认记录数 &#x2F; 锁等待数</td>
+</tr>
+<tr>
+<td>资源开销</td>
+<td>低</td>
+<td>较高（状态持久化 + 锁管理）</td>
+</tr>
+<tr>
+<td>适用</td>
+<td>事件流、CDC、日志、需要顺序</td>
+<td>任务队列、异步作业、慢任务、流量削峰</td>
+</tr>
+</tbody></table>
+<p><strong>一句话选型：</strong></p>
+<blockquote>
+<p>需要「按 key 保序」→ 消费组；需要「横向扩容处理慢任务」→ 共享组。</p>
+</blockquote>
+<hr>
+<h2 id="五、什么时候真的该用它"><a href="#五、什么时候真的该用它" class="headerlink" title="五、什么时候真的该用它"></a>五、什么时候真的该用它</h2><h3 id="适合"><a href="#适合" class="headerlink" title="适合"></a>适合</h3><ul>
+<li><strong>任务型负载</strong>：每个消息是一个独立任务（转码、导出、对账、发券），任务之间无顺序依赖；</li>
+<li><strong>处理时长差异极大</strong>：99% 的消息 10ms，1% 的消息 5 分钟。消费组里那个 5 分钟的消息会把整条分区堵死；共享组里它只是占一个 consumer；</li>
+<li><strong>突发流量削峰</strong>：瞬时 10 万条任务，需要临时把 worker 从 20 扩到 200；</li>
+<li><strong>需要内置重试与 DLQ</strong>：不想自己写「重试表 + 定时扫描」。</li>
+</ul>
+<h3 id="不适合"><a href="#不适合" class="headerlink" title="不适合"></a>不适合</h3><ul>
+<li><strong>严格顺序</strong>：同一订单的状态变更必须按序处理 → 用消费组 + key 分区；</li>
+<li><strong>需要精确的消费进度</strong>：依赖 <code>committed offset</code> 做断点续传 &#x2F; 数据校验；</li>
+<li><strong>超低延迟</strong>：共享组的锁管理有额外开销，纯转发场景不如消费组；</li>
+<li><strong>老版本集群</strong>：broker 必须支持共享组，客户端也要升级。</li>
+</ul>
+<hr>
+<h2 id="六、生产落地踩坑清单"><a href="#六、生产落地踩坑清单" class="headerlink" title="六、生产落地踩坑清单"></a>六、生产落地踩坑清单</h2><h3 id="坑-1：锁时长-处理时长-→-无限重复消费"><a href="#坑-1：锁时长-处理时长-→-无限重复消费" class="headerlink" title="坑 1：锁时长 &lt; 处理时长 → 无限重复消费"></a>坑 1：锁时长 &lt; 处理时长 → 无限重复消费</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">group.share.record.lock.duration.ms:</span> <span class="number">30000</span>   <span class="comment"># 30 秒</span></span><br><span class="line"><span class="comment"># 但你的下游调用 P99 是 45 秒</span></span><br></pre></td></tr></table></figure>
+
+<p>结果：每条消息都被处理两次以上，而且日志看起来「都成功了」。</p>
+<p><strong>做法</strong>：锁时长 ≥ 处理时长 P99.9 × 1.5。处理时长不可控（比如调外部 API）时，改用 <code>RELEASE</code> + 自建重试队列，而不是硬占锁。</p>
+<h3 id="坑-2：max-poll-records-开太大"><a href="#坑-2：max-poll-records-开太大" class="headerlink" title="坑 2：max.poll.records 开太大"></a>坑 2：<code>max.poll.records</code> 开太大</h3><p>一次领 500 条，锁 30 秒，实际处理完要 5 分钟 → 后面 450 条全超时重投，形成「<strong>重投风暴</strong>」，集群负载反而飙升。</p>
+<p><strong>做法</strong>：<code>max.poll.records</code> 从 10~50 起步，按实测吞吐调。</p>
+<h3 id="坑-3：用-lag-做告警"><a href="#坑-3：用-lag-做告警" class="headerlink" title="坑 3：用 lag 做告警"></a>坑 3：用 lag 做告警</h3><p>共享组没有 committed offset，原来的 <code>kafka_consumergroup_lag</code> 指标直接失效（显示为 0 或 NaN）。上线后「看起来一切正常」，实际上堆了几十万条未确认记录。</p>
+<p><strong>做法</strong>：改用「未确认记录数」「平均投递次数」「锁超时次数」三个指标。<strong>平均投递次数 &gt; 1.2 就说明有重复消费在发生</strong>。</p>
+<h3 id="坑-4：把-REJECT-当-RELEASE-用"><a href="#坑-4：把-REJECT-当-RELEASE-用" class="headerlink" title="坑 4：把 REJECT 当 RELEASE 用"></a>坑 4：把 <code>REJECT</code> 当 <code>RELEASE</code> 用</h3><p><code>REJECT</code> 不重投。如果你的 catch 块里图省事写了 <code>REJECT</code>，等于<strong>静默丢消息</strong>。</p>
+<p><strong>做法</strong>：<code>REJECT</code> 只用于「反序列化失败 &#x2F; 业务校验永久失败」这类确定不可恢复的场景，并且必须打 error 日志 + 落库留痕。</p>
+<h3 id="坑-5：忘记处理-rebalance-后的「半成品」"><a href="#坑-5：忘记处理-rebalance-后的「半成品」" class="headerlink" title="坑 5：忘记处理 rebalance 后的「半成品」"></a>坑 5：忘记处理 rebalance 后的「半成品」</h3><p>消费者被分配到一批记录后崩溃，其中一部分已处理完但没 ack。重投后这些记录会被重复处理。如果处理逻辑不是幂等的，就是<strong>重复扣款 &#x2F; 重复发货</strong>。</p>
+<p><strong>做法</strong>：幂等表 + 唯一索引，双保险。</p>
+<h3 id="坑-6：以为共享组能替代分区扩容"><a href="#坑-6：以为共享组能替代分区扩容" class="headerlink" title="坑 6：以为共享组能替代分区扩容"></a>坑 6：以为共享组能替代分区扩容</h3><p>共享组的并发上限确实不再等于分区数，但<strong>单个分区的读取吞吐仍有上限</strong>。分区太小，broker 侧的读取会成为瓶颈。</p>
+<p><strong>做法</strong>：分区数仍要按目标吞吐规划，共享组解决的是「消费端并发」，不是「存储端并行度」。</p>
+<h3 id="坑-7：混用两种协议"><a href="#坑-7：混用两种协议" class="headerlink" title="坑 7：混用两种协议"></a>坑 7：混用两种协议</h3><p>同一个 <code>group.id</code> 不能既是 <code>classic</code> 又是 <code>share</code>。迁移时<strong>必须换 group.id</strong>，否则客户端直接报错。</p>
+<p><strong>做法</strong>：灰度期用双写或影子 topic，两个组并行跑，比对结果后再切流。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：KIP-932 解决了什么问题？</strong></p>
+<p>解决了 Kafka「分区独占」导致的三个问题：并发受分区数限制、慢消息阻塞分区、缺少内置重试与死信。它把消费语义从「流」扩展到「队列」，让 Kafka 能覆盖任务队列场景。</p>
+<p><strong>Q2：共享组怎么保证不重复消费？</strong></p>
+<p><strong>保证不了</strong>，它只保证「至少一次」。去重必须靠消费端幂等（唯一键 &#x2F; 幂等表 &#x2F; 状态机）。共享组能做的是通过 delivery count + DLQ 控制重复的上限。</p>
+<p><strong>Q3：共享组的分区顺序还有意义吗？</strong></p>
+<p>没有。同一分区的不同记录可能被不同消费者并发处理，顺序完全丢失。需要顺序就必须用传统消费组。</p>
+<p><strong>Q4：为什么共享组的状态要持久化？</strong></p>
+<p>因为 broker 需要知道「某条记录被谁锁着、投递了几次」。不持久化的话 broker 重启就会把正在处理中的记录重新分配，导致大规模重复消费，delivery count 也会丢。代价是额外的内部 topic 写入。</p>
+<p><strong>Q5：共享组和 RabbitMQ 的队列有什么本质区别？</strong></p>
+<ul>
+<li>RabbitMQ 是「消息从队列删除」，Kafka 是「日志追加 + 状态标记」，共享组的记录仍在日志里，只是被标记为已确认；</li>
+<li>Kafka 的共享组仍受分区存储模型约束，单分区吞吐有上限；</li>
+<li>Kafka 保留了「回放」能力（数据仍在），RabbitMQ 消费完就没了。</li>
+</ul>
+<p><strong>Q6：迁移到共享组要注意什么？</strong></p>
+<p>四件事：换 <code>group.id</code>、重做监控指标、消费逻辑幂等化、锁时长按 P99 调优。缺一项都别上生产。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>Kafka 共享组的意义，不是「Kafka 变成 RabbitMQ 了」，而是<strong>同一个日志存储可以同时服务两种消费语义</strong>：</p>
+<ul>
+<li>需要顺序、回放、流处理 → 传统消费组；</li>
+<li>需要弹性扩容、任务分发、内置重试 → 共享组。</li>
+</ul>
+<p>落地时的三条铁律：</p>
+<ol>
+<li><strong>幂等是前提</strong>，不是优化项；</li>
+<li><strong>锁时长必须大于处理时长</strong>，否则重投风暴比原问题更严重；</li>
+<li><strong>监控指标要重建</strong>，lag 那一套在共享组里不成立。</li>
+</ol>
+<p>如果你正在用「Kafka + 自建重试表 + 定时补偿」拼一个任务队列，共享组值得认真评估一次——它把这套基础设施的成本，从你的应用层挪回了 broker。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/24/kafka-share-group-queue-consumption-deep-dive/">https://jiweidong.github.io/2026/10/24/kafka-share-group-queue-consumption-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/Kafka/">Kafka</a><a class="post-meta__tags" href="/tags/KIP-932/">KIP-932</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E8%B4%B9%E6%A8%A1%E5%9E%8B/">消费模型</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/24/java-embedding-search-deep-practice/" title="【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新</div></div><div class="info-2"><div class="info-item-1">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新前言LIKE &#39;%退款%&#39; 这种检索有个致命缺陷：用户问「钱什么时候退回来」，它一条都匹配不上。语义检索要解决的正是这个问题——把文本映射到向量空间，用「距离」代替「字面匹配」。 但真正落地时，Embedding 远不是「调个 API 拿个 float 数组」那么简单。你会踩到这些坑：  余弦相似度算出 0.83，到底算不算「相关」？阈值怎么定？ 换了 embedding 模型，为什么老数据全部失效、召回暴跌？ 文档改了一个字，要不要全量重算 200 万条向量？ 归一化忘了做，内积和余弦算出来的排序完全不同； 1024 维向量存 float[]，1000 万条吃掉多少内存？  这篇文章用 Java 视角把这条链路讲透：向量化 → 相似度度量 → 索引 → 增量更新 → 评测。代码基于 Spring AI 的 EmbeddingModel 抽象，换模型只需改配置。  一、Embedding 到底在做什么Embedding 模型是一个函数： 1f: text → R^d     d ...</div></div></div></a><a class="pagination-related" href="/2026/10/24/mybatis-typehandler-custom-mapping-deep-dive/" title="【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单</div></div><div class="info-2"><div class="info-item-1">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举&#x2F;JSON 映射与踩坑清单前言几乎每个用 MyBatis 的项目都会遇到这几件事：  枚举字段存进库成了 0/1/2 或者 ORDINAL 序号，产品改一次枚举顺序，历史数据全错位； 一个 List&lt;String&gt; 想直接存成 JSON 列，结果报 Cannot convert String to List； 手机号、身份证要加密落库，在 Service 层手动加解密，漏一个字段就是安全事故； 明明写了 typeHandler，就是不生效，日志里全是默认的 StringTypeHandler。  这些问题的共同答案是同一个东西：TypeHandler。它是 MyBatis 里「Java 类型 ↔ JDBC 类型」的唯一转换入口，但绝大多数人只在报错时才想起它。 这篇文章从它在 MyBatis 中的位置讲起，把 TypeHandlerRegistry 的查找链、自定义枚举&#x2F;JSON&#x2F;加密处理器的落地、Spring Boot 下的注册方式、以及 8 个高频踩坑一次...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/21/kafka-consumer-offset-management-deep-dive/" title="【Kafka 实战】消费者位移（Offset）管理深度解析：自动提交陷阱、手动提交与重复消费治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【Kafka 实战】消费者位移（Offset）管理深度解析：自动提交陷阱、手动提交与重复消费治理</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】消费者位移（Offset）管理深度解析前言线上 MQ 出的问题，九成不是「消息丢了」，而是「消息重复了」或者「消费卡住了」。这两件事的根，几乎都指向同一个地方——位移（Offset）。 先看两个真实工单： 工单 A：订单履约服务重启后，把 3 小时前的 2 万条发货消息又消费了一遍，导致重复发货。日志显示 enable.auto.commit=true，且消费逻辑里有 200ms 的 RPC 调用。 工单 B：某个 consumer group 的 lag 一直涨，但消费线程是活的、日志没报错。最后发现是某台机器的处理线程卡在一个没有超时的 HTTP 调用上，poll() 再也回不来，触发了 max.poll.interval.ms，rebalance 后它又拿回同一个分区，继续卡。 这两个案例都不是「Kafka 的 bug」，而是对位移语义理解不到位。这一篇把 offset 这件事从存储结构讲到代码实践：自动提交到底什么时候提交、手动提交怎么选、rebalance 时会发生什么、重复消费怎么治理、lag 怎么算才是对的。  一、Offset 到底存在哪1.1...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/08/25/mq-ordered-message-deep-dive/" title="【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-25</div><div class="info-item-2">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现</div></div><div class="info-2"><div class="info-item-1">【消息队列】顺序消息深度解析：Kafka 分区有序与 RocketMQ 队列有序的底层实现面试官：你们的订单消息需要保证顺序吗？Kafka 怎么保证顺序？“消息顺序”是 MQ 面试的钉子户。很多人知道”Kafka 只能保证分区内有序”，但说不清为什么只能分区内有序、怎么做到分区内有序、哪些场景会悄悄破坏顺序。本文从存储模型讲到生产消费全链路，一次讲透。 一、什么是顺序消息？全局有序 vs 分区有序 全局有序：所有消息严格按照发送顺序被消费（要求单分区&#x2F;单队列 + 单消费者） 分区有序（局部有序）：同一业务维度（如同一订单、同一用户）的消息有序，不同维度之间不要求有序  现实业务几乎只用分区有序：订单的”创建→支付→发货”必须有序，但订单 A 和订单 B 之间无所谓。全局有序的代价是吞吐量断崖式下跌（退化成单队列单消费者），没人这么用。 二、Kafka 的顺序保证：分区内有序1. 存储模型决定了”分区 &#x3D; 顺序的天然边界”Kafka 的 Topic 被切成多个 Partition，每个 Partition 是追加写的日志（log segment）： 123Top...</div></div></div></a><a class="pagination-related" href="/2026/08/03/kafka-message-ordering-guarantee-deep-dive/" title="【消息队列】Kafka 消息顺序性保证深度解析：从分区模型到生产实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【消息队列】Kafka 消息顺序性保证深度解析：从分区模型到生产实践</div></div><div class="info-2"><div class="info-item-1">【消息队列】Kafka 消息顺序性保证深度解析：从分区模型到生产实践面试官：Kafka 怎么保证消息的顺序性？“Kafka 如何保证消息顺序”是消息队列面试的高频题。答”同一个分区内有序”只能算及格，面试官会接着问：生产端怎么保证同一业务的消息进同一个分区？重试会不会乱序？消费端怎么保证按序处理？ 今天从 Kafka 的分区模型讲起，把顺序性的来龙去脉一次说透。 一、先理解 Kafka 的顺序性边界Kafka 的顺序性保证有一个明确的前提：  Kafka 只保证同一个分区（Partition）内消息的有序性（FIFO），不保证跨分区的全局有序。  为什么这样设计？因为全局有序意味着所有消息只能进一个分区、只能被一个消费者顺序消费，完全牺牲了并行度。Kafka 用”分区内有序 + 跨分区并行”换取吞吐，这是分布式消息系统的经典取舍。 二、生产端：怎么保证同一业务的消息进同一个分区？要利用”分区内有序”，第一步是让同一业务实体的消息路由到同一个分区。Kafka 的分区选择规则（DefaultPartitioner）： 12分区 = hash(key) % numPartitions ...</div></div></div></a><a class="pagination-related" href="/2026/08/20/kafka-connect-deep-practice/" title="Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践</div></div><div class="info-2"><div class="info-item-1">Kafka Connect 深度实战：从单机到集群的数据管道与 CDC 实践引言：为什么需要 Kafka Connect？很多团队接 Kafka 的方式是”写个消费者程序，把数据从 Topic 搬到数据库”。一个系统这么干没问题，当系统多起来：订单数据进 ES、埋点数据进 HDFS、MySQL 变更同步到 Redis……每个需求写一个消费程序，就要重复处理：  分区分配与 Rebalance 位移提交与 Exactly-Once 语义 断线重连、重试、死信 连接管理、线程池、资源释放  Kafka Connect 的价值就是把”搬数据”这件事框架化：你只需要写（或直接复用现成的）Source&#x2F;Sink Connector，框架帮你搞定分布式执行、容错、偏移量管理、负载均衡。本文从架构原理到生产落地，带你把 Kafka Connect 用明白。 一、核心架构：三个角色 + 两类组件1.1 三个运行时角色   角色 说明    Worker 运行 Connector 和 Task 的 JVM 进程。分 Standalone（单机）和 Distributed（集群）两种模式 ...</div></div></div></a><a class="pagination-related" href="/2026/10/22/kafka-consumer-multithread-concurrency-deep-dive/" title="【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-22</div><div class="info-item-2">【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】多线程并发消费深度解析：消费模型、顺序性与位点提交治理前言Kafka 消费者是单线程的——准确说，KafkaConsumer 实例不是线程安全的，一个 consumer 只能被一个线程使用。但业务侧的消息处理往往很慢（写库、调三方、跑模型），单线程处理能力很快成为瓶颈。 于是就有了”多线程消费”这个经典命题。但绝大多数团队在这件事上至少踩过一次坑，典型症状：  加了线程池，吞吐没上去，反而开始重复消费； 消费顺序乱了，同一个订单的”创建”跑在”支付”后面； commitSync 报了 CommitFailedException，日志里一堆”offset commit failed”； 扩容实例后，分区没重新分配，新实例空转； 出现了”消息处理成功但位点丢了”导致的重复处理，下游没做幂等 → 数据翻倍。  本文把 Kafka 多线程消费的四种模型、顺序性代价、位点提交的确定性规则讲透，并给出可直接落地的代码骨架。  一、先明确约束：为什么不能共享 Consumer1234// ❌ 绝对错误：多线程共享同一个 consumerKafkaConsumer&lt;St...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">817</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">918</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Kafka-4-x%E3%80%91%E5%85%B1%E4%BA%AB%E7%BB%84%EF%BC%88Share-Group%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AKIP-932-%E9%98%9F%E5%88%97%E8%AF%AD%E4%B9%89%E3%80%81%E5%8D%8F%E5%90%8C%E6%B6%88%E8%B4%B9%E4%B8%8E%E4%BD%8D%E7%A7%BB%E6%B2%BB%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5%EF%BC%9A%E4%BB%8E%E3%80%8C%E5%88%86%E5%8C%BA%E7%8B%AC%E5%8D%A0%E3%80%8D%E5%88%B0%E3%80%8C%E8%AE%B0%E5%BD%95%E7%BA%A7%E5%8D%8F%E4%BD%9C%E3%80%8D"><span class="toc-number">1.2.</span> <span class="toc-text">一、核心概念：从「分区独占」到「记录级协作」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E4%BC%A0%E7%BB%9F%E6%B6%88%E8%B4%B9%E7%BB%84"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 传统消费组</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E5%85%B1%E4%BA%AB%E7%BB%84"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 共享组</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E5%85%B3%E9%94%AE%E6%9C%BA%E5%88%B6"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 关键机制</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%8A%B6%E6%80%81%E6%9C%BA%EF%BC%9A%E4%B8%80%E6%9D%A1%E8%AE%B0%E5%BD%95%E7%9A%84%E4%B8%80%E7%94%9F"><span class="toc-number">1.3.</span> <span class="toc-text">二、状态机：一条记录的一生</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Java-%E8%90%BD%E5%9C%B0%EF%BC%9AKafkaShareConsumer"><span class="toc-number">1.4.</span> <span class="toc-text">三、Java 落地：KafkaShareConsumer</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%9F%BA%E7%A1%80%E9%85%8D%E7%BD%AE"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 基础配置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E6%B6%88%E8%B4%B9%E5%BE%AA%E7%8E%AF"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 消费循环</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%B9%82%E7%AD%89%EF%BC%9A%E4%B8%8D%E6%98%AF%E5%8F%AF%E9%80%89%E9%A1%B9"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 幂等：不是可选项</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E4%B8%8E%E4%BC%A0%E7%BB%9F%E6%B6%88%E8%B4%B9%E7%BB%84%E7%9A%84%E5%AE%8C%E6%95%B4%E5%AF%B9%E6%AF%94"><span class="toc-number">1.5.</span> <span class="toc-text">四、与传统消费组的完整对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E7%9C%9F%E7%9A%84%E8%AF%A5%E7%94%A8%E5%AE%83"><span class="toc-number">1.6.</span> <span class="toc-text">五、什么时候真的该用它</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E9%80%82%E5%90%88"><span class="toc-number">1.6.1.</span> <span class="toc-text">适合</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%8D%E9%80%82%E5%90%88"><span class="toc-number">1.6.2.</span> <span class="toc-text">不适合</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E7%94%9F%E4%BA%A7%E8%90%BD%E5%9C%B0%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.7.</span> <span class="toc-text">六、生产落地踩坑清单</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-1%EF%BC%9A%E9%94%81%E6%97%B6%E9%95%BF-%E5%A4%84%E7%90%86%E6%97%B6%E9%95%BF-%E2%86%92-%E6%97%A0%E9%99%90%E9%87%8D%E5%A4%8D%E6%B6%88%E8%B4%B9"><span class="toc-number">1.7.1.</span> <span class="toc-text">坑 1：锁时长 &lt; 处理时长 → 无限重复消费</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-2%EF%BC%9Amax-poll-records-%E5%BC%80%E5%A4%AA%E5%A4%A7"><span class="toc-number">1.7.2.</span> <span class="toc-text">坑 2：max.poll.records 开太大</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-3%EF%BC%9A%E7%94%A8-lag-%E5%81%9A%E5%91%8A%E8%AD%A6"><span class="toc-number">1.7.3.</span> <span class="toc-text">坑 3：用 lag 做告警</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-4%EF%BC%9A%E6%8A%8A-REJECT-%E5%BD%93-RELEASE-%E7%94%A8"><span class="toc-number">1.7.4.</span> <span class="toc-text">坑 4：把 REJECT 当 RELEASE 用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-5%EF%BC%9A%E5%BF%98%E8%AE%B0%E5%A4%84%E7%90%86-rebalance-%E5%90%8E%E7%9A%84%E3%80%8C%E5%8D%8A%E6%88%90%E5%93%81%E3%80%8D"><span class="toc-number">1.7.5.</span> <span class="toc-text">坑 5：忘记处理 rebalance 后的「半成品」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-6%EF%BC%9A%E4%BB%A5%E4%B8%BA%E5%85%B1%E4%BA%AB%E7%BB%84%E8%83%BD%E6%9B%BF%E4%BB%A3%E5%88%86%E5%8C%BA%E6%89%A9%E5%AE%B9"><span class="toc-number">1.7.6.</span> <span class="toc-text">坑 6：以为共享组能替代分区扩容</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-7%EF%BC%9A%E6%B7%B7%E7%94%A8%E4%B8%A4%E7%A7%8D%E5%8D%8F%E8%AE%AE"><span class="toc-number">1.7.7.</span> <span class="toc-text">坑 7：混用两种协议</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/enterprise-knowledge-base-rag-system-design/" title="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源">【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</a><time datetime="2026-10-24T00:25:00.000Z" title="发表于 2026-10-24 08:25:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/java-embedding-search-deep-practice/" title="【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新</a><time datetime="2026-10-24T00:20:00.000Z" title="发表于 2026-10-24 08:20:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/kafka-share-group-queue-consumption-deep-dive/" title="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理">【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</a><time datetime="2026-10-24T00:15:00.000Z" title="发表于 2026-10-24 08:15:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/mybatis-typehandler-custom-mapping-deep-dive/" title="【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单</a><time datetime="2026-10-24T00:10:00.000Z" title="发表于 2026-10-24 08:10:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/java-locksupport-park-unpark-deep-dive/" title="【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石">【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石</a><time datetime="2026-10-24T00:05:00.000Z" title="发表于 2026-10-24 08:05:00">2026-10-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

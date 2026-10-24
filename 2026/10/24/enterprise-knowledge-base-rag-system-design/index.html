@@ -1,0 +1,666 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源前言搭一个 RAG demo 只要两小时：pdf → 切分 → embedding → 向量库 → 拼 prompt → 调模型。但把它做成企业内部可用的知识库问答，通常要六个月。 差距不在模型，在四件事：  文档解析：企业文档是 PDF 扫描件、Word 里的合并单元格、PPT 里的图片、Confluence 导出页。解析质量直">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/24/enterprise-knowledge-base-rag-system-design/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源前言搭一个 RAG demo 只要两小时：pdf → 切分 → embedding → 向量库 → 拼 prompt → 调模型。但把它做成企业内部可用的知识库问答，通常要六个月。 差距不在模型，在四件事：  文档解析：企业文档是 PDF 扫描件、Word 里的合并单元格、PPT 里的图片、Confluence 导出页。解析质量直">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-24T00:25:00.000Z">
+<meta property="article:modified_time" content="2026-10-24T00:03:35.093Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="AI">
+<meta property="article:tag" content="RAG">
+<meta property="article:tag" content="引用溯源">
+<meta property="article:tag" content="权限控制">
+<meta property="article:tag" content="知识库">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源",
+  "url": "https://jiweidong.github.io/2026/10/24/enterprise-knowledge-base-rag-system-design/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-24T00:25:00.000Z",
+  "dateModified": "2026-10-24T00:03:35.093Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/24/enterprise-knowledge-base-rag-system-design/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">817</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">918</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-24T00:25:00.000Z" title="发表于 2026-10-24 08:25:00">2026-10-24</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-24T00:03:35.093Z" title="更新于 2026-10-24 08:03:35">2026-10-24</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/AI-%E5%B7%A5%E7%A8%8B/">AI 工程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源"><a href="#【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源" class="headerlink" title="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源"></a>【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>搭一个 RAG demo 只要两小时：<code>pdf → 切分 → embedding → 向量库 → 拼 prompt → 调模型</code>。但把它做成<strong>企业内部可用的知识库问答</strong>，通常要六个月。</p>
+<p>差距不在模型，在四件事：</p>
+<ol>
+<li><strong>文档解析</strong>：企业文档是 PDF 扫描件、Word 里的合并单元格、PPT 里的图片、Confluence 导出页。解析质量直接决定上限。</li>
+<li><strong>权限隔离</strong>：员工 A 不能通过问答看到员工 B 的薪酬表。而向量检索天然是「按相似度返回 Top-K」——<strong>它不管你有没有权限</strong>。</li>
+<li><strong>引用溯源</strong>：回答必须能点回原文的具体段落，否则没人敢用（尤其在法务、财务、运维场景）。</li>
+<li><strong>时效性</strong>：文档更新、删除、改权限，索引必须跟上，否则就是「拿旧制度回答新问题」。</li>
+</ol>
+<p>这篇文章给一套完整的架构设计，重点讲清三件事：<strong>解析链路怎么分层、权限怎么做才能不漏、引用怎么做才可信</strong>。代码用 Java（Spring Boot + Spring AI）视角。</p>
+<hr>
+<h2 id="一、先定指标，再谈架构"><a href="#一、先定指标，再谈架构" class="headerlink" title="一、先定指标，再谈架构"></a>一、先定指标，再谈架构</h2><p>企业知识库问答不是「好玩」，是要被考核的。上线前必须和业务方对齐这组指标：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>指标</th>
+<th>目标值</th>
+<th>怎么测</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>效果</td>
+<td>答案正确率</td>
+<td>&gt; 80%</td>
+<td>黄金集人工标注</td>
+</tr>
+<tr>
+<td>效果</td>
+<td>引用准确率</td>
+<td>&gt; 95%</td>
+<td>引用片段是否真能支撑结论</td>
+</tr>
+<tr>
+<td>效果</td>
+<td>拒答率（该拒的拒）</td>
+<td>&gt; 90%</td>
+<td>构造「库里没有」的问题</td>
+</tr>
+<tr>
+<td>安全</td>
+<td>越权召回率</td>
+<td><strong>0</strong></td>
+<td>红队测试：用低权限账号查高密文档</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>首字节延迟 P95</td>
+<td>&lt; 1.5s</td>
+<td>流式输出，首 token 时间</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>完整回答 P95</td>
+<td>&lt; 8s</td>
+<td>端到端</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>单次问答成本</td>
+<td>&lt; 0.05 元</td>
+<td>token 账单 &#x2F; 请求数</td>
+</tr>
+<tr>
+<td>运维</td>
+<td>文档更新到可检索</td>
+<td>&lt; 5 分钟</td>
+<td>埋点</td>
+</tr>
+</tbody></table>
+<p><strong>注意「越权召回率 &#x3D; 0」是硬指标，不是「越低越好」。</strong> 这决定了权限必须在<strong>检索前</strong>生效，而不是事后过滤（后面详述）。</p>
+<hr>
+<h2 id="二、整体架构"><a href="#二、整体架构" class="headerlink" title="二、整体架构"></a>二、整体架构</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line">┌─────────────────────────────────────────────────────────────────┐</span><br><span class="line">│                         接入层                                   │</span><br><span class="line">│  Web / 企业微信 / 钉钉 / API     ── SSO 登录 ──▶ 用户身份+权限集  │</span><br><span class="line">└────────────────────────────┬────────────────────────────────────┘</span><br><span class="line">                             ▼</span><br><span class="line">┌─────────────────────────────────────────────────────────────────┐</span><br><span class="line">│                       问答编排层（Orchestrator）                  │</span><br><span class="line">│  ① Query 理解  ② 改写/扩展  ③ 权限过滤条件构造                    │</span><br><span class="line">│  ④ 混合检索    ⑤ 重排      ⑥ 上下文组装   ⑦ 生成 + 引用绑定       │</span><br><span class="line">└───────┬──────────────────────────────────┬──────────────────────┘</span><br><span class="line">        ▼                                  ▼</span><br><span class="line">┌───────────────────┐              ┌──────────────────────────────┐</span><br><span class="line">│   检索服务         │              │        生成服务               │</span><br><span class="line">│  · 向量检索(HNSW)  │              │  · LLM 网关（多模型路由）      │</span><br><span class="line">│  · BM25 关键词     │              │  · 流式输出 SSE               │</span><br><span class="line">│  · RRF 融合        │              │  · 引用校验 / 幻觉拦截         │</span><br><span class="line">│  · Reranker 重排   │              │  · 内容安全审核               │</span><br><span class="line">└─────────┬─────────┘              └──────────────────────────────┘</span><br><span class="line">          ▼</span><br><span class="line">┌─────────────────────────────────────────────────────────────────┐</span><br><span class="line">│                       索引层                                     │</span><br><span class="line">│  向量库（Milvus/pgvector/ES）  全文索引（ES）  元数据库（MySQL）   │</span><br><span class="line">└────────────────────────────┬────────────────────────────────────┘</span><br><span class="line">                             ▲</span><br><span class="line">┌────────────────────────────┴────────────────────────────────────┐</span><br><span class="line">│                    文档接入 Pipeline（异步）                      │</span><br><span class="line">│  采集 → 解析 → 清洗 → 切分 → 富化(元数据/权限) → 向量化 → 入库    │</span><br><span class="line">│  失败重试 / 死信 / 版本管理 / 删除传播                             │</span><br><span class="line">└─────────────────────────────────────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>四个关键设计决策：</strong></p>
+<ol>
+<li><strong>索引与问答完全解耦</strong>，通过消息队列异步连接。文档接入慢不能影响问答可用性。</li>
+<li><strong>检索是混合的</strong>（向量 + 关键词），单一向量检索在专有名词、错误码、型号上必然翻车。</li>
+<li><strong>权限是「检索条件」不是「结果过滤」</strong>。</li>
+<li><strong>生成必须有引用绑定</strong>，且引用可校验。</li>
+</ol>
+<hr>
+<h2 id="三、文档解析：决定系统上限的一步"><a href="#三、文档解析：决定系统上限的一步" class="headerlink" title="三、文档解析：决定系统上限的一步"></a>三、文档解析：决定系统上限的一步</h2><h3 id="3-1-解析质量的三层"><a href="#3-1-解析质量的三层" class="headerlink" title="3.1 解析质量的三层"></a>3.1 解析质量的三层</h3><table>
+<thead>
+<tr>
+<th>层级</th>
+<th>内容</th>
+<th>差距</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>L1 纯文本</td>
+<td>能抽出字</td>
+<td>表格变乱码、标题层级丢失、页眉页脚混入</td>
+</tr>
+<tr>
+<td>L2 结构化</td>
+<td>保留标题&#x2F;列表&#x2F;表格结构</td>
+<td>需要版面分析</td>
+</tr>
+<tr>
+<td>L3 语义单元</td>
+<td>识别章节、条款、代码块、图表标题</td>
+<td>需要文档模型 + 规则</td>
+</tr>
+</tbody></table>
+<p>大多数团队停在 L1，然后在「切分」环节花大量时间补救——<strong>这是本末倒置</strong>。解析阶段丢的结构，切分阶段补不回来。</p>
+<h3 id="3-2-分类型选型"><a href="#3-2-分类型选型" class="headerlink" title="3.2 分类型选型"></a>3.2 分类型选型</h3><table>
+<thead>
+<tr>
+<th>文档类型</th>
+<th>推荐方案</th>
+<th>注意点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>PDF（文本型）</td>
+<td>Apache PDFBox 3.x 提取 + 坐标信息</td>
+<td>多栏排版会串行，需要按 x 坐标重排</td>
+</tr>
+<tr>
+<td>PDF（扫描件）</td>
+<td>OCR（PaddleOCR &#x2F; 云 OCR）+ 版面分析</td>
+<td>表格识别要单独模型</td>
+</tr>
+<tr>
+<td>Word (.docx)</td>
+<td>Apache POI <code>XWPF</code></td>
+<td>合并单元格、文本框、批注要特殊处理</td>
+</tr>
+<tr>
+<td>Excel</td>
+<td>POI <code>XSSF</code> + EasyExcel 流式读</td>
+<td>大表要按 Sheet 拆，别整个读进内存</td>
+</tr>
+<tr>
+<td>PPT</td>
+<td>POI <code>XSLF</code></td>
+<td>演讲者备注往往比正文更有价值</td>
+</tr>
+<tr>
+<td>HTML &#x2F; Confluence</td>
+<td>Jsoup + 自定义清洗规则</td>
+<td>去掉导航、页脚、评论区</td>
+</tr>
+<tr>
+<td>Markdown</td>
+<td>直接按标题树解析</td>
+<td>代码块要单独标记</td>
+</tr>
+<tr>
+<td>图片</td>
+<td>多模态模型生成描述</td>
+<td>图片描述作为独立 chunk，关联原图 URL</td>
+</tr>
+</tbody></table>
+<h3 id="3-3-解析产物的统一模型"><a href="#3-3-解析产物的统一模型" class="headerlink" title="3.3 解析产物的统一模型"></a>3.3 解析产物的统一模型</h3><p>不管源格式是什么，最终都要归一到一个结构：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ParsedDocument</span><span class="params">(</span></span><br><span class="line"><span class="params">        String docId,</span></span><br><span class="line"><span class="params">        String title,</span></span><br><span class="line"><span class="params">        String sourceType,          // PDF / DOCX / HTML ...</span></span><br><span class="line"><span class="params">        String version,             // 内容版本号</span></span><br><span class="line"><span class="params">        List&lt;Block&gt; blocks</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">sealed</span> <span class="keyword">interface</span> <span class="title class_">Block</span> <span class="keyword">permits</span> Heading, Paragraph, Table, CodeBlock, ImageBlock &#123;</span><br><span class="line">    <span class="type">int</span> <span class="title function_">order</span><span class="params">()</span>;</span><br><span class="line">    String <span class="title function_">text</span><span class="params">()</span>;</span><br><span class="line">    Map&lt;String, String&gt; <span class="title function_">attrs</span><span class="params">()</span>;    <span class="comment">// 层级、页码、坐标、样式</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">Heading</span><span class="params">(<span class="type">int</span> order, <span class="type">int</span> level, String text, Map&lt;String, String&gt; attrs)</span> <span class="keyword">implements</span> <span class="title class_">Block</span> &#123;&#125;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">Paragraph</span><span class="params">(<span class="type">int</span> order, String text, Map&lt;String, String&gt; attrs)</span> <span class="keyword">implements</span> <span class="title class_">Block</span> &#123;&#125;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">Table</span><span class="params">(<span class="type">int</span> order, List&lt;List&lt;String&gt;&gt; rows, String caption, Map&lt;String, String&gt; attrs)</span> <span class="keyword">implements</span> <span class="title class_">Block</span> &#123;&#125;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">CodeBlock</span><span class="params">(<span class="type">int</span> order, String language, String code, Map&lt;String, String&gt; attrs)</span> <span class="keyword">implements</span> <span class="title class_">Block</span> &#123;&#125;</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ImageBlock</span><span class="params">(<span class="type">int</span> order, String imageUrl, String ocrText, Map&lt;String, String&gt; attrs)</span> <span class="keyword">implements</span> <span class="title class_">Block</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>这个模型是整个系统的地基。</strong> 有了 <code>order</code> 和 <code>attrs</code>（页码、坐标），后面的「切分保留标题路径」和「引用定位到原文位置」才有可能。</p>
+<h3 id="3-4-清洗规则（别跳过）"><a href="#3-4-清洗规则（别跳过）" class="headerlink" title="3.4 清洗规则（别跳过）"></a>3.4 清洗规则（别跳过）</h3><p>真实企业文档里，30% 的 token 是噪声：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TextCleaner</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Pattern</span> <span class="variable">PAGE_HEADER</span> <span class="operator">=</span> Pattern.compile(<span class="string">&quot;^第\\s*\\d+\\s*页\\s*/?\\s*共?\\s*\\d*\\s*页?$&quot;</span>);</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Pattern</span> <span class="variable">CONFIDENTIAL</span> <span class="operator">=</span> Pattern.compile(<span class="string">&quot;^(内部资料|机密|绝密|仅供内部使用).*$&quot;</span>);</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Pattern</span> <span class="variable">MULTI_BLANK</span>  <span class="operator">=</span> Pattern.compile(<span class="string">&quot;\\n&#123;3,&#125;&quot;</span>);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">clean</span><span class="params">(String raw)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> raw.lines()</span><br><span class="line">                .map(String::strip)</span><br><span class="line">                .filter(l -&gt; !l.isEmpty())</span><br><span class="line">                .filter(l -&gt; !PAGE_HEADER.matcher(l).matches())</span><br><span class="line">                .filter(l -&gt; !CONFIDENTIAL.matcher(l).matches())</span><br><span class="line">                .collect(Collectors.joining(<span class="string">&quot;\n&quot;</span>))</span><br><span class="line">                .replaceAll(MULTI_BLANK.pattern(), <span class="string">&quot;\n\n&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：<code>CONFIDENTIAL</code> 这类标记不要直接删——它是重要的权限线索，应该抽出来写进元数据，而不是丢掉。</p>
+<hr>
+<h2 id="四、切分：结构优先，长度兜底"><a href="#四、切分：结构优先，长度兜底" class="headerlink" title="四、切分：结构优先，长度兜底"></a>四、切分：结构优先，长度兜底</h2><h3 id="4-1-四种切分策略"><a href="#4-1-四种切分策略" class="headerlink" title="4.1 四种切分策略"></a>4.1 四种切分策略</h3><table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>固定长度</td>
+<td>每 512 字符切</td>
+<td>简单</td>
+<td>切断句子、丢上下文</td>
+</tr>
+<tr>
+<td>递归字符</td>
+<td>按 <code>\n\n</code> → <code>\n</code> → <code>。</code> → <code>，</code> 逐级切</td>
+<td>通用、可控</td>
+<td>不理解结构</td>
+</tr>
+<tr>
+<td>结构感知</td>
+<td>按标题树切，超长再递归</td>
+<td><strong>推荐</strong></td>
+<td>依赖解析质量</td>
+</tr>
+<tr>
+<td>语义切分</td>
+<td>计算相邻句向量相似度，找断点</td>
+<td>边界最准</td>
+<td>贵、慢</td>
+</tr>
+</tbody></table>
+<p><strong>生产方案：结构感知 + 递归兜底 + 父子块。</strong></p>
+<h3 id="4-2-父块-子块（Parent-Child）"><a href="#4-2-父块-子块（Parent-Child）" class="headerlink" title="4.2 父块 &#x2F; 子块（Parent-Child）"></a>4.2 父块 &#x2F; 子块（Parent-Child）</h3><p>核心思想：<strong>用小块检索（精准），用大块生成（上下文完整）。</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ChildChunk</span><span class="params">(</span></span><br><span class="line"><span class="params">        String id,            // docId:parentId:seq</span></span><br><span class="line"><span class="params">        String parentId,</span></span><br><span class="line"><span class="params">        String docId,</span></span><br><span class="line"><span class="params">        String text,          // 200~400 token，用于向量化</span></span><br><span class="line"><span class="params">        String headingPath,   // &quot;第3章 &gt; 3.2 退款政策 &gt; 3.2.1 时效&quot;</span></span><br><span class="line"><span class="params">        <span class="type">int</span> page,</span></span><br><span class="line"><span class="params">        <span class="type">float</span>[] vector</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ParentChunk</span><span class="params">(</span></span><br><span class="line"><span class="params">        String parentId,</span></span><br><span class="line"><span class="params">        String docId,</span></span><br><span class="line"><span class="params">        String text,          // 800~1500 token，用于拼 prompt</span></span><br><span class="line"><span class="params">        String headingPath,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> startPage,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> endPage</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<p>检索命中 <code>ChildChunk</code>，返回时替换成对应的 <code>ParentChunk</code> 内容。这样既保证召回精度，又保证生成时有足够上下文。</p>
+<p><strong>实测收益</strong>：在制度问答场景，父子块相比单层切分，答案正确率提升 8~15 个点。原因是很多问题的答案需要跨段落（比如「退款时效」在表格里，「例外情况」在下一段）。</p>
+<h3 id="4-3-切分参数"><a href="#4-3-切分参数" class="headerlink" title="4.3 切分参数"></a>4.3 切分参数</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">rag:</span></span><br><span class="line">  <span class="attr">splitter:</span></span><br><span class="line">    <span class="attr">child-size:</span> <span class="number">350</span>          <span class="comment"># token</span></span><br><span class="line">    <span class="attr">child-overlap:</span> <span class="number">50</span></span><br><span class="line">    <span class="attr">parent-size:</span> <span class="number">1200</span></span><br><span class="line">    <span class="attr">min-chunk-size:</span> <span class="number">80</span>       <span class="comment"># 小于这个合并到上一块</span></span><br><span class="line">    <span class="attr">keep-heading-path:</span> <span class="literal">true</span>  <span class="comment"># 每个 chunk 前面拼上标题路径</span></span><br><span class="line">    <span class="attr">table-as-whole:</span> <span class="literal">true</span>     <span class="comment"># 表格不切，整块作为 chunk</span></span><br><span class="line">    <span class="attr">code-as-whole:</span> <span class="literal">true</span>      <span class="comment"># 代码块不切</span></span><br></pre></td></tr></table></figure>
+
+<p><strong><code>keep-heading-path</code> 的隐藏价值</strong>：它让 chunk 自带层级上下文。一个孤立的「时效为 7 个工作日」没有任何意义，加上「退款政策 &gt; 审核通过后」才可检索、可理解。</p>
+<hr>
+<h2 id="五、权限隔离：这是最容易出事的地方"><a href="#五、权限隔离：这是最容易出事的地方" class="headerlink" title="五、权限隔离：这是最容易出事的地方"></a>五、权限隔离：这是最容易出事的地方</h2><h3 id="5-1-三种方案对比"><a href="#5-1-三种方案对比" class="headerlink" title="5.1 三种方案对比"></a>5.1 三种方案对比</h3><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>安全性</th>
+<th>性能</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>前置过滤</strong></td>
+<td>检索时把权限作为 filter 下推给向量库</td>
+<td><strong>高</strong></td>
+<td>好</td>
+<td>推荐</td>
+</tr>
+<tr>
+<td>后置过滤</td>
+<td>先检索 Top-100，再按权限过滤</td>
+<td><strong>低</strong></td>
+<td>差</td>
+<td>❌ 不可用</td>
+</tr>
+<tr>
+<td>分区索引</td>
+<td>每个权限域一个 collection</td>
+<td>高</td>
+<td>好</td>
+<td>权限维度少、文档量巨大</td>
+</tr>
+</tbody></table>
+<p><strong>为什么后置过滤不可用</strong>：假设用户只能看 100 篇文档中的 2 篇，检索 Top-10 全是无权文档，过滤完剩 0 条 → 系统「查不到」。加大 Top-K 到 1000 才能凑够，延迟爆炸，<strong>而且过滤前的日志&#x2F;缓存可能已经泄露了无权内容</strong>。</p>
+<h3 id="5-2-权限模型设计"><a href="#5-2-权限模型设计" class="headerlink" title="5.2 权限模型设计"></a>5.2 权限模型设计</h3><p>企业权限通常是「<strong>多维叠加</strong>」，不是单一 owner：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">DocAcl</span><span class="params">(</span></span><br><span class="line"><span class="params">        String docId,</span></span><br><span class="line"><span class="params">        String ownerId,</span></span><br><span class="line"><span class="params">        Set&lt;String&gt; allowedUserIds,      // 白名单</span></span><br><span class="line"><span class="params">        Set&lt;String&gt; allowedDeptIds,      // 部门</span></span><br><span class="line"><span class="params">        Set&lt;String&gt; allowedRoleIds,      // 角色</span></span><br><span class="line"><span class="params">        Set&lt;String&gt; deniedUserIds,       // 黑名单（优先级最高）</span></span><br><span class="line"><span class="params">        String sensitivity               // PUBLIC / INTERNAL / CONFIDENTIAL / SECRET</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<p>配置示例（YAML 风格，便于业务方维护）：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">doc-acl:</span></span><br><span class="line">  <span class="bullet">-</span> <span class="attr">doc-id:</span> <span class="string">hr-salary-2026</span></span><br><span class="line">    <span class="attr">sensitivity:</span> <span class="string">SECRET</span></span><br><span class="line">    <span class="attr">allowed-depts:</span> [<span class="string">HR</span>, <span class="string">FINANCE</span>]</span><br><span class="line">    <span class="attr">allowed-roles:</span> [<span class="string">HRBP</span>]</span><br><span class="line">    <span class="attr">denied-users:</span> [<span class="string">intern-001</span>]</span><br><span class="line">  <span class="bullet">-</span> <span class="attr">doc-id:</span> <span class="string">tech-arch-guide</span></span><br><span class="line">    <span class="attr">sensitivity:</span> <span class="string">INTERNAL</span></span><br><span class="line">    <span class="attr">allowed-depts:</span> [<span class="string">&quot;*&quot;</span>]        <span class="comment"># 全员</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-权限如何下推到向量库"><a href="#5-3-权限如何下推到向量库" class="headerlink" title="5.3 权限如何下推到向量库"></a>5.3 权限如何下推到向量库</h3><p>向量库的 filter 表达能力有限，通常是「标量字段 + 布尔表达式」。所以要把 ACL <strong>展开成可过滤的标量字段</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">VectorMeta</span><span class="params">(</span></span><br><span class="line"><span class="params">        String docId,</span></span><br><span class="line"><span class="params">        String chunkId,</span></span><br><span class="line"><span class="params">        String sensitivity,</span></span><br><span class="line"><span class="params">        List&lt;String&gt; allowDepts,     // 数组字段</span></span><br><span class="line"><span class="params">        List&lt;String&gt; allowRoles,</span></span><br><span class="line"><span class="params">        List&lt;String&gt; allowUsers,</span></span><br><span class="line"><span class="params">        List&lt;String&gt; denyUsers,</span></span><br><span class="line"><span class="params">        <span class="type">long</span> version,</span></span><br><span class="line"><span class="params">        String status                // ACTIVE / DELETED</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<p>检索时构造 filter：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> String <span class="title function_">buildFilter</span><span class="params">(UserContext user)</span> &#123;</span><br><span class="line">    <span class="comment">// 用户能看到：公开 或 部门命中 或 角色命中 或 用户白名单命中</span></span><br><span class="line">    <span class="comment">// 并且：不在黑名单，且状态为 ACTIVE</span></span><br><span class="line">    <span class="keyword">return</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">        status == &quot;ACTIVE&quot;</span></span><br><span class="line"><span class="string">        &amp;&amp; !(denyUsers in [%s])</span></span><br><span class="line"><span class="string">        &amp;&amp; (</span></span><br><span class="line"><span class="string">             sensitivity == &quot;PUBLIC&quot;</span></span><br><span class="line"><span class="string">             || allowDepts in [%s]</span></span><br><span class="line"><span class="string">             || allowRoles in [%s]</span></span><br><span class="line"><span class="string">             || allowUsers in [%s]</span></span><br><span class="line"><span class="string">           )</span></span><br><span class="line"><span class="string">        &quot;&quot;&quot;</span>.formatted(</span><br><span class="line">            joinQuoted(user.userId()),</span><br><span class="line">            joinQuoted(user.deptIds()),</span><br><span class="line">            joinQuoted(user.roleIds()),</span><br><span class="line">            joinQuoted(user.userId()));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>三个必须注意的点：</strong></p>
+<ol>
+<li><strong>部门要包含父部门</strong>。用户在「技术部 &gt; 后端组」，应该能看到「技术部」级的文档。查询前把 <code>deptIds</code> 展开成完整路径集合。</li>
+<li><strong>黑名单优先级最高</strong>，用 <code>!(denyUsers in [...])</code> 而不是靠「不在白名单」。</li>
+<li><strong><code>status == &quot;ACTIVE&quot;</code> 必须带</strong>，这是防「已删除文档泄露」的最后一道闸。</li>
+</ol>
+<h3 id="5-4-权限变更的传播"><a href="#5-4-权限变更的传播" class="headerlink" title="5.4 权限变更的传播"></a>5.4 权限变更的传播</h3><p>改权限不需要重新向量化（向量只跟内容有关），只需要更新元数据：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@EventListener</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onAclChanged</span><span class="params">(AclChangedEvent e)</span> &#123;</span><br><span class="line">    vectorStore.updateMetadata(e.docId(), Map.of(</span><br><span class="line">            <span class="string">&quot;allowDepts&quot;</span>, e.newAcl().allowedDeptIds(),</span><br><span class="line">            <span class="string">&quot;allowRoles&quot;</span>, e.newAcl().allowedRoleIds(),</span><br><span class="line">            <span class="string">&quot;allowUsers&quot;</span>, e.newAcl().allowedUserIds(),</span><br><span class="line">            <span class="string">&quot;denyUsers&quot;</span>,  e.newAcl().deniedUserIds(),</span><br><span class="line">            <span class="string">&quot;sensitivity&quot;</span>, e.newAcl().sensitivity()</span><br><span class="line">    ));</span><br><span class="line">    <span class="comment">// 同时失效该文档相关的答案缓存</span></span><br><span class="line">    answerCache.evictByDocId(e.docId());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>别忘了失效缓存</strong>。如果你的答案缓存 key 里没有权限维度，A 问过的问题被缓存后，B 可能直接拿到 A 的答案——这是真实发生过的越权事故。</p>
+<p><strong>缓存 key 必须包含「权限指纹」</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">String</span> <span class="variable">cacheKey</span> <span class="operator">=</span> sha256(query + <span class="string">&quot;|&quot;</span> + user.permissionFingerprint() + <span class="string">&quot;|&quot;</span> + indexVersion);</span><br></pre></td></tr></table></figure>
+
+<p><code>permissionFingerprint</code> 是「部门集合 + 角色集合 + 密级上限」的哈希。</p>
+<h3 id="5-5-红队测试清单"><a href="#5-5-红队测试清单" class="headerlink" title="5.5 红队测试清单"></a>5.5 红队测试清单</h3><p>上线前必须跑一遍：</p>
+<ul>
+<li><input disabled="" type="checkbox"> 低权限账号直接问「高管薪酬表内容」</li>
+<li><input disabled="" type="checkbox"> 用同义词绕过（「工资明细」「薪资结构」）</li>
+<li><input disabled="" type="checkbox"> 问「总结一下我不能看的那些文档」</li>
+<li><input disabled="" type="checkbox"> 通过引用链接直接访问（引用 URL 是否也鉴权）</li>
+<li><input disabled="" type="checkbox"> 缓存穿透（A 问过，B 再问）</li>
+<li><input disabled="" type="checkbox"> 历史会话（权限被回收后，旧会话是否还能看到）</li>
+<li><input disabled="" type="checkbox"> 导出功能（对话导出是否带权限校验）</li>
+<li><input disabled="" type="checkbox"> 管理员降权后，其创建的知识库是否仍可见</li>
+</ul>
+<hr>
+<h2 id="六、引用溯源：让答案可被审计"><a href="#六、引用溯源：让答案可被审计" class="headerlink" title="六、引用溯源：让答案可被审计"></a>六、引用溯源：让答案可被审计</h2><h3 id="6-1-引用必须满足三条"><a href="#6-1-引用必须满足三条" class="headerlink" title="6.1 引用必须满足三条"></a>6.1 引用必须满足三条</h3><ol>
+<li><strong>可定位</strong>：能跳到原文的页码 + 段落，最好高亮</li>
+<li><strong>可校验</strong>：引用片段里确实包含支撑答案的句子</li>
+<li><strong>可追溯</strong>：知道这条引用来自哪个版本的文档</li>
+</ol>
+<h3 id="6-2-数据结构"><a href="#6-2-数据结构" class="headerlink" title="6.2 数据结构"></a>6.2 数据结构</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">Citation</span><span class="params">(</span></span><br><span class="line"><span class="params">        <span class="type">int</span> index,              // [1] [2]</span></span><br><span class="line"><span class="params">        String docId,</span></span><br><span class="line"><span class="params">        String docTitle,</span></span><br><span class="line"><span class="params">        String chunkId,</span></span><br><span class="line"><span class="params">        String headingPath,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> page,</span></span><br><span class="line"><span class="params">        String snippet,         // 引用原文（≤200 字）</span></span><br><span class="line"><span class="params">        String sourceUrl,       // 带定位参数的深链</span></span><br><span class="line"><span class="params">        String docVersion,      // 文档版本</span></span><br><span class="line"><span class="params">        <span class="type">double</span> score            // 检索得分，便于排查</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">Answer</span><span class="params">(</span></span><br><span class="line"><span class="params">        String text,</span></span><br><span class="line"><span class="params">        List&lt;Citation&gt; citations,</span></span><br><span class="line"><span class="params">        <span class="type">boolean</span> refused,        // 是否拒答</span></span><br><span class="line"><span class="params">        String refuseReason</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-生成时强制引用"><a href="#6-3-生成时强制引用" class="headerlink" title="6.3 生成时强制引用"></a>6.3 生成时强制引用</h3><p>Prompt 里必须硬性约束：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line">你是企业知识库助手。请严格基于【参考资料】回答。</span><br><span class="line"></span><br><span class="line">规则：</span><br><span class="line">1. 每个结论后面必须标注来源编号，格式 [1]、[2]。</span><br><span class="line">2. 如果参考资料中没有答案，直接回答&quot;知识库中未找到相关信息&quot;，禁止推测。</span><br><span class="line">3. 不得引用【参考资料】之外的内容。</span><br><span class="line">4. 如果资料之间冲突，指出冲突并分别标注来源。</span><br><span class="line"></span><br><span class="line">【参考资料】</span><br><span class="line">[1] (来源: 员工手册 v3.2, 第 4 章 4.3 节)</span><br><span class="line">...内容...</span><br><span class="line"></span><br><span class="line">[2] (来源: 报销制度 v1.8, 第 2 章)</span><br><span class="line">...内容...</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-4-引用校验（关键环节）"><a href="#6-4-引用校验（关键环节）" class="headerlink" title="6.4 引用校验（关键环节）"></a>6.4 引用校验（关键环节）</h3><p>模型会编造引用编号，也可能引用了一段但不支持结论。<strong>必须做程序化校验</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">CitationValidator</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 校验 1：编号必须存在 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">validateIndexes</span><span class="params">(Answer answer, List&lt;Citation&gt; available)</span> &#123;</span><br><span class="line">        Set&lt;Integer&gt; valid = available.stream().map(Citation::index).collect(Collectors.toSet());</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> idx : extractIndexes(answer.text())) &#123;</span><br><span class="line">            <span class="keyword">if</span> (!valid.contains(idx)) &#123;</span><br><span class="line">                <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">InvalidCitationException</span>(<span class="string">&quot;引用了不存在的编号: &quot;</span> + idx);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 校验 2：引用片段必须能在原文中找到（防模型改写引用） */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">validateSnippet</span><span class="params">(Citation c, String originalChunkText)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">normalized</span> <span class="operator">=</span> normalize(c.snippet());</span><br><span class="line">        <span class="keyword">if</span> (!normalize(originalChunkText).contains(normalized)) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">InvalidCitationException</span>(<span class="string">&quot;引用内容与原文不符: &quot;</span> + c.chunkId());</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 校验 3：答案里的关键数字/日期必须出现在引用片段中 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">validateFacts</span><span class="params">(String answerText, List&lt;Citation&gt; citations)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">corpus</span> <span class="operator">=</span> citations.stream().map(Citation::snippet).collect(Collectors.joining(<span class="string">&quot;\n&quot;</span>));</span><br><span class="line">        <span class="keyword">for</span> (String token : extractNumbersAndDates(answerText)) &#123;</span><br><span class="line">            <span class="keyword">if</span> (!corpus.contains(token)) &#123;</span><br><span class="line">                log.warn(<span class="string">&quot;疑似幻觉：答案中的 &#x27;&#123;&#125;&#x27; 未在任何引用中出现&quot;</span>, token);</span><br><span class="line">                <span class="comment">// 可配置为：降级为&quot;仅供参考&quot; / 直接拒答</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> String <span class="title function_">normalize</span><span class="params">(String s)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> s.replaceAll(<span class="string">&quot;\\s+&quot;</span>, <span class="string">&quot;&quot;</span>).replaceAll(<span class="string">&quot;[，。、；：]&quot;</span>, <span class="string">&quot;&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>校验 3 是最有效的一条</strong>。企业问答里最致命的错误是数字错（「报销上限 5000」答成「8000」）。数字和日期是最容易程序化验证的事实。</p>
+<h3 id="6-5-拒答策略"><a href="#6-5-拒答策略" class="headerlink" title="6.5 拒答策略"></a>6.5 拒答策略</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">检索最高分 &lt; 阈值        → 直接拒答（不调模型，省钱）</span><br><span class="line">检索结果全部被权限过滤掉  → &quot;未找到你有权限查看的资料&quot;</span><br><span class="line">引用校验失败              → 降级：返回原文片段，不给结论</span><br><span class="line">生成内容包含&quot;根据我的理解&quot; → 强制重生成或拒答</span><br></pre></td></tr></table></figure>
+
+<p><strong>拒答不是失败，是能力。</strong> 一个从不拒答的知识库，等于一个不能信任的知识库。</p>
+<hr>
+<h2 id="七、时效性：删除比新增更难"><a href="#七、时效性：删除比新增更难" class="headerlink" title="七、时效性：删除比新增更难"></a>七、时效性：删除比新增更难</h2><h3 id="7-1-三种变更"><a href="#7-1-三种变更" class="headerlink" title="7.1 三种变更"></a>7.1 三种变更</h3><table>
+<thead>
+<tr>
+<th>变更</th>
+<th>处理</th>
+<th>难点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>新增文档</td>
+<td>解析 → 切分 → 向量化 → 入库</td>
+<td>幂等（重复投递不能产生重复 chunk）</td>
+</tr>
+<tr>
+<td>修改内容</td>
+<td>差量更新 chunk（见 Embedding 一文）</td>
+<td>切分点漂移</td>
+</tr>
+<tr>
+<td>删除文档</td>
+<td>元数据置 <code>DELETED</code> + 异步物理删</td>
+<td>三个存储要一致</td>
+</tr>
+</tbody></table>
+<h3 id="7-2-删除的完整链路"><a href="#7-2-删除的完整链路" class="headerlink" title="7.2 删除的完整链路"></a>7.2 删除的完整链路</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Transactional</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">deleteDocument</span><span class="params">(String docId)</span> &#123;</span><br><span class="line">    <span class="comment">// 1. 业务库标记删除（真相源）</span></span><br><span class="line">    documentRepo.markDeleted(docId);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 2. 发事件（事务提交后发送，避免事务回滚但消息已发）</span></span><br><span class="line">    eventPublisher.publishEvent(<span class="keyword">new</span> <span class="title class_">DocumentDeletedEvent</span>(docId));</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="meta">@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onDeleted</span><span class="params">(DocumentDeletedEvent e)</span> &#123;</span><br><span class="line">    <span class="comment">// 3. 向量库/全文索引软删除（保证检索立即不可见）</span></span><br><span class="line">    vectorStore.markDeleted(e.docId());</span><br><span class="line">    searchIndex.markDeleted(e.docId());</span><br><span class="line">    <span class="comment">// 4. 失效缓存</span></span><br><span class="line">    answerCache.evictByDocId(e.docId());</span><br><span class="line">    <span class="comment">// 5. 投递到延迟队列，24h 后物理删除（留出回滚窗口）</span></span><br><span class="line">    cleanupQueue.schedule(e.docId(), Duration.ofHours(<span class="number">24</span>));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>为什么「软删除 + 延迟物理删」</strong>：误删是常态。留 24 小时窗口，运维可以一键恢复；物理删完就真的没了。</p>
+<h3 id="7-3-对账任务"><a href="#7-3-对账任务" class="headerlink" title="7.3 对账任务"></a>7.3 对账任务</h3><p>每周跑一次全量对账，三个存储两两比对：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Scheduled(cron = &quot;0 0 3 * * SUN&quot;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">reconcile</span><span class="params">()</span> &#123;</span><br><span class="line">    Set&lt;String&gt; dbDocs = documentRepo.listActiveIds();</span><br><span class="line">    Set&lt;String&gt; vectorDocs = vectorStore.listDocIds();</span><br><span class="line"></span><br><span class="line">    Set&lt;String&gt; orphanInVector = difference(vectorDocs, dbDocs);   <span class="comment">// 向量库多余</span></span><br><span class="line">    Set&lt;String&gt; missingInVector = difference(dbDocs, vectorDocs);  <span class="comment">// 向量库缺失</span></span><br><span class="line"></span><br><span class="line">    log.info(<span class="string">&quot;对账: 多余 &#123;&#125; 条, 缺失 &#123;&#125; 条&quot;</span>, orphanInVector.size(), missingInVector.size());</span><br><span class="line">    <span class="comment">// 多余 → 删除；缺失 → 重新入队</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>没有对账的 RAG 系统，半年后一定会出现「查不到已存在的文档」和「查到已删除的文档」两个方向的 bug。</strong></p>
+<hr>
+<h2 id="八、容量与成本估算"><a href="#八、容量与成本估算" class="headerlink" title="八、容量与成本估算"></a>八、容量与成本估算</h2><p>假设：5000 员工，日活 1000，人均 10 次问答，文档 50 万页。</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>估算</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Chunk 数</td>
+<td>50 万页 × 1.5 ≈ 75 万</td>
+<td>每页约 1.5 个 chunk</td>
+</tr>
+<tr>
+<td>向量存储</td>
+<td>75 万 × 1024 × 4B ≈ 3 GB</td>
+<td>单副本，含图索引 ~4 GB</td>
+</tr>
+<tr>
+<td>原文存储</td>
+<td>50 万页 × 3KB ≈ 1.5 GB</td>
+<td>对象存储</td>
+</tr>
+<tr>
+<td>元数据</td>
+<td>75 万 × 300B ≈ 225 MB</td>
+<td>MySQL</td>
+</tr>
+<tr>
+<td>日请求量</td>
+<td>1000 × 10 &#x3D; 1 万次</td>
+<td>峰值按 5 倍 &#x3D; 5 万&#x2F;天</td>
+</tr>
+<tr>
+<td>单次 token</td>
+<td>输入 3000（检索+历史）+ 输出 400</td>
+<td>父子块 + 重排后</td>
+</tr>
+<tr>
+<td>日 token</td>
+<td>1 万 × 3400 &#x3D; 3400 万</td>
+<td></td>
+</tr>
+<tr>
+<td>日成本</td>
+<td>≈ 3400 万 × 3 元&#x2F;百万 ≈ 100 元</td>
+<td>按混合单价粗算</td>
+</tr>
+<tr>
+<td>月成本</td>
+<td>≈ 3000 元</td>
+<td>含 embedding 摊销</td>
+</tr>
+</tbody></table>
+<p><strong>优化空间：</strong></p>
+<ul>
+<li><strong>缓存</strong>：重复问题占比 30~50%，命中即省；</li>
+<li><strong>意图分流</strong>：简单问题走小模型，复杂问题走大模型，可省 40%；</li>
+<li><strong>检索压缩</strong>：把 10 个 chunk 压成 5 个（去重 + 摘要），输入 token 减半。</li>
+</ul>
+<hr>
+<h2 id="九、演进的四个阶段"><a href="#九、演进的四个阶段" class="headerlink" title="九、演进的四个阶段"></a>九、演进的四个阶段</h2><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>能力</th>
+<th>团队规模</th>
+<th>周期</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>P0 能用</td>
+<td>单文档类型、全量重建、无权限</td>
+<td>1 人</td>
+<td>2 周</td>
+</tr>
+<tr>
+<td>P1 好用</td>
+<td>多格式、增量更新、文档级权限、引用</td>
+<td>2~3 人</td>
+<td>2 个月</td>
+</tr>
+<tr>
+<td>P2 可信</td>
+<td>混合检索 + 重排、引用校验、评测体系、拒答</td>
+<td>4~5 人</td>
+<td>4 个月</td>
+</tr>
+<tr>
+<td>P3 智能</td>
+<td>Agentic RAG、多轮改写、权限继承、主动推送</td>
+<td>6+ 人</td>
+<td>6 个月+</td>
+</tr>
+</tbody></table>
+<p><strong>别一上来就做 P3。</strong> 大部分企业内部需求，P1 + P2 的混合检索和引用校验就能满足 90% 的场景。</p>
+<hr>
+<h2 id="十、面试追问"><a href="#十、面试追问" class="headerlink" title="十、面试追问"></a>十、面试追问</h2><p><strong>Q1：为什么权限过滤必须在检索前？</strong></p>
+<p>因为向量检索返回的是「最相似 Top-K」。如果先检索后过滤，一是 Top-K 可能被无权文档占满导致查不到，二是过滤前的中间结果可能进日志&#x2F;缓存造成泄露，三是放大 Top-K 会让延迟和成本不可控。<strong>安全要求决定了过滤必须下推。</strong></p>
+<p><strong>Q2：父块&#x2F;子块索引解决了什么问题？</strong></p>
+<p>解决了「检索精度」与「生成上下文完整性」的矛盾。小块向量表达更聚焦、召回更准；大块包含更多上下文、生成更完整。用小块检索、大块生成，两头的好处都拿到。</p>
+<p><strong>Q3：怎么防止模型编造引用？</strong></p>
+<p>三道校验：编号必须存在于候选集、引用片段必须能在原文中匹配（做归一化后 substring 匹配）、答案中的数字&#x2F;日期必须出现在引用片段里。第三条能抓住最常见的幻觉类型。</p>
+<p><strong>Q4：文档删除怎么保证「立即不可见」？</strong></p>
+<p>业务库标记删除 → 检索侧元数据立即置 <code>DELETED</code>（filter 生效，秒级不可见）→ 缓存失效 → 24 小时后物理删除。关键是<strong>检索侧永远带 <code>status = ACTIVE</code> 条件</strong>，即使下游同步失败也不会泄露。</p>
+<p><strong>Q5：为什么要混合检索？</strong></p>
+<p>向量检索擅长语义泛化，弱在精确匹配（错误码、型号、人名、条款号）。BM25 正好相反。两者用 RRF 融合，能同时覆盖「意思相近」和「字面精确」两类需求。实测 Recall@10 通常能提升 10 个点以上。</p>
+<p><strong>Q6：知识库和微调怎么选？</strong></p>
+<p>知识频繁变化、需要引用、需要权限控制 → RAG；风格&#x2F;格式&#x2F;领域语言习惯需要固化 → 微调。企业知识问答 95% 的场景应该用 RAG，因为<strong>微调无法解决「知识过期」和「引用溯源」</strong>。</p>
+<p><strong>Q7：怎么评估这套系统好不好？</strong></p>
+<p>三层：检索层看 Recall@K &#x2F; MRR（黄金集）；生成层看答案正确率、引用准确率、拒答准确率；业务层看采纳率、二次追问率、人工工单下降量。<strong>只看最后一层会被「用户不问」误导</strong>，必须三层都看。</p>
+<hr>
+<h2 id="十一、总结"><a href="#十一、总结" class="headerlink" title="十一、总结"></a>十一、总结</h2><p>企业知识库问答的架构，本质是把四个「不性感但决定成败」的工程问题解决好：</p>
+<ol>
+<li><strong>解析</strong>：结构化模型 + 分类型选型，别指望切分补救；</li>
+<li><strong>切分</strong>：结构感知 + 父子块，标题路径必须带；</li>
+<li><strong>权限</strong>：过滤下推 + 缓存隔离 + 红队验证，<code>status=ACTIVE</code> 永远带着；</li>
+<li><strong>引用</strong>：编号校验 + 片段校验 + 数字校验，拒答是能力不是缺陷。</li>
+</ol>
+<p>再叠加「增量更新 + 定时对账」保证时效，「混合检索 + 重排」保证效果，「评测体系」保证可迭代。</p>
+<p>模型会换、框架会换，这四件事不会变。<strong>把地基做对，换哪家大模型都能用；地基做错，换 GPT-5 也救不回来。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/24/enterprise-knowledge-base-rag-system-design/">https://jiweidong.github.io/2026/10/24/enterprise-knowledge-base-rag-system-design/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/AI/">AI</a><a class="post-meta__tags" href="/tags/RAG/">RAG</a><a class="post-meta__tags" href="/tags/%E7%9F%A5%E8%AF%86%E5%BA%93/">知识库</a><a class="post-meta__tags" href="/tags/%E6%9D%83%E9%99%90%E6%8E%A7%E5%88%B6/">权限控制</a><a class="post-meta__tags" href="/tags/%E5%BC%95%E7%94%A8%E6%BA%AF%E6%BA%90/">引用溯源</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/10/24/java-embedding-search-deep-practice/" title="【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新</div></div><div class="info-2"><div class="info-item-1">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新前言LIKE &#39;%退款%&#39; 这种检索有个致命缺陷：用户问「钱什么时候退回来」，它一条都匹配不上。语义检索要解决的正是这个问题——把文本映射到向量空间，用「距离」代替「字面匹配」。 但真正落地时，Embedding 远不是「调个 API 拿个 float 数组」那么简单。你会踩到这些坑：  余弦相似度算出 0.83，到底算不算「相关」？阈值怎么定？ 换了 embedding 模型，为什么老数据全部失效、召回暴跌？ 文档改了一个字，要不要全量重算 200 万条向量？ 归一化忘了做，内积和余弦算出来的排序完全不同； 1024 维向量存 float[]，1000 万条吃掉多少内存？  这篇文章用 Java 视角把这条链路讲透：向量化 → 相似度度量 → 索引 → 增量更新 → 评测。代码基于 Spring AI 的 EmbeddingModel 抽象，换模型只需改配置。  一、Embedding 到底在做什么Embedding 模型是一个函数： 1f: text → R^d     d ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/22/ai-coding-assistant-system-design/" title="【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-22</div><div class="info-item-2">【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路</div></div><div class="info-2"><div class="info-item-1">【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路前言AI 编程助手是过去两年最成功的 AI 应用形态，没有之一。但”能跑 Demo”和”能用在 IDE 里”之间隔着一条鸿沟：  Demo 里调用一次 GPT-4 要 2 秒，你能忍；IDE 里光标停下 2 秒才出补全，用户会直接关掉插件。 Demo 里把整个文件塞进 prompt 就行；真实仓库有几万个文件、单文件上万行，窗口根本装不下。 Demo 里模型答错无所谓；IDE 里补全出一个不存在的 API，用户会骂”这玩意儿在乱写”。  本文从系统设计视角拆解 AI 编程助手：补全链路、代码检索、上下文组装、成本与延迟预算、质量评估。这是”AI 系统设计”面试里非常容易考、但很少有人能讲全的题目。  一、先分清两类产品很多人把”代码补全”和”代码 Agent”混为一谈，但它们的架构完全不同：    维度 行内补全（Tab Completion） 对话式改码（Chat &#x2F; Agent）    触发 打字停顿时自动 用户显式提问&#x2F;下指令   延迟要求 P95 &lt; 300ms（体验生死线） 1~...</div></div></div></a><a class="pagination-related" href="/2026/10/15/spring-ai-rag-vectorstore-deep-practice/" title="【Java AI】Spring AI RAG 深度实战：VectorStore、ETL Pipeline 与检索增强落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-15</div><div class="info-item-2">【Java AI】Spring AI RAG 深度实战：VectorStore、ETL Pipeline 与检索增强落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】Spring AI RAG 深度实战：VectorStore、ETL Pipeline 与检索增强落地前言用 Java 落地 RAG，2024 年之前基本等于”自己拼装”：调 Embedding API、算余弦相似度、手撸召回逻辑。Spring AI 的价值在于，它把 RAG 拆成了几个可插拔的抽象——VectorStore、EmbeddingModel、DocumentReader/Transformer/Writer、Advisor——让 Java 工程师用 Spring 的惯用方式（依赖注入、自动配置、Advisor 链）把 RAG 拼起来。 本文是「Java × AI 工程落地」系列的一篇，聚焦三件事：  VectorStore 抽象：接口契约、检索参数（topK &#x2F; threshold &#x2F; filter）与后端选型； ETL Pipeline：文档读取、切分、元数据增强、入库； Advisor 与检索增强：从 QuestionAnswerAdvisor 到模块化的 RetrievalAugmentationAdvisor。   前置...</div></div></div></a><a class="pagination-related" href="/2026/10/19/ai-application-engineer-interview-guide/" title="【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-19</div><div class="info-item-2">【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路</div></div><div class="info-2"><div class="info-item-1">【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路前言2026 年的 AI 应用开发岗（也叫 LLM 应用工程师、Agent 工程师、AI 平台工程师）已经过了”会调 OpenAI API 就能入职”的阶段。 现在的面试官普遍会做三件事：  用场景题筛掉”只会写 demo”的人：不是问”什么是 RAG”，而是问”你的 RAG 为什么召回不准，怎么定位”。 用追问链挖深度：一个问题连着问四层，看你是背的还是有真实工程经验。 用成本&#x2F;稳定性问题筛掉”没上过生产”的人：Token 账单、P99 延迟、幻觉率、灰度方案。  这篇文章把过去一年高频出现的题目按模块整理，并给出可以直接套用的答题框架。重点不是”标准答案”，而是答题的结构——面试官真正在评估的是你的思维方式。  一、面试流程与评估维度典型 4 轮：    轮次 时长 考察 通过关键    一面（基础） 45min LLM 基础、Prompt、RAG 概念、代码 概念准确、不装懂   二面（项目） 60min 你的项目细节、技术选型、踩坑 能讲清”为什么这么选”   三面（系统设计） 60min ...</div></div></div></a><a class="pagination-related" href="/2026/10/23/agent-workflow-orchestration-deep-dive/" title="【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-23</div><div class="info-item-2">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入</div></div><div class="info-2"><div class="info-item-1">【AI Agent】智能体工作流编排深度解析：DAG、状态机与人工介入前言刚开始做 Agent，大家都是这么写的： 123456789while (!done) &#123;    response = llm.chat(messages, tools);    if (response.hasToolCalls()) &#123;        results = executeTools(response.toolCalls());        messages.addAll(results);    &#125; else &#123;        done = true;    &#125;&#125;  一个 while 循环，看起来很优雅。上线之后你会发现：  有的请求跑了 40 轮还没停，烧了 20 万 token； 第 3 步工具失败了，只能整条重跑； 用户等了 90 秒，产品经理要求「中间结果先展示」； 出了事故要复盘，但你不知道它当时到底走了哪条路径； 合规要求高风险操作必须人工确认，你没地方插这个「确认」。  这些问题不是 Prompt 能解决的，它们是...</div></div></div></a><a class="pagination-related" href="/2026/10/21/rag-evaluation-ragas-deep-practice/" title="【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证</div></div><div class="info-2"><div class="info-item-1">【RAG 进阶】RAG 评测深度实战：RAGAS 指标、黄金集与回归验证前言RAG 项目最容易出现的一种对话：  「我把 chunk size 从 512 调到 1024，感觉效果好多了。」「怎么个好法？」「我试了几个问题，回答更完整了。」  这不是评测，这是手感。手感的问题在于：  你试的 5 个问题，可能正好是 chunk&#x3D;1024 擅长的； 你没试到的那 200 个问题里，可能有一半变差了； 下周有人调了 embedding 模型，没人知道整体是变好还是变坏； 老板问「这个 RAG 准确率多少」，你答不上来。  RAG 是一个多阶段的管道：文档解析 → 切分 → 向量化 → 检索 → 重排 → 组装 prompt → 生成。任何一个环节的改动，都可能是「一类问题变好、另一类问题变坏」。没有评测集，你连「变没变」都不知道，更别说「哪变了」。 这一篇讲怎么把 RAG 评测做成工程：指标怎么定义、黄金集怎么建、RAGAS 的四个核心指标怎么算、怎么用 Java 落地、怎么接进 CI 做回归。Python 生态的 RAGAS 很好用，但生产系统是 Java 的，评测必须能...</div></div></div></a><a class="pagination-related" href="/2026/10/11/langchain4j-java-llm-deep-practice/" title="【Java AI】LangChain4j 深度实战：AiServices、工具调用与 RAG 生产落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-11</div><div class="info-item-2">【Java AI】LangChain4j 深度实战：AiServices、工具调用与 RAG 生产落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】LangChain4j 深度实战：AiServices、工具调用与 RAG 生产落地面试官：Java 后端现在也要写大模型应用了，你怎么看？这两年最尴尬的岗位描述莫过于：“熟悉 Java，有 LLM 应用开发经验优先”。Python 那边 LangChain 已经卷到生态爆炸，而 Java 工程师打开 IDE 发现除了 Spring AI，还有一个名字很像、定位也几乎重合的框架——LangChain4j。 很多人第一反应是：”这俩选哪个？” 先给结论：Spring AI 深度绑定 Spring 生态，适合”我本来就是个 Spring Boot 应用，顺手接个大模型”；LangChain4j 是独立的编排框架，抽象更贴近 LangChain 原语，适合”我要认真做一个 AI 应用”。两者并不互斥，Spring Boot 里完全可以引入 LangChain4j。 这篇文章不讲空泛的对比，我们直接从工程视角把 LangChain4j 的三块核心吃透：模型抽象、AiServices 声明式调用、工具调用（Function Calling）与 RAG，最后落到生产环境的坑...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">817</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">918</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E3%80%91%E4%BC%81%E4%B8%9A%E7%9F%A5%E8%AF%86%E5%BA%93%E9%97%AE%E7%AD%94%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1%EF%BC%9A%E6%96%87%E6%A1%A3%E8%A7%A3%E6%9E%90%E3%80%81%E6%9D%83%E9%99%90%E9%9A%94%E7%A6%BB%E4%B8%8E%E5%BC%95%E7%94%A8%E6%BA%AF%E6%BA%90"><span class="toc-number">1.</span> <span class="toc-text">【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%AE%9A%E6%8C%87%E6%A0%87%EF%BC%8C%E5%86%8D%E8%B0%88%E6%9E%B6%E6%9E%84"><span class="toc-number">1.2.</span> <span class="toc-text">一、先定指标，再谈架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%95%B4%E4%BD%93%E6%9E%B6%E6%9E%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、整体架构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%96%87%E6%A1%A3%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%86%B3%E5%AE%9A%E7%B3%BB%E7%BB%9F%E4%B8%8A%E9%99%90%E7%9A%84%E4%B8%80%E6%AD%A5"><span class="toc-number">1.4.</span> <span class="toc-text">三、文档解析：决定系统上限的一步</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E8%A7%A3%E6%9E%90%E8%B4%A8%E9%87%8F%E7%9A%84%E4%B8%89%E5%B1%82"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 解析质量的三层</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%88%86%E7%B1%BB%E5%9E%8B%E9%80%89%E5%9E%8B"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 分类型选型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E8%A7%A3%E6%9E%90%E4%BA%A7%E7%89%A9%E7%9A%84%E7%BB%9F%E4%B8%80%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 解析产物的统一模型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E6%B8%85%E6%B4%97%E8%A7%84%E5%88%99%EF%BC%88%E5%88%AB%E8%B7%B3%E8%BF%87%EF%BC%89"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 清洗规则（别跳过）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%88%87%E5%88%86%EF%BC%9A%E7%BB%93%E6%9E%84%E4%BC%98%E5%85%88%EF%BC%8C%E9%95%BF%E5%BA%A6%E5%85%9C%E5%BA%95"><span class="toc-number">1.5.</span> <span class="toc-text">四、切分：结构优先，长度兜底</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%9B%9B%E7%A7%8D%E5%88%87%E5%88%86%E7%AD%96%E7%95%A5"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 四种切分策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E7%88%B6%E5%9D%97-%E5%AD%90%E5%9D%97%EF%BC%88Parent-Child%EF%BC%89"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 父块 &#x2F; 子块（Parent-Child）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%88%87%E5%88%86%E5%8F%82%E6%95%B0"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 切分参数</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%9D%83%E9%99%90%E9%9A%94%E7%A6%BB%EF%BC%9A%E8%BF%99%E6%98%AF%E6%9C%80%E5%AE%B9%E6%98%93%E5%87%BA%E4%BA%8B%E7%9A%84%E5%9C%B0%E6%96%B9"><span class="toc-number">1.6.</span> <span class="toc-text">五、权限隔离：这是最容易出事的地方</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%B8%89%E7%A7%8D%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 三种方案对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E6%9D%83%E9%99%90%E6%A8%A1%E5%9E%8B%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 权限模型设计</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E6%9D%83%E9%99%90%E5%A6%82%E4%BD%95%E4%B8%8B%E6%8E%A8%E5%88%B0%E5%90%91%E9%87%8F%E5%BA%93"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 权限如何下推到向量库</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E6%9D%83%E9%99%90%E5%8F%98%E6%9B%B4%E7%9A%84%E4%BC%A0%E6%92%AD"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 权限变更的传播</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-5-%E7%BA%A2%E9%98%9F%E6%B5%8B%E8%AF%95%E6%B8%85%E5%8D%95"><span class="toc-number">1.6.5.</span> <span class="toc-text">5.5 红队测试清单</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%BC%95%E7%94%A8%E6%BA%AF%E6%BA%90%EF%BC%9A%E8%AE%A9%E7%AD%94%E6%A1%88%E5%8F%AF%E8%A2%AB%E5%AE%A1%E8%AE%A1"><span class="toc-number">1.7.</span> <span class="toc-text">六、引用溯源：让答案可被审计</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%BC%95%E7%94%A8%E5%BF%85%E9%A1%BB%E6%BB%A1%E8%B6%B3%E4%B8%89%E6%9D%A1"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 引用必须满足三条</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 数据结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E7%94%9F%E6%88%90%E6%97%B6%E5%BC%BA%E5%88%B6%E5%BC%95%E7%94%A8"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 生成时强制引用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E5%BC%95%E7%94%A8%E6%A0%A1%E9%AA%8C%EF%BC%88%E5%85%B3%E9%94%AE%E7%8E%AF%E8%8A%82%EF%BC%89"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 引用校验（关键环节）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-5-%E6%8B%92%E7%AD%94%E7%AD%96%E7%95%A5"><span class="toc-number">1.7.5.</span> <span class="toc-text">6.5 拒答策略</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%97%B6%E6%95%88%E6%80%A7%EF%BC%9A%E5%88%A0%E9%99%A4%E6%AF%94%E6%96%B0%E5%A2%9E%E6%9B%B4%E9%9A%BE"><span class="toc-number">1.8.</span> <span class="toc-text">七、时效性：删除比新增更难</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-%E4%B8%89%E7%A7%8D%E5%8F%98%E6%9B%B4"><span class="toc-number">1.8.1.</span> <span class="toc-text">7.1 三种变更</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-2-%E5%88%A0%E9%99%A4%E7%9A%84%E5%AE%8C%E6%95%B4%E9%93%BE%E8%B7%AF"><span class="toc-number">1.8.2.</span> <span class="toc-text">7.2 删除的完整链路</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-3-%E5%AF%B9%E8%B4%A6%E4%BB%BB%E5%8A%A1"><span class="toc-number">1.8.3.</span> <span class="toc-text">7.3 对账任务</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E5%AE%B9%E9%87%8F%E4%B8%8E%E6%88%90%E6%9C%AC%E4%BC%B0%E7%AE%97"><span class="toc-number">1.9.</span> <span class="toc-text">八、容量与成本估算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%BC%94%E8%BF%9B%E7%9A%84%E5%9B%9B%E4%B8%AA%E9%98%B6%E6%AE%B5"><span class="toc-number">1.10.</span> <span class="toc-text">九、演进的四个阶段</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.11.</span> <span class="toc-text">十、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E4%B8%80%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.12.</span> <span class="toc-text">十一、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/enterprise-knowledge-base-rag-system-design/" title="【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源">【系统设计】企业知识库问答系统架构设计：文档解析、权限隔离与引用溯源</a><time datetime="2026-10-24T00:25:00.000Z" title="发表于 2026-10-24 08:25:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/java-embedding-search-deep-practice/" title="【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新">【Java AI】Embedding 与语义检索深度实战：向量化、相似度度量与增量更新</a><time datetime="2026-10-24T00:20:00.000Z" title="发表于 2026-10-24 08:20:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/kafka-share-group-queue-consumption-deep-dive/" title="【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理">【Kafka 4.x】共享组（Share Group）深度解析：KIP-932 队列语义、协同消费与位移治理</a><time datetime="2026-10-24T00:15:00.000Z" title="发表于 2026-10-24 08:15:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/mybatis-typehandler-custom-mapping-deep-dive/" title="【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单">【MyBatis 源码】TypeHandler 深度解析：注册查找链、自定义枚举/JSON 映射与踩坑清单</a><time datetime="2026-10-24T00:10:00.000Z" title="发表于 2026-10-24 08:10:00">2026-10-24</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/24/java-locksupport-park-unpark-deep-dive/" title="【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石">【并发底层】LockSupport 深度解析：park/unpark 许可机制、伪唤醒与 AQS 基石</a><time datetime="2026-10-24T00:05:00.000Z" title="发表于 2026-10-24 08:05:00">2026-10-24</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
