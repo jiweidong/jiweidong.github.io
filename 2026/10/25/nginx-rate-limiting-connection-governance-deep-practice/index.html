@@ -1,0 +1,513 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱前言一个让人印象深刻的故障：有人为了「保护后端」，在大促前给 Nginx 加了： 12limit_req zone&#x3D;api burst&#x3D;5 nodelay;limit_conn addr 2;  结果大促一开始，首页的雪碧图（当时还有 sprite）+ 十几个静态资源请求并发打到同一个 loc">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱前言一个让人印象深刻的故障：有人为了「保护后端」，在大促前给 Nginx 加了： 12limit_req zone&#x3D;api burst&#x3D;5 nodelay;limit_conn addr 2;  结果大促一开始，首页的雪碧图（当时还有 sprite）+ 十几个静态资源请求并发打到同一个 loc">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-25T00:05:00.000Z">
+<meta property="article:modified_time" content="2026-10-25T00:05:29.596Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Nginx">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="漏桶算法">
+<meta property="article:tag" content="限流">
+<meta property="article:tag" content="高并发">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱",
+  "url": "https://jiweidong.github.io/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-25T00:05:00.000Z",
+  "dateModified": "2026-10-25T00:05:29.596Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">822</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">923</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-25T00:05:00.000Z" title="发表于 2026-10-25 08:05:00">2026-10-25</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-25T00:05:29.596Z" title="更新于 2026-10-25 08:05:29">2026-10-25</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Nginx-实战】限流与连接治理深度实战：limit-req、limit-conn-与集群限流的精度陷阱"><a href="#【Nginx-实战】限流与连接治理深度实战：limit-req、limit-conn-与集群限流的精度陷阱" class="headerlink" title="【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱"></a>【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>一个让人印象深刻的故障：有人为了「保护后端」，在大促前给 Nginx 加了：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">limit_req</span> zone=api burst=<span class="number">5</span> nodelay;</span><br><span class="line"><span class="attribute">limit_conn</span> addr <span class="number">2</span>;</span><br></pre></td></tr></table></figure>
+
+<p>结果大促一开始，首页的雪碧图（当时还有 sprite）+ 十几个静态资源请求并发打到同一个 <code>location</code>，<code>limit_conn addr 2</code> 直接把正常用户的图片请求全拒了。监控上是「429 激增」，用户看到的是「页面空白」。</p>
+<p>限流参数从来不是「加上就安全」，而是<strong>必须回答三个问题</strong>：限谁（key 是什么）、限多严（rate + burst）、超了怎么办（拒绝 &#x2F; 排队 &#x2F; 降级）。</p>
+<p>这篇文章讲 Nginx 两把限流武器（<code>limit_req</code> 漏桶、<code>limit_conn</code> 并发连接数）的真实语义、参数之间的数学关系、集群限流的精度陷阱，以及它和 Java 侧（Sentinel）的分工。</p>
+<hr>
+<h2 id="一、limit-req：不是令牌桶，是漏桶"><a href="#一、limit-req：不是令牌桶，是漏桶" class="headerlink" title="一、limit_req：不是令牌桶，是漏桶"></a>一、<code>limit_req</code>：不是令牌桶，是漏桶</h2><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">http</span> &#123;</span><br><span class="line">    <span class="comment"># 定义限流维度：按 IP，10MB 共享内存，每秒 20 个请求</span></span><br><span class="line">    <span class="attribute">limit_req_zone</span> <span class="variable">$binary_remote_addr</span> zone=perip:<span class="number">10m</span> rate=20r/s;</span><br><span class="line">    <span class="comment"># 按域名 + URI（对接口做细粒度限流）</span></span><br><span class="line">    <span class="attribute">limit_req_zone</span> <span class="variable">$server_name</span><span class="variable">$uri</span> zone=perapi:<span class="number">20m</span> rate=100r/s;</span><br><span class="line"></span><br><span class="line">    <span class="section">server</span> &#123;</span><br><span class="line">        <span class="section">location</span> /api/order/ &#123;</span><br><span class="line">            <span class="attribute">limit_req</span> zone=perapi burst=<span class="number">20</span> nodelay;</span><br><span class="line">            <span class="attribute">limit_req_status</span> <span class="number">429</span>;</span><br><span class="line">            <span class="attribute">proxy_pass</span> http://order_service;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-1-语义：漏桶（leaky-bucket）"><a href="#1-1-语义：漏桶（leaky-bucket）" class="headerlink" title="1.1 语义：漏桶（leaky bucket）"></a>1.1 语义：漏桶（leaky bucket）</h3><ul>
+<li><code>rate=20r/s</code>：<strong>平均速率</strong>，即每 50ms 放行一个请求。</li>
+<li><code>burst=20</code>：桶的容量（允许的突发量）。</li>
+<li><code>nodelay</code>：突发部分<strong>立即放行</strong>而不是排队等待。</li>
+</ul>
+<p>不加 <code>nodelay</code> 时，超出的请求会<strong>在桶里排队</strong>（每个请求等 <code>1/rate</code> 的倍数），客户端体感是延迟变高而不是被拒绝。加了 <code>nodelay</code>，突发请求一次性放行，之后的请求按 <code>rate</code> 补充。两种模式的区别：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>行为</th>
+<th>客户端体感</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>burst=20</code>（无 nodelay）</td>
+<td>峰值为 20 的排队，队列满则 503&#x2F;429</td>
+<td>延迟变高，有抖动</td>
+<td>不宜拒绝的场景（内部 API）</td>
+</tr>
+<tr>
+<td><code>burst=20 nodelay</code></td>
+<td>20 个突发立即放行，之后严格按 rate</td>
+<td>突发不受影响，持续高频被拒</td>
+<td>对外 API（推荐）</td>
+</tr>
+<tr>
+<td><code>burst=0</code></td>
+<td>完全不允许突发，严格间隔</td>
+<td>正常用户也会偶发被拒</td>
+<td>❌ 基本不要用</td>
+</tr>
+</tbody></table>
+<p><strong>关键结论：<code>burst=0</code> 是个陷阱。</strong> 因为浏览器的并发请求、TCP 重传、客户端重试都会产生不可预测的微突发，<code>burst=0</code> 会把「正常但稍快」的用户打成 429。经验值：<code>burst ≈ rate × 0.5~2</code>。</p>
+<h3 id="1-2-内存怎么算"><a href="#1-2-内存怎么算" class="headerlink" title="1.2 内存怎么算"></a>1.2 内存怎么算</h3><p><code>limit_req_zone</code> 的共享内存按 <strong>key 的数量</strong> 估算，每个 key 约占 128 字节（64 位系统）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">10MB / 128B ≈ 81,920 个 key</span><br></pre></td></tr></table></figure>
+
+<p>如果用 <code>$binary_remote_addr</code>（IPv4 4 字节），一个 10MB 的 zone 大约能记 8 万个 IP 的限流状态。<strong>超出后 Nginx 会淘汰最久未使用的 key（LRU），限流状态被重置</strong>——这也是「为什么攻击者能绕过限流」的一个原因（IP 池足够大时，把老 IP 的状态挤掉）。</p>
+<h3 id="1-3-一个必须知道的精度问题"><a href="#1-3-一个必须知道的精度问题" class="headerlink" title="1.3 一个必须知道的精度问题"></a>1.3 一个必须知道的精度问题</h3><p><code>limit_req</code> 的桶是<strong>按毫秒级补充</strong>的（内部是 <code>excess</code> 计数 + 时间差衰减），不是「每秒清零计数器」。所以：</p>
+<ul>
+<li>它<strong>不是固定窗口</strong>，不会有「59.999s 打满 + 60.001s 再打满」的双倍突发问题；</li>
+<li>但它也<strong>不是严格的令牌桶</strong>，<code>nodelay</code> 下允许「瞬间 burst + 持续 rate」的组合突刺。</li>
+</ul>
+<p>如果你的业务要求「每秒绝对不超过 100 次」，<code>limit_req</code> 做不到严格保证（它允许 100 + burst 的瞬时峰值）。严格硬限流要靠 Java 侧的滑动窗口（Sentinel）或 Redis 计数器。</p>
+<h3 id="1-4-返回值：429-还是-503"><a href="#1-4-返回值：429-还是-503" class="headerlink" title="1.4 返回值：429 还是 503"></a>1.4 返回值：429 还是 503</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">limit_req_status</span> <span class="number">429</span>;   <span class="comment"># 默认是 503</span></span><br><span class="line"><span class="attribute">limit_conn_status</span> <span class="number">429</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>一定要改成 429。</strong> 503 会被客户端和监控理解成「服务不可用」，触发熔断&#x2F;告警风暴；429（Too Many Requests）语义正确，且 <code>Retry-After</code> 头可以告诉客户端什么时候重试。</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">limit_req_status</span> <span class="number">429</span>;</span><br><span class="line"><span class="attribute">add_header</span> Retry-After <span class="number">1</span> always;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、limit-conn：限的是「并发连接数」"><a href="#二、limit-conn：限的是「并发连接数」" class="headerlink" title="二、limit_conn：限的是「并发连接数」"></a>二、<code>limit_conn</code>：限的是「并发连接数」</h2><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">limit_conn_zone</span> <span class="variable">$binary_remote_addr</span> zone=conn_perip:<span class="number">10m</span>;</span><br><span class="line"><span class="attribute">limit_conn_zone</span> <span class="variable">$server_name</span> zone=conn_perserver:<span class="number">10m</span>;</span><br><span class="line"></span><br><span class="line"><span class="section">server</span> &#123;</span><br><span class="line">    <span class="attribute">limit_conn</span> conn_perip <span class="number">20</span>;      <span class="comment"># 单 IP 最多 20 个并发连接</span></span><br><span class="line">    <span class="attribute">limit_conn</span> conn_perserver <span class="number">2000</span>; <span class="comment"># 单 server 最多 2000 个并发连接</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>两者语义完全不同：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>limit_req</code></th>
+<th><code>limit_conn</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>限制对象</td>
+<td>请求速率（req&#x2F;s）</td>
+<td>并发连接数（个）</td>
+</tr>
+<tr>
+<td>算法</td>
+<td>漏桶</td>
+<td>计数器（连接建立 +1，关闭 -1）</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>防刷接口、防爬虫</td>
+<td>防慢速攻击、防长连接占满、保护后端连接池</td>
+</tr>
+<tr>
+<td>副作用</td>
+<td>无（不占连接）</td>
+<td>阻塞在 Nginx 侧，占内存</td>
+</tr>
+</tbody></table>
+<p><strong><code>limit_conn</code> 的真正价值是防「慢速连接攻击」（Slowloris）</strong>：攻击者只发一半的 HTTP 请求头，保持连接不关，就能用几百个连接占满 Nginx 的 <code>worker_connections</code>。<code>limit_req</code> 对这种攻击完全无效（因为它压根没发完整请求）。</p>
+<p>配套的防御：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">client_header_timeout</span> <span class="number">10s</span>;    <span class="comment"># 请求头必须在 10s 内发完</span></span><br><span class="line"><span class="attribute">client_body_timeout</span> <span class="number">10s</span>;      <span class="comment"># 请求体同理</span></span><br><span class="line"><span class="attribute">send_timeout</span> <span class="number">10s</span>;             <span class="comment"># 响应发送超时</span></span><br><span class="line"><span class="attribute">client_max_body_size</span> <span class="number">10m</span>;     <span class="comment"># 防大文件上传打满磁盘</span></span><br></pre></td></tr></table></figure>
+
+<p><strong>但 <code>limit_conn</code> 按 IP 限并发是有代价的</strong>：企业内网、运营商 NAT、公司出口 IP 后面可能有几千人。给 <code>limit_conn</code> 设一个很小的值（比如 2），就是把整个公司墙在外面。这就是前言里那个故障的成因。</p>
+<p>安全取值：<code>limit_conn per IP ≥ 20</code>，并且在 <code>location ~* \.(js|css|png|jpg|woff2)$</code> 这类静态资源上<strong>不要</strong>开（浏览器有 6 个并发连接是标配）。</p>
+<hr>
+<h2 id="三、限流维度怎么选（key-的设计）"><a href="#三、限流维度怎么选（key-的设计）" class="headerlink" title="三、限流维度怎么选（key 的设计）"></a>三、限流维度怎么选（key 的设计）</h2><table>
+<thead>
+<tr>
+<th>key</th>
+<th>表达</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>$binary_remote_addr</code></td>
+<td>客户端 IP</td>
+<td>简单、能挡单机刷</td>
+<td>NAT 误伤；IPv6 需单独考虑</td>
+</tr>
+<tr>
+<td><code>$http_x_forwarded_for</code></td>
+<td>真实客户端 IP（过 CDN 后）</td>
+<td>准确</td>
+<td><strong>可伪造</strong>（除非只信任自家 CDN 的段）</td>
+</tr>
+<tr>
+<td><code>$server_name</code></td>
+<td>域名</td>
+<td>保护后端整体</td>
+<td>粒度太粗</td>
+</tr>
+<tr>
+<td><code>$server_name$uri</code></td>
+<td>域名 + 路径</td>
+<td>可按接口限流</td>
+<td>路径多会导致 zone 内存涨</td>
+</tr>
+<tr>
+<td><code>$http_authorization</code> &#x2F; <code>$cookie_uid</code></td>
+<td>用户维度</td>
+<td>最贴近业务</td>
+<td>需哈希，且未登录用户无法限制</td>
+</tr>
+<tr>
+<td><code>$geoip_country_code</code>（需模块）</td>
+<td>地域</td>
+<td>可做海外&#x2F;国内分离</td>
+<td>需 GeoIP 库</td>
+</tr>
+</tbody></table>
+<p><strong>生产推荐组合（三段式）</strong>：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 第一段：按 IP 粗限，挡脚本刷（宽）</span></span><br><span class="line"><span class="attribute">limit_req_zone</span> <span class="variable">$binary_remote_addr</span> zone=ip:<span class="number">20m</span> rate=50r/s;</span><br><span class="line"><span class="comment"># 第二段：按接口细限，保护热点接口（严）</span></span><br><span class="line"><span class="attribute">limit_req_zone</span> <span class="variable">$server_name</span><span class="variable">$uri</span> zone=api:<span class="number">20m</span> rate=100r/s;</span><br><span class="line"><span class="comment"># 第三段：按用户（已登录）限，做业务级配额（最严）</span></span><br><span class="line"><span class="attribute">map</span> <span class="variable">$http_authorization</span> <span class="variable">$limit_key</span> &#123;</span><br><span class="line">    &quot;&quot;      $binary_remote_addr;      <span class="comment"># 未登录回退到 IP</span></span><br><span class="line">    <span class="attribute">default</span> <span class="variable">$http_authorization</span>;</span><br><span class="line">&#125;</span><br><span class="line"><span class="attribute">limit_req_zone</span> <span class="variable">$limit_key</span> zone=user:<span class="number">20m</span> rate=10r/s;</span><br><span class="line"></span><br><span class="line"><span class="section">server</span> &#123;</span><br><span class="line">    <span class="section">location</span> /api/seckill/ &#123;</span><br><span class="line">        <span class="attribute">limit_req</span> zone=ip burst=<span class="number">20</span> nodelay;</span><br><span class="line">        <span class="attribute">limit_req</span> zone=api burst=<span class="number">10</span> nodelay;</span><br><span class="line">        <span class="attribute">limit_req</span> zone=user burst=<span class="number">5</span> nodelay;</span><br><span class="line">        <span class="attribute">limit_req_status</span> <span class="number">429</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>多个 <code>limit_req</code> 会依次评估，任意一个超限即拒绝</strong>。这形成了「漏斗」：IP 50&#x2F;s → 接口 100&#x2F;s（全站）→ 用户 10&#x2F;s。注意顺序不影响结果，但 Nginx 会为每个 zone 维护独立状态。</p>
+<p><strong><code>$http_x_forwarded_for</code> 的安全用法</strong>：只信任自家 CDN 的 IP 段，用 <code>real_ip</code> 模块还原：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">set_real_ip_from</span> <span class="number">10.0.0.0</span>/<span class="number">8</span>;          <span class="comment"># CDN 回源段</span></span><br><span class="line"><span class="attribute">set_real_ip_from</span> <span class="number">172.16.0.0</span>/<span class="number">12</span>;</span><br><span class="line"><span class="attribute">real_ip_header</span> X-Forwarded-For;</span><br><span class="line"><span class="attribute">real_ip_recursive</span> <span class="literal">on</span>;</span><br></pre></td></tr></table></figure>
+
+<p>否则攻击者直接发一个 <code>X-Forwarded-For: 1.2.3.4</code>，就能无限换 IP 绕过 IP 限流。</p>
+<hr>
+<h2 id="四、集群限流：Nginx-最大的精度陷阱"><a href="#四、集群限流：Nginx-最大的精度陷阱" class="headerlink" title="四、集群限流：Nginx 最大的精度陷阱"></a>四、集群限流：Nginx 最大的精度陷阱</h2><p><code>limit_req_zone</code> 的状态在<strong>每个 Nginx 实例的共享内存里</strong>。有 4 台 Nginx 时：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">rate=100r/s × 4 台 = 实际放行 400r/s</span><br></pre></td></tr></table></figure>
+
+<p>这不是 BUG，是设计。但很多人在做容量规划时按 100r&#x2F;s 算后端能力，结果后端被打 4 倍。</p>
+<h3 id="4-1-三种解法"><a href="#4-1-三种解法" class="headerlink" title="4.1 三种解法"></a>4.1 三种解法</h3><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>精度</th>
+<th>复杂度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单点总和分摊</td>
+<td>中</td>
+<td>低</td>
+<td>每台配 <code>rate/节点数</code>，误差随节点数增大</td>
+</tr>
+<tr>
+<td>OpenResty + Redis</td>
+<td>高</td>
+<td>中</td>
+<td>Lua 脚本里做分布式计数，多一次 Redis RTT</td>
+</tr>
+<tr>
+<td>只做粗限流，精限流交给 Java</td>
+<td>高</td>
+<td>低</td>
+<td><strong>推荐</strong>：Nginx 挡洪水，Sentinel 管配额</td>
+</tr>
+</tbody></table>
+<p><strong>推荐的分层架构</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">L1  CDN / WAF         → 挡 DDoS、地域封禁（百万级 QPS）</span><br><span class="line">L2  Nginx limit_req   → 挡单 IP 刷、慢速攻击（万级 QPS，宽限）</span><br><span class="line">L3  网关 / Sentinel   → 按用户/租户/接口的精确配额（千级 QPS，严限）</span><br><span class="line">L4  业务侧限流         → 数据库连接池、线程池、信号量（最终防线）</span><br></pre></td></tr></table></figure>
+
+<p><strong>L2 的目标不是「精确」，是「把明显异常的流量挡在门外」</strong>，所以给足 burst，宁可漏放不可误杀。<strong>L3 才是真正的配额</strong>，因为它能拿到用户身份、能读实时指标、能做动态调整。</p>
+<h3 id="4-2-如果非要用-Redis-做集群限流"><a href="#4-2-如果非要用-Redis-做集群限流" class="headerlink" title="4.2 如果非要用 Redis 做集群限流"></a>4.2 如果非要用 Redis 做集群限流</h3><figure class="highlight lua"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- OpenResty 侧：滑动窗口计数</span></span><br><span class="line"><span class="keyword">local</span> key = <span class="string">&quot;rl:&quot;</span> .. ngx.var.binary_remote_addr .. <span class="string">&quot;:&quot;</span> .. ngx.var.uri</span><br><span class="line"><span class="keyword">local</span> now = ngx.now()</span><br><span class="line"><span class="keyword">local</span> window = <span class="number">1.0</span>     <span class="comment">-- 1 秒</span></span><br><span class="line"><span class="keyword">local</span> limit = <span class="number">100</span></span><br><span class="line"></span><br><span class="line">redis.call(<span class="string">&#x27;ZREMRANGEBYSCORE&#x27;</span>, key, <span class="number">0</span>, now - window)</span><br><span class="line"><span class="keyword">local</span> count = redis.call(<span class="string">&#x27;ZCARD&#x27;</span>, key)</span><br><span class="line"><span class="keyword">if</span> count &gt;= limit <span class="keyword">then</span></span><br><span class="line">    <span class="keyword">return</span> <span class="number">0</span></span><br><span class="line"><span class="keyword">end</span></span><br><span class="line">redis.call(<span class="string">&#x27;ZADD&#x27;</span>, key, now, now .. <span class="built_in">math</span>.<span class="built_in">random</span>())</span><br><span class="line">redis.call(<span class="string">&#x27;PEXPIRE&#x27;</span>, key, <span class="number">2000</span>)</span><br><span class="line"><span class="keyword">return</span> <span class="number">1</span></span><br></pre></td></tr></table></figure>
+
+<p>代价：每个请求多一次 Redis 往返（+0.3~1ms），且 Redis 成单点。<strong>只有在「限流必须全局精确」的场景（如按 API Key 计费的开放平台）才值得</strong>。</p>
+<hr>
+<h2 id="五、压测验证：怎么确认限流真的生效"><a href="#五、压测验证：怎么确认限流真的生效" class="headerlink" title="五、压测验证：怎么确认限流真的生效"></a>五、压测验证：怎么确认限流真的生效</h2><p>限流配置最怕「看起来配了，其实没生效」。三个验证步骤：</p>
+<h3 id="5-1-单机压测"><a href="#5-1-单机压测" class="headerlink" title="5.1 单机压测"></a>5.1 单机压测</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 用 ab 打 100 并发、1000 个请求，看 429 比例</span></span><br><span class="line">ab -n 1000 -c 100 http://127.0.0.1/api/order/list</span><br><span class="line"></span><br><span class="line"><span class="comment"># 关注这两行</span></span><br><span class="line"><span class="comment"># Non-2xx responses:     823</span></span><br><span class="line"><span class="comment"># Requests per second:   20.15   ← 应该接近 rate 值</span></span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>Requests per second</code> 远大于 <code>rate</code>，说明 zone 没生效（常见原因：<code>limit_req_zone</code> 写在 <code>server</code> 块里——它<strong>只能在 <code>http</code> 块</strong>）。</p>
+<h3 id="5-2-验证-burst-行为"><a href="#5-2-验证-burst-行为" class="headerlink" title="5.2 验证 burst 行为"></a>5.2 验证 burst 行为</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 10 个并发打一次（burst 内，应该全部 200）</span></span><br><span class="line"><span class="built_in">seq</span> 10 | xargs -P10 -I&#123;&#125; curl -s -o /dev/null -w <span class="string">&quot;%&#123;http_code&#125;\n&quot;</span> http://127.0.0.1/api/order/list</span><br><span class="line"></span><br><span class="line"><span class="comment"># 紧接着 30 个并发（超出 burst，应该有 429）</span></span><br><span class="line"><span class="built_in">seq</span> 30 | xargs -P30 -I&#123;&#125; curl -s -o /dev/null -w <span class="string">&quot;%&#123;http_code&#125;\n&quot;</span> http://127.0.0.1/api/order/list</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-看指标"><a href="#5-3-看指标" class="headerlink" title="5.3 看指标"></a>5.3 看指标</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 日志里带上限流状态</span></span><br><span class="line"><span class="attribute">log_format</span> rl <span class="string">&#x27;<span class="variable">$remote_addr</span> &quot;<span class="variable">$request</span>&quot; <span class="variable">$status</span> &#x27;</span></span><br><span class="line">              <span class="string">&#x27;req_limit=<span class="variable">$limit_req_status</span> conn_limit=<span class="variable">$limit_conn_status</span>&#x27;</span>;</span><br><span class="line"><span class="attribute">access_log</span> /var/log/nginx/access.log rl;</span><br></pre></td></tr></table></figure>
+
+<p><code>$limit_req_status</code> 取值：<code>PASSED</code> &#x2F; <code>DELAYED</code> &#x2F; <code>REJECTED</code> &#x2F; <code>BURST</code>。<strong>统计 <code>REJECTED</code> 的占比</strong>是判断「限流是否误伤」的核心指标：</p>
+<ul>
+<li><code>REJECTED &gt; 5%</code>：参数太严，正常用户在被拒；</li>
+<li><code>REJECTED = 0</code> 且 QPS 很高：限流没生效或太松。</li>
+</ul>
+<hr>
+<h2 id="六、Nginx-限流-vs-Java-限流：职责边界"><a href="#六、Nginx-限流-vs-Java-限流：职责边界" class="headerlink" title="六、Nginx 限流 vs Java 限流：职责边界"></a>六、Nginx 限流 vs Java 限流：职责边界</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Nginx <code>limit_req</code></th>
+<th>Sentinel &#x2F; Resilience4j</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>位置</td>
+<td>请求入口，最早</td>
+<td>业务方法&#x2F;接口内</td>
+</tr>
+<tr>
+<td>状态</td>
+<td>单机内存（不共享）</td>
+<td>单机（集群流控需额外组件）</td>
+</tr>
+<tr>
+<td>维度</td>
+<td>IP &#x2F; URI &#x2F; Header</td>
+<td>任意（用户、租户、参数、方法）</td>
+</tr>
+<tr>
+<td>动态调整</td>
+<td>需 reload</td>
+<td>实时（配置中心推送）</td>
+</tr>
+<tr>
+<td>熔断降级</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>资源消耗</td>
+<td>极低（C 实现）</td>
+<td>有（拦截器 + 指标统计）</td>
+</tr>
+<tr>
+<td>误伤成本</td>
+<td>高（拦在业务之前，无法区分用户）</td>
+<td>低（能看到业务上下文）</td>
+</tr>
+</tbody></table>
+<p><strong>分工原则</strong>：</p>
+<ol>
+<li><strong>Nginx 负责「与身份无关」的粗粒度防护</strong>：单 IP 速率、单 IP 并发、URI 级总量、慢速攻击。这些在 Java 侧做，成本高且为时已晚（请求已经占用了 Tomcat 线程）。</li>
+<li><strong>Java 侧负责「与身份&#x2F;业务有关」的精细配额</strong>：用户级、租户级、VIP 豁免、按接口成本的差异化（查询 1 次 &#x3D; 1 单位，导出 1 次 &#x3D; 100 单位）。</li>
+<li><strong>两者都要有</strong>，但不要在两边配同一个阈值——否则调参时会互相干扰，出问题无法定位是哪一层拦的。</li>
+</ol>
+<p>Sentinel 侧的对应实现（按调用方做热点参数限流）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@PostMapping(&quot;/api/order/list&quot;)</span></span><br><span class="line"><span class="meta">@SentinelResource(value = &quot;orderList&quot;, blockHandler = &quot;onBlocked&quot;)</span></span><br><span class="line"><span class="keyword">public</span> Result&lt;List&lt;OrderVO&gt;&gt; <span class="title function_">list</span><span class="params">(<span class="meta">@RequestParam(defaultValue = &quot;1&quot;)</span> <span class="type">int</span> page)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> Result.ok(orderService.list(page));</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> Result&lt;List&lt;OrderVO&gt;&gt; <span class="title function_">onBlocked</span><span class="params">(<span class="type">int</span> page, BlockException ex)</span> &#123;</span><br><span class="line">    <span class="comment">// 返回 429 + Retry-After 语义，而不是笼统的 500</span></span><br><span class="line">    <span class="keyword">return</span> Result.fail(<span class="number">429</span>, <span class="string">&quot;请求过于频繁，请稍后重试&quot;</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 参数级限流：同一个 userId 每秒最多 5 次</span></span><br><span class="line"><span class="type">ParamFlowRule</span> <span class="variable">rule</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ParamFlowRule</span>(<span class="string">&quot;orderList&quot;</span>)</span><br><span class="line">        .setParamIdx(<span class="number">0</span>)</span><br><span class="line">        .setCount(<span class="number">5</span>);</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、四个真实踩坑"><a href="#七、四个真实踩坑" class="headerlink" title="七、四个真实踩坑"></a>七、四个真实踩坑</h2><h3 id="坑-1：limit-req-zone-写错位置"><a href="#坑-1：limit-req-zone-写错位置" class="headerlink" title="坑 1：limit_req_zone 写错位置"></a>坑 1：<code>limit_req_zone</code> 写错位置</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">server</span> &#123;</span><br><span class="line">    <span class="attribute">limit_req_zone</span> <span class="variable">$binary_remote_addr</span> zone=ip:<span class="number">10m</span> rate=20r/s;   <span class="comment"># ❌ 无效！</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>limit_req_zone</code> &#x2F; <code>limit_conn_zone</code> 只能在 <code>http</code> 块。写在 <code>server</code> 里 Nginx <strong>不会报错</strong>（某些版本会忽略），但 zone 不会被创建，<code>limit_req zone=ip</code> 会报 <code>unknown limit_req_zone &quot;ip&quot;</code>——至少这个会启动失败。更隐蔽的是 <code>limit_conn_zone</code> 写了两份，后一份覆盖前一份的共享内存名。</p>
+<h3 id="坑-2：burst-太大等于没限流"><a href="#坑-2：burst-太大等于没限流" class="headerlink" title="坑 2：burst 太大等于没限流"></a>坑 2：<code>burst</code> 太大等于没限流</h3><p><code>rate=20r/s, burst=1000 nodelay</code> 意味着：<strong>瞬间可以放 1000 个请求</strong>。攻击者只要每 50 秒发一波 1000 个请求，就能持续打满后端——平均速率只有 20&#x2F;s，但瞬时是 1000。而 Nginx 的 <code>limit_req</code> 恰恰擅长的是「平均速率」，所以这种配置把它的能力废掉了。</p>
+<p><strong><code>burst</code> 的正确取值：<code>rate × 允许的突刺秒数</code>。</strong> 允许 1 秒突刺就 <code>burst = rate × 1</code>。</p>
+<h3 id="坑-3：限流和重试的叠加放大"><a href="#坑-3：限流和重试的叠加放大" class="headerlink" title="坑 3：限流和重试的叠加放大"></a>坑 3：限流和重试的叠加放大</h3><p>Nginx 返回 429 后，客户端的重试（尤其是移动端的「网络异常自动重试」）会立刻再打一次。如果 429 没有携带 <code>Retry-After</code>，客户端可能立即重试 3 次 → <strong>限流不但没减轻压力，反而放大了 3 倍</strong>。</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">limit_req_status</span> <span class="number">429</span>;</span><br><span class="line"><span class="attribute">add_header</span> Retry-After <span class="number">1</span> always;</span><br><span class="line"><span class="comment"># 并且要求在 Java SDK 侧做「指数退避 + 尊重 Retry-After」</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="坑-4：限流把健康检查也挡住了"><a href="#坑-4：限流把健康检查也挡住了" class="headerlink" title="坑 4：限流把健康检查也挡住了"></a>坑 4：限流把健康检查也挡住了</h3><p>K8s 的 <code>readinessProbe</code> 每 10 秒打一次 <code>/actuator/health</code>，多个副本 + 多次重试后，如果探测路径和业务路径共用一个 <code>location</code>，健康检查会被 429 → <strong>Pod 被判定不健康 → 滚动重启 → 雪崩</strong>。</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> = /actuator/health &#123;</span><br><span class="line">    <span class="attribute">allow</span> <span class="number">10.0.0.0</span>/<span class="number">8</span>;      <span class="comment"># 只允许内网探活</span></span><br><span class="line">    <span class="attribute">deny</span> all;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://app;</span><br><span class="line">    <span class="comment"># 不配 limit_req</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>所有探活&#x2F;内部调用路径必须显式排除在限流之外。</strong></p>
+<hr>
+<h2 id="八、面试追问"><a href="#八、面试追问" class="headerlink" title="八、面试追问"></a>八、面试追问</h2><p><strong>Q1：<code>limit_req</code> 是令牌桶还是漏桶？</strong><br>对外表现为漏桶：请求以固定速率流出，<code>burst</code> 是桶容量。实现上用的是「<code>excess</code> 计数 + 按时间差衰减」，可以理解为「速率限制的漏桶」。它<strong>不是令牌桶</strong>——令牌桶允许「积累令牌后一次性爆发」，Nginx 的 <code>burst + nodelay</code> 效果类似，但实现机制不同。</p>
+<p><strong>Q2：<code>nodelay</code> 到底改变了什么？</strong><br>不加 <code>nodelay</code> 时，超速请求会被<strong>延迟处理</strong>（排队，每个请求等到下一个时间片）；加了之后，<code>burst</code> 范围内的请求<strong>立即放行</strong>，只有超过 <code>burst</code> 的才拒绝。所以 <code>nodelay</code> 是把「延迟」换成了「允许突刺」，不是「取消限流」。</p>
+<p><strong>Q3：4 台 Nginx 想实现全局 100r&#x2F;s 怎么做？</strong><br><code>limit_req_zone</code> 是进程内共享内存，跨机器不共享。三个方案：① 每台配 25r&#x2F;s（简单，但误差大）；② OpenResty + Redis 做分布式计数（精确，但多一次 RTT 且 Redis 成为依赖）；③ Nginx 粗限流 + 网关&#x2F;Java 侧精确限流（推荐）。</p>
+<p><strong>Q4：限流和熔断的区别？</strong><br>限流是<strong>主动的、预防性的</strong>（按预设速率丢请求），目的是「不让系统过载」；熔断是<strong>被动的、反应性的</strong>（观察下游错误率，超过阈值后直接快速失败），目的是「不让故障扩散」。限流看「入口速率」，熔断看「下游健康度」。生产上两者都要，且通常在不同层。</p>
+<p><strong>Q5：为什么 <code>limit_conn</code> 可能比 <code>limit_req</code> 更危险？</strong><br>因为它限制的是<strong>连接</strong>，而连接的分配与「用户身份」无关。NAT 后的大量用户共享 IP、浏览器并发 6 连接、HTTP&#x2F;2 单连接多路复用（此时 <code>limit_conn</code> 反而几乎不生效）——都会导致误伤或失效。<code>limit_req</code> 至少是按请求计数，粒度更细。</p>
+<p><strong>Q6：HTTP&#x2F;2 下 <code>limit_conn</code> 还有意义吗？</strong><br>意义大幅下降。HTTP&#x2F;2 一个 TCP 连接承载所有并发流，<code>limit_conn</code> 按连接数限流基本失效。此时应该用 <code>limit_req</code>（按请求）或者 <code>limit_conn</code> 改按 <code>$server_name</code> 做总量保护。这也是 HTTP&#x2F;2 环境下限流策略必须重新设计的原因。</p>
+<hr>
+<h2 id="九、上线检查清单"><a href="#九、上线检查清单" class="headerlink" title="九、上线检查清单"></a>九、上线检查清单</h2><ul>
+<li><input disabled="" type="checkbox"> <code>limit_req_zone</code> &#x2F; <code>limit_conn_zone</code> 在 <code>http</code> 块，共享内存 ≥ <code>key 数 × 128B</code></li>
+<li><input disabled="" type="checkbox"> <code>burst</code> 与 <code>rate</code> 有明确的数学关系（<code>burst ≈ rate × 允许突刺秒数</code>），不是拍脑袋</li>
+<li><input disabled="" type="checkbox"> <code>limit_req_status</code> &#x2F; <code>limit_conn_status</code> 改成 <strong>429</strong>，并带 <code>Retry-After</code></li>
+<li><input disabled="" type="checkbox"> 静态资源 location <strong>不</strong>开 <code>limit_conn</code>（浏览器并发 6）</li>
+<li><input disabled="" type="checkbox"> 探活路径（<code>/actuator/health</code>）显式排除限流</li>
+<li><input disabled="" type="checkbox"> 三段式 key：IP 粗限 + URI 细限 + 用户精限</li>
+<li><input disabled="" type="checkbox"> <code>X-Forwarded-For</code> 只在信任的 CDN 段使用，配 <code>set_real_ip_from</code></li>
+<li><input disabled="" type="checkbox"> 集群限流做了「总和分摊」或明确交给上层，容量按总放行量算</li>
+<li><input disabled="" type="checkbox"> 日志含 <code>$limit_req_status</code>，监控 <code>REJECTED</code> 占比（&gt;5% 需调参）</li>
+<li><input disabled="" type="checkbox"> 客户端 SDK 尊重 <code>Retry-After</code> 并做指数退避</li>
+<li><input disabled="" type="checkbox"> 压测验证：QPS 收敛到 rate、burst 内全 200、burst 外 429</li>
+</ul>
+<p>限流这件事，配对比配多重要。<strong>限流的目的是「让系统在过载时优雅地降级」，不是「把用户挡在门外」</strong>。当你发现限流误伤的投诉比过载还多时，说明参数该松了——而这个判断，只能靠 <code>REJECTED</code> 指标和业务数据，不能靠感觉。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/">https://jiweidong.github.io/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%B9%B6%E5%8F%91/">高并发</a><a class="post-meta__tags" href="/tags/%E9%99%90%E6%B5%81/">限流</a><a class="post-meta__tags" href="/tags/Nginx/">Nginx</a><a class="post-meta__tags" href="/tags/%E6%BC%8F%E6%A1%B6%E7%AE%97%E6%B3%95/">漏桶算法</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/25/mysql-current-read-locking-scope-deep-practice/" title="【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查前言库存扣减这个场景，把 MySQL 的「读语义」暴露得干干净净： 1234-- 方案 A：先查后改（90% 的人第一版代码）SELECT stock FROM sku WHERE id = 100;-- Java 里判断 stock &gt;= 1UPDATE sku SET stock = stock - 1 WHERE id = 100;  单机测试永远没问题，压测一上就超卖。因为它读的是快照（一致性读），查到的 stock 可能是 5 秒前的值；改的时候也没有「stock &gt;&#x3D; 1」的条件。 修完超卖之后，第二个问题来了：错误地加了 FOR UPDATE 但 WHERE 条件没走索引，锁从「行锁」升级成「表锁」，整个库的写操作全被堵住——这比超卖更致命。 这篇文章讲清楚：两种读语义到底差在哪、FOR UPDATE 的加锁范围由什么决定、库存扣减该选哪个方案、锁等待怎么定位。  一、一致性读 vs 当前读InnoDB 有两种完全不同的读：     一致性读（...</div></div></div></a><a class="pagination-related" href="/2026/10/25/nginx-upstream-load-balancing-keepalive-deep-practice/" title="【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战前言一个很典型的生产事故：Java 服务扩到 8 个实例，QPS 上去了，但 P99 延迟反而从 40ms 涨到 300ms，netstat 一看 TIME_WAIT 上万，Nginx error.log 里零星出现： 1upstream prematurely closed connection while reading response header from upstream  排查半天发现三个配置问题叠在一起：upstream 没开 keepalive、proxy_http_version 还是 1.0、后端 Tomcat 的 keep-alive-timeout 比 Nginx 短。于是每次请求都是「新建 TCP → 后端已经准备关连接 → 撞上关闭窗口」的恶性组合。 这篇把 Nginx upstream 这一层从算法选型 → 长连接池 → 健康检查 → 故障排查串起来，重点讲清楚「配置项之间的相互制约」，而不是罗列指令。  一、负载均衡算法：不是选最花的，是选最匹配的1234567upstr...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/26/distributed-rate-limiting-redis-lua-deep-practice/" title="【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-26</div><div class="info-item-2">【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案</div></div><div class="info-2"><div class="info-item-1">【高并发实战】分布式限流深度实战：Redis + Lua 原子限流与网关级方案面试官：单机限流和分布式限流有什么区别？Redis 限流怎么保证原子性？上一篇文章讲了限流的四种算法（固定窗口、滑动窗口、漏桶、令牌桶），那都是单机视角。生产环境服务是集群部署的——你有 10 个实例，每个实例限 100 QPS，整体就能被冲到 1000 QPS，限流形同虚设。所以必须做分布式限流：把限流状态放到所有实例共享的地方（Redis），让整个集群统一限流。 本文实战讲解分布式限流的完整方案：Redis + Lua 的原子实现、滑动窗口与令牌桶的 Lua 脚本、网关层（Spring Cloud Gateway）限流落地，以及各种方案的对比与坑。 一、为什么必须用 Lua 脚本？1.1 分布式限流的本质矛盾分布式限流的核心操作是”读计数 → 判断 → 写计数”，例如固定窗口： 12INCR key          # 计数 +1if 计数 &gt; 限额: 拒绝  如果是”先 GET 再 INCR”，在高并发下会出现竞态条件：两个请求同时读到计数&#x3D;99，都 INCR 到 100，都放行...</div></div></div></a><a class="pagination-related" href="/2026/10/25/nginx-upstream-load-balancing-keepalive-deep-practice/" title="【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-25</div><div class="info-item-2">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战前言一个很典型的生产事故：Java 服务扩到 8 个实例，QPS 上去了，但 P99 延迟反而从 40ms 涨到 300ms，netstat 一看 TIME_WAIT 上万，Nginx error.log 里零星出现： 1upstream prematurely closed connection while reading response header from upstream  排查半天发现三个配置问题叠在一起：upstream 没开 keepalive、proxy_http_version 还是 1.0、后端 Tomcat 的 keep-alive-timeout 比 Nginx 短。于是每次请求都是「新建 TCP → 后端已经准备关连接 → 撞上关闭窗口」的恶性组合。 这篇把 Nginx upstream 这一层从算法选型 → 长连接池 → 健康检查 → 故障排查串起来，重点讲清楚「配置项之间的相互制约」，而不是罗列指令。  一、负载均衡算法：不是选最花的，是选最匹配的1234567upstr...</div></div></div></a><a class="pagination-related" href="/2026/10/01/kafka-quota-throttling-deep-practice/" title="【Kafka 实战】配额与限流（Quota &amp; Throttling）深度解析：client.id&#x2F;user 配额、动态调整与 Broker 保护"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-01</div><div class="info-item-2">【Kafka 实战】配额与限流（Quota &amp; Throttling）深度解析：client.id&#x2F;user 配额、动态调整与 Broker 保护</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】配额与限流（Quota &amp; Throttling）深度解析：client.id&#x2F;user 配额、动态调整与 Broker 保护面试官：Kafka 集群被一个业务打爆了，你怎么防？这是道非常真实的场景题。答案通常有两层：  外层防御：入口限流、连接数控制、监控告警； 内层防御：Kafka 自身的配额机制（Quota）。  很多人只知道”可以在 server.properties 里配 quota.producer.default“，但说不清楚：配额是按什么维度划分的？超限之后 Kafka 是怎么”慢下来”的？为什么有时候配了配额还是被压垮？ 这篇文章把 Kafka 配额机制从概念到源码实现讲透。 一、为什么需要配额Kafka 是一个多租户的共享集群。同一个集群上，可能同时跑着：  日志采集（高吞吐、低价值）； 订单事件（低吞吐、高价值）； 数据同步（突发批量）。  如果没有隔离，一条”疯狂生产”的链路可以：  打满 broker 的网络带宽，导致其他 topic 的 fetch 超时； 撑爆 page cache，把热数据挤出，抬高所有消费者的...</div></div></div></a><a class="pagination-related" href="/2026/08/16/delay-queue-solutions-deep-dive/" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</div></div><div class="info-2"><div class="info-item-1">延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。 一、什么是延迟队列？普通队列：生产者放入消息，消费者立即消费。延迟队列：消息进入队列后，等待指定时间才被消费者消费。 核心能力：“到点了才执行”。 典型业务场景：    场景 延迟时间 到期动作    订单超时未支付 30 分钟 关闭订单、释放库存   用户下单未评价 7 天 发送提醒   定时发布文章 自定义 自动上架   支付成功通知 5 秒 通知下游   分布式锁续期 30 秒 续期&#x2F;释放   失败重试 递增 重新投递   二、方案一：数据库轮询（最朴素，先被否定）用定时任务（XXL-Job &#x2F; Quart...</div></div></div></a><a class="pagination-related" href="/2026/08/04/java-timing-wheel-algorithm-deep-dive/" title="【中间件原理】时间轮算法（TimingWheel）深度解析：从 Kafka 到 Netty 的延迟任务实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-04</div><div class="info-item-2">【中间件原理】时间轮算法（TimingWheel）深度解析：从 Kafka 到 Netty 的延迟任务实现</div></div><div class="info-2"><div class="info-item-1">【中间件原理】时间轮算法（TimingWheel）深度解析：从 Kafka 到 Netty 的延迟任务实现引子：延迟任务为什么难做？面试官： 假如你要实现一个延迟消息队列——用户下单 30 分钟后未支付就自动关闭订单，你会怎么做？ 候选人： 最简单的方案是用 ScheduledExecutorService.schedule()，或者用一个后台线程定时扫描数据库里的订单表…… 面试官： 那如果订单量是百万级、千万级呢？每 1 秒扫一次全表？延迟精度怎么保证？定时任务线程怎么管理？ 候选人： ……这就引出今天的主角了——时间轮（TimingWheel）算法。 一、传统延迟任务方案的痛点1.1 方案一：定时扫描数据库123456@Scheduled(fixedDelay = 1000)public void scanExpiredOrders() &#123;    // 每 1 秒扫描一次超时未支付订单    List&lt;Order&gt; orders = orderMapper.selectExpiredOrders(now);    orders.forEach(orde...</div></div></div></a><a class="pagination-related" href="/2026/06/24/api-idempotence-design-practice/" title="【高并发设计】接口幂等性方案全解析：从原理到代码实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-24</div><div class="info-item-2">【高并发设计】接口幂等性方案全解析：从原理到代码实战</div></div><div class="info-2"><div class="info-item-1">【高并发设计】接口幂等性方案全解析：从原理到代码实战一、什么是幂等性？ 幂等（Idempotent）：在编程中，一个幂等操作的特点是其任意多次执行所产生的影响均与一次执行的影响相同。  举个生活例子：电梯按钮——按一次电梯到1楼，按十次电梯还是到1楼，结果不会变。这就是幂等。 在分布式系统中，幂等性尤为重要，因为网络不可靠，重试是常态。 为什么需要幂等？   场景 问题 后果    支付接口重试 用户点了两次”支付” 重复扣款   订单创建重试 提交订单超时，自动重试 生成重复订单   MQ 消息重复消费 消费成功但 ACK 失败 重复处理   前端重复提交 用户狂点提交按钮 数据重复    幂等设计是分布式系统的第一道防线。  二、幂等实现方案全景图1234567891011方案对比总览┌─────────────────────────────────────────────────┐│                 幂等方案                          │├───────────────────────────────────────────────...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">822</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">923</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Nginx-%E5%AE%9E%E6%88%98%E3%80%91%E9%99%90%E6%B5%81%E4%B8%8E%E8%BF%9E%E6%8E%A5%E6%B2%BB%E7%90%86%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9Alimit-req%E3%80%81limit-conn-%E4%B8%8E%E9%9B%86%E7%BE%A4%E9%99%90%E6%B5%81%E7%9A%84%E7%B2%BE%E5%BA%A6%E9%99%B7%E9%98%B1"><span class="toc-number">1.</span> <span class="toc-text">【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81limit-req%EF%BC%9A%E4%B8%8D%E6%98%AF%E4%BB%A4%E7%89%8C%E6%A1%B6%EF%BC%8C%E6%98%AF%E6%BC%8F%E6%A1%B6"><span class="toc-number">1.2.</span> <span class="toc-text">一、limit_req：不是令牌桶，是漏桶</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E8%AF%AD%E4%B9%89%EF%BC%9A%E6%BC%8F%E6%A1%B6%EF%BC%88leaky-bucket%EF%BC%89"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 语义：漏桶（leaky bucket）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E5%86%85%E5%AD%98%E6%80%8E%E4%B9%88%E7%AE%97"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 内存怎么算</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E4%B8%80%E4%B8%AA%E5%BF%85%E9%A1%BB%E7%9F%A5%E9%81%93%E7%9A%84%E7%B2%BE%E5%BA%A6%E9%97%AE%E9%A2%98"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 一个必须知道的精度问题</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-4-%E8%BF%94%E5%9B%9E%E5%80%BC%EF%BC%9A429-%E8%BF%98%E6%98%AF-503"><span class="toc-number">1.2.4.</span> <span class="toc-text">1.4 返回值：429 还是 503</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81limit-conn%EF%BC%9A%E9%99%90%E7%9A%84%E6%98%AF%E3%80%8C%E5%B9%B6%E5%8F%91%E8%BF%9E%E6%8E%A5%E6%95%B0%E3%80%8D"><span class="toc-number">1.3.</span> <span class="toc-text">二、limit_conn：限的是「并发连接数」</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E9%99%90%E6%B5%81%E7%BB%B4%E5%BA%A6%E6%80%8E%E4%B9%88%E9%80%89%EF%BC%88key-%E7%9A%84%E8%AE%BE%E8%AE%A1%EF%BC%89"><span class="toc-number">1.4.</span> <span class="toc-text">三、限流维度怎么选（key 的设计）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E9%9B%86%E7%BE%A4%E9%99%90%E6%B5%81%EF%BC%9ANginx-%E6%9C%80%E5%A4%A7%E7%9A%84%E7%B2%BE%E5%BA%A6%E9%99%B7%E9%98%B1"><span class="toc-number">1.5.</span> <span class="toc-text">四、集群限流：Nginx 最大的精度陷阱</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%B8%89%E7%A7%8D%E8%A7%A3%E6%B3%95"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 三种解法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%A6%82%E6%9E%9C%E9%9D%9E%E8%A6%81%E7%94%A8-Redis-%E5%81%9A%E9%9B%86%E7%BE%A4%E9%99%90%E6%B5%81"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 如果非要用 Redis 做集群限流</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%8E%8B%E6%B5%8B%E9%AA%8C%E8%AF%81%EF%BC%9A%E6%80%8E%E4%B9%88%E7%A1%AE%E8%AE%A4%E9%99%90%E6%B5%81%E7%9C%9F%E7%9A%84%E7%94%9F%E6%95%88"><span class="toc-number">1.6.</span> <span class="toc-text">五、压测验证：怎么确认限流真的生效</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%8D%95%E6%9C%BA%E5%8E%8B%E6%B5%8B"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 单机压测</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E9%AA%8C%E8%AF%81-burst-%E8%A1%8C%E4%B8%BA"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 验证 burst 行为</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%9C%8B%E6%8C%87%E6%A0%87"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 看指标</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Nginx-%E9%99%90%E6%B5%81-vs-Java-%E9%99%90%E6%B5%81%EF%BC%9A%E8%81%8C%E8%B4%A3%E8%BE%B9%E7%95%8C"><span class="toc-number">1.7.</span> <span class="toc-text">六、Nginx 限流 vs Java 限流：职责边界</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%9B%9B%E4%B8%AA%E7%9C%9F%E5%AE%9E%E8%B8%A9%E5%9D%91"><span class="toc-number">1.8.</span> <span class="toc-text">七、四个真实踩坑</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-1%EF%BC%9Alimit-req-zone-%E5%86%99%E9%94%99%E4%BD%8D%E7%BD%AE"><span class="toc-number">1.8.1.</span> <span class="toc-text">坑 1：limit_req_zone 写错位置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-2%EF%BC%9Aburst-%E5%A4%AA%E5%A4%A7%E7%AD%89%E4%BA%8E%E6%B2%A1%E9%99%90%E6%B5%81"><span class="toc-number">1.8.2.</span> <span class="toc-text">坑 2：burst 太大等于没限流</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-3%EF%BC%9A%E9%99%90%E6%B5%81%E5%92%8C%E9%87%8D%E8%AF%95%E7%9A%84%E5%8F%A0%E5%8A%A0%E6%94%BE%E5%A4%A7"><span class="toc-number">1.8.3.</span> <span class="toc-text">坑 3：限流和重试的叠加放大</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-4%EF%BC%9A%E9%99%90%E6%B5%81%E6%8A%8A%E5%81%A5%E5%BA%B7%E6%A3%80%E6%9F%A5%E4%B9%9F%E6%8C%A1%E4%BD%8F%E4%BA%86"><span class="toc-number">1.8.4.</span> <span class="toc-text">坑 4：限流把健康检查也挡住了</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E4%B8%8A%E7%BA%BF%E6%A3%80%E6%9F%A5%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、上线检查清单</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/25/llm-fine-tuning-lora-deep-practice/" title="【AI 进阶】大模型微调深度实战：LoRA/QLoRA 原理、数据构造与效果评估">【AI 进阶】大模型微调深度实战：LoRA/QLoRA 原理、数据构造与效果评估</a><time datetime="2026-10-25T00:20:00.000Z" title="发表于 2026-10-25 08:20:00">2026-10-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/25/java-agent-tool-permission-security-deep-practice/" title="【Java AI】Agent 工具权限与沙箱安全深度实战：最小权限、审批流与审计">【Java AI】Agent 工具权限与沙箱安全深度实战：最小权限、审批流与审计</a><time datetime="2026-10-25T00:15:00.000Z" title="发表于 2026-10-25 08:15:00">2026-10-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/25/mysql-current-read-locking-scope-deep-practice/" title="【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查">【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查</a><time datetime="2026-10-25T00:10:00.000Z" title="发表于 2026-10-25 08:10:00">2026-10-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/" title="【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱">【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱</a><time datetime="2026-10-25T00:05:00.000Z" title="发表于 2026-10-25 08:05:00">2026-10-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/25/nginx-upstream-load-balancing-keepalive-deep-practice/" title="【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战</a><time datetime="2026-10-25T00:00:00.000Z" title="发表于 2026-10-25 08:00:00">2026-10-25</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
