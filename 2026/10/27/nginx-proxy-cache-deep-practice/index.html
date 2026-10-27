@@ -1,0 +1,439 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Nginx 实战】proxy_cache 缓存深度实战前言很多团队一提到缓存，第一反应就是 Redis。但在真实的高并发系统里，最便宜、最近、最有效的一层缓存，往往是 Nginx 的 proxy_cache。 它挡在 Tomcat 前面，命中时连 Java 进程都不用碰：一次请求在 Nginx 内部完成磁盘（或内存）读取并直接返回，省掉了内核态到用户态的多次拷贝、省掉了 Spring 的一整条">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/27/nginx-proxy-cache-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Nginx 实战】proxy_cache 缓存深度实战前言很多团队一提到缓存，第一反应就是 Redis。但在真实的高并发系统里，最便宜、最近、最有效的一层缓存，往往是 Nginx 的 proxy_cache。 它挡在 Tomcat 前面，命中时连 Java 进程都不用碰：一次请求在 Nginx 内部完成磁盘（或内存）读取并直接返回，省掉了内核态到用户态的多次拷贝、省掉了 Spring 的一整条">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-27T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-27T00:02:31.031Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Nginx">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="缓存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理",
+  "url": "https://jiweidong.github.io/2026/10/27/nginx-proxy-cache-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-27T00:00:00.000Z",
+  "dateModified": "2026-10-27T00:02:31.031Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/27/nginx-proxy-cache-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">832</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">935</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-27T00:02:31.031Z" title="更新于 2026-10-27 08:02:31">2026-10-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Nginx-实战】proxy-cache-缓存深度实战"><a href="#【Nginx-实战】proxy-cache-缓存深度实战" class="headerlink" title="【Nginx 实战】proxy_cache 缓存深度实战"></a>【Nginx 实战】proxy_cache 缓存深度实战</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>很多团队一提到缓存，第一反应就是 Redis。但在真实的高并发系统里，<strong>最便宜、最近、最有效的一层缓存，往往是 Nginx 的 <code>proxy_cache</code></strong>。</p>
+<p>它挡在 Tomcat 前面，命中时连 Java 进程都不用碰：一次请求在 Nginx 内部完成磁盘（或内存）读取并直接返回，省掉了内核态到用户态的多次拷贝、省掉了 Spring 的一整条 Filter&#x2F;Interceptor&#x2F;AOP 链路，也省掉了数据库连接。</p>
+<p>但 <code>proxy_cache</code> 是典型的「配置五行能跑，生产半年出事故」的组件：缓存键设计不当导致串号、<code>Set-Cookie</code> 被缓存导致用户串登录、<code>proxy_cache_lock</code> 没开导致缓存击穿打爆回源、磁盘 IO 打满导致 Nginx 自己变成瓶颈。</p>
+<p>这篇文章把 <code>proxy_cache</code> 从原理到生产配置讲透，最后给出一套可以直接抄的配置模板和排查手册。</p>
+<hr>
+<h2 id="一、proxy-cache-的工作模型"><a href="#一、proxy-cache-的工作模型" class="headerlink" title="一、proxy_cache 的工作模型"></a>一、proxy_cache 的工作模型</h2><p>先建立一个正确的心理模型。Nginx 的缓存是<strong>反向代理层的响应缓存</strong>，它缓存的是「上游返回的 HTTP 响应」，不是一个 KV 存储。</p>
+<p>一次请求进来，Nginx 的处理顺序是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">客户端 → Nginx</span><br><span class="line">  ├─ 1. 用 proxy_cache_key 计算缓存键</span><br><span class="line">  ├─ 2. 查 cache zone 的元数据（keys zone，内存）</span><br><span class="line">  │     ├─ 命中且未过期 → 直接读缓存文件返回（$upstream_cache_status = HIT）</span><br><span class="line">  │     └─ 未命中 → 进入下一步</span><br><span class="line">  ├─ 3. 判断是否需要加锁（proxy_cache_lock）</span><br><span class="line">  ├─ 4. 回源到 upstream，边接收边写临时文件</span><br><span class="line">  ├─ 5. 响应完成后 rename 成正式缓存文件（原子替换）</span><br><span class="line">  └─ 6. 返回给客户端</span><br></pre></td></tr></table></figure>
+
+<p>这里有两个关键设计必须记住：</p>
+<ol>
+<li><strong>元数据在共享内存（<code>keys_zone</code>），响应体在磁盘。</strong> <code>keys_zone=api_cache:20m</code> 里的 20MB 只存 key 和文件指针，大约能存 8 万个 key（1MB ≈ 8000 个 key，官方经验值），不是存响应体。</li>
+<li><strong>写入是「临时文件 + rename」的原子操作。</strong> 所以并发的读请求不会读到半截文件，这是它能安全用于生产的基础。</li>
+</ol>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_cache_path</span> /data/nginx/cache</span><br><span class="line">                 levels=<span class="number">1</span>:<span class="number">2</span></span><br><span class="line">                 keys_zone=api_cache:<span class="number">50m</span></span><br><span class="line">                 max_size=<span class="number">20g</span></span><br><span class="line">                 inactive=<span class="number">60m</span></span><br><span class="line">                 use_temp_path=<span class="literal">off</span>;</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>含义</th>
+<th>生产建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>levels=1:2</code></td>
+<td>二级目录散列，避免单目录文件过多</td>
+<td>保持 1:2，别用 1:1:1（目录太深 inode 浪费）</td>
+</tr>
+<tr>
+<td><code>keys_zone</code></td>
+<td>元数据共享内存</td>
+<td>每 8000 个 key 约 1MB，按峰值 key 数 × 1.5 预留</td>
+</tr>
+<tr>
+<td><code>max_size</code></td>
+<td>磁盘上限</td>
+<td>独立挂盘，别和日志同盘</td>
+</tr>
+<tr>
+<td><code>inactive</code></td>
+<td>多久没被访问就淘汰</td>
+<td>通常 ≥ 缓存有效期，否则会「刚缓存就被清」</td>
+</tr>
+<tr>
+<td><code>use_temp_path=off</code></td>
+<td>临时文件直接写在缓存目录</td>
+<td><strong>必开</strong>，避免跨文件系统 rename 变成 copy</td>
+</tr>
+</tbody></table>
+<p><code>use_temp_path=off</code> 这一条特别容易漏。默认临时目录在 <code>/var/lib/nginx/tmp</code>，如果它和缓存目录不在同一个文件系统，<code>rename()</code> 会退化成「复制 + 删除」，一个 10MB 的响应就要多写一次磁盘，QPS 一高磁盘直接顶满。</p>
+<hr>
+<h2 id="二、缓存键：90-的线上事故都出在这里"><a href="#二、缓存键：90-的线上事故都出在这里" class="headerlink" title="二、缓存键：90% 的线上事故都出在这里"></a>二、缓存键：90% 的线上事故都出在这里</h2><h3 id="2-1-默认缓存键是危险的"><a href="#2-1-默认缓存键是危险的" class="headerlink" title="2.1 默认缓存键是危险的"></a>2.1 默认缓存键是危险的</h3><p>Nginx 默认的 <code>proxy_cache_key</code> 是 <code>$scheme$proxy_host$request_uri</code>。注意它<strong>不包含</strong> <code>Host</code>、不包含 Cookie、不包含任何请求头。</p>
+<p>这意味着下面两类事故几乎必然发生：</p>
+<ul>
+<li>多域名共用一套 Nginx（<code>server_name a.com b.com</code>），<code>proxy_host</code> 相同 → <strong>A 站内容被 B 站命中</strong>。</li>
+<li>接口按 <code>Authorization</code> 或租户 ID 返回不同数据 → <strong>租户数据串号</strong>，这是安全事故级别的问题。</li>
+</ul>
+<h3 id="2-2-正确的缓存键设计"><a href="#2-2-正确的缓存键设计" class="headerlink" title="2.2 正确的缓存键设计"></a>2.2 正确的缓存键设计</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 公共静态资源：按 host + 完整 URI</span></span><br><span class="line"><span class="attribute">proxy_cache_key</span> <span class="string">&quot;<span class="variable">$scheme</span><span class="variable">$host</span><span class="variable">$request_uri</span>&quot;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 需要区分租户的接口：显式加入业务维度</span></span><br><span class="line"><span class="attribute">proxy_cache_key</span> <span class="string">&quot;<span class="variable">$scheme</span><span class="variable">$host</span><span class="variable">$request_uri</span>|<span class="variable">$http_x_tenant_id</span>|<span class="variable">$cookie_session_hash</span>&quot;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 需要区分设备/语言</span></span><br><span class="line"><span class="attribute">proxy_cache_key</span> <span class="string">&quot;<span class="variable">$scheme</span><span class="variable">$host</span><span class="variable">$request_uri</span>|<span class="variable">$http_accept_language</span>|<span class="variable">$http_user_agent_type</span>&quot;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>设计原则：</p>
+<ol>
+<li><strong>默认全部带上 <code>$host</code></strong>，成本几乎为零。</li>
+<li><strong>只加真正影响响应内容的维度。</strong> 每加一个维度，键空间就乘一次，缓存命中率就掉一截。<code>User-Agent</code> 千万别整串塞进去，先做归一化（移动端&#x2F;PC&#x2F;爬虫）。</li>
+<li><strong>绝对不要把原始 Cookie 整串放进缓存键</strong>，一是键太长（Nginx 变量上限受 <code>large_client_header_buffers</code> 影响），二是会导致「每个用户一份缓存」，等于没缓存。</li>
+<li>敏感维度用哈希：<code>$cookie_session_hash</code> 可以用 <code>map</code> + <code>md5</code> 预先算好。</li>
+</ol>
+<blockquote>
+<p>面试高频追问：<strong>为什么不能把 <code>Authorization</code> 直接放缓存键？</strong> 因为它包含 token 原文，会被写进磁盘文件名（虽然做了 md5，但 key 本身仍在共享内存），而且 token 轮换会导致缓存全量失效。正确做法是把「用户身份」映射成稳定的内部 ID，再作为维度。</p>
+</blockquote>
+<hr>
+<h2 id="三、缓存状态可观测：-upstream-cache-status"><a href="#三、缓存状态可观测：-upstream-cache-status" class="headerlink" title="三、缓存状态可观测：$upstream_cache_status"></a>三、缓存状态可观测：<code>$upstream_cache_status</code></h2><p>不做可观测的缓存等于没有缓存。必须先把状态打到日志里：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">log_format</span> cache_log <span class="string">&#x27;<span class="variable">$remote_addr</span> - <span class="variable">$host</span> &quot;<span class="variable">$request</span>&quot; &#x27;</span></span><br><span class="line">                     <span class="string">&#x27;status=<span class="variable">$status</span> cache=<span class="variable">$upstream_cache_status</span> &#x27;</span></span><br><span class="line">                     <span class="string">&#x27;upstream=<span class="variable">$upstream_addr</span> time=<span class="variable">$request_time</span> &#x27;</span></span><br><span class="line">                     <span class="string">&#x27;urt=<span class="variable">$upstream_response_time</span> bytes=<span class="variable">$body_bytes_sent</span>&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="attribute">access_log</span> /var/log/nginx/cache.log cache_log;</span><br></pre></td></tr></table></figure>
+
+<p><code>$upstream_cache_status</code> 的取值及含义：</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>含义</th>
+<th>是否回源</th>
+<th>需要关注</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>MISS</code></td>
+<td>未命中，正常回源</td>
+<td>是</td>
+<td>命中率低时看这个</td>
+</tr>
+<tr>
+<td><code>HIT</code></td>
+<td>命中</td>
+<td>否</td>
+<td>目标：静态资源 &gt; 95%，接口 60%~85%</td>
+</tr>
+<tr>
+<td><code>EXPIRED</code></td>
+<td>有缓存但已过期，回源</td>
+<td>是</td>
+<td>正常现象，看 TTL 是否合理</td>
+</tr>
+<tr>
+<td><code>STALE</code></td>
+<td>返回了过期缓存（配合 <code>proxy_cache_use_stale</code>）</td>
+<td>否</td>
+<td>说明上游异常，应告警</td>
+</tr>
+<tr>
+<td><code>UPDATING</code></td>
+<td>缓存正在后台更新，返回旧的</td>
+<td>否</td>
+<td>正常，说明 <code>background_update</code> 生效</td>
+</tr>
+<tr>
+<td><code>REVALIDATED</code></td>
+<td>304 协商缓存命中</td>
+<td>是（304）</td>
+<td>正常</td>
+</tr>
+<tr>
+<td><code>BYPASS</code></td>
+<td>被 <code>proxy_cache_bypass</code> 跳过</td>
+<td>是</td>
+<td><strong>异常信号，通常是误配</strong></td>
+</tr>
+</tbody></table>
+<p>线上排查的第一步永远是：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 命中率（按小时）</span></span><br><span class="line">awk <span class="string">&#x27;&#123;for(i=1;i&lt;=NF;i++) if($i ~ /^cache=/) print $i&#125;&#x27;</span> /var/log/nginx/cache.log \</span><br><span class="line">  | <span class="built_in">sort</span> | <span class="built_in">uniq</span> -c | <span class="built_in">sort</span> -rn</span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>BYPASS</code> 占比高，常见原因是 <code>proxy_cache_bypass $cookie_nocache $arg_nocache</code> 这类配置，而某些客户端恰好带了同名参数。</p>
+<hr>
+<h2 id="四、缓存击穿、穿透、雪崩的三道防线"><a href="#四、缓存击穿、穿透、雪崩的三道防线" class="headerlink" title="四、缓存击穿、穿透、雪崩的三道防线"></a>四、缓存击穿、穿透、雪崩的三道防线</h2><h3 id="4-1-击穿：热点-key-过期瞬间并发回源"><a href="#4-1-击穿：热点-key-过期瞬间并发回源" class="headerlink" title="4.1 击穿：热点 key 过期瞬间并发回源"></a>4.1 击穿：热点 key 过期瞬间并发回源</h3><p>这是 Nginx 缓存最经典的坑。一个 QPS 5000 的热点接口，缓存 TTL 60s，在第 60 秒的瞬间，可能有几百个并发请求同时发现缓存失效，同时回源，直接把后端打挂。</p>
+<p><strong>防线一：<code>proxy_cache_lock</code></strong></p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_cache_lock</span> <span class="literal">on</span>;</span><br><span class="line"><span class="attribute">proxy_cache_lock_timeout</span> <span class="number">5s</span>;</span><br><span class="line"><span class="attribute">proxy_cache_lock_age</span> <span class="number">5s</span>;</span><br></pre></td></tr></table></figure>
+
+<p>开启后，同一个缓存键在同一时刻只允许<strong>一个</strong>请求回源，其他请求排队等待，等第一个请求写完后直接用缓存。这是最有效的一招，成本几乎为零。</p>
+<p>注意 <code>proxy_cache_lock_timeout</code> 到期后，等待的请求会「放行」回源（但不会写缓存），所以这个值要略大于你后端 P99 响应时间。</p>
+<p><strong>防线二：<code>proxy_cache_use_stale</code> + 后台更新</strong></p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_cache_use_stale</span> <span class="literal">error</span> timeout updating http_500 http_502 http_503 http_504;</span><br><span class="line"><span class="attribute">proxy_cache_background_update</span> <span class="literal">on</span>;</span><br></pre></td></tr></table></figure>
+
+<p>含义是：当上游报错、超时，或者缓存正在更新时，<strong>返回旧的缓存内容</strong>（<code>STALE</code>）。<code>background_update on</code> 则让「过期后第一个请求」立即返回旧内容，同时在后台异步回源更新。</p>
+<p>这两个配合起来，用户侧几乎感知不到缓存过期，也不会出现「过期瞬间集体卡住」。</p>
+<p><strong>防线三：TTL 打散</strong></p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 用请求参数的哈希做 ±10% 抖动</span></span><br><span class="line"><span class="attribute">set</span> <span class="variable">$ttl_jitter</span> <span class="number">0</span>;</span><br><span class="line"><span class="attribute">proxy_cache_valid</span> <span class="number">200</span> <span class="number">302</span> <span class="number">10m</span>;</span><br></pre></td></tr></table></figure>
+
+<p>严格来说 Nginx 原生不支持 TTL 抖动，工程上的做法是让后端在 <code>Cache-Control: max-age</code> 里返回带随机抖动的值，Nginx 用 <code>proxy_cache_valid</code> 不覆盖响应头时可以吃这个值（需要 <code>proxy_ignore_headers</code> 不屏蔽 <code>Cache-Control</code>）。这一点很多文章讲错，务必实测。</p>
+<h3 id="4-2-穿透：查询不存在的数据"><a href="#4-2-穿透：查询不存在的数据" class="headerlink" title="4.2 穿透：查询不存在的数据"></a>4.2 穿透：查询不存在的数据</h3><p>如果接口对「不存在的 ID」也返回 200 + 空结果，且不缓存，那么恶意请求可以用随机 ID 无限打穿缓存。做法是<strong>空结果也缓存，但 TTL 要短</strong>：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">map</span> <span class="variable">$upstream_http_x_cacheable</span> <span class="variable">$cache_empty</span> &#123;</span><br><span class="line">    <span class="attribute">default</span>        <span class="number">0</span>;</span><br><span class="line">    &quot;1&quot;            1;</span><br><span class="line">&#125;</span><br><span class="line"><span class="attribute">proxy_cache_valid</span> <span class="number">404</span> <span class="number">1m</span>;   <span class="comment"># 404 缓存 1 分钟，控制穿透</span></span><br></pre></td></tr></table></figure>
+
+<p>同时在后端做布隆过滤器&#x2F;参数合法性校验，Nginx 这层只做兜底。</p>
+<h3 id="4-3-雪崩：大量-key-同时过期"><a href="#4-3-雪崩：大量-key-同时过期" class="headerlink" title="4.3 雪崩：大量 key 同时过期"></a>4.3 雪崩：大量 key 同时过期</h3><p>除了 TTL 抖动，更根本的手段是<strong>分层</strong>：CDN → Nginx 缓存 → 应用本地缓存（Caffeine）→ Redis → DB。每一层的 TTL 依次递增，即使上层全挂，下层也能顶住。</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>典型 TTL</th>
+<th>容量</th>
+<th>命中耗时</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CDN</td>
+<td>1h~7d</td>
+<td>海量</td>
+<td>10~40ms（边缘）</td>
+</tr>
+<tr>
+<td>Nginx proxy_cache</td>
+<td>1~30min</td>
+<td>受磁盘限制</td>
+<td>0.1~1ms（本地盘）</td>
+</tr>
+<tr>
+<td>Caffeine（JVM 内）</td>
+<td>10s~5min</td>
+<td>受堆限制</td>
+<td>100ns 级</td>
+</tr>
+<tr>
+<td>Redis</td>
+<td>5~60min</td>
+<td>受内存限制</td>
+<td>0.5~2ms</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="五、最容易踩的五个坑"><a href="#五、最容易踩的五个坑" class="headerlink" title="五、最容易踩的五个坑"></a>五、最容易踩的五个坑</h2><h3 id="坑-1：把带-Set-Cookie-的响应缓存了"><a href="#坑-1：把带-Set-Cookie-的响应缓存了" class="headerlink" title="坑 1：把带 Set-Cookie 的响应缓存了"></a>坑 1：把带 <code>Set-Cookie</code> 的响应缓存了</h3><p>Nginx 默认<strong>不缓存</strong>带 <code>Set-Cookie</code> 的响应（因为 <code>proxy_ignore_headers</code> 没开）。但很多人为了「提高命中率」加了：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_ignore_headers</span> Set-Cookie Cache-Control Expires;</span><br></pre></td></tr></table></figure>
+
+<p>这一行是<strong>登录态串号事故的头号元凶</strong>。一旦忽略 <code>Set-Cookie</code>，A 用户的登录响应会被缓存并返回给 B 用户。</p>
+<p>正确做法：<strong>只对明确无状态的接口开缓存</strong>，用独立的 <code>location</code> 隔离，不要全局开。</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> <span class="regexp">~ ^/api/public/</span> &#123;</span><br><span class="line">    <span class="attribute">proxy_cache</span> api_cache;</span><br><span class="line">    <span class="attribute">proxy_cache_key</span> <span class="string">&quot;<span class="variable">$scheme</span><span class="variable">$host</span><span class="variable">$request_uri</span>&quot;</span>;</span><br><span class="line">    <span class="attribute">proxy_cache_valid</span> <span class="number">200</span> <span class="number">5m</span>;</span><br><span class="line">    <span class="attribute">proxy_ignore_headers</span> Set-Cookie;   <span class="comment"># 仅限确定无 Cookie 的公开接口</span></span><br><span class="line">    <span class="attribute">proxy_hide_header</span> Set-Cookie;      <span class="comment"># 并且把 Cookie 从响应里摘掉</span></span><br><span class="line">    <span class="attribute">add_header</span> X-Cache-Status <span class="variable">$upstream_cache_status</span> always;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="section">location</span> /api/ &#123;</span><br><span class="line">    <span class="attribute">proxy_cache</span> <span class="literal">off</span>;                   <span class="comment"># 其余接口一律不缓存</span></span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>add_header ... always</code> 里的 <code>always</code> 很重要，否则 4xx&#x2F;5xx 响应不会带这个头，排查时看不到。</p>
+<h3 id="坑-2：缓存了大文件，磁盘-IO-打满"><a href="#坑-2：缓存了大文件，磁盘-IO-打满" class="headerlink" title="坑 2：缓存了大文件，磁盘 IO 打满"></a>坑 2：缓存了大文件，磁盘 IO 打满</h3><p>视频、Excel 导出、大 PDF 不适合放 <code>proxy_cache</code>（尤其是机械盘）。这类内容应该走对象存储 + CDN。</p>
+<p>判断标准：<strong>单响应 &gt; 1MB 且 QPS &gt; 100</strong>，就不要走 Nginx 磁盘缓存。</p>
+<h3 id="坑-3：Vary-头导致命中率归零"><a href="#坑-3：Vary-头导致命中率归零" class="headerlink" title="坑 3：Vary 头导致命中率归零"></a>坑 3：<code>Vary</code> 头导致命中率归零</h3><p>上游返回 <code>Vary: Accept-Encoding, User-Agent, Cookie</code> 时，Nginx 会按这些头分别缓存。<code>User-Agent</code> 有几千种取值，等于缓存全废。</p>
+<p>处理方式：<code>proxy_ignore_headers Vary;</code>（在你确认内容与这些头无关时），或者在后端收敛 <code>Vary</code>。</p>
+<h3 id="坑-4：缓存目录和日志同盘"><a href="#坑-4：缓存目录和日志同盘" class="headerlink" title="坑 4：缓存目录和日志同盘"></a>坑 4：缓存目录和日志同盘</h3><p>Nginx 的 access log 是追加写，缓存是随机读写。同盘时缓存淘汰产生的大量小文件 IO 会和日志刷盘互相干扰。生产上缓存目录必须独立挂盘，并且优先 SSD。</p>
+<h3 id="坑-5：proxy-cache-valid-覆盖了后端语义"><a href="#坑-5：proxy-cache-valid-覆盖了后端语义" class="headerlink" title="坑 5：proxy_cache_valid 覆盖了后端语义"></a>坑 5：<code>proxy_cache_valid</code> 覆盖了后端语义</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_cache_valid</span> <span class="number">200</span> <span class="number">10m</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这会让<strong>所有 200 响应</strong>都按 10 分钟缓存，包括那些本该 <code>no-store</code> 的响应。正确姿势是让后端用 <code>Cache-Control</code> 表达语义，Nginx 只在后端没给时兜底：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_cache_valid</span> <span class="number">200</span> <span class="number">302</span> <span class="number">10m</span>;</span><br><span class="line"><span class="attribute">proxy_cache_valid</span> <span class="number">404</span> <span class="number">1m</span>;</span><br><span class="line"><span class="attribute">proxy_ignore_headers</span> X-Accel-Expires;   <span class="comment"># 允许后端用 X-Accel-Expires 精细控制</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、完整可抄配置模板"><a href="#六、完整可抄配置模板" class="headerlink" title="六、完整可抄配置模板"></a>六、完整可抄配置模板</h2><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># ---------- http 块 ----------</span></span><br><span class="line"><span class="attribute">proxy_cache_path</span> /data/nginx/cache levels=<span class="number">1</span>:<span class="number">2</span> keys_zone=api_cache:<span class="number">50m</span></span><br><span class="line">                 max_size=<span class="number">20g</span> inactive=<span class="number">60m</span> use_temp_path=<span class="literal">off</span></span><br><span class="line">                 manager_sleep=50ms manager_files=<span class="number">200</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 设备归一化，避免 UA 键空间爆炸</span></span><br><span class="line"><span class="attribute">map</span> <span class="variable">$http_user_agent</span> <span class="variable">$device_type</span> &#123;</span><br><span class="line">    <span class="attribute">default</span>        <span class="string">&quot;pc&quot;</span>;</span><br><span class="line">    ~*<span class="attribute">mobile</span>       <span class="string">&quot;mobile&quot;</span>;</span><br><span class="line">    ~*bot|<span class="attribute">spider</span>   <span class="string">&quot;bot&quot;</span>;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="section">server</span> &#123;</span><br><span class="line">    <span class="attribute">listen</span> <span class="number">80</span>;</span><br><span class="line">    <span class="attribute">server_name</span> api.example.com;</span><br><span class="line"></span><br><span class="line">    <span class="comment"># 公开只读接口：可缓存</span></span><br><span class="line">    <span class="section">location</span> <span class="regexp">~ ^/api/v1/(catalog|config|dict)/</span> &#123;</span><br><span class="line">        <span class="attribute">proxy_cache</span>            api_cache;</span><br><span class="line">        <span class="attribute">proxy_cache_key</span>        <span class="string">&quot;<span class="variable">$scheme</span><span class="variable">$host</span><span class="variable">$request_uri</span>|<span class="variable">$device_type</span>&quot;</span>;</span><br><span class="line">        <span class="attribute">proxy_cache_valid</span>      <span class="number">200</span> <span class="number">302</span> <span class="number">5m</span>;</span><br><span class="line">        <span class="attribute">proxy_cache_valid</span>      <span class="number">404</span> <span class="number">30s</span>;</span><br><span class="line">        <span class="attribute">proxy_cache_lock</span>       <span class="literal">on</span>;</span><br><span class="line">        <span class="attribute">proxy_cache_lock_timeout</span> <span class="number">3s</span>;</span><br><span class="line">        <span class="attribute">proxy_cache_use_stale</span>  <span class="literal">error</span> timeout updating http_500 http_502 http_503 http_504;</span><br><span class="line">        <span class="attribute">proxy_cache_background_update</span> <span class="literal">on</span>;</span><br><span class="line">        <span class="attribute">proxy_cache_revalidate</span> <span class="literal">on</span>;</span><br><span class="line">        <span class="attribute">proxy_ignore_headers</span>   Set-Cookie Vary;</span><br><span class="line">        <span class="attribute">proxy_hide_header</span>      Set-Cookie;</span><br><span class="line"></span><br><span class="line">        <span class="attribute">add_header</span> X-Cache-Status <span class="variable">$upstream_cache_status</span> always;</span><br><span class="line">        <span class="attribute">add_header</span> X-Cache-Key    <span class="variable">$scheme</span><span class="variable">$host</span><span class="variable">$request_uri</span> always;</span><br><span class="line"></span><br><span class="line">        <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment"># 业务接口：一律不缓存</span></span><br><span class="line">    <span class="section">location</span> /api/ &#123;</span><br><span class="line">        <span class="attribute">proxy_cache</span> <span class="literal">off</span>;</span><br><span class="line">        <span class="attribute">proxy_pass</span>  http://backend;</span><br><span class="line">        <span class="attribute">proxy_http_version</span> <span class="number">1</span>.<span class="number">1</span>;</span><br><span class="line">        <span class="attribute">proxy_set_header</span> Connection <span class="string">&quot;&quot;</span>;</span><br><span class="line">        <span class="attribute">proxy_set_header</span> Host <span class="variable">$host</span>;</span><br><span class="line">        <span class="attribute">proxy_set_header</span> X-Real-IP <span class="variable">$remote_addr</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：Nginx 缓存和 Redis 缓存怎么分工？</strong></p>
+<p>Nginx 缓存的是「完整的 HTTP 响应」，属于<strong>边缘缓存</strong>，优势是零业务侵入、命中时延极低（亚毫秒）、不占 JVM 内存；劣势是无法做细粒度失效（只能按 key purge，需要 <code>ngx_cache_purge</code> 模块）、不适合个性化数据。Redis 缓存的是「业务数据片段」，可以做精确失效、可以跨服务共享。</p>
+<p>实践原则：<strong>能缓存在边缘的绝不放到应用层，能放到应用层的绝不打到数据库。</strong></p>
+<p><strong>Q2：<code>proxy_cache_lock</code> 会不会把 Nginx worker 阻塞住？</strong></p>
+<p>不会。Nginx 是事件驱动，等待锁的请求只是挂在等待队列上，worker 继续处理其他连接。但要注意 <code>proxy_cache_lock_timeout</code> 不能设太大，否则大量请求长时间挂起会耗尽 <code>worker_connections</code>。</p>
+<p><strong>Q3：怎么做到「发布后立即刷新缓存」？</strong></p>
+<p>三种方式：① 主动 <code>proxy_cache_purge</code>（需要模块）；② 版本化 URL（<code>?v=20261027</code>），最推荐，天然无失效问题；③ 缩短 TTL + <code>background_update</code>。生产上最稳的是 ②。</p>
+<p><strong>Q4：<code>inactive</code> 和 <code>proxy_cache_valid</code> 有什么区别？</strong></p>
+<p><code>proxy_cache_valid</code> 控制的是「缓存内容的新鲜度」，过期后要回源；<code>inactive</code> 控制的是「多久没被访问就删除」，是淘汰策略。一个缓存项可能已经过期（不再返回 HIT）但仍未被删除（还没到 <code>inactive</code>）。这也是为什么 <code>inactive</code> 应该 ≥ 有效期的原因。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p><code>proxy_cache</code> 的价值在于<strong>用最少的资源挡掉最多的流量</strong>，但它有三个必须守住的底线：</p>
+<ol>
+<li><strong>缓存键必须包含 <code>$host</code> 和所有影响响应的业务维度</strong>，宁少勿滥。</li>
+<li><strong><code>proxy_cache_lock</code> + <code>proxy_cache_use_stale</code> + <code>background_update</code> 是生产必备三件套</strong>，缺一个就会有击穿风险。</li>
+<li><strong>绝不全局 <code>proxy_ignore_headers Set-Cookie</code></strong>，无状态接口必须用独立 location 隔离。</li>
+</ol>
+<p>做到这三点，一个 2 核 4G 的 Nginx 顶上几千 QPS 的读流量完全不是问题，而后端只需要处理真正需要动态计算的那部分请求。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/27/nginx-proxy-cache-deep-practice/">https://jiweidong.github.io/2026/10/27/nginx-proxy-cache-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Nginx/">Nginx</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/%E7%BC%93%E5%AD%98/">缓存</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/" title="【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路</div></div><div class="info-2"><div class="info-item-1">【RabbitMQ 实战】消费端流控深度实战前言RabbitMQ 的「消息堆积」问题，十次里有七次根因不在消费者代码慢，而在消费端的流控参数配错了。 最典型的现象是：队列里堆了 200 万条消息，消费者 8 个线程 CPU 只有 15%，日志显示每条消息处理只要 5ms，但消费速度就是上不去。运维上去一看，prefetch_count 配的是默认值 250，而每个消费者的处理耗时波动极大——一个慢请求就把整个 channel 的窗口占满，其余消息全在客户端内存里排队。 这篇把 RabbitMQ 的四层流控讲清楚：consumer prefetch、channel 级 credit、connection 级阻塞、Broker 内存&#x2F;磁盘告警。然后给出可以直接用的 Spring Boot 配置和压测方法。  一、RabbitMQ 流控的四个层次很多人以为流控只有 prefetch，其实 RabbitMQ 有一套分层机制，从生产者一直管到消费者： 123456789101112131415Producer  │  ① Connection 级阻塞（blocked 状态）  │...</div></div></div></a><a class="pagination-related" href="/2026/10/27/kafka-message-compression-tuning-deep-practice/" title="【Kafka 实战】消息压缩深度实战：lz4/zstd/gzip/snappy 选型、批量参数与 Broker 侧解压陷阱"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Kafka 实战】消息压缩深度实战：lz4/zstd/gzip/snappy 选型、批量参数与 Broker 侧解压陷阱</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】消息压缩深度实战前言Kafka 之所以能用相对廉价的硬件扛住百万级 TPS，压缩是核心功臣之一。但绝大多数团队对压缩的认知停留在「配个 compression.type=lz4 就完事了」，结果经常出现：  配了 lz4，磁盘占用没降反升； 消费端 CPU 打满，追查发现是解压线程成了瓶颈； Broker 侧 compression.type 配成 producer 之外的值，导致所有消息被反复解压再压缩，吞吐直接腰斩； 生产者 batch.size 太小，压缩算法根本没有足够的上下文，压缩率只有个位数。  这篇文章把 Kafka 压缩的层次、算法选型、参数联动、监控指标和生产踩坑完整讲清楚，并给出可运行的 Java 客户端配置。  一、先搞清楚：压缩发生在哪一层Kafka 的压缩是批（RecordBatch）级别的，不是单条消息级别。这一点是理解所有现象的前提。 一条消息从生产到消费，压缩相关动作分布如下： 1234567891011121314Producer  ├─ 消息进入 RecordAccumulator（按 partition 攒批）  ├─ 达...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/24/redis-eviction-policies-deep-dive/" title="【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战</div></div><div class="info-2"><div class="info-item-1">【Redis 原理】Redis 内存淘汰策略（Eviction Policies）深度解析与实战前言Redis 作为内存数据库，其所有数据都存储在内存中。当写入速度超过内存容量时，Redis 必须决定应该删除哪些数据——这就是内存淘汰策略（Eviction Policy）。选错淘汰策略可能导致缓存命中率断崖式下跌、大量请求穿透到数据库，甚至引发雪崩。 很多开发者只知道 allkeys-lru 或 volatile-ttl 这些名字，但面试官一旦追问”Redis 的近似 LRU 和标准 LRU 有什么区别？””LFU 的 counter 是如何衰减的？”，就容易答不上来。 本文将对 Redis 的 8 种淘汰策略进行深度解析，从源码层面揭秘近 LRU&#x2F;LFU 的实现，并通过实战案例帮你做出最佳选择。  一、Redis 内存淘汰机制总览1.1 触发条件当以下条件满足时，Redis 会触发内存淘汰： 12345# 设置最大内存（默认不限制）maxmemory 4gb# 达到 maxmemory 后，Redis 会尝试淘汰数据# 如果无法释放足够内存，写入操作会返回 OOM 错...</div></div></div></a><a class="pagination-related" href="/2026/07/07/java-bitwise-bitset-deep-dive/" title="【Java进阶】Java 位运算与 BitSet 实战：从源码到性能优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-07</div><div class="info-item-2">【Java进阶】Java 位运算与 BitSet 实战：从源码到性能优化</div></div><div class="info-2"><div class="info-item-1">【Java进阶】Java 位运算与 BitSet 实战：从源码到性能优化为什么位运算值得认真学？很多 Java 开发者日常 CRUD 很少用到位运算，觉得它只是面试点缀。但事实上，位运算在高性能编程、权限控制、状态压缩、网络协议解析、布隆过滤器等场景中扮演着不可替代的角色。 一个典型对比： 12345678// 传统做法：4个 boolean 字段boolean flag1, flag2, flag3, flag4;  // 占用 4 字节// 位运算做法：一个 int 搞定int flags = 0;                          // 占用 4 字节，可以存 32 个标志位flags |= 1 &lt;&lt; 0;   // 设置第 1 位flags |= 1 &lt;&lt; 3;   // 设置第 4 位boolean has3 = (flags &amp; (1 &lt;&lt; 2)) != 0;  // 检查第 3 位  位运算为什么快？ 因为 CPU 对位操作是原生支持的，一个时钟周期就能完成，比乘除法快几十倍，比分支跳转更没有预测开销。 本...</div></div></div></a><a class="pagination-related" href="/2026/10/27/kafka-message-compression-tuning-deep-practice/" title="【Kafka 实战】消息压缩深度实战：lz4&#x2F;zstd&#x2F;gzip&#x2F;snappy 选型、批量参数与 Broker 侧解压陷阱"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-27</div><div class="info-item-2">【Kafka 实战】消息压缩深度实战：lz4&#x2F;zstd&#x2F;gzip&#x2F;snappy 选型、批量参数与 Broker 侧解压陷阱</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】消息压缩深度实战前言Kafka 之所以能用相对廉价的硬件扛住百万级 TPS，压缩是核心功臣之一。但绝大多数团队对压缩的认知停留在「配个 compression.type=lz4 就完事了」，结果经常出现：  配了 lz4，磁盘占用没降反升； 消费端 CPU 打满，追查发现是解压线程成了瓶颈； Broker 侧 compression.type 配成 producer 之外的值，导致所有消息被反复解压再压缩，吞吐直接腰斩； 生产者 batch.size 太小，压缩算法根本没有足够的上下文，压缩率只有个位数。  这篇文章把 Kafka 压缩的层次、算法选型、参数联动、监控指标和生产踩坑完整讲清楚，并给出可运行的 Java 客户端配置。  一、先搞清楚：压缩发生在哪一层Kafka 的压缩是批（RecordBatch）级别的，不是单条消息级别。这一点是理解所有现象的前提。 一条消息从生产到消费，压缩相关动作分布如下： 1234567891011121314Producer  ├─ 消息进入 RecordAccumulator（按 partition 攒批）  ├─ 达...</div></div></div></a><a class="pagination-related" href="/2026/10/08/java-csv-parsing-large-file-deep-practice/" title="【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-08</div><div class="info-item-2">【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析</div></div><div class="info-2"><div class="info-item-1">【Java 实战】CSV 大文件解析深度实战：OpenCSV、Commons CSV、流式读取与 RFC 4180 坑位全解析面试官：一个 2GB 的 CSV 上传接口，把服务打挂了 “我们有个对账文件导入功能，客户上传 CSV，我们解析入库。平时文件都几 MB，没问题。上周有个客户传了个 2GB 的，接口直接 OOM，把整个服务搞挂了。代码很简单啊：Files.readAllLines(path) 然后 line.split(&quot;,&quot;)。你打算怎么改？”  这个问题的”标准答案”有三层，而且每一层都有面试官在等着追问：  别把文件读进内存 —— 改成流式逐行处理（BufferedReader &#x2F; readLine）； split(&quot;,&quot;) 根本不是 CSV 解析 —— RFC 4180 里引号、转义、内嵌换行全都会让你解析错； 光流式还不够 —— 入库要批处理、要事务边界、要有上限保护和断点续传。  这篇文章从 RFC 4180 讲到四个主流库的选型、流式架构、内存与并发控制，最后把导出侧的坑也补齐（因为”导入导出”从来是一体的）...</div></div></div></a><a class="pagination-related" href="/2026/08/03/redis-db-cache-consistency-deep-dive/" title="【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-03</div><div class="info-item-2">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 缓存与数据库一致性：双写、延迟双删与 Canal 终极方案面试官：数据更新时，你是怎么保证 Redis 缓存和 MySQL 数据一致性的？这是 Redis 面试的”必考题”，也是生产环境最容易踩坑的地方。很多同学背了”先更新数据库，再删缓存”的口诀，但被追问一句”那并发情况下还有问题吗”就卡住了。今天我们把缓存一致性这个问题从方案到原理到代码彻底讲透。 一、先搞清楚：为什么会有缓存不一致？缓存不一致的根源只有一个：对同一份数据，MySQL 和 Redis 各存了一份，而更新操作不是原子的。  更新 MySQL 成功、更新 Redis 失败 → 不一致； 更新 Redis 成功、更新 MySQL 失败 → 不一致； 两个都成功，但执行顺序不同 → 中间态不一致； 并发读写交叉 → 旧数据覆盖新数据。  要理解各种方案，先看业界标准的四种缓存读写模式：    模式 读 写 特点    Cache Aside（旁路缓存） 读 Miss 后回源 DB 先更新 DB，再删缓存 最常用，简单可控   Read Through 缓存组件负责回源 同 Cache ...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 System.gc() 产生千丝万缕的联系。 本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：  System.gc() 到底做了什么 JVM 在什么情况下会自动触发 GC -XX:+DisableExplicitGC 和其它 GC 相关参数的作用 DirectBuffer 回收与 System.gc() 的关系 如何正确进行 GC 调优   一、System.gc() 调用链全解析1.1 从 Java 代码到 JVM 实现先看一个最简单的调用链： 1234...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">832</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">935</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Nginx-%E5%AE%9E%E6%88%98%E3%80%91proxy-cache-%E7%BC%93%E5%AD%98%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【Nginx 实战】proxy_cache 缓存深度实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81proxy-cache-%E7%9A%84%E5%B7%A5%E4%BD%9C%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.2.</span> <span class="toc-text">一、proxy_cache 的工作模型</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%BC%93%E5%AD%98%E9%94%AE%EF%BC%9A90-%E7%9A%84%E7%BA%BF%E4%B8%8A%E4%BA%8B%E6%95%85%E9%83%BD%E5%87%BA%E5%9C%A8%E8%BF%99%E9%87%8C"><span class="toc-number">1.3.</span> <span class="toc-text">二、缓存键：90% 的线上事故都出在这里</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E9%BB%98%E8%AE%A4%E7%BC%93%E5%AD%98%E9%94%AE%E6%98%AF%E5%8D%B1%E9%99%A9%E7%9A%84"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 默认缓存键是危险的</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E6%AD%A3%E7%A1%AE%E7%9A%84%E7%BC%93%E5%AD%98%E9%94%AE%E8%AE%BE%E8%AE%A1"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 正确的缓存键设计</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E7%BC%93%E5%AD%98%E7%8A%B6%E6%80%81%E5%8F%AF%E8%A7%82%E6%B5%8B%EF%BC%9A-upstream-cache-status"><span class="toc-number">1.4.</span> <span class="toc-text">三、缓存状态可观测：$upstream_cache_status</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E7%BC%93%E5%AD%98%E5%87%BB%E7%A9%BF%E3%80%81%E7%A9%BF%E9%80%8F%E3%80%81%E9%9B%AA%E5%B4%A9%E7%9A%84%E4%B8%89%E9%81%93%E9%98%B2%E7%BA%BF"><span class="toc-number">1.5.</span> <span class="toc-text">四、缓存击穿、穿透、雪崩的三道防线</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%87%BB%E7%A9%BF%EF%BC%9A%E7%83%AD%E7%82%B9-key-%E8%BF%87%E6%9C%9F%E7%9E%AC%E9%97%B4%E5%B9%B6%E5%8F%91%E5%9B%9E%E6%BA%90"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 击穿：热点 key 过期瞬间并发回源</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E7%A9%BF%E9%80%8F%EF%BC%9A%E6%9F%A5%E8%AF%A2%E4%B8%8D%E5%AD%98%E5%9C%A8%E7%9A%84%E6%95%B0%E6%8D%AE"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 穿透：查询不存在的数据</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E9%9B%AA%E5%B4%A9%EF%BC%9A%E5%A4%A7%E9%87%8F-key-%E5%90%8C%E6%97%B6%E8%BF%87%E6%9C%9F"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 雪崩：大量 key 同时过期</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%9C%80%E5%AE%B9%E6%98%93%E8%B8%A9%E7%9A%84%E4%BA%94%E4%B8%AA%E5%9D%91"><span class="toc-number">1.6.</span> <span class="toc-text">五、最容易踩的五个坑</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-1%EF%BC%9A%E6%8A%8A%E5%B8%A6-Set-Cookie-%E7%9A%84%E5%93%8D%E5%BA%94%E7%BC%93%E5%AD%98%E4%BA%86"><span class="toc-number">1.6.1.</span> <span class="toc-text">坑 1：把带 Set-Cookie 的响应缓存了</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-2%EF%BC%9A%E7%BC%93%E5%AD%98%E4%BA%86%E5%A4%A7%E6%96%87%E4%BB%B6%EF%BC%8C%E7%A3%81%E7%9B%98-IO-%E6%89%93%E6%BB%A1"><span class="toc-number">1.6.2.</span> <span class="toc-text">坑 2：缓存了大文件，磁盘 IO 打满</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-3%EF%BC%9AVary-%E5%A4%B4%E5%AF%BC%E8%87%B4%E5%91%BD%E4%B8%AD%E7%8E%87%E5%BD%92%E9%9B%B6"><span class="toc-number">1.6.3.</span> <span class="toc-text">坑 3：Vary 头导致命中率归零</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-4%EF%BC%9A%E7%BC%93%E5%AD%98%E7%9B%AE%E5%BD%95%E5%92%8C%E6%97%A5%E5%BF%97%E5%90%8C%E7%9B%98"><span class="toc-number">1.6.4.</span> <span class="toc-text">坑 4：缓存目录和日志同盘</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-5%EF%BC%9Aproxy-cache-valid-%E8%A6%86%E7%9B%96%E4%BA%86%E5%90%8E%E7%AB%AF%E8%AF%AD%E4%B9%89"><span class="toc-number">1.6.5.</span> <span class="toc-text">坑 5：proxy_cache_valid 覆盖了后端语义</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%AE%8C%E6%95%B4%E5%8F%AF%E6%8A%84%E9%85%8D%E7%BD%AE%E6%A8%A1%E6%9D%BF"><span class="toc-number">1.7.</span> <span class="toc-text">六、完整可抄配置模板</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/agentic-rag-deep-dive/" title="【RAG 进阶】Agentic RAG 深度解析：查询规划、自适应检索与自我纠错">【RAG 进阶】Agentic RAG 深度解析：查询规划、自适应检索与自我纠错</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/java-local-llm-ollama-vllm-deep-practice/" title="【Java AI】本地大模型部署与 Java 调用深度实战：Ollama、vLLM 与 OpenAI 兼容协议">【Java AI】本地大模型部署与 Java 调用深度实战：Ollama、vLLM 与 OpenAI 兼容协议</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/kafka-message-compression-tuning-deep-practice/" title="【Kafka 实战】消息压缩深度实战：lz4/zstd/gzip/snappy 选型、批量参数与 Broker 侧解压陷阱">【Kafka 实战】消息压缩深度实战：lz4/zstd/gzip/snappy 选型、批量参数与 Broker 侧解压陷阱</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/nginx-proxy-cache-deep-practice/" title="【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理">【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/" title="【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路">【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

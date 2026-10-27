@@ -1,0 +1,402 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【RabbitMQ 实战】消费端流控深度实战前言RabbitMQ 的「消息堆积」问题，十次里有七次根因不在消费者代码慢，而在消费端的流控参数配错了。 最典型的现象是：队列里堆了 200 万条消息，消费者 8 个线程 CPU 只有 15%，日志显示每条消息处理只要 5ms，但消费速度就是上不去。运维上去一看，prefetch_count 配的是默认值 250，而每个消费者的处理耗时波动极大——一个慢">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【RabbitMQ 实战】消费端流控深度实战前言RabbitMQ 的「消息堆积」问题，十次里有七次根因不在消费者代码慢，而在消费端的流控参数配错了。 最典型的现象是：队列里堆了 200 万条消息，消费者 8 个线程 CPU 只有 15%，日志显示每条消息处理只要 5ms，但消费速度就是上不去。运维上去一看，prefetch_count 配的是默认值 250，而每个消费者的处理耗时波动极大——一个慢">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-27T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-27T00:03:26.658Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="RabbitMQ">
+<meta property="article:tag" content="流控">
+<meta property="article:tag" content="消息队列">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路",
+  "url": "https://jiweidong.github.io/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-27T00:00:00.000Z",
+  "dateModified": "2026-10-27T00:03:26.658Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">832</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">935</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-27T00:03:26.658Z" title="更新于 2026-10-27 08:03:26">2026-10-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【RabbitMQ-实战】消费端流控深度实战"><a href="#【RabbitMQ-实战】消费端流控深度实战" class="headerlink" title="【RabbitMQ 实战】消费端流控深度实战"></a>【RabbitMQ 实战】消费端流控深度实战</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>RabbitMQ 的「消息堆积」问题，十次里有七次根因不在消费者代码慢，而在<strong>消费端的流控参数配错了</strong>。</p>
+<p>最典型的现象是：队列里堆了 200 万条消息，消费者 8 个线程 CPU 只有 15%，日志显示每条消息处理只要 5ms，但消费速度就是上不去。运维上去一看，<code>prefetch_count</code> 配的是默认值 250，而每个消费者的处理耗时波动极大——一个慢请求就把整个 channel 的窗口占满，其余消息全在客户端内存里排队。</p>
+<p>这篇把 RabbitMQ 的<strong>四层流控</strong>讲清楚：consumer prefetch、channel 级 credit、connection 级阻塞、Broker 内存&#x2F;磁盘告警。然后给出可以直接用的 Spring Boot 配置和压测方法。</p>
+<hr>
+<h2 id="一、RabbitMQ-流控的四个层次"><a href="#一、RabbitMQ-流控的四个层次" class="headerlink" title="一、RabbitMQ 流控的四个层次"></a>一、RabbitMQ 流控的四个层次</h2><p>很多人以为流控只有 <code>prefetch</code>，其实 RabbitMQ 有一套分层机制，从生产者一直管到消费者：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line">Producer</span><br><span class="line">  │  ① Connection 级阻塞（blocked 状态）</span><br><span class="line">  │     触发：Broker 内存/磁盘告警</span><br><span class="line">  ▼</span><br><span class="line">Broker</span><br><span class="line">  │  ② Channel 级 credit flow（内部信用窗口）</span><br><span class="line">  │     触发：队列积压、进程繁忙</span><br><span class="line">  ▼</span><br><span class="line">Queue → Consumer</span><br><span class="line">  │  ③ Consumer prefetch（basic.qos）</span><br><span class="line">  │     触发：unacked 数达到阈值</span><br><span class="line">  ▼</span><br><span class="line">  │  ④ 应用层并发控制（线程池 / 信号量）</span><br><span class="line">  ▼</span><br><span class="line">业务处理</span><br></pre></td></tr></table></figure>
+
+<p>这四层是<strong>串联</strong>关系：任何一层卡住，上游都会跟着停。理解这一点，才能定位「为什么生产者发不进去」和「为什么消费者拉不到」。</p>
+<h3 id="1-1-Connection-级阻塞（最容易被误判）"><a href="#1-1-Connection-级阻塞（最容易被误判）" class="headerlink" title="1.1 Connection 级阻塞（最容易被误判）"></a>1.1 Connection 级阻塞（最容易被误判）</h3><p>当 Broker 的内存使用超过 <code>vm_memory_high_watermark</code>（默认 0.4，即 40% 物理内存），或者磁盘剩余低于 <code>disk_free_limit</code>（默认 50MB），Broker 会：</p>
+<ol>
+<li>停止接收新消息（对开启了 <code>publisher confirms</code> 的生产者，<code>confirm</code> 不再返回）；</li>
+<li>在管理界面把该 connection 标记为 <code>blocked</code>；</li>
+<li>已连接的消费者<strong>仍然可以消费</strong>（这点很重要，说明「阻塞」不是全停）。</li>
+</ol>
+<p>排查命令：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">rabbitmqctl status | grep -A5 <span class="string">&quot;Alarms&quot;</span></span><br><span class="line">rabbitmqctl list_connections name state  | grep blocked</span><br></pre></td></tr></table></figure>
+
+<p>如果是内存告警，还要看是谁占的：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">rabbitmqctl list_queues name messages memory --sort-by memory | <span class="built_in">head</span> -20</span><br></pre></td></tr></table></figure>
+
+<p>很多时候是某个队列堆了几十万条大消息，把内存吃满，然后整条链路被阻塞——<strong>这就是「消费慢 → 堆积 → 内存告警 → 生产者被阻塞 → 业务超时」的完整雪崩链</strong>。</p>
+<h3 id="1-2-Channel-级-credit-flow"><a href="#1-2-Channel-级-credit-flow" class="headerlink" title="1.2 Channel 级 credit flow"></a>1.2 Channel 级 credit flow</h3><p>RabbitMQ 内部对每个 channel 有信用窗口（credit），当 Broker 侧的进程队列积压时，会减少发放给 channel 的 credit，表现为「客户端 send 变慢」。</p>
+<p>这一层是自动的，不用配，但要知道它的存在：当你在客户端看到 <code>send()</code> 耗时从 0.1ms 涨到 20ms，而网络和 CPU 都正常时，大概率是 credit 被收紧了。</p>
+<h3 id="1-3-Consumer-prefetch（本文重点）"><a href="#1-3-Consumer-prefetch（本文重点）" class="headerlink" title="1.3 Consumer prefetch（本文重点）"></a>1.3 Consumer prefetch（本文重点）</h3><p><code>basic.qos(prefetchCount)</code> 定义了「一个 channel 上最多允许多少条消息处于已投递但未 ACK 的状态」。</p>
+<p>关键在于：<strong>prefetch 是 channel 级别的，不是 consumer 级别的</strong>。一个 channel 上如果有 8 个 consumer，共享这 250 个额度。</p>
+<p>而且 RabbitMQ 的投递是「轮询分发」：当窗口满时，Broker 停止给该 channel 投递，<strong>即使某个 consumer 已经空闲</strong>。这就导致经典的「消费者饿死」：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">channel 上 prefetch=250，2 个 consumer</span><br><span class="line">consumer A 拿到 200 条（其中 1 条卡在 30s 的慢查询上）</span><br><span class="line">consumer B 只拿到 50 条，处理完后无事可做</span><br><span class="line">Broker 认为 channel 窗口已满（250 条 unacked），不再投递</span><br><span class="line">→ CPU 利用率只有 12%，队列却在堆积</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-4-应用层并发"><a href="#1-4-应用层并发" class="headerlink" title="1.4 应用层并发"></a>1.4 应用层并发</h3><p>Spring 的 <code>SimpleMessageListenerContainer</code> 用 <code>concurrency</code> 控制 consumer 数量、<code>max-concurrency</code> 控制弹性上限。这一层和 prefetch 是乘数关系，下面会讲怎么配。</p>
+<hr>
+<h2 id="二、prefetch-怎么取值：一个可计算的公式"><a href="#二、prefetch-怎么取值：一个可计算的公式" class="headerlink" title="二、prefetch 怎么取值：一个可计算的公式"></a>二、prefetch 怎么取值：一个可计算的公式</h2><p>网上流传的「prefetch 设 1 最公平」「设 250 是默认值」都是片面的。正确的取值要基于<strong>单个消费者的并发能力 × 处理耗时</strong>。</p>
+<h3 id="2-1-核心公式"><a href="#2-1-核心公式" class="headerlink" title="2.1 核心公式"></a>2.1 核心公式</h3><p>实际并发处理能力：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">有效并发 ≈ min(prefetch × consumerCount, 线程池大小)</span><br></pre></td></tr></table></figure>
+
+<p>而吞吐上限：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">吞吐(条/秒) = 有效并发 / 平均处理耗时(秒)</span><br></pre></td></tr></table></figure>
+
+<p>反过来，给定目标吞吐和平均耗时，可以推出需要的 prefetch：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">prefetch ≈ 目标并发 / consumerCount</span><br><span class="line">目标并发 = 目标吞吐 × 平均处理耗时</span><br></pre></td></tr></table></figure>
+
+<p>举例：目标 2000 条&#x2F;秒，平均处理耗时 50ms，4 个 consumer：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">目标并发 = 2000 × 0.05 = 100</span><br><span class="line">prefetch = 100 / 4 = 25</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-2-但还必须考虑「耗时方差」"><a href="#2-2-但还必须考虑「耗时方差」" class="headerlink" title="2.2 但还必须考虑「耗时方差」"></a>2.2 但还必须考虑「耗时方差」</h3><p>上面是平均值。如果 P99 是平均值的 20 倍（很常见：大部分 50ms，少数 1s），那么：</p>
+<ul>
+<li>prefetch 太小（如 1）→ 消费者经常空等网络往返（每次投递要一次 RTT，约 0.5~2ms），吞吐被 RTT 限制；</li>
+<li>prefetch 太大（如 500）→ 一个慢请求会让大量消息在客户端堆着，一旦消费者崩溃，这些消息全部 requeue，造成「重复消费风暴」。</li>
+</ul>
+<p><strong>经验公式（带方差修正）</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">prefetch = 目标并发 / consumerCount × (1 + P99/平均耗时 × 0.5)</span><br></pre></td></tr></table></figure>
+
+<p>上例中 P99&#x2F;平均 &#x3D; 20，则 prefetch ≈ 25 × 11 &#x3D; 275。这时要再和「内存容忍度」做权衡：每条消息在客户端占用的内存 &#x3D; 消息体大小 + 对象开销（约 200~500 字节），275 条 × 10KB ≈ 2.75MB，完全可接受。</p>
+<h3 id="2-3-不同场景的推荐值"><a href="#2-3-不同场景的推荐值" class="headerlink" title="2.3 不同场景的推荐值"></a>2.3 不同场景的推荐值</h3><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>prefetch</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>消息处理极快（&lt; 1ms，如写缓存）</td>
+<td>100~300</td>
+<td>让窗口足够大以掩盖 RTT</td>
+</tr>
+<tr>
+<td>处理耗时稳定（10~50ms）</td>
+<td>20~50</td>
+<td>平衡吞吐与故障重投递量</td>
+</tr>
+<tr>
+<td>处理耗时波动大（含外部调用）</td>
+<td>1~5 + 提高 consumer 数</td>
+<td>避免慢请求拖死整个 channel</td>
+</tr>
+<tr>
+<td>强顺序 + 单条确认</td>
+<td>1</td>
+<td>保证不并发、不重复</td>
+</tr>
+<tr>
+<td>批量处理（一次拉 N 条）</td>
+<td>N 的整数倍</td>
+<td>避免窗口不足导致批处理断档</td>
+</tr>
+</tbody></table>
+<p><strong>最重要的原则：如果处理耗时不可预测（依赖第三方 API、DB 慢查询），prefetch 一定要小，靠增加 consumer 数来扩吞吐。</strong> 因为 prefetch 大 + 耗时方差大 &#x3D; 内存里堆着一堆「还没开始处理」的消息，这些消息在消费者重启时全部重投，等价于一次流量放大。</p>
+<hr>
+<h2 id="三、批量-ACK：吞吐与可靠性的平衡"><a href="#三、批量-ACK：吞吐与可靠性的平衡" class="headerlink" title="三、批量 ACK：吞吐与可靠性的平衡"></a>三、批量 ACK：吞吐与可靠性的平衡</h2><h3 id="3-1-三种确认方式"><a href="#3-1-三种确认方式" class="headerlink" title="3.1 三种确认方式"></a>3.1 三种确认方式</h3><table>
+<thead>
+<tr>
+<th>方式</th>
+<th>API</th>
+<th>优点</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单条确认</td>
+<td><code>basicAck(deliveryTag, false)</code></td>
+<td>语义精确，重投递量最小</td>
+<td>每条一次网络往返，吞吐受限</td>
+</tr>
+<tr>
+<td>批量确认</td>
+<td><code>basicAck(tag, true)</code></td>
+<td>一次确认多条，吞吐高</td>
+<td>中间的失败消息也会被一并确认（丢失）</td>
+</tr>
+<tr>
+<td>手动不确认</td>
+<td>不调用</td>
+<td>——</td>
+<td>消息永不删除，队列撑爆</td>
+</tr>
+</tbody></table>
+<p><code>multiple=true</code> 的语义是「确认所有 deliveryTag ≤ 该值的消息」。这意味着一批里只要有一条成功，前面的失败消息也会被确认掉。</p>
+<p><strong>正确用法</strong>：批量 ACK 只适用于「整批同质、要么全成要么全败」的场景，且失败时必须先 <code>basicNack(requeue=true)</code> 再抛异常，让整批重来。</p>
+<h3 id="3-2-Spring-Boot-的-ACK-模式"><a href="#3-2-Spring-Boot-的-ACK-模式" class="headerlink" title="3.2 Spring Boot 的 ACK 模式"></a>3.2 Spring Boot 的 ACK 模式</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">rabbitmq:</span></span><br><span class="line">    <span class="attr">listener:</span></span><br><span class="line">      <span class="attr">simple:</span></span><br><span class="line">        <span class="attr">acknowledge-mode:</span> <span class="string">manual</span>        <span class="comment"># NONE / AUTO / MANUAL</span></span><br><span class="line">        <span class="attr">prefetch:</span> <span class="number">20</span></span><br><span class="line">        <span class="attr">concurrency:</span> <span class="number">4</span></span><br><span class="line">        <span class="attr">max-concurrency:</span> <span class="number">16</span></span><br><span class="line">        <span class="attr">batch-size:</span> <span class="number">50</span>                  <span class="comment"># 开启批处理</span></span><br><span class="line">        <span class="attr">receive-timeout:</span> <span class="number">1000</span></span><br><span class="line">        <span class="attr">default-requeue-rejected:</span> <span class="literal">false</span> <span class="comment"># 重要：避免死循环重投</span></span><br></pre></td></tr></table></figure>
+
+<p><code>acknowledge-mode</code> 三选一：</p>
+<ul>
+<li><code>NONE</code>：自动确认，消息一投递就删。<strong>只在能容忍丢消息时用</strong>。</li>
+<li><code>AUTO</code>：Spring 在监听方法正常返回后 ack，抛异常则 nack 并 requeue。<strong>大多数场景用这个</strong>。</li>
+<li><code>MANUAL</code>：自己调 <code>channel.basicAck</code>。适合需要「处理成功但稍后确认」或批处理场景。</li>
+</ul>
+<p>特别注意 <code>default-requeue-rejected: false</code>：默认值是 <code>true</code>，意味着业务异常导致的消息会被<strong>无限重投</strong>，形成「毒消息死循环」，CPU 打满、日志刷爆。生产上必须配成 <code>false</code>，配合死信队列兜底。</p>
+<h3 id="3-3-完整的手动-ACK-示例"><a href="#3-3-完整的手动-ACK-示例" class="headerlink" title="3.3 完整的手动 ACK 示例"></a>3.3 完整的手动 ACK 示例</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">import</span> com.rabbitmq.client.Channel;</span><br><span class="line"><span class="keyword">import</span> org.springframework.amqp.core.Message;</span><br><span class="line"><span class="keyword">import</span> org.springframework.amqp.rabbit.annotation.RabbitListener;</span><br><span class="line"><span class="keyword">import</span> org.springframework.stereotype.Component;</span><br><span class="line"><span class="keyword">import</span> lombok.extern.slf4j.Slf4j;</span><br><span class="line"></span><br><span class="line"><span class="meta">@Slf4j</span></span><br><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderMessageConsumer</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@RabbitListener(</span></span><br><span class="line"><span class="meta">        queues = &quot;order.queue&quot;,</span></span><br><span class="line"><span class="meta">        concurrency = &quot;4&quot;,</span></span><br><span class="line"><span class="meta">        ackMode = &quot;MANUAL&quot;</span></span><br><span class="line"><span class="meta">    )</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onMessage</span><span class="params">(Message message, Channel channel)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">tag</span> <span class="operator">=</span> message.getMessageProperties().getDeliveryTag();</span><br><span class="line">        <span class="type">String</span> <span class="variable">body</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">String</span>(message.getBody());</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            process(body);</span><br><span class="line">            <span class="comment">// 单条确认：multiple=false</span></span><br><span class="line">            channel.basicAck(tag, <span class="literal">false</span>);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (BusinessRejectException e) &#123;</span><br><span class="line">            <span class="comment">// 业务明确拒绝：不重回队列，走死信</span></span><br><span class="line">            log.warn(<span class="string">&quot;reject message, tag=&#123;&#125;, reason=&#123;&#125;&quot;</span>, tag, e.getMessage());</span><br><span class="line">            channel.basicReject(tag, <span class="literal">false</span>);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">            <span class="comment">// 系统异常：重回队列，但要靠 x-delivery-count 限制次数</span></span><br><span class="line">            log.error(<span class="string">&quot;process failed, tag=&#123;&#125;&quot;</span>, tag, e);</span><br><span class="line">            channel.basicNack(tag, <span class="literal">false</span>, <span class="literal">true</span>);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">void</span> <span class="title function_">process</span><span class="params">(String body)</span> &#123;</span><br><span class="line">        <span class="comment">// 业务逻辑</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>注意：<code>basicNack(tag, false, true)</code> 会把消息放回队列<strong>头部</strong>（RabbitMQ 的 requeue 是重新入队到原位置附近），如果失败是确定性的，就会立刻再次投递，形成热循环。必须配合 <code>x-delivery-count</code>（Quorum 队列自带）或自己记录重试次数。</p>
+</blockquote>
+<hr>
+<h2 id="四、消费者扩容的正确姿势"><a href="#四、消费者扩容的正确姿势" class="headerlink" title="四、消费者扩容的正确姿势"></a>四、消费者扩容的正确姿势</h2><h3 id="4-1-先看是不是「假性瓶颈」"><a href="#4-1-先看是不是「假性瓶颈」" class="headerlink" title="4.1 先看是不是「假性瓶颈」"></a>4.1 先看是不是「假性瓶颈」</h3><p>在加机器之前，先确认瓶颈在哪一层：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. 队列积压与消费者数量</span></span><br><span class="line">rabbitmqctl list_queues name messages messages_unacknowledged consumers</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. 消费者详情（含 prefetch）</span></span><br><span class="line">rabbitmqctl list_consumers queue_name channel_pid prefetch_count ack_required</span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. 全局吞吐</span></span><br><span class="line">rabbitmqctl list_queues name message_stats.publish_details.rate \</span><br><span class="line">                        message_stats.deliver_get_details.rate</span><br></pre></td></tr></table></figure>
+
+<p>诊断逻辑：</p>
+<ul>
+<li><code>consumers = 0</code> → 消费者掉线，不是性能问题；</li>
+<li><code>messages_unacknowledged</code> 持续接近 <code>prefetch × consumers</code> → 窗口打满，要么处理慢，要么 prefetch 太小；</li>
+<li><code>messages_unacknowledged</code> 远小于窗口 → 消费者在等消息，瓶颈在上游或队列本身；</li>
+<li>两者都低但队列在涨 → 检查 connection 是否 blocked、是否有内存告警。</li>
+</ul>
+<h3 id="4-2-队列是瓶颈：单队列无法水平扩展"><a href="#4-2-队列是瓶颈：单队列无法水平扩展" class="headerlink" title="4.2 队列是瓶颈：单队列无法水平扩展"></a>4.2 队列是瓶颈：单队列无法水平扩展</h3><p>这是 RabbitMQ 与 Kafka 最大的架构差异：<strong>一个队列的消息只能被一个 consumer 顺序投递（除非用 quorum queue 的多个 consumer，但仍然是同一队列）</strong>。所以：</p>
+<ul>
+<li>单队列的吞吐上限 ≈ 单消费者吞吐 × consumer 数，但受 Broker 单队列进程的调度能力限制；</li>
+<li>要真正水平扩展，必须<strong>分片</strong>：按业务 key 拆成 <code>order.queue.0 ~ order.queue.7</code>，或者用一致性哈希交换机。</li>
+</ul>
+<p>分片带来的问题是「顺序性」和「消费端复杂度」。如果业务需要按 <code>orderId</code> 有序，就用 <code>orderId.hashCode() % N</code> 路由到固定队列——这跟 Kafka 的分区语义是一致的。</p>
+<h3 id="4-3-弹性扩缩容的坑"><a href="#4-3-弹性扩缩容的坑" class="headerlink" title="4.3 弹性扩缩容的坑"></a>4.3 弹性扩缩容的坑</h3><p>Spring 的 <code>max-concurrency</code> 看起来能自动扩容，但它的扩容触发条件是「有消息积压」，缩容是「空闲」。问题是：</p>
+<ul>
+<li>扩容时新建的 consumer 需要重新建立 channel，有 100~500ms 的冷启动；</li>
+<li>缩容时如果还有 unacked 消息，会触发 requeue，造成重复消费。</li>
+</ul>
+<p>所以自动扩缩容要配合<strong>幂等消费</strong>，否则宁可固定 <code>concurrency</code>，用 K8s HPA 按队列长度扩 Pod（Pod 级别扩容更干净）。</p>
+<hr>
+<h2 id="五、生产者侧的配合：publisher-confirms-与批量"><a href="#五、生产者侧的配合：publisher-confirms-与批量" class="headerlink" title="五、生产者侧的配合：publisher confirms 与批量"></a>五、生产者侧的配合：publisher confirms 与批量</h2><p>消费端调优的同时，别忘了生产端：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">rabbitmq:</span></span><br><span class="line">    <span class="attr">publisher-confirm-type:</span> <span class="string">correlated</span>   <span class="comment"># 异步 confirm，带 correlationData</span></span><br><span class="line">    <span class="attr">publisher-returns:</span> <span class="literal">true</span></span><br><span class="line">    <span class="attr">template:</span></span><br><span class="line">      <span class="attr">mandatory:</span> <span class="literal">true</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Bean</span></span><br><span class="line"><span class="keyword">public</span> RabbitTemplate <span class="title function_">rabbitTemplate</span><span class="params">(ConnectionFactory cf)</span> &#123;</span><br><span class="line">    <span class="type">RabbitTemplate</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">RabbitTemplate</span>(cf);</span><br><span class="line">    t.setConfirmCallback((correlation, ack, cause) -&gt; &#123;</span><br><span class="line">        <span class="keyword">if</span> (!ack) &#123;</span><br><span class="line">            log.error(<span class="string">&quot;publish nack, cause=&#123;&#125;&quot;</span>, cause);</span><br><span class="line">            <span class="comment">// 落库补偿或重投</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;);</span><br><span class="line">    t.setReturnsCallback(returned -&gt;</span><br><span class="line">        log.error(<span class="string">&quot;message returned: &#123;&#125;&quot;</span>, returned.getReplyText()));</span><br><span class="line">    <span class="keyword">return</span> t;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意 <code>publisher-confirm-type: correlated</code> 与 <code>simple</code> 的区别：<code>simple</code> 是同步等待，会严重拖慢发送；<code>correlated</code> 是异步回调，生产必须用这个。</p>
+<hr>
+<h2 id="六、五个高频踩坑"><a href="#六、五个高频踩坑" class="headerlink" title="六、五个高频踩坑"></a>六、五个高频踩坑</h2><h3 id="坑-1：prefetch-配了但没生效"><a href="#坑-1：prefetch-配了但没生效" class="headerlink" title="坑 1：prefetch 配了但没生效"></a>坑 1：<code>prefetch</code> 配了但没生效</h3><p>原因通常是：① 用的是 <code>DIRECT</code> 容器而不是 <code>SIMPLE</code>；② 多个 <code>@RabbitListener</code> 共用 channel（不会，Spring 每个 listener 独立 channel）；③ 配在了错误的层级（<code>spring.rabbitmq.listener.direct.prefetch</code> vs <code>simple.prefetch</code>）。</p>
+<p>验证方法：<code>rabbitmqctl list_consumers</code> 看 <code>prefetch_count</code> 是否是你要的值。</p>
+<h3 id="坑-2：消费线程池被耗尽"><a href="#坑-2：消费线程池被耗尽" class="headerlink" title="坑 2：消费线程池被耗尽"></a>坑 2：消费线程池被耗尽</h3><p><code>concurrency=4</code> 只代表 4 个 consumer，但如果业务方法内部用了 <code>@Async</code> 或自定义线程池，实际并发会翻倍。要注意 <code>SimpleMessageListenerContainer</code> 的线程是<strong>专用的</strong>，不要在里面做阻塞 30s 的调用。</p>
+<h3 id="坑-3：requeue-true-导致-CPU-100"><a href="#坑-3：requeue-true-导致-CPU-100" class="headerlink" title="坑 3：requeue=true 导致 CPU 100%"></a>坑 3：<code>requeue=true</code> 导致 CPU 100%</h3><p>毒消息无限重投。解决：<code>default-requeue-rejected: false</code> + 死信队列 + 重试次数上限（用 Quorum 队列的 <code>x-delivery-limit</code>）。</p>
+<h3 id="坑-4：内存告警导致生产者全阻塞"><a href="#坑-4：内存告警导致生产者全阻塞" class="headerlink" title="坑 4：内存告警导致生产者全阻塞"></a>坑 4：内存告警导致生产者全阻塞</h3><p>根本解法是给队列设 <code>x-max-length</code> 或 <code>x-max-length-bytes</code>，溢出时走死信或直接丢弃（看业务）。同时监控 <code>rabbitmq_alarms_memory_used_watermark</code>。</p>
+<h3 id="坑-5：消费者重启后消息「消失」"><a href="#坑-5：消费者重启后消息「消失」" class="headerlink" title="坑 5：消费者重启后消息「消失」"></a>坑 5：消费者重启后消息「消失」</h3><p>如果用了 <code>acknowledge-mode: none</code>，消息在投递瞬间就被删除，消费者崩溃就丢了。这不是 RabbitMQ 的 bug，是配置语义。</p>
+<hr>
+<h2 id="七、面试追问"><a href="#七、面试追问" class="headerlink" title="七、面试追问"></a>七、面试追问</h2><p><strong>Q1：prefetch 是 consumer 级还是 channel 级？</strong></p>
+<p>channel 级。<code>basic.qos</code> 作用于 channel，多个 consumer 共享同一 channel 的额度。Spring 默认为每个 <code>@RabbitListener</code> 创建独立 channel，所以看起来像 consumer 级，但底层语义是 channel。</p>
+<p><strong>Q2：prefetch 设 1 有什么优缺点？</strong></p>
+<p>优点：负载最均匀（每个 consumer 一次只拿一条，处理完才拿下一条），故障时重投递量最小。缺点：吞吐受网络 RTT 限制，每条消息都要一次往返，在高吞吐场景下会浪费大量时间在等待上。适合「处理慢且耗时方差大」的场景。</p>
+<p><strong>Q3：RabbitMQ 能保证消息不丢吗？</strong></p>
+<p>需要三处配合：① 生产者 <code>publisher-confirm</code> + <code>publisher-returns</code>；② 队列和消息持久化（<code>durable=true</code> + <code>delivery_mode=2</code>）；③ 消费者手动 ACK 且处理成功后才确认。三者缺一不可。注意：即使全开，在「ACK 已发出但 Broker 未落盘」的瞬间崩溃仍可能丢，需要业务侧对账兜底。</p>
+<p><strong>Q4：Quorum 队列和经典队列在流控上有什么区别？</strong></p>
+<p>Quorum 队列基于 Raft，写入需要多数派确认，天然支持 <code>x-delivery-limit</code>（投递次数上限）和更好的消息安全性，但吞吐低于经典队列（约 30%~50%）。RabbitMQ 3.13 起官方推荐新业务一律用 Quorum 队列。</p>
+<p><strong>Q5：为什么我的消费者 CPU 很低但消费很慢？</strong></p>
+<p>先查三个地方：① <code>messages_unacknowledged</code> 是否打满 prefetch；② connection 是否 blocked（内存&#x2F;磁盘告警）；③ 是否有大量 <code>basicNack(requeue=true)</code> 造成的重投循环。三者都不是，再看是不是单队列调度瓶颈——此时需要分片。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>RabbitMQ 消费端流控的核心可以浓缩成四句话：</p>
+<ol>
+<li><strong>prefetch 不是越大越好，也不是越小越好</strong>，它应该由「目标并发 ÷ consumer 数 × 方差修正」推出。</li>
+<li><strong>耗时方差大就把 prefetch 调小、consumer 调多</strong>，别让一个慢请求拖死整个 channel。</li>
+<li><strong><code>default-requeue-rejected</code> 必须设 false</strong>，配合死信队列，否则毒消息会打死消费者。</li>
+<li><strong>单队列有吞吐上限</strong>，真正要水平扩展必须分片，而分片要处理顺序性问题。</li>
+</ol>
+<p>把这四点配好，同样的机器通常能把消费吞吐提升 2~3 倍，同时把「消息堆积」的告警频率降一个数量级。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/">https://jiweidong.github.io/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%B6%88%E6%81%AF%E9%98%9F%E5%88%97/">消息队列</a><a class="post-meta__tags" href="/tags/RabbitMQ/">RabbitMQ</a><a class="post-meta__tags" href="/tags/%E6%B5%81%E6%8E%A7/">流控</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/10/27/nginx-proxy-cache-deep-practice/" title="【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】proxy_cache 缓存深度实战前言很多团队一提到缓存，第一反应就是 Redis。但在真实的高并发系统里，最便宜、最近、最有效的一层缓存，往往是 Nginx 的 proxy_cache。 它挡在 Tomcat 前面，命中时连 Java 进程都不用碰：一次请求在 Nginx 内部完成磁盘（或内存）读取并直接返回，省掉了内核态到用户态的多次拷贝、省掉了 Spring 的一整条 Filter&#x2F;Interceptor&#x2F;AOP 链路，也省掉了数据库连接。 但 proxy_cache 是典型的「配置五行能跑，生产半年出事故」的组件：缓存键设计不当导致串号、Set-Cookie 被缓存导致用户串登录、proxy_cache_lock 没开导致缓存击穿打爆回源、磁盘 IO 打满导致 Nginx 自己变成瓶颈。 这篇文章把 proxy_cache 从原理到生产配置讲透，最后给出一套可以直接抄的配置模板和排查手册。  一、proxy_cache 的工作模型先建立一个正确的心理模型。Nginx 的缓存是反向代理层的响应缓存，它缓存的是「上游返回的 HTTP ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/22/spring-boot-rabbitmq-integration-deep-practice/" title="Spring Boot 集成 RabbitMQ 深度实战：从消息模型到死信队列与可靠性投递"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-22</div><div class="info-item-2">Spring Boot 集成 RabbitMQ 深度实战：从消息模型到死信队列与可靠性投递</div></div><div class="info-2"><div class="info-item-1">Spring Boot 集成 RabbitMQ 深度实战：从消息模型到死信队列与可靠性投递面试官：你们项目里 RabbitMQ 是怎么用的？说说 Spring Boot 集成 RabbitMQ 的完整套路很多同学简历上写着”熟练使用 RabbitMQ”，但被问到集成细节就露馅了：交换机类型怎么选？消息丢了怎么办？死信队列怎么配？消费失败重试几次？今天这篇，我们从 Spring Boot 集成的完整链路讲起，把 RabbitMQ 的生产级用法一次讲透。 一、核心概念回顾：交换机、队列、绑定RabbitMQ 的核心模型是 AMQP 协议，它和 Kafka 最大的区别在于引入了 Exchange（交换机） 这一层。生产者不直接发消息到队列，而是发到交换机，由交换机根据 RoutingKey（路由键） 和 Binding（绑定） 规则把消息路由到队列。 四种交换机类型：    类型 路由规则 典型场景    Direct RoutingKey 精确匹配 点对点消息、按级别路由日志   Topic RoutingKey 通配符匹配（* 匹配一个词，# 匹配零个或多个） 按主题分类的灵活路由...</div></div></div></a><a class="pagination-related" href="/2026/10/26/rabbitmq-shovel-federation-cross-dc-deep-practice/" title="【RabbitMQ 实战】Shovel 与 Federation 深度实战：跨机房消息同步与拓扑治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-26</div><div class="info-item-2">【RabbitMQ 实战】Shovel 与 Federation 深度实战：跨机房消息同步与拓扑治理</div></div><div class="info-2"><div class="info-item-1">【RabbitMQ 实战】Shovel 与 Federation 深度实战：跨机房消息同步与拓扑治理前言单机房 RabbitMQ 玩得很顺，一旦业务要求「双机房&#x2F;多地部署」，问题立刻变味：  两个机房各建一个集群，业务消息怎么互通？ 跨机房网络 RTT 30ms、偶尔抖动 2 秒，会不会把生产者堵死？ 同一个队列在两个机房都消费，会不会重复消费、顺序错乱？ 消费者在 B 机房，生产者只往 A 机房发，怎么让消息「流过去」？  很多人第一反应是「把两个机房组成一个大集群」。这是最危险的做法——RabbitMQ 集群依赖 Erlang 分布式通信，要求低延迟、稳定网络，跨机房组集群会频繁触发网络分区（partition），甚至出现脑裂后队列不可用。 正确姿势是集群内高可用 + 集群间消息同步，而 RabbitMQ 官方的两个同步组件就是 Shovel 和 Federation。这篇文章把两者的原理、配置、取舍和生产踩坑讲透。 一、先明确边界：什么该跨机房，什么不该   场景 推荐方案    同城双活，两个机房都要能读写 双集群 + Shovel 双向同步 + 消费端幂等  ...</div></div></div></a><a class="pagination-related" href="/2026/08/16/mq-message-backlog-deep-dive/" title="消息积压排查与治理实战：从消费能力分析到削峰填谷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">消息积压排查与治理实战：从消费能力分析到削峰填谷</div></div><div class="info-2"><div class="info-item-1">消息积压排查与治理实战：从消费能力分析到削峰填谷面试官：线上消息堆积了几百万条，你怎么办？这是消息队列方向最高频的面试题，也是生产环境最让人头秃的故障之一。消息积压意味着业务处理严重滞后：订单状态不更新、通知发不出去、数据对不上账。 面试官想听的绝不是”重启消费者”这种话，而是完整的思路：发现问题 → 定位原因 → 应急止血 → 根治方案。 一、什么是消息积压？危害有多大？积压定义：生产者生产消息的速度 &gt; 消费者消费的速度，消息在 Broker 中越堆越多。 衡量指标：    指标 含义 Kafka RocketMQ    Consumer Lag 消费者落后生产者的消息数 每个分区有 Lag 消费进度落后位点   积压消息数 队列中待消费消息总量 sum(分区Lag) sum(队列Lag)   消费延迟 最新消息到被消费的时间差 秒~小时级 秒~小时级   危害：  业务延迟：订单 30 分钟不发货、优惠券核销不及时，直接损失营收 消息过期：RocketMQ&#x2F;Kafka 有消息保留期，积压太久消息被清理 &#x3D; 数据丢失 下游连锁反应：消费慢 → 下游系...</div></div></div></a><a class="pagination-related" href="/2026/08/16/delay-queue-solutions-deep-dive/" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</div></div><div class="info-2"><div class="info-item-1">延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。 一、什么是延迟队列？普通队列：生产者放入消息，消费者立即消费。延迟队列：消息进入队列后，等待指定时间才被消费者消费。 核心能力：“到点了才执行”。 典型业务场景：    场景 延迟时间 到期动作    订单超时未支付 30 分钟 关闭订单、释放库存   用户下单未评价 7 天 发送提醒   定时发布文章 自定义 自动上架   支付成功通知 5 秒 通知下游   分布式锁续期 30 秒 续期&#x2F;释放   失败重试 递增 重新投递   二、方案一：数据库轮询（最朴素，先被否定）用定时任务（XXL-Job &#x2F; Quart...</div></div></div></a><a class="pagination-related" href="/2026/08/16/distributed-transaction-final-consistency-deep-dive/" title="分布式事务最终一致性实战：本地消息表、事务消息与最大努力通知深度对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">分布式事务最终一致性实战：本地消息表、事务消息与最大努力通知深度对比</div></div><div class="info-2"><div class="info-item-1">分布式事务最终一致性实战：本地消息表、事务消息与最大努力通知深度对比面试官：跨服务调用怎么保证数据一致性？微服务架构下，一个业务往往横跨多个服务、多个数据库。比如”下单”要同时完成：订单库扣减库存、账户库扣减余额、积分库增加积分——任何一个失败，数据就乱了。 强一致方案（2PC&#x2F;XA）在互联网场景基本被抛弃（性能差、协调者单点、阻塞）。真正落地的是最终一致性：允许中间状态不一致，但通过消息、对账等手段保证最终一致。 本文深挖三个最核心的最终一致性方案：本地消息表、事务消息、最大努力通知，讲清原理、代码和选型。 一、先看问题本质1234567// 伪代码：下单同时扣库存@Transactionalpublic void createOrder(Order order) &#123;    orderMapper.insert(order);                    // ① 本地订单    inventoryService.deduct(order.getSkuId());    // ② 远程扣库存    // ② 失败了怎么办？① 已经提交了！&#125...</div></div></div></a><a class="pagination-related" href="/2026/06/11/message-queue-kafka-rabbitmq/" title="消息队列核心原理与实战 — Kafka &amp; RabbitMQ 对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">消息队列核心原理与实战 — Kafka &amp; RabbitMQ 对比</div></div><div class="info-2"><div class="info-item-1">前言消息队列是分布式系统中的关键组件，承担着削峰填谷、异步解耦、流式处理等核心职责。市面上主流的消息中间件中，Kafka 和 RabbitMQ 最具代表性。本文将从原理到实战，系统讲解消息队列的核心知识点。  一、消息队列解决了什么问题？1.1 异步解耦123456789❌ 没有 MQ：下单 → 扣库存 → 发短信 → 发邮件 → 返回（串行等待，耗时 2s+）        每个步骤的延迟是累加的 → 用户体验差        任何一个环节挂掉 → 整个下单失败✅ 有 MQ：下单 → 写入 DB → 发消息到 MQ → 返回（耗时 50ms）            └── MQ ──→ 扣库存服务（异步）                  └──→ 短信服务（异步）                  └──→ 邮件服务（异步）        各消费者独立运行，互不影响  1.2 削峰填谷12345678910流量曲线：请求量 ↑ 3000│  ████████ 2000│  ████████████ 1000│  ████████████████     └──────────...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">832</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">935</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90RabbitMQ-%E5%AE%9E%E6%88%98%E3%80%91%E6%B6%88%E8%B4%B9%E7%AB%AF%E6%B5%81%E6%8E%A7%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【RabbitMQ 实战】消费端流控深度实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81RabbitMQ-%E6%B5%81%E6%8E%A7%E7%9A%84%E5%9B%9B%E4%B8%AA%E5%B1%82%E6%AC%A1"><span class="toc-number">1.2.</span> <span class="toc-text">一、RabbitMQ 流控的四个层次</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-Connection-%E7%BA%A7%E9%98%BB%E5%A1%9E%EF%BC%88%E6%9C%80%E5%AE%B9%E6%98%93%E8%A2%AB%E8%AF%AF%E5%88%A4%EF%BC%89"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 Connection 级阻塞（最容易被误判）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-Channel-%E7%BA%A7-credit-flow"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 Channel 级 credit flow</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-Consumer-prefetch%EF%BC%88%E6%9C%AC%E6%96%87%E9%87%8D%E7%82%B9%EF%BC%89"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 Consumer prefetch（本文重点）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-4-%E5%BA%94%E7%94%A8%E5%B1%82%E5%B9%B6%E5%8F%91"><span class="toc-number">1.2.4.</span> <span class="toc-text">1.4 应用层并发</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81prefetch-%E6%80%8E%E4%B9%88%E5%8F%96%E5%80%BC%EF%BC%9A%E4%B8%80%E4%B8%AA%E5%8F%AF%E8%AE%A1%E7%AE%97%E7%9A%84%E5%85%AC%E5%BC%8F"><span class="toc-number">1.3.</span> <span class="toc-text">二、prefetch 怎么取值：一个可计算的公式</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E6%A0%B8%E5%BF%83%E5%85%AC%E5%BC%8F"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 核心公式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%BD%86%E8%BF%98%E5%BF%85%E9%A1%BB%E8%80%83%E8%99%91%E3%80%8C%E8%80%97%E6%97%B6%E6%96%B9%E5%B7%AE%E3%80%8D"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 但还必须考虑「耗时方差」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E4%B8%8D%E5%90%8C%E5%9C%BA%E6%99%AF%E7%9A%84%E6%8E%A8%E8%8D%90%E5%80%BC"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 不同场景的推荐值</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%89%B9%E9%87%8F-ACK%EF%BC%9A%E5%90%9E%E5%90%90%E4%B8%8E%E5%8F%AF%E9%9D%A0%E6%80%A7%E7%9A%84%E5%B9%B3%E8%A1%A1"><span class="toc-number">1.4.</span> <span class="toc-text">三、批量 ACK：吞吐与可靠性的平衡</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%89%E7%A7%8D%E7%A1%AE%E8%AE%A4%E6%96%B9%E5%BC%8F"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 三种确认方式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-Spring-Boot-%E7%9A%84-ACK-%E6%A8%A1%E5%BC%8F"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 Spring Boot 的 ACK 模式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%AE%8C%E6%95%B4%E7%9A%84%E6%89%8B%E5%8A%A8-ACK-%E7%A4%BA%E4%BE%8B"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 完整的手动 ACK 示例</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%B6%88%E8%B4%B9%E8%80%85%E6%89%A9%E5%AE%B9%E7%9A%84%E6%AD%A3%E7%A1%AE%E5%A7%BF%E5%8A%BF"><span class="toc-number">1.5.</span> <span class="toc-text">四、消费者扩容的正确姿势</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%85%88%E7%9C%8B%E6%98%AF%E4%B8%8D%E6%98%AF%E3%80%8C%E5%81%87%E6%80%A7%E7%93%B6%E9%A2%88%E3%80%8D"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 先看是不是「假性瓶颈」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E9%98%9F%E5%88%97%E6%98%AF%E7%93%B6%E9%A2%88%EF%BC%9A%E5%8D%95%E9%98%9F%E5%88%97%E6%97%A0%E6%B3%95%E6%B0%B4%E5%B9%B3%E6%89%A9%E5%B1%95"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 队列是瓶颈：单队列无法水平扩展</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%BC%B9%E6%80%A7%E6%89%A9%E7%BC%A9%E5%AE%B9%E7%9A%84%E5%9D%91"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 弹性扩缩容的坑</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%94%9F%E4%BA%A7%E8%80%85%E4%BE%A7%E7%9A%84%E9%85%8D%E5%90%88%EF%BC%9Apublisher-confirms-%E4%B8%8E%E6%89%B9%E9%87%8F"><span class="toc-number">1.6.</span> <span class="toc-text">五、生产者侧的配合：publisher confirms 与批量</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BA%94%E4%B8%AA%E9%AB%98%E9%A2%91%E8%B8%A9%E5%9D%91"><span class="toc-number">1.7.</span> <span class="toc-text">六、五个高频踩坑</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-1%EF%BC%9Aprefetch-%E9%85%8D%E4%BA%86%E4%BD%86%E6%B2%A1%E7%94%9F%E6%95%88"><span class="toc-number">1.7.1.</span> <span class="toc-text">坑 1：prefetch 配了但没生效</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-2%EF%BC%9A%E6%B6%88%E8%B4%B9%E7%BA%BF%E7%A8%8B%E6%B1%A0%E8%A2%AB%E8%80%97%E5%B0%BD"><span class="toc-number">1.7.2.</span> <span class="toc-text">坑 2：消费线程池被耗尽</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-3%EF%BC%9Arequeue-true-%E5%AF%BC%E8%87%B4-CPU-100"><span class="toc-number">1.7.3.</span> <span class="toc-text">坑 3：requeue&#x3D;true 导致 CPU 100%</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-4%EF%BC%9A%E5%86%85%E5%AD%98%E5%91%8A%E8%AD%A6%E5%AF%BC%E8%87%B4%E7%94%9F%E4%BA%A7%E8%80%85%E5%85%A8%E9%98%BB%E5%A1%9E"><span class="toc-number">1.7.4.</span> <span class="toc-text">坑 4：内存告警导致生产者全阻塞</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E5%9D%91-5%EF%BC%9A%E6%B6%88%E8%B4%B9%E8%80%85%E9%87%8D%E5%90%AF%E5%90%8E%E6%B6%88%E6%81%AF%E3%80%8C%E6%B6%88%E5%A4%B1%E3%80%8D"><span class="toc-number">1.7.5.</span> <span class="toc-text">坑 5：消费者重启后消息「消失」</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/agentic-rag-deep-dive/" title="【RAG 进阶】Agentic RAG 深度解析：查询规划、自适应检索与自我纠错">【RAG 进阶】Agentic RAG 深度解析：查询规划、自适应检索与自我纠错</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/java-local-llm-ollama-vllm-deep-practice/" title="【Java AI】本地大模型部署与 Java 调用深度实战：Ollama、vLLM 与 OpenAI 兼容协议">【Java AI】本地大模型部署与 Java 调用深度实战：Ollama、vLLM 与 OpenAI 兼容协议</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/kafka-message-compression-tuning-deep-practice/" title="【Kafka 实战】消息压缩深度实战：lz4/zstd/gzip/snappy 选型、批量参数与 Broker 侧解压陷阱">【Kafka 实战】消息压缩深度实战：lz4/zstd/gzip/snappy 选型、批量参数与 Broker 侧解压陷阱</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/nginx-proxy-cache-deep-practice/" title="【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理">【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/27/rabbitmq-consumer-prefetch-flow-control-deep-practice/" title="【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路">【RabbitMQ 实战】消费端流控深度实战：prefetch、批量 ACK 与内存告警链路</a><time datetime="2026-10-27T00:00:00.000Z" title="发表于 2026-10-27 08:00:00">2026-10-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
