@@ -1,0 +1,441 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累前言先说一个真实场景。 某业务库磁盘告警，ibdata1 和 undo 表空间一路涨到 200 多 G，业务写入 TPS 没涨，数据量也没涨。DBA 上去看了一眼： 12SHOW ENGINE INNODB STATUS\G-- History list length 6842137">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累">
+<meta property="og:url" content="https://jiweidong.github.io/2026/10/29/mysql-innodb-purge-history-list-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累前言先说一个真实场景。 某业务库磁盘告警，ibdata1 和 undo 表空间一路涨到 200 多 G，业务写入 TPS 没涨，数据量也没涨。DBA 上去看了一眼： 12SHOW ENGINE INNODB STATUS\G-- History list length 6842137">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-10-29T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-10-29T00:02:43.154Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="InnoDB">
+<meta property="article:tag" content="MVCC">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="undo log">
+<meta property="article:tag" content="长事务">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累",
+  "url": "https://jiweidong.github.io/2026/10/29/mysql-innodb-purge-history-list-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-10-29T00:00:00.000Z",
+  "dateModified": "2026-10-29T00:02:43.154Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/10/29/mysql-innodb-purge-history-list-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">842</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">946</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-10-29T00:00:00.000Z" title="发表于 2026-10-29 08:00:00">2026-10-29</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-10-29T00:02:43.154Z" title="更新于 2026-10-29 08:02:43">2026-10-29</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-底层】InnoDB-Purge-机制深度解析：History-List、undo-版本回收与长事务拖累"><a href="#【MySQL-底层】InnoDB-Purge-机制深度解析：History-List、undo-版本回收与长事务拖累" class="headerlink" title="【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累"></a>【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>先说一个真实场景。</p>
+<p>某业务库磁盘告警，<code>ibdata1</code> 和 undo 表空间一路涨到 200 多 G，业务写入 TPS 没涨，数据量也没涨。DBA 上去看了一眼：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> ENGINE INNODB STATUS\G</span><br><span class="line"><span class="comment">-- History list length 6842137</span></span><br></pre></td></tr></table></figure>
+
+<p>History List Length（下面简称 HLL）六百多万，purge 完全跟不上。再查 <code>information_schema.innodb_trx</code>，发现一个跑了 <strong>9 个小时</strong> 的只读事务——某个报表任务用 <code>REPEATABLE READ</code> 开了一个事务，中间在等外部接口，一直没提交。</p>
+<p>这一个事务，让 InnoDB 不敢回收它之后产生的所有 undo 版本。写入照常进行，undo 只能一直堆，purge 线程空转，磁盘被慢慢吃光。</p>
+<p>这类问题的根因不是”磁盘不够”，而是对 <strong>purge 机制</strong> 没有建立正确的模型。本文把这条链路拆开讲：undo 版本链怎么产生、purge 什么时候能回收、HLL 怎么读、长事务为什么是 purge 的天敌、以及 Java 应用侧怎么把长事务挡在门外。</p>
+<h2 id="一、purge-到底在清理什么"><a href="#一、purge-到底在清理什么" class="headerlink" title="一、purge 到底在清理什么"></a>一、purge 到底在清理什么</h2><p>要理解 purge，先要理解 MVCC 的”版本链”。</p>
+<p>InnoDB 的每行记录都有隐藏列：</p>
+<table>
+<thead>
+<tr>
+<th>隐藏列</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DB_TRX_ID</code></td>
+<td>最后修改这行的事务 ID</td>
+</tr>
+<tr>
+<td><code>DB_ROLL_PTR</code></td>
+<td>指向 undo log 中上一个版本的回滚指针</td>
+</tr>
+<tr>
+<td><code>DB_ROW_ID</code></td>
+<td>无主键时生成的行 ID（有主键则不生成）</td>
+</tr>
+</tbody></table>
+<p>一次 <code>UPDATE</code> 并不是”原地改”，而是：</p>
+<ol>
+<li>把旧值写进 undo log，形成一条 undo record；</li>
+<li>修改当前行，<code>DB_TRX_ID</code> 设为当前事务 ID，<code>DB_ROLL_PTR</code> 指向刚写的 undo record。</li>
+</ol>
+<p>于是同一行的多个历史版本通过 <code>DB_ROLL_PTR</code> 串成一条 <strong>版本链</strong>。快照读（普通 <code>SELECT</code>）根据自己的 ReadView 沿版本链往回找”我能看见的那个版本”。</p>
+<p><strong>关键点来了</strong>：只要还有一个活跃 ReadView 可能读到某个旧版本，这个旧版本就不能删。purge 的职责就是：判断哪些 undo record “已经没有任何 ReadView 需要了”，把它们及其对应的索引记录真正删除，然后释放 undo 空间。</p>
+<blockquote>
+<p>一句话：<strong>purge 不是在清理日志，而是在回收”再也不会被读到”的历史版本。</strong></p>
+</blockquote>
+<h2 id="二、purge-的线程模型"><a href="#二、purge-的线程模型" class="headerlink" title="二、purge 的线程模型"></a>二、purge 的线程模型</h2><p>MySQL 5.7 之后 purge 是”协调者 + 工作者”模型：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">                    ┌──────────────────────────┐</span><br><span class="line">                    │  purge coordinator thread │</span><br><span class="line">                    │  (srv_purge_coordinator)  │</span><br><span class="line">                    └────────────┬─────────────┘</span><br><span class="line">                                 │ 分配任务（按 undo 表空间/回滚段）</span><br><span class="line">      ┌──────────────────────────┼──────────────────────────┐</span><br><span class="line">      ▼                          ▼                          ▼</span><br><span class="line">purge worker 0            purge worker 1            purge worker N</span><br><span class="line">(innodb_purge_threads)    (innodb_purge_threads)    (innodb_purge_threads)</span><br><span class="line">      │                          │                          │</span><br><span class="line">      └──────────► 解析 undo record → 删除标记记录 → 清理二级索引 → 推进 purge view</span><br></pre></td></tr></table></figure>
+
+<p>几个必须记住的参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>默认值</th>
+<th>作用</th>
+<th>调优建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>innodb_purge_threads</code></td>
+<td>4</td>
+<td>purge worker 数量</td>
+<td>写密集且 purge lag 高时可到 8，但别超 CPU 核数一半</td>
+</tr>
+<tr>
+<td><code>innodb_purge_batch_size</code></td>
+<td>300</td>
+<td>每轮处理的 undo 页数</td>
+<td>影响单轮工作量，不是”越大越好”，过大反而拉长单次持锁</td>
+</tr>
+<tr>
+<td><code>innodb_max_purge_lag</code></td>
+<td>0</td>
+<td>HLL 超过该值时给 DML 加延迟</td>
+<td>0 表示不限制；线上建议设一个阈值做自我保护</td>
+</tr>
+<tr>
+<td><code>innodb_max_purge_lag_delay</code></td>
+<td>0</td>
+<td>上述延迟的最大毫秒数</td>
+<td>与上者配合，避免把写入彻底拖死</td>
+</tr>
+<tr>
+<td><code>innodb_undo_log_truncate</code></td>
+<td>ON（8.0）</td>
+<td>允许 truncate undo 表空间</td>
+<td>必须配合独立 undo 表空间才生效</td>
+</tr>
+</tbody></table>
+<h3 id="2-1-为什么-purge-是”分批”而不是”一次清完”"><a href="#2-1-为什么-purge-是”分批”而不是”一次清完”" class="headerlink" title="2.1 为什么 purge 是”分批”而不是”一次清完”"></a>2.1 为什么 purge 是”分批”而不是”一次清完”</h3><p>purge 在清理时需要在 B+ 树里定位并删除记录，会持有短期 latches，也可能产生 redo。如果一次清太多：</p>
+<ul>
+<li>单次持有 latch 时间变长 → 其他 DML 排队；</li>
+<li>一个巨大的 purge 批次可能造成 IO 尖峰；</li>
+<li>崩溃恢复时间变长。</li>
+</ul>
+<p>所以设计成”每轮 300 个 undo 页，处理完让出”，用 <code>innodb_purge_batch_size</code> 控制节奏。这也解释了为什么 HLL 高位时 purge 需要”慢慢追”——它是被刻意限速的。</p>
+<h2 id="三、History-List-Length-怎么读"><a href="#三、History-List-Length-怎么读" class="headerlink" title="三、History List Length 怎么读"></a>三、History List Length 怎么读</h2><p>HLL 是 <code>trx_sys-&gt;rseg_history_len</code>，表示 <strong>history list 上未被 purge 的 undo record 数量</strong>。查看方式：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 方式 1：引擎状态（最常用）</span></span><br><span class="line"><span class="keyword">SHOW</span> ENGINE INNODB STATUS\G</span><br><span class="line"><span class="comment">-- 输出中：History list length 1234</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 方式 2：metrics 表（8.0，更细）</span></span><br><span class="line"><span class="keyword">SELECT</span> NAME, COUNT</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_metrics</span><br><span class="line"><span class="keyword">WHERE</span> NAME <span class="keyword">IN</span> (<span class="string">&#x27;trx_rseg_history_len&#x27;</span>,</span><br><span class="line">               <span class="string">&#x27;trx_undo_recs_purged&#x27;</span>,</span><br><span class="line">               <span class="string">&#x27;purge_undo_batch_rounds&#x27;</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 方式 3：Prometheus（mysqld_exporter）</span></span><br><span class="line"><span class="comment">-- mysql_innodb_trx_rseg_history_len</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-1-判读标准（经验值）"><a href="#3-1-判读标准（经验值）" class="headerlink" title="3.1 判读标准（经验值）"></a>3.1 判读标准（经验值）</h3><table>
+<thead>
+<tr>
+<th>HLL 区间</th>
+<th>判读</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&lt; 1 万</td>
+<td>健康</td>
+<td>无需关注</td>
+</tr>
+<tr>
+<td>1 万 ~ 10 万</td>
+<td>轻度积压</td>
+<td>看是否有慢事务；观察趋势</td>
+</tr>
+<tr>
+<td>10 万 ~ 100 万</td>
+<td>明显积压</td>
+<td>立即查长事务、检查 purge 是否被阻塞</td>
+</tr>
+<tr>
+<td>&gt; 100 万</td>
+<td>严重</td>
+<td>undo 空间会快速膨胀，写入性能开始受影响，必须处置</td>
+</tr>
+</tbody></table>
+<p>重点不是瞬时值，而是 <strong>斜率和持续性</strong>。业务高峰期 HLL 冲到 5 万然后回落是正常的；一直单调上涨就是病。</p>
+<p>一个非常实用的监控表达式：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"># HLL 10 分钟内涨幅，&gt; 1000/s 说明 purge 明显跟不上</span><br><span class="line">increase(mysql_innodb_trx_rseg_history_len[10m]) / 600</span><br></pre></td></tr></table></figure>
+
+<h2 id="四、purge-被什么卡住"><a href="#四、purge-被什么卡住" class="headerlink" title="四、purge 被什么卡住"></a>四、purge 被什么卡住</h2><p>这是本文的核心。purge 推进的边界由 <strong>最老的活跃 ReadView</strong> 决定。而 ReadView 由活跃事务持有。所以：</p>
+<blockquote>
+<p><strong>purge 的上限 &#x3D; min(所有活跃事务中最老的 ReadView)</strong></p>
+</blockquote>
+<p>四种典型的”卡住”来源：</p>
+<h3 id="4-1-长事务（read-view-长期不释放）"><a href="#4-1-长事务（read-view-长期不释放）" class="headerlink" title="4.1 长事务（read view 长期不释放）"></a>4.1 长事务（read view 长期不释放）</h3><p><code>REPEATABLE READ</code> 下，事务里第一条快照读就会创建 ReadView，直到事务结束才释放。中间哪怕一直在 sleep，purge 也过不去。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 找出运行超过 60 秒的事务</span></span><br><span class="line"><span class="keyword">SELECT</span> trx_id, trx_state, trx_started,</span><br><span class="line">       TIMESTAMPDIFF(<span class="keyword">SECOND</span>, trx_started, NOW()) <span class="keyword">AS</span> secs,</span><br><span class="line">       trx_mysql_thread_id <span class="keyword">AS</span> conn_id,</span><br><span class="line">       trx_rows_modified, trx_isolation_level</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_trx</span><br><span class="line"><span class="keyword">WHERE</span> TIMESTAMPDIFF(<span class="keyword">SECOND</span>, trx_started, NOW()) <span class="operator">&gt;</span> <span class="number">60</span></span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> trx_started;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-备份-从库延迟"><a href="#4-2-备份-从库延迟" class="headerlink" title="4.2 备份 &#x2F; 从库延迟"></a>4.2 备份 &#x2F; 从库延迟</h3><p>逻辑备份工具（<code>mysqldump --single-transaction</code>、<code>mydumper</code>）会用一致性快照，备份跑多久，ReadView 就活多久。物理备份（XtraBackup）不持有长 ReadView，影响小得多。</p>
+<p>从库如果 <code>STOP SLAVE SQL_THREAD</code> 或严重延迟，主库上的 purge 不受影响，但<strong>从库自己</strong>的 HLL 会疯涨——因为从库回放时也在生成 undo，而它的 purge 需要等 SQL 线程推进。</p>
+<h3 id="4-3-purge-自身被-latch-或-IO-阻塞"><a href="#4-3-purge-自身被-latch-或-IO-阻塞" class="headerlink" title="4.3 purge 自身被 latch 或 IO 阻塞"></a>4.3 purge 自身被 latch 或 IO 阻塞</h3><p>如果 <code>innodb_purge_threads</code> 太少、单轮批次太大、或者磁盘 IO 打满，purge worker 会卡在 IO 上，表现为：</p>
+<ul>
+<li><code>trx_undo_recs_purged</code> 增长缓慢；</li>
+<li><code>SHOW ENGINE INNODB STATUS</code> 里 purge 相关等待（<code>innodb_purge_...</code>）;</li>
+<li><code>innodb_metrics</code> 中 <code>purge_del_mark_records</code> 停滞。</li>
+</ul>
+<h3 id="4-4-大事务造成的”瞬间巨量待清理”"><a href="#4-4-大事务造成的”瞬间巨量待清理”" class="headerlink" title="4.4 大事务造成的”瞬间巨量待清理”"></a>4.4 大事务造成的”瞬间巨量待清理”</h3><p>一次 <code>DELETE FROM t WHERE create_time &lt; &#39;2025-01-01&#39;</code> 删掉 2000 万行，会产生巨量 delete-mark 记录和 undo。即使事务立刻提交，purge 也要花很长时间消化——期间二级索引里全是”标记删除但未物理删除”的记录，查询会变慢（扫描到大量死记录）。</p>
+<h2 id="五、把长事务挡在-Java-应用侧"><a href="#五、把长事务挡在-Java-应用侧" class="headerlink" title="五、把长事务挡在 Java 应用侧"></a>五、把长事务挡在 Java 应用侧</h2><p>DBA 能 kill 事务，但根因通常在应用代码。三个层面治理：</p>
+<h3 id="5-1-事务边界审计：MyBatis-拦截器打印慢事务"><a href="#5-1-事务边界审计：MyBatis-拦截器打印慢事务" class="headerlink" title="5.1 事务边界审计：MyBatis 拦截器打印慢事务"></a>5.1 事务边界审计：MyBatis 拦截器打印慢事务</h3><p>思路：在 <code>Executor</code> 层记录事务开始时间，<code>commit/rollback</code> 时打印耗时与 SQL 数量。轻量、无侵入、能定位到具体 Mapper 方法。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Intercepts(&#123;</span></span><br><span class="line"><span class="meta">    @Signature(type = Executor.class, method = &quot;update&quot;,</span></span><br><span class="line"><span class="meta">               args = &#123;MappedStatement.class, Object.class&#125;),</span></span><br><span class="line"><span class="meta">    @Signature(type = Executor.class, method = &quot;query&quot;,</span></span><br><span class="line"><span class="meta">               args = &#123;MappedStatement.class, Object.class, RowBounds.class,</span></span><br><span class="line"><span class="meta">                       ResultHandler.class&#125;)</span></span><br><span class="line"><span class="meta">&#125;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SlowTransactionInterceptor</span> <span class="keyword">implements</span> <span class="title class_">Interceptor</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Logger</span> <span class="variable">log</span> <span class="operator">=</span> LoggerFactory.getLogger(SlowTransactionInterceptor.class);</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">THRESHOLD_MS</span> <span class="operator">=</span> <span class="number">1000L</span>;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> Object <span class="title function_">intercept</span><span class="params">(Invocation invocation)</span> <span class="keyword">throws</span> Throwable &#123;</span><br><span class="line">        <span class="type">MappedStatement</span> <span class="variable">ms</span> <span class="operator">=</span> (MappedStatement) invocation.getArgs()[<span class="number">0</span>];</span><br><span class="line">        <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">return</span> invocation.proceed();</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">costMs</span> <span class="operator">=</span> (System.nanoTime() - start) / <span class="number">1_000_000</span>;</span><br><span class="line">            <span class="keyword">if</span> (costMs &gt; THRESHOLD_MS) &#123;</span><br><span class="line">                <span class="comment">// 注意：这是单条 SQL 慢，不是事务慢，两者要分开看</span></span><br><span class="line">                log.warn(<span class="string">&quot;slow-sql cost=&#123;&#125;ms id=&#123;&#125; sql=&#123;&#125;&quot;</span>,</span><br><span class="line">                        costMs, ms.getId(), ms.getBoundSql(invocation.getArgs()[<span class="number">1</span>]).getSql());</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>单条 SQL 慢和事务长是两件事。真正抓”事务级”长事务，要在 <code>DataSourceTransactionManager</code> 外包一层：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TransactionDurationAspect</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Around(&quot;@annotation(org.springframework.transaction.annotation.Transactional)&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> Object <span class="title function_">around</span><span class="params">(ProceedingJoinPoint pjp)</span> <span class="keyword">throws</span> Throwable &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">        <span class="type">String</span> <span class="variable">method</span> <span class="operator">=</span> pjp.getSignature().toShortString();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">return</span> pjp.proceed();</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">cost</span> <span class="operator">=</span> System.currentTimeMillis() - start;</span><br><span class="line">            <span class="keyword">if</span> (cost &gt; <span class="number">3000</span>) &#123;</span><br><span class="line">                log.error(<span class="string">&quot;LONG_TRANSACTION method=&#123;&#125; cost=&#123;&#125;ms thread=&#123;&#125;&quot;</span>,</span><br><span class="line">                        method, cost, Thread.currentThread().getName());</span><br><span class="line">                <span class="comment">// 打点上报，接入 Prometheus Counter，配合告警</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-2-事务里绝对不要做远程调用"><a href="#5-2-事务里绝对不要做远程调用" class="headerlink" title="5.2 事务里绝对不要做远程调用"></a>5.2 事务里绝对不要做远程调用</h3><p>以下操作必须移出事务：</p>
+<ul>
+<li>HTTP &#x2F; RPC 调用（第三方接口、微服务）；</li>
+<li>发 MQ 消息（应该用本地消息表 + 事务外投递，或事务消息）；</li>
+<li>文件上传&#x2F;下载、OSS 操作；</li>
+<li>大批量循环里的 <code>selectOne</code>（N+1，事务时长线性放大）；</li>
+<li><code>Thread.sleep</code> &#x2F; 锁等待 &#x2F; 分布式锁续期。</li>
+</ul>
+<p>一个很常见的错误写法：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Transactional</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">createOrder</span><span class="params">(OrderCmd cmd)</span> &#123;</span><br><span class="line">    orderMapper.insert(cmd.toOrder());</span><br><span class="line">    <span class="comment">// ❌ 事务内调用风控 RPC，超时 3 秒 → 事务至少 3 秒</span></span><br><span class="line">    <span class="type">RiskResult</span> <span class="variable">r</span> <span class="operator">=</span> riskClient.check(cmd.getUserId(), cmd.getAmount());</span><br><span class="line">    <span class="keyword">if</span> (!r.isPass()) &#123;</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">BizException</span>(<span class="string">&quot;风控拒绝&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// ❌ 事务内发 MQ，Broker 抖动直接拖长事务</span></span><br><span class="line">    mqProducer.send(<span class="keyword">new</span> <span class="title class_">Message</span>(<span class="string">&quot;order-created&quot;</span>, cmd.getOrderId()));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>正确做法：先远程校验 → 再开短事务写库 → 事务提交后再发消息（或落本地消息表由后台投递）。</p>
+<h3 id="5-3-拆大事务：批处理-分片"><a href="#5-3-拆大事务：批处理-分片" class="headerlink" title="5.3 拆大事务：批处理 + 分片"></a>5.3 拆大事务：批处理 + 分片</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">archiveOldOrders</span><span class="params">(LocalDate before, <span class="type">int</span> batchSize)</span> &#123;</span><br><span class="line">    <span class="keyword">while</span> (<span class="literal">true</span>) &#123;</span><br><span class="line">        <span class="comment">// 每批独立短事务，批间 sleep 让 purge 追上</span></span><br><span class="line">        <span class="type">int</span> <span class="variable">deleted</span> <span class="operator">=</span> txTemplate.execute(status -&gt;</span><br><span class="line">                orderMapper.deleteBatch(before, batchSize));</span><br><span class="line">        <span class="keyword">if</span> (deleted &lt; batchSize) &#123;</span><br><span class="line">            <span class="keyword">break</span>;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            Thread.sleep(<span class="number">50</span>);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (InterruptedException e) &#123;</span><br><span class="line">            Thread.currentThread().interrupt();</span><br><span class="line">            <span class="keyword">break</span>;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意：<code>DELETE ... LIMIT</code> 每批也要走索引，别写成全表扫描；<code>archiveOldOrders</code> 应在低峰执行，并观察 HLL 变化，如果 HLL 涨得太快就加大 sleep。</p>
+<h2 id="六、事后急救与空间回收"><a href="#六、事后急救与空间回收" class="headerlink" title="六、事后急救与空间回收"></a>六、事后急救与空间回收</h2><h3 id="6-1-急救顺序"><a href="#6-1-急救顺序" class="headerlink" title="6.1 急救顺序"></a>6.1 急救顺序</h3><ol>
+<li><strong>先查再杀</strong>：确认是哪个连接、哪个业务、能否沟通；<code>KILL &lt;thread_id&gt;</code> 前先 <code>SHOW PROCESSLIST</code> 看状态。</li>
+<li><strong>观察 HLL 拐点</strong>：kill 后 HLL 不会立刻下降（purge 有延迟），看 <code>trx_undo_recs_purged</code> 是否开始增长。</li>
+<li><strong>临时加大 purge 能力</strong>：<code>SET GLOBAL innodb_purge_threads = 8;</code>（8.0 支持动态调整）。</li>
+<li><strong>必要时加保护</strong>：<code>SET GLOBAL innodb_max_purge_lag = 1000000;</code> 让 DML 主动让路，避免 undo 无限膨胀。</li>
+</ol>
+<h3 id="6-2-真正把磁盘还回去"><a href="#6-2-真正把磁盘还回去" class="headerlink" title="6.2 真正把磁盘还回去"></a>6.2 真正把磁盘还回去</h3><p>只 purge 不 truncate，undo 表空间文件不会变小（<code>innodb_undo_log_truncate</code> 只截断到初始大小附近）。步骤：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 1. 确认有独立 undo 表空间（8.0 默认有 2 个）</span></span><br><span class="line"><span class="keyword">SELECT</span> SPACE_NAME, FILE_NAME, SIZE, STATE</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_tablespaces</span><br><span class="line"><span class="keyword">WHERE</span> SPACE_TYPE <span class="operator">=</span> <span class="string">&#x27;Undo&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 2. 确认 truncate 开启</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_undo_log_truncate&#x27;</span>;   <span class="comment">-- ON</span></span><br><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;innodb_purge_rseg_truncate_frequency&#x27;</span>; <span class="comment">-- 默认 128</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 3. 等到 undo 表空间进入 inactive 才会截断，靠 purge 推进</span></span><br><span class="line"><span class="comment">-- 观察：</span></span><br><span class="line"><span class="keyword">SELECT</span> NAME, COUNT <span class="keyword">FROM</span> information_schema.innodb_metrics</span><br><span class="line"><span class="keyword">WHERE</span> NAME <span class="operator">=</span> <span class="string">&#x27;trx_rseg_history_len&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>想立刻回收磁盘，只能停机 + 重建 undo 表空间（<code>innodb_undo_tablespaces</code> 变更属于初始化参数，8.0 需 <code>--initialize</code> 或 <code>ALTER UNDO TABLESPACE ... SET INACTIVE</code> 后删除文件），生产上通常选择”先让 HLL 降下来，让 truncate 自然生效”。</p>
+<h2 id="七、一张表串起来"><a href="#七、一张表串起来" class="headerlink" title="七、一张表串起来"></a>七、一张表串起来</h2><table>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能原因</th>
+<th>定位手段</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>HLL 单调上涨</td>
+<td>长事务 &#x2F; 备份快照</td>
+<td><code>innodb_trx</code> 看 <code>trx_started</code></td>
+<td>kill 或改代码</td>
+</tr>
+<tr>
+<td>HLL 高但 purge 在涨</td>
+<td>历史欠账太多</td>
+<td><code>trx_undo_recs_purged</code> 斜率</td>
+<td>加大 purge_threads，等它追</td>
+</tr>
+<tr>
+<td>HLL 低但 undo 文件大</td>
+<td>未 truncate</td>
+<td><code>innodb_tablespaces</code></td>
+<td>开 truncate，等 inactive</td>
+</tr>
+<tr>
+<td>删除后查询变慢</td>
+<td>delete-mark 未清理</td>
+<td><code>EXPLAIN</code> 看扫描行数 &#x2F; <code>innodb_metrics</code></td>
+<td>等 purge，避免大事务 DELETE</td>
+</tr>
+<tr>
+<td>从库 HLL 暴涨</td>
+<td>SQL 线程停&#x2F;延迟</td>
+<td><code>SHOW SLAVE STATUS</code></td>
+<td>恢复回放，检查大事务</td>
+</tr>
+</tbody></table>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：purge 和 MVCC 是什么关系？</strong><br>purge 是 MVCC 的”回收器”。MVCC 靠 undo 版本链实现快照读，purge 负责在确认没有 ReadView 需要旧版本后删除它们。没有 purge，undo 会无限增长；purge 太激进，会破坏正在读的一致性视图。</p>
+<p><strong>Q2：为什么 RR 隔离级别下长事务危害更大？</strong><br>RR 的 ReadView 在事务第一次快照读时创建，并且<strong>整个事务期间复用</strong>，所以它”钉住”的版本边界是事务开始时刻。RC 每条语句新建 ReadView，边界可以往前推，长事务的危害相对小（但仍有 undo 与锁的问题）。</p>
+<p><strong>Q3：<code>innodb_max_purge_lag</code> 调大是不是能解决问题？</strong><br>不能。它只是”当积压严重时让 DML 变慢”，属于保护机制，不是清理机制。真正的解法是消除长事务 + 提升 purge 吞吐。而且它限制的是延迟，如果 <code>innodb_max_purge_lag_delay</code> 没配，延迟计算可能把写入拖到不可用。</p>
+<p><strong>Q4：<code>DELETE</code> 和 <code>TRUNCATE</code> 对 purge 的影响？</strong><br><code>DELETE</code> 是逐行标记删除，产生 undo 与 delete-mark，需要 purge 清理；<code>TRUNCATE</code> 是重建表空间，几乎不产生 undo，HLL 不受影响。所以清理大表历史数据，优先考虑分区表 <code>DROP PARTITION</code>，其次 <code>TRUNCATE</code> 整表，最后才是分批 <code>DELETE</code>。</p>
+<p><strong>Q5：从库的 purge 和主库有关系吗？</strong><br>没有直接关系。从库回放 binlog 时自己生成 undo，自己 purge。但主库的大事务会在从库产生同样大的 undo 峰值，且从库回放常是单线程（或有限并行），更容易积压。</p>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>把 purge 这件事压缩成三句话：</p>
+<ol>
+<li><strong>undo 版本能不能删，取决于最老的活跃 ReadView</strong>——所以长事务是 purge 的天敌，不是”慢 SQL”的问题。</li>
+<li><strong>HLL 是唯一需要长期盯的指标</strong>，看斜率不看瞬时值；配合 <code>trx_undo_recs_purged</code> 判断是”欠账多”还是”被卡住”。</li>
+<li><strong>治理在应用侧</strong>：短事务、远程调用出事务、大操作拆批、删历史数据用分区，这四件事做到，purge 基本不会成为问题。</li>
+</ol>
+<p>磁盘告警往往只是最后一张多米诺骨牌。真正该看的是那块倒下的第一张：一个忘了提交的事务。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/10/29/mysql-innodb-purge-history-list-deep-dive/">https://jiweidong.github.io/2026/10/29/mysql-innodb-purge-history-list-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/InnoDB/">InnoDB</a><a class="post-meta__tags" href="/tags/MVCC/">MVCC</a><a class="post-meta__tags" href="/tags/undo-log/">undo log</a><a class="post-meta__tags" href="/tags/%E9%95%BF%E4%BA%8B%E5%8A%A1/">长事务</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/10/29/java-tcp-nagle-delayed-ack-deep-dive/" title="【Java 网络】Nagle 算法、延迟 ACK 与 TCP_NODELAY 深度解析：40ms 延迟抖动排查实录"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 网络】Nagle 算法、延迟 ACK 与 TCP_NODELAY 深度解析：40ms 延迟抖动排查实录</div></div><div class="info-2"><div class="info-item-1">【Java 网络】Nagle 算法、延迟 ACK 与 TCP_NODELAY 深度解析：40ms 延迟抖动排查实录前言线上一个内部 RPC 网关，P99 延迟本该在 15ms 以内，监控却稳定地冒出 40~45ms 的尖刺。奇怪的是：  服务端日志显示业务处理耗时 2ms； CPU、GC、连接池全部正常； 尖刺不随机，而是”每隔一段时间来一批”，且同一时刻多个客户端一起中招； 换机器、换网卡没解决，重启进程会好一段时间，然后复发。  最后定位到根因：请求被拆成两个小包发送，第二个包被 Nagle 算法扣住，等第一个包的 ACK；而服务端开了延迟 ACK，ACK 又要等 40ms 才发。 两个算法各自”合理”，凑在一起就是经典的 Nagle + Delayed ACK 死锁式延迟。 这篇把这条链路讲透：两个算法分别在做什么、为什么会产生 40ms、Java&#x2F;Netty 里怎么关、关掉之后有什么代价、以及其他容易混淆的 TCP 参数。 一、Nagle 算法：用延迟换带宽1.1 它要解决的问题1984 年的网络，链路带宽小、路由器缓冲区浅。如果应用每次 write 一个字节就...</div></div></div></a><a class="pagination-related" href="/2026/10/28/graphrag-knowledge-graph-rag-deep-dive/" title="【RAG 进阶】GraphRAG 深度解析：知识图谱构建、社区摘要与全局问答的 Java 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【RAG 进阶】GraphRAG 深度解析：知识图谱构建、社区摘要与全局问答的 Java 落地</div></div><div class="info-2"><div class="info-item-1">【RAG 进阶】GraphRAG 深度解析：知识图谱构建、社区摘要与全局问答的 Java 落地前言向量 RAG 有一个绕不过去的天花板：它只会「找相似的片段」。 问一个具体问题——「退款时效是几天？」——向量检索很擅长，找到《售后政策》第 3.2 节就完事。但换成这几类问题，向量 RAG 就开始胡说：  全局性问题：「这份 200 页的尽调报告，主要风险有哪些？」——答案分散在几十个段落里，没有任何一个 chunk 包含「整体结论」。 多跳问题：「A 公司的供应商里，哪些也供货给 B 公司？」——需要「A → 供应商 → B」两跳推理，向量相似度帮不上忙。 关系性问题：「张三和李四在项目里是什么关系？」——关系本身就是答案，但它不在任何单段文本里。  GraphRAG 就是为这三类问题生的。它把文档「拆成实体和关系」，建成知识图谱，再用社区检测 + 社区摘要回答全局性问题。 但这玩意儿的代价也很真实：索引成本是向量 RAG 的 10~100 倍。所以本文除了讲原理，更重要的是讲什么时候该用、什么时候纯属浪费钱，以及 Java 侧怎么落地。 一、GraphRAG 的核心思想Micr...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/08/mysql-innodb-redo-undo-binlog-deep-dive/" title="【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复面试官：一条 UPDATE 语句在 InnoDB 里是怎么执行的？宕机了数据怎么不丢？这是 MySQL 面试的”必考压轴题”。要答好它，必须吃透 InnoDB 的三大日志：redo log（重做日志）、undo log（回滚日志）和 binlog（归档日志）。它们分别解决了崩溃恢复、事务回滚、主从复制三个核心问题。 本文从一条 UPDATE 的执行链路讲起，深入源码与磁盘结构，最后用”两阶段提交”串起整个故事。   一、先看全局：一条 UPDATE 的执行链路1UPDATE user SET age = 30 WHERE id = 1;  这条语句在 InnoDB 中的完整执行流程： 1234567891011121. 连接器：校验权限2. 分析器：词法/语法解析3. 优化器：选择索引，生成执行计划4. 执行器：调用 InnoDB 引擎接口   │   ├─ ① 从 Buffer Pool 读取 id=1 的页（若不在则从磁盘加载）   ├─ ② 在 undo l...</div></div></div></a><a class="pagination-related" href="/2026/09/22/mysql-doublewrite-buffer-crash-recovery-deep-dive/" title="【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 双写缓冲（Doublewrite Buffer）深度解析：页断裂、崩溃恢复与性能取舍面试官：数据库机器突然断电，重启之后为什么数据不是坏的？大多数人第一反应是”因为有 redo log”。这个答案不算错，但它解释不了另一个更隐蔽的问题：redo log 本身也是一个文件，它靠什么保证不坏？ 再想深一层。InnoDB 写数据页的单位是 16KB，而操作系统写磁盘的最小单位是 512B（或 4KB）。一次 16KB 的写入不是原子的——如果在写到一半的时候断电，磁盘上就会留下一个写了一半的页。这种页既不是旧数据，也不是新数据，而是一堆新旧混杂的字节。等恢复流程拿起 redo log 去”重放”时，它无法判断这个页到底是完整的还是残缺的，于是就有了经典的 “页断裂”（torn page &#x2F; partial page write） 问题。 双写缓冲（Doublewrite Buffer）就是为了解决这个问题而存在的。它是 InnoDB 里非常小、但非常关键的一块逻辑。下面从它的物理结构、写入流程、恢复流程、性能开销一路讲到 8.0 的新变化。 ...</div></div></div></a><a class="pagination-related" href="/2026/10/09/mysql-innodb-dirty-page-flush-checkpoint-deep-dive/" title="【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing面试官：你说 redo log 保证崩溃恢复，那 redo log 是不是可以无限写？不会。如果 redo log 能无限写下去，那崩溃恢复时要重放的日志量就是无止境的，恢复时间不可控。 面试官接着问：那当 redo log 写满的时候会发生什么？脏页是怎么被刷盘的？为什么有时候会突然出现”数据库抖动”，所有更新都卡住？ 答案就落在两个词上：Checkpoint（检查点） 和 脏页刷盘（Flushing）。这篇文章把 LSN、Checkpoint、Adaptive Flushing、刷脏线程、Doublewrite 的关系一次讲清楚。 一、先建立坐标系：LSN 是一切的基础InnoDB 里所有关于”进度”的话题都围绕 LSN（Log Sequence Number），它是一个全局单调递增的 uint64，单位是字节。  每产生一条 redo 记录，log_sys-&gt;lsn 就往前推进 len 字节。 redo 文件是环形的（innodb_lo...</div></div></div></a><a class="pagination-related" href="/2026/09/07/mysql-table-fragmentation-optimize-rebuild/" title="【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-07</div><div class="info-item-2">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】MySQL 表碎片化深度解析：页分裂与空洞的产生、检测与 OPTIMIZE TABLE 重建优化一个线上事故：删除一半数据，表反而更慢了？某订单归档系统上线半年后，运维定期把 3 个月前的订单从 order 表 DELETE 掉。某天 DBA 发现：这张表明明只剩 2000 万行（高峰期 6000 万），但查询却越来越慢，磁盘占用还有 30GB 不降。 问题出在哪？答案就是表碎片（fragmentation）。DELETE 掉的行并没有真正释放空间，InnoDB 只是把它们标记为”可复用”，数据页里留下大量空洞；而频繁的随机更新又让索引页不断分裂，物理存储的连续性被破坏——InnoDB 不得不扫描大量”半空”的页来找到数据。 一、碎片是怎么产生的？三种来源1. DELETE 留下的空洞InnoDB 以 页（Page，默认 16KB） 为单位管理数据。DELETE 一行并不会立即把页里的空间归还给文件系统，而是在行记录上打删除标记，页内留下空洞。这些空洞只能被后续插入的、大小相近的行复用： 12-- 大量删除后，页内空间分布变成这样（示意）-- | 行1 | 空...</div></div></div></a><a class="pagination-related" href="/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/" title="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？这是我被问过最多次的问题之一。候选人通常答”因为 InnoDB 是页管理的，删除只是打标记”。这个答案对了一半，但要真正说清楚，必须把 InnoDB 的表空间（Tablespace）体系讲透：数据到底存在哪个文件里、页怎么分配、空闲空间为什么不还给操作系统、ibdata1 为什么越涨越大。 表空间是 InnoDB 存储引擎的逻辑-物理映射层。它向上承接表、索引这些逻辑对象，向下管理文件、区、页这些物理单位。这篇文章从磁盘文件一路拆到页，把 InnoDB 的表空间体系完整梳理一遍。 一、先建立坐标系：从文件到行记录的六层结构InnoDB 的数据组织是一条自顶向下的链路，理解这条链路，后面所有概念都能挂上去：    层级 名称 典型大小 说明    1 表空间 Tablespace 文件级别 逻辑上可包含多张表，物理上对应一个或多个 .ibd 文件   2 段 Segment 逻辑概念 一个索引对应两个段：叶子...</div></div></div></a><a class="pagination-related" href="/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/" title="【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？这个问题几乎是我面试 MySQL 方向必问的一道。候选人一般能答出”有 WAL，先写日志再写数据”，但当我追问下面三个问题时，能答清楚的就不多了：  一次提交到底要落几次盘？分别落的是什么？ 如果是”每提交一次就 fsync 一次”，那 QPS 上限就是磁盘 IOPS 上限，几千都到不了，为什么实际能到几万？ redo log 和 binlog 是两份日志，怎么保证它们的一致性？  答案的核心是 两阶段提交（2PC） 加 组提交（Group Commit）。前者解决”两份日志不能写一半”，后者解决”每次提交都 fsync 太慢”。这两件事经常被混在一起讲，其实它们解决的问题完全不同，下面拆开说。  一、先看清楚一次提交要落几次盘假设 innodb_flush_log_at_trx_commit=1、sync_binlog=1（双 1 配置，最常用也最安全的配置），一次普通的事...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">842</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">946</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">242</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%BA%95%E5%B1%82%E3%80%91InnoDB-Purge-%E6%9C%BA%E5%88%B6%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AHistory-List%E3%80%81undo-%E7%89%88%E6%9C%AC%E5%9B%9E%E6%94%B6%E4%B8%8E%E9%95%BF%E4%BA%8B%E5%8A%A1%E6%8B%96%E7%B4%AF"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81purge-%E5%88%B0%E5%BA%95%E5%9C%A8%E6%B8%85%E7%90%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、purge 到底在清理什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81purge-%E7%9A%84%E7%BA%BF%E7%A8%8B%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.3.</span> <span class="toc-text">二、purge 的线程模型</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%BA%E4%BB%80%E4%B9%88-purge-%E6%98%AF%E2%80%9D%E5%88%86%E6%89%B9%E2%80%9D%E8%80%8C%E4%B8%8D%E6%98%AF%E2%80%9D%E4%B8%80%E6%AC%A1%E6%B8%85%E5%AE%8C%E2%80%9D"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 为什么 purge 是”分批”而不是”一次清完”</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81History-List-Length-%E6%80%8E%E4%B9%88%E8%AF%BB"><span class="toc-number">1.4.</span> <span class="toc-text">三、History List Length 怎么读</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%88%A4%E8%AF%BB%E6%A0%87%E5%87%86%EF%BC%88%E7%BB%8F%E9%AA%8C%E5%80%BC%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 判读标准（经验值）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81purge-%E8%A2%AB%E4%BB%80%E4%B9%88%E5%8D%A1%E4%BD%8F"><span class="toc-number">1.5.</span> <span class="toc-text">四、purge 被什么卡住</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E9%95%BF%E4%BA%8B%E5%8A%A1%EF%BC%88read-view-%E9%95%BF%E6%9C%9F%E4%B8%8D%E9%87%8A%E6%94%BE%EF%BC%89"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 长事务（read view 长期不释放）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%A4%87%E4%BB%BD-%E4%BB%8E%E5%BA%93%E5%BB%B6%E8%BF%9F"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 备份 &#x2F; 从库延迟</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-purge-%E8%87%AA%E8%BA%AB%E8%A2%AB-latch-%E6%88%96-IO-%E9%98%BB%E5%A1%9E"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 purge 自身被 latch 或 IO 阻塞</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E5%A4%A7%E4%BA%8B%E5%8A%A1%E9%80%A0%E6%88%90%E7%9A%84%E2%80%9D%E7%9E%AC%E9%97%B4%E5%B7%A8%E9%87%8F%E5%BE%85%E6%B8%85%E7%90%86%E2%80%9D"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 大事务造成的”瞬间巨量待清理”</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8A%8A%E9%95%BF%E4%BA%8B%E5%8A%A1%E6%8C%A1%E5%9C%A8-Java-%E5%BA%94%E7%94%A8%E4%BE%A7"><span class="toc-number">1.6.</span> <span class="toc-text">五、把长事务挡在 Java 应用侧</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%BA%8B%E5%8A%A1%E8%BE%B9%E7%95%8C%E5%AE%A1%E8%AE%A1%EF%BC%9AMyBatis-%E6%8B%A6%E6%88%AA%E5%99%A8%E6%89%93%E5%8D%B0%E6%85%A2%E4%BA%8B%E5%8A%A1"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 事务边界审计：MyBatis 拦截器打印慢事务</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E4%BA%8B%E5%8A%A1%E9%87%8C%E7%BB%9D%E5%AF%B9%E4%B8%8D%E8%A6%81%E5%81%9A%E8%BF%9C%E7%A8%8B%E8%B0%83%E7%94%A8"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 事务里绝对不要做远程调用</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E6%8B%86%E5%A4%A7%E4%BA%8B%E5%8A%A1%EF%BC%9A%E6%89%B9%E5%A4%84%E7%90%86-%E5%88%86%E7%89%87"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 拆大事务：批处理 + 分片</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BA%8B%E5%90%8E%E6%80%A5%E6%95%91%E4%B8%8E%E7%A9%BA%E9%97%B4%E5%9B%9E%E6%94%B6"><span class="toc-number">1.7.</span> <span class="toc-text">六、事后急救与空间回收</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E6%80%A5%E6%95%91%E9%A1%BA%E5%BA%8F"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 急救顺序</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E7%9C%9F%E6%AD%A3%E6%8A%8A%E7%A3%81%E7%9B%98%E8%BF%98%E5%9B%9E%E5%8E%BB"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 真正把磁盘还回去</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E4%B8%80%E5%BC%A0%E8%A1%A8%E4%B8%B2%E8%B5%B7%E6%9D%A5"><span class="toc-number">1.8.</span> <span class="toc-text">七、一张表串起来</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/29/ai-agent-evaluation-benchmark-deep-dive/" title="【AI Agent】Agent 评测体系深度解析：基准、轨迹判分、LLM-as-Judge 与 CI 回归">【AI Agent】Agent 评测体系深度解析：基准、轨迹判分、LLM-as-Judge 与 CI 回归</a><time datetime="2026-10-29T00:40:00.000Z" title="发表于 2026-10-29 08:40:00">2026-10-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/29/java-reranker-hybrid-search-deep-practice/" title="【Java AI】重排模型（Reranker）深度实战：Bi-Encoder 召回 + Cross-Encoder 精排的 Java 全链路落地">【Java AI】重排模型（Reranker）深度实战：Bi-Encoder 召回 + Cross-Encoder 精排的 Java 全链路落地</a><time datetime="2026-10-29T00:30:00.000Z" title="发表于 2026-10-29 08:30:00">2026-10-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/29/spring-cloud-refresh-scope-deep-dive/" title="【Spring 源码】@RefreshScope 与配置动态刷新深度解析：代理重建、Bean 生命周期与线程安全陷阱">【Spring 源码】@RefreshScope 与配置动态刷新深度解析：代理重建、Bean 生命周期与线程安全陷阱</a><time datetime="2026-10-29T00:20:00.000Z" title="发表于 2026-10-29 08:20:00">2026-10-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/29/java-tcp-nagle-delayed-ack-deep-dive/" title="【Java 网络】Nagle 算法、延迟 ACK 与 TCP_NODELAY 深度解析：40ms 延迟抖动排查实录">【Java 网络】Nagle 算法、延迟 ACK 与 TCP_NODELAY 深度解析：40ms 延迟抖动排查实录</a><time datetime="2026-10-29T00:10:00.000Z" title="发表于 2026-10-29 08:10:00">2026-10-29</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/10/29/mysql-innodb-purge-history-list-deep-dive/" title="【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累">【MySQL 底层】InnoDB Purge 机制深度解析：History List、undo 版本回收与长事务拖累</a><time datetime="2026-10-29T00:00:00.000Z" title="发表于 2026-10-29 08:00:00">2026-10-29</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
