@@ -1,0 +1,453 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【性能调优】eBPF 观测 Java 应用深度实战前言Java 的性能观测工具链已经很成熟：JFR 看 JVM 内部事件，async-profiler 出 CPU&#x2F;分配&#x2F;锁火焰图，Arthas 做在线诊断。但它们有一个共同的盲区——它们都活在 JVM 内部。 有些问题从 JVM 里根本看不见：  线程明明在 RUNNABLE，CPU 却上不去（等锁、等 IO、等缺页） GC 时">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/05/ebpf-java-application-observability-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【性能调优】eBPF 观测 Java 应用深度实战前言Java 的性能观测工具链已经很成熟：JFR 看 JVM 内部事件，async-profiler 出 CPU&#x2F;分配&#x2F;锁火焰图，Arthas 做在线诊断。但它们有一个共同的盲区——它们都活在 JVM 内部。 有些问题从 JVM 里根本看不见：  线程明明在 RUNNABLE，CPU 却上不去（等锁、等 IO、等缺页） GC 时">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-05T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-11-05T00:02:48.901Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="bpftrace">
+<meta property="article:tag" content="eBPF">
+<meta property="article:tag" content="可观测性">
+<meta property="article:tag" content="性能调优">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动",
+  "url": "https://jiweidong.github.io/2026/11/05/ebpf-java-application-observability-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-05T00:20:00.000Z",
+  "dateModified": "2026-11-05T00:02:48.901Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/05/ebpf-java-application-observability-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">877</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">993</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">246</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-05T00:20:00.000Z" title="发表于 2026-11-05 08:20:00">2026-11-05</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-05T00:02:48.901Z" title="更新于 2026-11-05 08:02:48">2026-11-05</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【性能调优】eBPF-观测-Java-应用深度实战"><a href="#【性能调优】eBPF-观测-Java-应用深度实战" class="headerlink" title="【性能调优】eBPF 观测 Java 应用深度实战"></a>【性能调优】eBPF 观测 Java 应用深度实战</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>Java 的性能观测工具链已经很成熟：JFR 看 JVM 内部事件，async-profiler 出 CPU&#x2F;分配&#x2F;锁火焰图，Arthas 做在线诊断。但它们有一个共同的盲区——<strong>它们都活在 JVM 内部</strong>。</p>
+<p>有些问题从 JVM 里根本看不见：</p>
+<ul>
+<li>线程明明在 RUNNABLE，CPU 却上不去（等锁、等 IO、等缺页）</li>
+<li>GC 时间正常、业务代码正常，但 P99 有 200ms 尖刺（内核调度、TCP 重传、磁盘抖动）</li>
+<li>「CPU 使用率 40% 但系统 load 30」（不可中断睡眠，D 状态）</li>
+<li>容器被 CPU throttling 限制，JVM 完全无感知</li>
+</ul>
+<p>这些都在内核态。而 eBPF 正是「从内核视角看 Java 进程」的那双眼睛。</p>
+<hr>
+<h2 id="一、eBPF-为什么适合做-Java-观测"><a href="#一、eBPF-为什么适合做-Java-观测" class="headerlink" title="一、eBPF 为什么适合做 Java 观测"></a>一、eBPF 为什么适合做 Java 观测</h2><h3 id="1-1-它能观测什么"><a href="#1-1-它能观测什么" class="headerlink" title="1.1 它能观测什么"></a>1.1 它能观测什么</h3><table>
+<thead>
+<tr>
+<th>观测面</th>
+<th>JFR</th>
+<th>async-profiler</th>
+<th>eBPF</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Java 方法耗时</td>
+<td>✅</td>
+<td>✅</td>
+<td>❌（需 USDT，见下）</td>
+</tr>
+<tr>
+<td>对象分配</td>
+<td>✅</td>
+<td>✅</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong>off-CPU 阻塞归因</strong></td>
+<td>部分（<code>jdk.ThreadPark</code>）</td>
+<td>✅（wall-clock 模式）</td>
+<td>✅✅（内核栈 + 完整原因）</td>
+</tr>
+<tr>
+<td><strong>锁竞争（futex）</strong></td>
+<td>部分</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>系统调用耗时</strong></td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>TCP 重传 &#x2F; 连接队列溢出</strong></td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>块设备 IO 延迟</strong></td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>调度延迟 &#x2F; 运行队列</strong></td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>页缺失 &#x2F; 内存回收</strong></td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>生产开销</td>
+<td>低</td>
+<td>中</td>
+<td>可调（采样后极低）</td>
+</tr>
+</tbody></table>
+<p>结论不是「谁替代谁」，而是<strong>分工</strong>：</p>
+<blockquote>
+<p>JFR 管 JVM 内部，async-profiler 管 Java 栈，eBPF 管内核与硬件之间那一层。</p>
+</blockquote>
+<h3 id="1-2-原理一句话"><a href="#1-2-原理一句话" class="headerlink" title="1.2 原理一句话"></a>1.2 原理一句话</h3><p>eBPF 把用户写的程序挂到内核的钩子上（kprobe &#x2F; tracepoint &#x2F; uprobe &#x2F; perf_event），事件触发时在内核态执行，结果通过 ring buffer 送回用户态。<strong>不需要改应用代码、不需要重启、不需要 agent</strong>。</p>
+<hr>
+<h2 id="二、环境准备（含容器限制）"><a href="#二、环境准备（含容器限制）" class="headerlink" title="二、环境准备（含容器限制）"></a>二、环境准备（含容器限制）</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 内核版本（建议 &gt;= 5.4，最好 5.10+）</span></span><br><span class="line"><span class="built_in">uname</span> -r</span><br><span class="line"></span><br><span class="line"><span class="comment"># 安装工具</span></span><br><span class="line">apt install -y bpfcc-tools bpftrace linux-tools-common linux-tools-$(<span class="built_in">uname</span> -r)</span><br><span class="line"></span><br><span class="line"><span class="comment"># 验证</span></span><br><span class="line">bpftrace -l <span class="string">&#x27;tracepoint:syscalls:sys_enter_*&#x27;</span> | <span class="built_in">head</span> -3</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-1-容器里的权限"><a href="#2-1-容器里的权限" class="headerlink" title="2.1 容器里的权限"></a>2.1 容器里的权限</h3><p>从内核 5.8 起，BPF 权限被拆成 <code>CAP_BPF</code> + <code>CAP_PERFMON</code>：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">securityContext:</span></span><br><span class="line">  <span class="attr">capabilities:</span></span><br><span class="line">    <span class="attr">add:</span> [<span class="string">&quot;BPF&quot;</span>, <span class="string">&quot;PERFMON&quot;</span>, <span class="string">&quot;SYS_RESOURCE&quot;</span>, <span class="string">&quot;SYS_PTRACE&quot;</span>]</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>SYS_RESOURCE</code>：提高 <code>RLIMIT_MEMLOCK</code>（老内核必须）</li>
+<li><code>SYS_PTRACE</code>：读 <code>/proc/&lt;pid&gt;/stack</code>、做 uprobe</li>
+<li>内核 &lt; 5.8 只能 <code>privileged: true</code>（不推荐）</li>
+<li>需要挂载 bpffs：<code>/sys/fs/bpf</code></li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 检查是否被禁用</span></span><br><span class="line"><span class="built_in">cat</span> /proc/sys/kernel/unprivileged_bpf_disabled   <span class="comment"># 2 = 完全禁用，需特权</span></span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>阿里云&#x2F;腾讯云的托管 K8s，很多默认策略会拦 <code>CAP_BPF</code>，需要走特权 DaemonSet 或在节点侧采集。这是落地时第一个现实障碍。</p>
+</blockquote>
+<hr>
+<h2 id="三、四个高频实战脚本"><a href="#三、四个高频实战脚本" class="headerlink" title="三、四个高频实战脚本"></a>三、四个高频实战脚本</h2><h3 id="3-1-场景一：CPU-不高但慢——off-CPU-分析"><a href="#3-1-场景一：CPU-不高但慢——off-CPU-分析" class="headerlink" title="3.1 场景一：CPU 不高但慢——off-CPU 分析"></a>3.1 场景一：CPU 不高但慢——off-CPU 分析</h3><p><strong>症状</strong>：8 核机器，Java 进程 CPU 300%，QPS 上不去，P99 400ms。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># bcc 自带，统计被阻塞的时长与内核栈</span></span><br><span class="line">offcputime -f -p $(pgrep -f <span class="string">&#x27;java.*myapp&#x27;</span>) 30 &gt; offcpu.folded</span><br><span class="line"><span class="comment"># 生成火焰图</span></span><br><span class="line">flamegraph.pl --color=io --title=<span class="string">&quot;Off-CPU&quot;</span> offcpu.folded &gt; offcpu.svg</span><br></pre></td></tr></table></figure>
+
+<p>输出里最常看到的栈：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">futex_wait_queue_me</span><br><span class="line">  do_futex</span><br><span class="line">    __futex_wait</span><br><span class="line">      [java] java.util.concurrent.locks.LockSupport.park</span><br></pre></td></tr></table></figure>
+
+<p>这就是「Java 层看到的 <code>park</code>」，但 eBPF 补上了<strong>内核侧等了多久、被谁唤醒</strong>。</p>
+<p>用 bpftrace 自己写一个更聚焦的版本（统计每个 Java 线程的阻塞分布）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">bpftrace -e <span class="string">&#x27;</span></span><br><span class="line"><span class="string">tracepoint:sched:sched_switch</span></span><br><span class="line"><span class="string">/args-&gt;prev_comm == &quot;java&quot; &amp;&amp; args-&gt;prev_state == 2/</span></span><br><span class="line"><span class="string">&#123;</span></span><br><span class="line"><span class="string">    @start[args-&gt;prev_pid] = nsecs;</span></span><br><span class="line"><span class="string">&#125;</span></span><br><span class="line"><span class="string"></span></span><br><span class="line"><span class="string">tracepoint:sched:sched_switch</span></span><br><span class="line"><span class="string">/args-&gt;next_comm == &quot;java&quot; &amp;&amp; @start[args-&gt;next_pid]/</span></span><br><span class="line"><span class="string">&#123;</span></span><br><span class="line"><span class="string">    $d = nsecs - @start[args-&gt;next_pid];</span></span><br><span class="line"><span class="string">    @blocked_us = hist($d / 1000);</span></span><br><span class="line"><span class="string">    delete(@start[args-&gt;next_pid]);</span></span><br><span class="line"><span class="string">&#125;</span></span><br><span class="line"><span class="string"></span></span><br><span class="line"><span class="string">interval:s:30 &#123; exit(); &#125;</span></span><br><span class="line"><span class="string">&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<p><code>prev_state == 2</code> 是 <code>TASK_UNINTERRUPTIBLE</code>，也就是 D 状态。<strong>如果 D 状态时间很长，八成是磁盘或网络文件系统</strong>。</p>
+<h3 id="3-2-场景二：系统调用谁最慢"><a href="#3-2-场景二：系统调用谁最慢" class="headerlink" title="3.2 场景二：系统调用谁最慢"></a>3.2 场景二：系统调用谁最慢</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line">bpftrace -e <span class="string">&#x27;</span></span><br><span class="line"><span class="string">tracepoint:raw_syscalls:sys_enter</span></span><br><span class="line"><span class="string">/pid == $1/ &#123; @start[tid] = nsecs; @name[tid] = args-&gt;id; &#125;</span></span><br><span class="line"><span class="string"></span></span><br><span class="line"><span class="string">tracepoint:raw_syscalls:sys_exit</span></span><br><span class="line"><span class="string">/pid == $1 &amp;&amp; @start[tid]/</span></span><br><span class="line"><span class="string">&#123;</span></span><br><span class="line"><span class="string">    $us = (nsecs - @start[tid]) / 1000;</span></span><br><span class="line"><span class="string">    @lat[@name[tid]] = hist($us);</span></span><br><span class="line"><span class="string">    delete(@start[tid]); delete(@name[tid]);</span></span><br><span class="line"><span class="string">&#125;</span></span><br><span class="line"><span class="string"></span></span><br><span class="line"><span class="string">interval:s:20 &#123; exit(); &#125;</span></span><br><span class="line"><span class="string">&#x27;</span> -p $(pgrep -f <span class="string">&#x27;java.*myapp&#x27;</span>)</span><br></pre></td></tr></table></figure>
+
+<p>Java 服务里最慢的 syscall 通常是 <code>epoll_wait</code>（正常，是空闲等待）、<code>futex</code>（锁）、<code>read</code>&#x2F;<code>write</code>（IO）、<code>sendto</code>（网络）。</p>
+<p>判断要点：<strong><code>epoll_wait</code> 占大头 &#x3D; 正常；<code>futex</code> 占大头 &#x3D; 锁竞争；<code>read</code> 慢 &#x3D; 磁盘或 NFS</strong>。</p>
+<h3 id="3-3-场景三：TCP-层的问题（JVM-看不见）"><a href="#3-3-场景三：TCP-层的问题（JVM-看不见）" class="headerlink" title="3.3 场景三：TCP 层的问题（JVM 看不见）"></a>3.3 场景三：TCP 层的问题（JVM 看不见）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 重传统计</span></span><br><span class="line">bpftrace -e <span class="string">&#x27;tracepoint:tcp:tcp_retransmit_skb &#123; @[comm, args-&gt;saddr] = count(); &#125;&#x27;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 或者用现成工具</span></span><br><span class="line">tcpretrans -p $(pgrep -f java)     <span class="comment"># bcc</span></span><br></pre></td></tr></table></figure>
+
+<p>线上一个经典案例：客户端 P99 抖动，服务端 JFR 完全正常。eBPF 抓到最后是 <code>tcp_retransmit_skb</code> 每 30 秒集中出现——原因是 NAT 网关的 conntrack 表满，不是应用问题。</p>
+<p>同类还有：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 连接队列溢出（SYN 丢包）</span></span><br><span class="line">bpftrace -e <span class="string">&#x27;tracepoint:sock:inet_sock_set_state</span></span><br><span class="line"><span class="string">/args-&gt;newstate == 7/ &#123; @over = count(); &#125;&#x27;</span>   <span class="comment"># TCP_CLOSE 状态转换异常</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 监听队列溢出计数</span></span><br><span class="line">nstat -az | grep -E <span class="string">&#x27;ListenOverflows|ListenDrops&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<p><code>ListenOverflows &gt; 0</code> 说明 <code>backlog</code> 太小或 accept 太慢，这个指标在 JVM 里永远看不到。</p>
+<h3 id="3-4-场景四：块设备-IO-延迟"><a href="#3-4-场景四：块设备-IO-延迟" class="headerlink" title="3.4 场景四：块设备 IO 延迟"></a>3.4 场景四：块设备 IO 延迟</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">biolatency -m 10        <span class="comment"># 毫秒级直方图</span></span><br><span class="line"><span class="comment"># 或按进程过滤</span></span><br><span class="line">biolatency -m -P 10 | grep java</span><br></pre></td></tr></table></figure>
+
+<p>如果 P99 落在 50~100ms 档，而应用层只读几百 KB，那大概率是 <strong>page cache miss + 云盘 IOPS 打满</strong>（云盘有 burst 额度，用完就掉速）。</p>
+<hr>
+<h2 id="四、能不能直接用-eBPF-抓-Java-方法？"><a href="#四、能不能直接用-eBPF-抓-Java-方法？" class="headerlink" title="四、能不能直接用 eBPF 抓 Java 方法？"></a>四、能不能直接用 eBPF 抓 Java 方法？</h2><p>可以，但有前提。HotSpot 支持 USDT 探针（<code>hotspot:gc__begin</code>、<code>hotspot:method__entry</code>），但：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 检查 libjvm.so 是否带 USDT</span></span><br><span class="line">readelf -n <span class="variable">$JAVA_HOME</span>/lib/server/libjvm.so | grep -i provider</span><br></pre></td></tr></table></figure>
+
+<p><strong>大多数发行版 OpenJDK 构建默认不开启 DTrace&#x2F;USDT</strong>（需要 <code>--enable-dtrace</code> 编译）。没有 provider 输出，就挂不上 <code>uprobe:/path/libjvm.so:...</code>。</p>
+<p>替代路径：</p>
+<ol>
+<li><strong>async-profiler 的 wall-clock 模式</strong>：<code>-e wall -t</code>，本质是用 <code>perf_event</code> 采样线程栈，能覆盖 off-CPU，Java 栈完整。</li>
+<li><strong>JFR 的 <code>jdk.ExecutionSample</code> + <code>jdk.NativeMethodSample</code></strong>：JFR 从 JDK 16 起支持 native 方法采样。</li>
+<li><strong>eBPF uprobe 到 JVM 的 <code>Java_*</code> JNI 入口</strong>：只能抓 native 方法调用，粒度粗。</li>
+<li><strong>自建 USDT</strong>：用 <code>-XX:+DTraceMethodProbes</code>（需 DTrace 构建版本），生产罕见。</li>
+</ol>
+<p>所以实战建议是：<strong>Java 栈用 async-profiler&#x2F;JFR，内核栈用 eBPF，两者用同一时间窗对齐</strong>。</p>
+<hr>
+<h2 id="五、生产落地的四个注意点"><a href="#五、生产落地的四个注意点" class="headerlink" title="五、生产落地的四个注意点"></a>五、生产落地的四个注意点</h2><h3 id="5-1-开销控制"><a href="#5-1-开销控制" class="headerlink" title="5.1 开销控制"></a>5.1 开销控制</h3><table>
+<thead>
+<tr>
+<th>手段</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>用采样不用全量</td>
+<td><code>profile:hz:99</code> 而非每次事件</td>
+</tr>
+<tr>
+<td>缩小过滤范围</td>
+<td><code>pid == $1</code> 一定要加，否则全机事件</td>
+</tr>
+<tr>
+<td>限制 map 大小</td>
+<td><code>--map-keys 1024</code>，避免内核内存膨胀</td>
+</tr>
+<tr>
+<td>控制输出频率</td>
+<td>用 <code>hist()</code>&#x2F;<code>count()</code> 聚合，不要每条 <code>printf</code></td>
+</tr>
+<tr>
+<td>定时退出</td>
+<td><code>interval:s:30 { exit(); }</code></td>
+</tr>
+</tbody></table>
+<p>经验值：99Hz 采样 + pid 过滤，CPU 开销通常 &lt; 1.5%。</p>
+<h3 id="5-2-不能做的事"><a href="#5-2-不能做的事" class="headerlink" title="5.2 不能做的事"></a>5.2 不能做的事</h3><ul>
+<li><strong>不要在内核里做字符串拼接</strong>（bpftrace 的 <code>printf</code> 会走 perf buffer，量大时丢事件）</li>
+<li><strong>不要在 kprobe 里 sleep</strong>（不可能，验证器会拒绝）</li>
+<li><strong>不要依赖 eBPF 做业务埋点</strong>（它是观测工具，不是 tracing 系统）</li>
+</ul>
+<h3 id="5-3-与现有体系的组合"><a href="#5-3-与现有体系的组合" class="headerlink" title="5.3 与现有体系的组合"></a>5.3 与现有体系的组合</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">┌─────────────── JVM 层 ───────────────┐</span><br><span class="line">│ JFR（GC、锁、异常、线程）             │</span><br><span class="line">│ Micrometer → Prometheus（业务指标）    │</span><br><span class="line">└──────────────────────────────────────┘</span><br><span class="line">┌─────────────── 内核层 ───────────────┐</span><br><span class="line">│ eBPF（syscall、调度、TCP、IO）        │</span><br><span class="line">│ node_exporter（机器指标）              │</span><br><span class="line">└──────────────────────────────────────┘</span><br><span class="line">        ↓ 同一条 traceId / 同一时间窗</span><br><span class="line">┌─────────────── 关联分析 ─────────────┐</span><br><span class="line">│ 把 JFR 事件时间戳与 eBPF 直方图对齐     │</span><br><span class="line">└──────────────────────────────────────┘</span><br></pre></td></tr></table></figure>
+
+<p>真实排障时最有价值的动作：<strong>把 JFR 的 GC pause 时间窗和 eBPF 的 <code>runqlat</code>&#x2F;<code>biolatency</code> 直方图叠在一起看</strong>。如果 GC pause 期间正好有大量 D 状态，那「GC 慢」只是表象，根因是 IO。</p>
+<h3 id="5-4-云厂商的替代品"><a href="#5-4-云厂商的替代品" class="headerlink" title="5.4 云厂商的替代品"></a>5.4 云厂商的替代品</h3><ul>
+<li>阿里云 ARMS &#x2F; SLS 的 eBPF 采集</li>
+<li>Datadog 的 <code>system-probe</code></li>
+<li>Pixie（K8s 原生，自带 eBPF 采集与 Java 支持）</li>
+</ul>
+<p>自建 vs 采购，取决于你是否需要「按需临时抓 30 秒」的能力。托管产品通常只给你固定指标，临时深挖还得自己上手。</p>
+<hr>
+<h2 id="六、面试追问"><a href="#六、面试追问" class="headerlink" title="六、面试追问"></a>六、面试追问</h2><p><strong>Q1：JFR 和 eBPF 的区别？</strong></p>
+<p>JFR 是 JVM 内部事件记录器（GC、锁、异常、线程、分配采样），只能看到 JVM 认为发生的事；eBPF 是内核级可观测框架，能看到 syscall、调度、网络、块设备。前者回答「Java 里发生了什么」，后者回答「操作系统对 Java 做了什么」。</p>
+<p><strong>Q2：线上 CPU 不高但 RT 高，你怎么排查？</strong></p>
+<p>先用 <code>top</code> 看 load 与 CPU 的背离 → <code>vmstat 1</code> 看 <code>r</code>（运行队列）和 <code>b</code>（阻塞数）→ 若 <code>b</code> 大，用 eBPF <code>offcputime</code> 抓 off-CPU 栈 → 区分是 futex（锁）、IO（磁盘&#x2F;NFS）、还是网络。最后回到 Java 层定位具体锁或连接池。</p>
+<p><strong>Q3：eBPF 会不会影响性能？</strong></p>
+<p>会，但可控。关键是采样率、pid 过滤、聚合输出、map 大小。99Hz + pid 过滤下通常 &lt; 1.5% CPU。全量 <code>printf</code> 是性能杀手。</p>
+<p><strong>Q4：容器里跑 eBPF 有什么限制？</strong></p>
+<p>需要 <code>CAP_BPF</code>&#x2F;<code>CAP_PERFMON</code>（内核 5.8+）或 privileged；需要访问 <code>/sys/kernel/debug</code> 或 bpffs；<code>unprivileged_bpf_disabled=2</code> 时普通用户完全不能用；部分托管 K8s 会直接拦截。</p>
+<p><strong>Q5：怎么观测 Java 方法级耗时？</strong></p>
+<p>eBPF 抓 Java 方法需要 USDT 探针，而主流 OpenJDK 构建默认未开启。所以方法级用 async-profiler（perf_event + Java 栈展开）或 JFR，eBPF 负责内核侧。</p>
+<hr>
+<h2 id="七、踩坑清单"><a href="#七、踩坑清单" class="headerlink" title="七、踩坑清单"></a>七、踩坑清单</h2><ol>
+<li><strong><code>bpftrace</code> 装了但 <code>-l</code> 列不出 tracepoint</strong>：内核没开 <code>CONFIG_DEBUG_INFO_BTF</code>，或 debugfs 未挂载。</li>
+<li><strong>容器里 <code>pgrep -f java</code> 拿到的是宿主机 PID</strong>：要用 <code>nsenter -t &lt;pid&gt; -p</code> 或直接在容器 PID namespace 内执行。</li>
+<li><strong><code>offcputime</code> 输出全是 <code>epoll_wait</code></strong>：那是空闲等待，别当成问题。要看的是阻塞时长 <strong>P99</strong>，不是总和。</li>
+<li><strong><code>-p</code> 参数写错导致抓到全机事件</strong>：<code>bpftrace</code> 的 <code>-p</code> 是 pid，<code>-c</code> 是 command，别混。</li>
+<li><strong>火焰图看不出东西</strong>：folded 文件必须先 <code>flamegraph.pl</code>，且 <code>-f</code>（full stack）要开。</li>
+<li><strong>生产直接跑 <code>biolatency -D</code></strong>：<code>-D</code> 是输出到文件并常驻，忘记 <code>Ctrl-C</code> 会一直挂着。</li>
+<li><strong>把 eBPF 当 APM 用</strong>：它不适合做请求级追踪（没有 traceId），只适合做「系统行为归因」。</li>
+</ol>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>eBPF 给 Java 工程师补上的，是「JVM 之外那半张图」：</p>
+<ul>
+<li><strong>off-CPU 归因</strong>：线程在等什么，等了多久</li>
+<li><strong>syscall&#x2F;网络&#x2F;磁盘</strong>：OS 层到底发生了什么</li>
+<li><strong>调度与容器 throttling</strong>：CPU 上不去的真相</li>
+</ul>
+<p>三层工具各司其职：</p>
+<table>
+<thead>
+<tr>
+<th>问题域</th>
+<th>工具</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>业务指标</td>
+<td>Micrometer + Prometheus</td>
+</tr>
+<tr>
+<td>JVM 内部</td>
+<td>JFR + jcmd</td>
+</tr>
+<tr>
+<td>Java 栈（CPU&#x2F;分配&#x2F;锁&#x2F;wall）</td>
+<td>async-profiler</td>
+</tr>
+<tr>
+<td>内核与硬件</td>
+<td>eBPF（bpftrace&#x2F;bcc）</td>
+</tr>
+</tbody></table>
+<p>排障的最高境界不是「哪个工具最强」，而是<strong>在正确的层次问正确的问题</strong>。这篇讲完内核层，下一篇回到 Java 层，聊 <code>Prompt 版本管理</code> 那类工程化问题——从「观测」走向「治理」。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/05/ebpf-java-application-observability-deep-practice/">https://jiweidong.github.io/2026/11/05/ebpf-java-application-observability-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E5%8F%AF%E8%A7%82%E6%B5%8B%E6%80%A7/">可观测性</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a><a class="post-meta__tags" href="/tags/eBPF/">eBPF</a><a class="post-meta__tags" href="/tags/bpftrace/">bpftrace</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/05/java-prompt-version-management-gray-release-deep-practice/" title="【Java AI】Prompt 版本管理与灰度发布深度实战：注册表、分桶分流与秒级回滚"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】Prompt 版本管理与灰度发布深度实战：注册表、分桶分流与秒级回滚</div></div><div class="info-2"><div class="info-item-1">【Java AI】Prompt 版本管理与灰度发布深度实战前言大部分团队做 AI 应用，第一版都是这样写的： 1String prompt = &quot;你是一个客服助手，请回答用户问题：&quot; + userInput;  三个月后，这段代码变成了： 123String prompt = &quot;你是一个专业的、友好的、严谨的客服助手，请基于以下知识库内容回答问题，&quot;        + &quot;如果无法回答请说不知道，不要编造，回答不超过 200 字，用中文，&quot;        + &quot;语气要专业但不生硬，注意：&quot; + extraRules + &quot;\n知识：&quot; + context + &quot;\n问题：&quot; + userInput;  再往后：运营想改一句话，得发版；出了问题想回滚，得回滚整个服务；A&#x2F;B 测试两版 prompt，只能靠改代码分两次上线；同一个用户一会儿被新版答、一会儿被旧版答，体验割裂。 Prompt 就是代码，而且是被高频修改、需要灰度、需要审计、需要回滚的代码。它应...</div></div></div></a><a class="pagination-related" href="/2026/11/05/jvm-native-memory-malloc-arena-deep-dive/" title="【JVM 排障】Native Memory 与 glibc malloc Arena 深度解析：堆才 4G，RSS 为什么涨到 12G"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【JVM 排障】Native Memory 与 glibc malloc Arena 深度解析：堆才 4G，RSS 为什么涨到 12G</div></div><div class="info-2"><div class="info-item-1">【JVM 排障】Native Memory 与 glibc malloc Arena 深度解析前言「堆内存 OOM 我能查，堆内存泄漏我能 dump，但 RSS 一直涨、容器一直被杀，heap dump 却是健康的」——这是 Java 生产排障里最让人无力的场景之一。 一个真实工单：Spring Boot 服务，-Xmx4g，容器 limit 8Gi。运行 3 天后 container_memory_working_set_bytes 稳定爬到 7.6Gi，被 kubelet OOMKilled。jmap -histo 正常，jstat 正常，MAT 打开 heap dump 只用了 2.8G。 剩下那 4G 去哪了？ 答案通常是三个字：malloc arena。  一、先把内存账算清楚：JVM 的 RSS 由什么构成JVM 进程的 RSS ≠ 堆大小。完整构成大致如下：    组成 典型大小 是否受 -Xmx 控制 观测手段    Java Heap -Xmx 是 jmap -heap、jstat -gc   Metaspace 100~500MB -XX:MaxMetaspa...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/05/numa-aware-jvm-performance-tuning-deep-dive/" title="【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-05</div><div class="info-item-2">【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战</div></div><div class="info-2"><div class="info-item-1">【JVM 性能】NUMA 架构与 JVM 调优深度解析前言一个很典型的线上怪象：两台机器，A 是 32 核 128G 单路，B 是 2×64 核 512G 双路。压测同一个 Spring Boot 服务，B 的 CPU 利用率上不去，P99 反而比 A 慢 30%，GC 次数还更多。 很多人第一反应是「GC 参数没调好」「线程池太小」，把 -Xmx、-XX:ParallelGCThreads、Tomcat 线程数全试了一遍，收益甚微。真实原因往往藏在 CPU 和内存的物理拓扑里——这台机器是 NUMA 架构，而 JVM 默认并不知道这件事。 这篇文章把 NUMA 的原理、JVM 在 NUMA 上的真实行为、四种落地方案、容器里的坑，以及面试会怎么问，一次讲清楚。  一、NUMA 到底是什么1.1 从 SMP 到 NUMA早期多核 server 是 SMP（Symmetric Multiprocessing）：所有 CPU 通过一条前端总线访问同一块内存，任意核访问任意内存地址的延迟都一样（UMA）。 核数一多，总线就成了瓶颈。于是有了 NUMA（Non-Uniform Memor...</div></div></div></a><a class="pagination-related" href="/2026/11/04/linux-page-cache-java-file-io-deep-dive/" title="【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-04</div><div class="info-item-2">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析前言一个很典型的现象：Java 服务写日志&#x2F;写文件，代码里 fileChannel.write() 返回成功、耗时 0.1ms，看起来磁盘快得离谱；但某天机器内存紧张，同一个写入突然变成 20ms，甚至出现大量 kswapd CPU 占用。 还有人问：FileOutputStream.write() 之后数据到底在哪？flush() 和 fsync() 有什么区别？为什么用 BufferedOutputStream 快 10 倍，但数据丢了？为什么 Kafka 号称”用页缓存所以快”，而 MySQL 却要自己管 buffer pool？ 这些问题的答案都在同一层：Linux Page Cache（页缓存）。这篇从内核机制讲到 Java API 语义，把”写文件”这件事彻底拆开。  一、Page Cache 是什么：内核的”第二层内存”1.1 一切皆页Linux 用 4KB 的页（page）管理物理内存，Page Cache 就是文件内容在内存中的副本，以 struct page 组织，用 a...</div></div></div></a><a class="pagination-related" href="/2026/06/19/java-performance-tuning-tools/" title="Java 性能监控与调优工具实战：JMC、async-profiler、JITWatch"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-19</div><div class="info-item-2">Java 性能监控与调优工具实战：JMC、async-profiler、JITWatch</div></div><div class="info-2"><div class="info-item-1">引言Java 应用上线后，OOM、CPU 飚高、响应变慢是三个最常见的”生产事故”。定位这些问题需要对 JVM 有深入理解，更需要趁手的工具。本文将深入讲解三个业界公认的利器——JDK Mission Control (JMC)、async-profiler 和 JITWatch，配合实战案例，助你成为 JVM 调优老手。 一、JDK Mission Control 与 Flight Recorder1.1 概述JDK Mission Control (JMC) 是 Oracle 提供的 JVM 监控和管理工具集，而 Java Flight Recorder (JFR) 是其底层的事件记录引擎。从 JDK 11 开始，JFR 已成为 OpenJDK 的一部分，无需商业授权即可使用。 JFR 的独特优势在于低开销：持续开启时的 CPU 开销通常低于 1%，可以在生产环境中长期运行。 1.2 JFR 事件类型配置JFR 将事件分为三类：    事件类型 说明 示例    Instantanous 瞬时发生的事件 线程启动、GC 暂停   Duration 有持续时间的操作 方法执行、...</div></div></div></a><a class="pagination-related" href="/2026/09/19/jvm-huge-pages-thp-tuning-deep-dive/" title="【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录</div></div><div class="info-2"><div class="info-item-1">【JVM 调优】透明大页（THP）与 Huge Pages 深度解析：TLB、-XX:+UseLargePages 与线上踩坑实录面试官：JVM 参数都调过了，还有什么能优化 GC 停顿？如果候选人已经聊完 G1&#x2F;ZGC、堆大小、Region 大小，还答不出”页大小”这一层，说明他对 JVM 的认识停在了”Java 层面”，没下探到操作系统与 CPU 的交互。 大页（Huge Pages）是一个典型的”不懂不影响跑，懂了能救命”的调优点：它在某些场景能显著减少 GC 停顿和 TLB miss，在另一些场景却会让 JVM 启动变慢、内存居高不下。这篇文章把 THP、HugeTLB、-XX:+UseLargePages 的原理、配置、收益边界与踩坑全讲一遍。 一、为什么要关心”页”：从 TLB 说起现代 CPU 的内存访问链路是： 1虚拟地址 → [TLB 查表] → 页表遍历 → 物理地址 → [CPU Cache] → 内存  关键点：  操作系统按”页”管理内存，传统页大小 4KB； TLB（Translation Lookaside Buffer）是页表项的硬件缓存...</div></div></div></a><a class="pagination-related" href="/2026/10/21/java-llm-observability-tracing-cost-deep-practice/" title="【Java AI】大模型可观测性与成本治理深度实战：Trace、Token 账本与告警"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【Java AI】大模型可观测性与成本治理深度实战：Trace、Token 账本与告警</div></div><div class="info-2"><div class="info-item-1">【Java AI】大模型可观测性与成本治理深度实战前言传统后端服务的可观测性，我们花了十年才做明白：Metrics 看趋势、Logs 看细节、Traces 看链路。但把大模型接进系统之后，这三件套突然不够用了。 先看一个真实的排查场景。某天客服机器人的 P99 从 3 秒涨到 11 秒，报警响了。你打开 APM，看到一个 POST /api/chat 的 span，耗时 11 秒，状态 200。然后呢？没有然后了。 你不知道：  是检索慢，还是模型慢？ 模型慢是因为输入变长了（context 从 2k 涨到 12k），还是供应商在降速？ 这一轮调了几次工具？每次工具调用花了多久？ 这 11 秒的请求，花了多少钱？是哪个租户、哪个功能花的？ 是不是触发了重试，导致同一个问题被计费两次？  传统 APM 只能告诉你「这个 HTTP 接口慢」，它不知道 HTTP 里面还套着一个「LLM 调用」这个耗时又花钱的黑盒。 这一篇讲的就是怎么把大模型应用从黑盒变成白盒：指标体系怎么定、Trace 怎么埋、Token 账本怎么记、成本怎么降、告警怎么配。代码全部基于 Java &#x2F; Sp...</div></div></div></a><a class="pagination-related" href="/2026/10/31/kafka-broker-request-processing-pipeline-deep-dive/" title="【Kafka 底层】Broker 请求处理全链路深度解析：Acceptor、Processor、RequestChannel 与 Purgatory"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-31</div><div class="info-item-2">【Kafka 底层】Broker 请求处理全链路深度解析：Acceptor、Processor、RequestChannel 与 Purgatory</div></div><div class="info-2"><div class="info-item-1">【Kafka 底层】Broker 请求处理全链路深度解析前言大部分人学 Kafka 的路径是：分区 → 副本 → ISR → 幂等 → 事务。这些是”语义层”。但真到了线上，Produce 请求 P99 突然从 8ms 涨到 300ms、RequestQueueTimeMs 报警、NetworkProcessorAvgIdlePercent 掉到 10%、消费者 fetch 全部超时——这时候语义层的知识一点用都没有，你必须知道一个请求从网卡进来到响应写回，到底经过了哪几个队列、哪几把锁、哪几个线程池。 Kafka 的网络层设计非常经典：1 个 Acceptor + N 个 Processor + 1 个共享请求队列 + M 个 Handler + Purgatory 延时机制。这套结构在 3.x&#x2F;4.x 基本没变（4.0 只是把 KRaft 变成唯一元数据模式），理解了它，绝大多数”Kafka 变慢”的问题都能在 10 分钟内定位到具体环节。 本文按请求生命周期逐段拆，配合源码入口、关键参数、监控指标，最后给一份调优决策表。  一、全局视图：一条 Produce 请求...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">877</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">993</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">246</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E3%80%91eBPF-%E8%A7%82%E6%B5%8B-Java-%E5%BA%94%E7%94%A8%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【性能调优】eBPF 观测 Java 应用深度实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81eBPF-%E4%B8%BA%E4%BB%80%E4%B9%88%E9%80%82%E5%90%88%E5%81%9A-Java-%E8%A7%82%E6%B5%8B"><span class="toc-number">1.2.</span> <span class="toc-text">一、eBPF 为什么适合做 Java 观测</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E5%AE%83%E8%83%BD%E8%A7%82%E6%B5%8B%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 它能观测什么</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E5%8E%9F%E7%90%86%E4%B8%80%E5%8F%A5%E8%AF%9D"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 原理一句话</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%8E%AF%E5%A2%83%E5%87%86%E5%A4%87%EF%BC%88%E5%90%AB%E5%AE%B9%E5%99%A8%E9%99%90%E5%88%B6%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、环境准备（含容器限制）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%AE%B9%E5%99%A8%E9%87%8C%E7%9A%84%E6%9D%83%E9%99%90"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 容器里的权限</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%9B%9B%E4%B8%AA%E9%AB%98%E9%A2%91%E5%AE%9E%E6%88%98%E8%84%9A%E6%9C%AC"><span class="toc-number">1.4.</span> <span class="toc-text">三、四个高频实战脚本</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%9C%BA%E6%99%AF%E4%B8%80%EF%BC%9ACPU-%E4%B8%8D%E9%AB%98%E4%BD%86%E6%85%A2%E2%80%94%E2%80%94off-CPU-%E5%88%86%E6%9E%90"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 场景一：CPU 不高但慢——off-CPU 分析</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%9C%BA%E6%99%AF%E4%BA%8C%EF%BC%9A%E7%B3%BB%E7%BB%9F%E8%B0%83%E7%94%A8%E8%B0%81%E6%9C%80%E6%85%A2"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 场景二：系统调用谁最慢</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%9C%BA%E6%99%AF%E4%B8%89%EF%BC%9ATCP-%E5%B1%82%E7%9A%84%E9%97%AE%E9%A2%98%EF%BC%88JVM-%E7%9C%8B%E4%B8%8D%E8%A7%81%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 场景三：TCP 层的问题（JVM 看不见）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%9C%BA%E6%99%AF%E5%9B%9B%EF%BC%9A%E5%9D%97%E8%AE%BE%E5%A4%87-IO-%E5%BB%B6%E8%BF%9F"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 场景四：块设备 IO 延迟</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%83%BD%E4%B8%8D%E8%83%BD%E7%9B%B4%E6%8E%A5%E7%94%A8-eBPF-%E6%8A%93-Java-%E6%96%B9%E6%B3%95%EF%BC%9F"><span class="toc-number">1.5.</span> <span class="toc-text">四、能不能直接用 eBPF 抓 Java 方法？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%94%9F%E4%BA%A7%E8%90%BD%E5%9C%B0%E7%9A%84%E5%9B%9B%E4%B8%AA%E6%B3%A8%E6%84%8F%E7%82%B9"><span class="toc-number">1.6.</span> <span class="toc-text">五、生产落地的四个注意点</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%BC%80%E9%94%80%E6%8E%A7%E5%88%B6"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 开销控制</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E4%B8%8D%E8%83%BD%E5%81%9A%E7%9A%84%E4%BA%8B"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 不能做的事</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E4%B8%8E%E7%8E%B0%E6%9C%89%E4%BD%93%E7%B3%BB%E7%9A%84%E7%BB%84%E5%90%88"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 与现有体系的组合</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E4%BA%91%E5%8E%82%E5%95%86%E7%9A%84%E6%9B%BF%E4%BB%A3%E5%93%81"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 云厂商的替代品</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.7.</span> <span class="toc-text">六、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/05/long-context-vs-rag-architecture-deep-dive/" title="【AI 体系】长上下文与 RAG 的边界深度解析：1M Token 时代还需要检索吗">【AI 体系】长上下文与 RAG 的边界深度解析：1M Token 时代还需要检索吗</a><time datetime="2026-11-05T00:40:00.000Z" title="发表于 2026-11-05 08:40:00">2026-11-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/05/java-prompt-version-management-gray-release-deep-practice/" title="【Java AI】Prompt 版本管理与灰度发布深度实战：注册表、分桶分流与秒级回滚">【Java AI】Prompt 版本管理与灰度发布深度实战：注册表、分桶分流与秒级回滚</a><time datetime="2026-11-05T00:30:00.000Z" title="发表于 2026-11-05 08:30:00">2026-11-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/05/ebpf-java-application-observability-deep-practice/" title="【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动">【性能调优】eBPF 观测 Java 应用深度实战：无侵入定位 off-CPU、锁等待与 IO 抖动</a><time datetime="2026-11-05T00:20:00.000Z" title="发表于 2026-11-05 08:20:00">2026-11-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/05/jvm-native-memory-malloc-arena-deep-dive/" title="【JVM 排障】Native Memory 与 glibc malloc Arena 深度解析：堆才 4G，RSS 为什么涨到 12G">【JVM 排障】Native Memory 与 glibc malloc Arena 深度解析：堆才 4G，RSS 为什么涨到 12G</a><time datetime="2026-11-05T00:10:00.000Z" title="发表于 2026-11-05 08:10:00">2026-11-05</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/05/numa-aware-jvm-performance-tuning-deep-dive/" title="【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战">【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战</a><time datetime="2026-11-05T00:00:00.000Z" title="发表于 2026-11-05 08:00:00">2026-11-05</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
