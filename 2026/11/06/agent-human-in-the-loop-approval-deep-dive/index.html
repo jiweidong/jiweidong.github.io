@@ -1,0 +1,425 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【AI Agent】Human-in-the-Loop 深度解析前言：Agent 一旦能”动手”，刹车就必须是设计的一部分我们做企业内部的运维 Agent，第一版非常惊艳：给它一个告警，它能自己查日志、定位服务、扩副本、回滚发布。演示的时候掌声一片。 上线第三天，它把一个”看起来 CPU 打满”的数据库只读副本判定为异常，然后自动执行了”重启”。那个副本正在跑一个 6 小时的报表导出，重启意味着">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/06/agent-human-in-the-loop-approval-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【AI Agent】Human-in-the-Loop 深度解析前言：Agent 一旦能”动手”，刹车就必须是设计的一部分我们做企业内部的运维 Agent，第一版非常惊艳：给它一个告警，它能自己查日志、定位服务、扩副本、回滚发布。演示的时候掌声一片。 上线第三天，它把一个”看起来 CPU 打满”的数据库只读副本判定为异常，然后自动执行了”重启”。那个副本正在跑一个 6 小时的报表导出，重启意味着">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-06T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-06T00:04:06.074Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="AI">
+<meta property="article:tag" content="Agent">
+<meta property="article:tag" content="HITL">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="系统设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计",
+  "url": "https://jiweidong.github.io/2026/11/06/agent-human-in-the-loop-approval-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-06T00:00:00.000Z",
+  "dateModified": "2026-11-06T00:04:06.074Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/06/agent-human-in-the-loop-approval-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">882</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">994</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">247</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-06T00:00:00.000Z" title="发表于 2026-11-06 08:00:00">2026-11-06</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-06T00:04:06.074Z" title="更新于 2026-11-06 08:04:06">2026-11-06</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/AI-Agent/">AI Agent</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【AI-Agent】Human-in-the-Loop-深度解析"><a href="#【AI-Agent】Human-in-the-Loop-深度解析" class="headerlink" title="【AI Agent】Human-in-the-Loop 深度解析"></a>【AI Agent】Human-in-the-Loop 深度解析</h1><h2 id="前言：Agent-一旦能”动手”，刹车就必须是设计的一部分"><a href="#前言：Agent-一旦能”动手”，刹车就必须是设计的一部分" class="headerlink" title="前言：Agent 一旦能”动手”，刹车就必须是设计的一部分"></a>前言：Agent 一旦能”动手”，刹车就必须是设计的一部分</h2><p>我们做企业内部的运维 Agent，第一版非常惊艳：给它一个告警，它能自己查日志、定位服务、扩副本、回滚发布。演示的时候掌声一片。</p>
+<p>上线第三天，它把一个”看起来 CPU 打满”的数据库只读副本判定为异常，然后自动执行了”重启”。那个副本正在跑一个 6 小时的报表导出，重启意味着 6 小时白干。</p>
+<p>复盘的时候大家争论的点很有意思：<strong>不是”Agent 判断错了”，而是”为什么它有权重启”</strong>。</p>
+<p>这就是 Human-in-the-Loop（HITL，人机协同）要解决的问题。它不是”给 Agent 加个确认弹窗”这么简单——<strong>确认弹窗是最容易做错的一环</strong>，因为它会让操作员产生”确认疲劳”，最后闭着眼点”同意”，比没有确认还糟。</p>
+<p>这篇文章讲 HITL 的工程设计：什么该拦、怎么拦、拦住了之后状态怎么存、超时怎么办、恢复怎么保证不重复执行、以及怎么衡量这套机制到底有没有用。</p>
+<hr>
+<h2 id="一、先想清楚：什么该拦"><a href="#一、先想清楚：什么该拦" class="headerlink" title="一、先想清楚：什么该拦"></a>一、先想清楚：什么该拦</h2><p>一个常见的错误是”所有写操作都拦”。结果：审批率 90%，操作员 5 秒点一次同意，HITL 名存实亡。</p>
+<p>正确的做法是<strong>按”不可逆性 × 影响范围 × 可观测性”三维分级</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th>特征</th>
+<th>例子</th>
+<th>策略</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>L0 只读</td>
+<td>不改状态</td>
+<td>查日志、查指标、读配置</td>
+<td><strong>不拦</strong>，只审计</td>
+</tr>
+<tr>
+<td>L1 可逆</td>
+<td>有回滚路径，影响单实例</td>
+<td>扩缩容、重启单副本、改灰度比例</td>
+<td><strong>事后复核</strong>（异步看板 + 异常告警）</td>
+</tr>
+<tr>
+<td>L2 有条件可逆</td>
+<td>可回滚但影响面大 &#x2F; 回滚有代价</td>
+<td>全量发布、批量配置下发、DB 索引变更</td>
+<td><strong>前置审批</strong></td>
+</tr>
+<tr>
+<td>L3 不可逆</td>
+<td>无法回滚</td>
+<td>删除数据、转账、发外部邮件、删库</td>
+<td><strong>前置审批 + 双人复核 + 二次确认</strong></td>
+</tr>
+</tbody></table>
+<p>三条工程规则：</p>
+<ol>
+<li><strong>风险等级必须由工具元数据声明，不能由模型判断。</strong> 模型判断”这个操作危不危险”是最不可靠的一环——它会被工具描述里的”这只是个无害的查询”骗过去。风险等级应该是工具注册时的静态属性（<code>riskLevel</code>），写在代码里、进代码评审。</li>
+<li><strong>升级只能由人降级。</strong> 模型不能自己把 L2 说成 L1。想调整等级，走配置变更流程。</li>
+<li><strong>L1 也必须”可观测”</strong>，否则事后复核变成事后追悔。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">enum</span> <span class="title class_">RiskLevel</span> &#123;</span><br><span class="line">    L0_READ,          <span class="comment">// 不拦</span></span><br><span class="line">    L1_REVERSIBLE,    <span class="comment">// 事后复核</span></span><br><span class="line">    L2_GATED,         <span class="comment">// 前置审批</span></span><br><span class="line">    L3_IRREVERSIBLE   <span class="comment">// 前置审批 + 双人 + 二次确认</span></span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ToolPolicy</span><span class="params">(</span></span><br><span class="line"><span class="params">        String toolName,</span></span><br><span class="line"><span class="params">        RiskLevel risk,</span></span><br><span class="line"><span class="params">        Set&lt;String&gt; requiredApproverRoles,</span></span><br><span class="line"><span class="params">        Duration approvalTtl,</span></span><br><span class="line"><span class="params">        <span class="type">boolean</span> requiresTwoPerson,</span></span><br><span class="line"><span class="params">        String rollbackProcedure   // 文档链接，强制字段</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>rollbackProcedure</code> 我强制设成必填——<strong>一个你说不出怎么回滚的操作，就不该被 Agent 自动执行。</strong></p>
+<hr>
+<h2 id="二、三种-HITL-形态，别混用"><a href="#二、三种-HITL-形态，别混用" class="headerlink" title="二、三种 HITL 形态，别混用"></a>二、三种 HITL 形态，别混用</h2><p>很多人把 HITL 等同于”审批”，其实它有三种截然不同的形态，工程实现完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>时机</th>
+<th>人工做什么</th>
+<th>典型场景</th>
+<th>状态复杂度</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Approval Gate</strong>（前置审批）</td>
+<td>执行前</td>
+<td>同意 &#x2F; 拒绝</td>
+<td>转账、删除、发布</td>
+<td>中（需要挂起 + 恢复）</td>
+</tr>
+<tr>
+<td><strong>Edit &amp; Continue</strong>（人工改写）</td>
+<td>执行前</td>
+<td>修改参数后放行</td>
+<td>Agent 生成的 SQL、生成的邮件草稿</td>
+<td>高（需要参数回写 + 重新校验）</td>
+</tr>
+<tr>
+<td><strong>Review</strong>（后置复核）</td>
+<td>执行后</td>
+<td>抽查、纠错、触发回滚</td>
+<td>L1 操作、Agent 生成的代码</td>
+<td>低（异步，不影响主链路）</td>
+</tr>
+</tbody></table>
+<p><strong>关键区别在”主链路是否阻塞”</strong>：Approval Gate 和 Edit 会阻塞 Agent 的执行流（可能几分钟到几天），Review 不阻塞。</p>
+<p>这决定了架构：<strong>阻塞型 HITL 必须依赖持久化，不能依赖内存里的线程等待。</strong> 一个等待 3 天的审批，你的 Tomcat 线程早被回收了，Pod 早就滚动了 5 次。</p>
+<hr>
+<h2 id="三、状态机：HITL-的核心是一个持久化状态机"><a href="#三、状态机：HITL-的核心是一个持久化状态机" class="headerlink" title="三、状态机：HITL 的核心是一个持久化状态机"></a>三、状态机：HITL 的核心是一个持久化状态机</h2><h3 id="3-1-状态定义"><a href="#3-1-状态定义" class="headerlink" title="3.1 状态定义"></a>3.1 状态定义</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line">               ┌──────────────┐</span><br><span class="line"> 执行工具 ───▶ │  PENDING     │  已创建审批请求，尚未有人处理</span><br><span class="line">               └──────┬───────┘</span><br><span class="line">                      │</span><br><span class="line">      ┌───────────────┼────────────────┐</span><br><span class="line">      ▼               ▼                ▼</span><br><span class="line">┌──────────┐   ┌───────────┐   ┌────────────┐</span><br><span class="line">│ APPROVED │   │ REJECTED  │   │  EXPIRED   │</span><br><span class="line">└────┬─────┘   └─────┬─────┘   └─────┬──────┘</span><br><span class="line">     │               │               │</span><br><span class="line">     ▼               ▼               ▼</span><br><span class="line">┌──────────┐   ┌───────────┐   ┌────────────┐</span><br><span class="line">│ RESUMING │   │ CANCELLED │   │ CANCELLED  │  ← 超时默认 = 拒绝，不是放行</span><br><span class="line">└────┬─────┘   └───────────┘   └────────────┘</span><br><span class="line">     │</span><br><span class="line">     ▼</span><br><span class="line">┌──────────┐        ┌──────────┐</span><br><span class="line">│ EXECUTING│──失败─▶│  FAILED  │</span><br><span class="line">└────┬─────┘        └──────────┘</span><br><span class="line">     ▼</span><br><span class="line">┌──────────┐</span><br><span class="line">│ COMPLETED│</span><br><span class="line">└──────────┘</span><br></pre></td></tr></table></figure>
+
+<p><strong>最容易做错的两个决策：</strong></p>
+<ol>
+<li><strong>超时后的默认行为</strong>。必须是”拒绝 + 通知发起方”，<strong>绝不是”放行”</strong>。我见过有系统写 <code>if (timeout) approve()</code>，理由是”避免阻塞业务”——这在 L3 场景下等于没有审批。</li>
+<li><strong><code>RESUMING</code> 必须是一个独立状态</strong>，不能从 <code>APPROVED</code> 直接跳 <code>COMPLETED</code>。因为恢复执行可能失败（下游服务已下线、参数已过期），需要重试和幂等保护。</li>
+</ol>
+<h3 id="3-2-表结构"><a href="#3-2-表结构" class="headerlink" title="3.2 表结构"></a>3.2 表结构</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE TABLE</span> agent_approval (</span><br><span class="line">    id                <span class="type">BIGINT</span> <span class="keyword">PRIMARY KEY</span> AUTO_INCREMENT,</span><br><span class="line">    approval_key      <span class="type">VARCHAR</span>(<span class="number">64</span>)  <span class="keyword">NOT NULL</span>,        <span class="comment">-- 幂等键（唯一）</span></span><br><span class="line">    task_id           <span class="type">VARCHAR</span>(<span class="number">64</span>)  <span class="keyword">NOT NULL</span>,        <span class="comment">-- 所属 Agent 任务</span></span><br><span class="line">    step_id           <span class="type">VARCHAR</span>(<span class="number">64</span>)  <span class="keyword">NOT NULL</span>,        <span class="comment">-- 任务内第几步</span></span><br><span class="line">    tool_name         <span class="type">VARCHAR</span>(<span class="number">128</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">    risk_level        <span class="type">VARCHAR</span>(<span class="number">16</span>)  <span class="keyword">NOT NULL</span>,</span><br><span class="line">    arguments_json    JSON         <span class="keyword">NOT NULL</span>,        <span class="comment">-- 参数快照（关键！）</span></span><br><span class="line">    context_snapshot  JSON         <span class="keyword">NOT NULL</span>,        <span class="comment">-- 模型推理摘要 + 引用证据</span></span><br><span class="line">    status            <span class="type">VARCHAR</span>(<span class="number">16</span>)  <span class="keyword">NOT NULL</span>,</span><br><span class="line">    version           <span class="type">INT</span>          <span class="keyword">NOT NULL</span> <span class="keyword">DEFAULT</span> <span class="number">0</span>,  <span class="comment">-- 乐观锁</span></span><br><span class="line">    requested_by      <span class="type">VARCHAR</span>(<span class="number">64</span>)  <span class="keyword">NOT NULL</span>,</span><br><span class="line">    requested_at      DATETIME(<span class="number">3</span>)  <span class="keyword">NOT NULL</span>,</span><br><span class="line">    expires_at        DATETIME(<span class="number">3</span>)  <span class="keyword">NOT NULL</span>,</span><br><span class="line">    decided_by        <span class="type">VARCHAR</span>(<span class="number">64</span>),</span><br><span class="line">    decided_at        DATETIME(<span class="number">3</span>),</span><br><span class="line">    decision_comment  <span class="type">VARCHAR</span>(<span class="number">1024</span>),</span><br><span class="line">    idempotency_key   <span class="type">VARCHAR</span>(<span class="number">64</span>),                  <span class="comment">-- 执行期幂等</span></span><br><span class="line">    <span class="keyword">UNIQUE</span> KEY uk_approval_key (approval_key),</span><br><span class="line">    <span class="keyword">UNIQUE</span> KEY uk_task_step (task_id, step_id),</span><br><span class="line">    KEY idx_status_expire (status, expires_at)</span><br><span class="line">) ENGINE<span class="operator">=</span>InnoDB;</span><br></pre></td></tr></table></figure>
+
+<p>三个字段值得单独说：</p>
+<ul>
+<li><strong><code>arguments_json</code>（参数快照）</strong>：审批人看到的必须是”将要执行的<strong>确切</strong>参数”，而不是”Agent 说要执行的参数”。恢复执行时必须用这份快照，不能重新生成——否则审批的和执行的不是一回事（TOCTOU 漏洞）。</li>
+<li><strong><code>context_snapshot</code>（上下文快照）</strong>：包含模型为什么这么决策、引用了哪些证据。<strong>只给审批人一句”Agent 想重启 db-replica-3，同意吗？”是无效审批</strong>，人没有判断依据，只能盲批。</li>
+<li><strong><code>uk_task_step</code></strong>：同一任务的同一步骤只能有一个审批单，从数据库层面杜绝”重复发起审批”。</li>
+</ul>
+<hr>
+<h2 id="四、Java-实现：挂起与恢复"><a href="#四、Java-实现：挂起与恢复" class="headerlink" title="四、Java 实现：挂起与恢复"></a>四、Java 实现：挂起与恢复</h2><h3 id="4-1-挂起"><a href="#4-1-挂起" class="headerlink" title="4.1 挂起"></a>4.1 挂起</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ApprovalService</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> ApprovalRepository repo;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> ApprovalNotifier notifier;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Clock clock;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** Agent 执行到高危工具时调用：创建审批单并抛出挂起信号 */</span></span><br><span class="line">    <span class="meta">@Transactional</span></span><br><span class="line">    <span class="keyword">public</span> ApprovalTicket <span class="title function_">requestApproval</span><span class="params">(AgentContext ctx, ToolCall call, ToolPolicy policy)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">approvalKey</span> <span class="operator">=</span> ctx.taskId() + <span class="string">&quot;:&quot;</span> + ctx.stepId();</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 幂等：重复请求返回已有单据，不重复通知</span></span><br><span class="line">        <span class="keyword">return</span> repo.findByApprovalKey(approvalKey).orElseGet(() -&gt; &#123;</span><br><span class="line">            <span class="type">ApprovalTicket</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ApprovalTicket</span>();</span><br><span class="line">            t.setApprovalKey(approvalKey);</span><br><span class="line">            t.setTaskId(ctx.taskId());</span><br><span class="line">            t.setStepId(ctx.stepId());</span><br><span class="line">            t.setToolName(call.toolName());</span><br><span class="line">            t.setRiskLevel(policy.risk());</span><br><span class="line">            t.setArgumentsJson(call.arguments());          <span class="comment">// 快照，不可变</span></span><br><span class="line">            t.setContextSnapshot(buildSnapshot(ctx, call)); <span class="comment">// 推理摘要 + 证据</span></span><br><span class="line">            t.setStatus(Status.PENDING);</span><br><span class="line">            t.setRequestedBy(ctx.userId());</span><br><span class="line">            t.setRequestedAt(Instant.now(clock));</span><br><span class="line">            t.setExpiresAt(Instant.now(clock).plus(policy.approvalTtl()));</span><br><span class="line">            repo.insert(t);</span><br><span class="line"></span><br><span class="line">            <span class="comment">// 按角色路由通知；L3 需要双人</span></span><br><span class="line">            notifier.notifyApprovers(t, policy.requiredApproverRoles(),</span><br><span class="line">                                     policy.requiresTwoPerson());</span><br><span class="line">            <span class="keyword">return</span> t;</span><br><span class="line">        &#125;);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>注意这里<strong>没有阻塞等待</strong>。Agent 的执行器收到 <code>ApprovalTicket</code> 后，把任务状态标记为 <code>WAITING_APPROVAL</code>，然后<strong>正常返回</strong>，释放线程。等审批结果到来时，由另一个入口触发恢复。</p>
+<h3 id="4-2-决策（并发安全）"><a href="#4-2-决策（并发安全）" class="headerlink" title="4.2 决策（并发安全）"></a>4.2 决策（并发安全）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Transactional</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">decide</span><span class="params">(<span class="type">long</span> approvalId, String approverId, Decision decision,</span></span><br><span class="line"><span class="params">                   String comment, <span class="type">int</span> expectedVersion)</span> &#123;</span><br><span class="line">    <span class="type">ApprovalTicket</span> <span class="variable">t</span> <span class="operator">=</span> repo.selectForUpdate(approvalId);   <span class="comment">// SELECT ... FOR UPDATE</span></span><br><span class="line"></span><br><span class="line">    <span class="keyword">if</span> (t.getStatus() != Status.PENDING) &#123;</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;already decided: &quot;</span> + t.getStatus());</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (Instant.now(clock).isAfter(t.getExpiresAt())) &#123;</span><br><span class="line">        <span class="comment">// 到期后不再接受决策，转 EXPIRED</span></span><br><span class="line">        t.setStatus(Status.EXPIRED);</span><br><span class="line">        repo.update(t);</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">ApprovalExpiredException</span>(approvalId);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (t.getRequestedBy().equals(approverId)) &#123;</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;self-approval forbidden&quot;</span>);   <span class="comment">// 禁止自批</span></span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">if</span> (t.getVersion() != expectedVersion) &#123;</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">OptimisticLockException</span>(<span class="string">&quot;stale view, please refresh&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    t.setStatus(decision == Decision.APPROVE ? Status.APPROVED : Status.REJECTED);</span><br><span class="line">    t.setDecidedBy(approverId);</span><br><span class="line">    t.setDecidedAt(Instant.now(clock));</span><br><span class="line">    t.setDecisionComment(comment);</span><br><span class="line">    repo.updateWithVersion(t);   <span class="comment">// version = version + 1</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>四个防护点：<strong>行锁防并发、状态检查防重复决策、时间检查防过期决策、自批检查防绕过</strong>。</p>
+<blockquote>
+<p>关于”禁止自批”：很多系统允许发起人自己批准，理由是”小团队没别人”。我的建议是——如果要放开，必须是<strong>配置项 + 审计 + 每日报表</strong>，而不是静默默认允许。</p>
+</blockquote>
+<h3 id="4-3-恢复执行（幂等是生命线）"><a href="#4-3-恢复执行（幂等是生命线）" class="headerlink" title="4.3 恢复执行（幂等是生命线）"></a>4.3 恢复执行（幂等是生命线）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ApprovalResumer</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> ApprovalRepository repo;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> AgentTaskStore taskStore;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> IdempotentExecutor executor;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Scheduled(fixedDelay = 5_000)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">resumeApproved</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="comment">// 分页捞取待恢复的单据，避免一次拉太多</span></span><br><span class="line">        List&lt;ApprovalTicket&gt; batch = repo.findByStatusAndExpiresAfter(</span><br><span class="line">                Status.APPROVED, Instant.now(), PageRequest.of(<span class="number">0</span>, <span class="number">100</span>));</span><br><span class="line"></span><br><span class="line">        <span class="keyword">for</span> (ApprovalTicket t : batch) &#123;</span><br><span class="line">            <span class="comment">// CAS 抢占：把 APPROVED -&gt; RESUMING，只有一个实例能成功</span></span><br><span class="line">            <span class="keyword">if</span> (!repo.casStatus(t.getId(), Status.APPROVED, Status.RESUMING)) &#123;</span><br><span class="line">                <span class="keyword">continue</span>;   <span class="comment">// 别的实例抢到了</span></span><br><span class="line">            &#125;</span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                <span class="comment">// 必须用审批时的参数快照，不能重新生成</span></span><br><span class="line">                <span class="type">ToolCall</span> <span class="variable">call</span> <span class="operator">=</span> ToolCall.fromJson(t.getArgumentsJson());</span><br><span class="line">                <span class="type">String</span> <span class="variable">idemKey</span> <span class="operator">=</span> t.getApprovalKey();   <span class="comment">// 幂等键 = 审批键</span></span><br><span class="line"></span><br><span class="line">                <span class="type">ToolResult</span> <span class="variable">result</span> <span class="operator">=</span> executor.executeOnce(idemKey, () -&gt;</span><br><span class="line">                        toolInvoker.invoke(t.getToolName(), call));</span><br><span class="line"></span><br><span class="line">                taskStore.appendStepResult(t.getTaskId(), t.getStepId(), result);</span><br><span class="line">                repo.casStatus(t.getId(), Status.RESUMING, Status.COMPLETED);</span><br><span class="line">                taskStore.wake(t.getTaskId());          <span class="comment">// 唤醒 Agent 主循环继续下一步</span></span><br><span class="line">            &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">                repo.casStatus(t.getId(), Status.RESUMING, Status.FAILED);</span><br><span class="line">                taskStore.fail(t.getTaskId(), t.getStepId(), e);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>三个关键设计：</p>
+<ol>
+<li><strong><code>casStatus(APPROVED → RESUMING)</code> 是分布式锁</strong>，避免多副本同时恢复导致重复执行。</li>
+<li><strong><code>executeOnce(idemKey, ...)</code> 是幂等执行</strong>：内部先查”这个幂等键是否已有执行记录”，有则直接返回结果。注意——<strong>如果下游工具本身不支持幂等（比如”发邮件”），这里只能保证”最多一次”或”至少一次”，必须业务侧接受其中一种语义</strong>。这一点必须在工具注册时就标注清楚。</li>
+<li><strong>恢复不是”重跑整个任务”，而是”从断点续跑”</strong>。这依赖 Agent 的持久化执行能力（事件日志 + 确定性重放）。如果你的 Agent 是纯内存的 ReAct 循环，做不到断点续跑，那 HITL 就只能做成”短时阻塞”（适合分钟级审批），做不了天级审批。</li>
+</ol>
+<h3 id="4-4-超时处理"><a href="#4-4-超时处理" class="headerlink" title="4.4 超时处理"></a>4.4 超时处理</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Scheduled(fixedDelay = 60_000)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">expireStale</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">int</span> <span class="variable">n</span> <span class="operator">=</span> repo.expireBatch(Status.PENDING, Status.EXPIRED, Instant.now(), <span class="number">500</span>);</span><br><span class="line">    <span class="keyword">if</span> (n &gt; <span class="number">0</span>) &#123;</span><br><span class="line">        log.warn(<span class="string">&quot;expired &#123;&#125; approval requests&quot;</span>, n);</span><br><span class="line">        metrics.counter(<span class="string">&quot;hitl.expired&quot;</span>).increment(n);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>配套两条规则：</p>
+<ul>
+<li><strong>过期前 25% 时间点提醒一次</strong>（<code>expires_at - ttl*0.25</code>），避免”审批人没看到”导致的过期。</li>
+<li><strong>过期后任务进入 <code>CANCELLED</code>，并把”未执行的原因”回写给模型</strong>，让 Agent 能向用户解释”因为审批超时，我没有执行重启”。这比静默失败体验好得多。</li>
+</ul>
+<hr>
+<h2 id="五、指标：怎么证明-HITL-真的有用"><a href="#五、指标：怎么证明-HITL-真的有用" class="headerlink" title="五、指标：怎么证明 HITL 真的有用"></a>五、指标：怎么证明 HITL 真的有用</h2><p>这套机制的隐性成本很高（人力 + 延迟），必须能被衡量，否则半年后就会有人提”要不我们把审批去掉吧”。</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>定义</th>
+<th>健康区间</th>
+<th>异常含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>审批率</strong></td>
+<td>需审批步骤 &#x2F; 总步骤</td>
+<td>10%~25%</td>
+<td>&gt;40% 说明风险分级太保守，人在盲批</td>
+</tr>
+<tr>
+<td><strong>同意率</strong></td>
+<td>APPROVED &#x2F; 总决策</td>
+<td>80%~95%</td>
+<td>&gt;98% 说明审批无信息量；&lt;60% 说明 Agent 判断力差</td>
+</tr>
+<tr>
+<td><strong>P50&#x2F;P95 等待</strong></td>
+<td>请求到决策耗时</td>
+<td>P95 &lt; 30min</td>
+<td>过长说明路由&#x2F;通知有问题</td>
+</tr>
+<tr>
+<td><strong>超时率</strong></td>
+<td>EXPIRED &#x2F; 总请求</td>
+<td>&lt;5%</td>
+<td>高说明审批人负载或通知链路坏</td>
+</tr>
+<tr>
+<td><strong>驳回后重试成功率</strong></td>
+<td>驳回→修正→通过的比例</td>
+<td>&gt;70%</td>
+<td>低说明反馈信息不足</td>
+</tr>
+<tr>
+<td><strong>人工改写率</strong></td>
+<td>Edit 形态占比</td>
+<td>观察值</td>
+<td>上升说明 Agent 参数生成不稳</td>
+</tr>
+<tr>
+<td><strong>审批后失败率</strong></td>
+<td>COMPLETED 中 FAILED 占比</td>
+<td>&lt;2%</td>
+<td>高说明审批的是”过时参数”</td>
+</tr>
+</tbody></table>
+<p><strong>同意率 98% 是个危险信号</strong>——它意味着审批人对 Agent 已经形成了”无脑信任”，HITL 退化成了合规表演。这时候应该做的不是加更多审批，而是<strong>把 L2 里那些真的从不被拒的操作降级为 L1</strong>，把人的注意力集中到真正危险的地方。</p>
+<hr>
+<h2 id="六、五个反模式"><a href="#六、五个反模式" class="headerlink" title="六、五个反模式"></a>六、五个反模式</h2><p><strong>反模式 1：只给一句”确认吗？”</strong><br>审批人看不到参数、看不到推理依据、看不到影响面，只能盲批。<strong>审批 UI 必须包含：确切参数、Agent 的决策理由、引用的证据、影响范围、回滚方式。</strong></p>
+<p><strong>反模式 2：超时默认放行</strong><br>前面说过，再强调一次：<strong>超时 &#x3D; 拒绝</strong>。要做”自动放行”，只能是显式的、按工具配置的策略，且必须落在 L1 及以下。</p>
+<p><strong>反模式 3：让模型自己决定是否需要审批</strong><br>“模型判断这个操作危险，所以请求审批”——模型会被工具描述的”无害”话术骗过去。风险等级必须是<strong>静态元数据</strong>。</p>
+<p><strong>反模式 4：恢复时重新生成参数</strong><br>审批的是 A，执行的是 B。这是最隐蔽的越权：审批人以为自己批了”重启 1 个副本”，实际执行的是”重启 10 个”。<strong>必须用参数快照。</strong></p>
+<p><strong>反模式 5：审批和权限混为一谈</strong><br>权限（<code>java-agent-tool-permission-security</code> 那篇讲的 RBAC&#x2F;ABAC&#x2F;沙箱）解决”Agent 有没有资格调这个工具”；HITL 解决”这一次具体调用要不要人点头”。<strong>两者是串联关系，都不能省。</strong> 只做权限不做审批，Agent 一旦有权限就能无限用；只做审批不做权限，审批人会被海量低价值请求淹没。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：HITL 会不会让 Agent 失去意义？</strong></p>
+<p>取决于分级。如果 90% 的操作都要人批，Agent 只是”自动填表机”。健康的分级是：L0&#x2F;L1 占 80%+ 全自动，L2 占 15% 左右前置审批，L3 极少但严格。<strong>HITL 的目标不是”减少人的参与”，而是”把人的注意力放到真正需要判断的地方”。</strong></p>
+<p><strong>Q2：审批状态存在哪里？为什么不能用内存？</strong></p>
+<p>必须持久化（DB）。原因：审批可能跨越数小时到数天，期间服务会重启、Pod 会滚动、节点会迁移。内存状态一丢，任务就永远卡在 <code>WAITING_APPROVAL</code>，而且没人知道它卡着。同时持久化才能支持”审批历史审计”这个合规刚需。</p>
+<p><strong>Q3：多个副本同时扫描待恢复任务，怎么防重复执行？</strong></p>
+<p>两级：<strong>DB 层 CAS</strong>（<code>UPDATE ... SET status=&#39;RESUMING&#39; WHERE id=? AND status=&#39;APPROVED&#39;</code>，靠影响行数判断）+ <strong>执行层幂等键</strong>（同一幂等键只执行一次）。只有 CAS 不够——因为 CAS 成功后进程可能崩溃在执行中，恢复时状态是 <code>RESUMING</code>，需要”僵死状态回收 + 幂等执行”配合。</p>
+<p><strong>Q4：Edit 形态怎么实现？参数被改了，之前的校验还生效吗？</strong></p>
+<p>不生效，必须<strong>重新校验</strong>。正确流程是：审批人改参数 → 服务端用<strong>同一个 schema</strong>重新校验 → 校验通过后更新 <code>arguments_json</code>（并记录 diff 到审计）→ 再走恢复。绝不能”因为人改的所以跳过校验”，人才是最容易手抖的一环。</p>
+<p><strong>Q5：怎么避免审批人变成”橡皮图章”？</strong></p>
+<p>四个手段：① 风险分级，只拦真正危险的；② 审批 UI 给足信息（参数、理由、证据、影响面）；③ 抽样事后审计审批质量（看有没有该拒没拒的）；④ <strong>指标驱动</strong>——同意率 &gt;98% 就主动降级一批 L2 为 L1，让注意力重新分配。</p>
+<hr>
+<h2 id="八、落地清单"><a href="#八、落地清单" class="headerlink" title="八、落地清单"></a>八、落地清单</h2><ol>
+<li>工具注册时<strong>强制声明</strong> <code>riskLevel</code> + <code>requiredApproverRoles</code> + <code>rollbackProcedure</code>，缺一不可上线。</li>
+<li>审批单存 DB，字段必须含<strong>参数快照 + 上下文快照 + 幂等键 + version</strong>。</li>
+<li>超时 <strong>&#x3D; 拒绝</strong>，过期前 25% 时间点提醒一次。</li>
+<li>恢复用 <strong>CAS 抢占 + 幂等执行 + 参数快照</strong>，三件套缺一不可。</li>
+<li>审批 UI 必须给”参数 &#x2F; 理由 &#x2F; 证据 &#x2F; 影响面 &#x2F; 回滚方式”五件套。</li>
+<li>监控七个指标，<strong>同意率 &gt;98% 视为告警</strong>（说明审批已失去信息量）。</li>
+<li>权限与审批<strong>串联</strong>，不是二选一。</li>
+</ol>
+<p>HITL 的本质不是”给 Agent 加限制”，而是<strong>在 Agent 的能力边界上画一条人类可理解的线</strong>。这条线画得好，Agent 才敢真正接管生产；画得不好，要么它闯祸，要么它被一堆无意义的弹窗废掉。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/06/agent-human-in-the-loop-approval-deep-dive/">https://jiweidong.github.io/2026/11/06/agent-human-in-the-loop-approval-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1/">系统设计</a><a class="post-meta__tags" href="/tags/AI/">AI</a><a class="post-meta__tags" href="/tags/Agent/">Agent</a><a class="post-meta__tags" href="/tags/HITL/">HITL</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/06/elasticsearch-source-doc-values-fielddata-deep-dive/" title="【ES 底层】_source、doc_values 与 fielddata 深度解析：Elasticsearch 到底吃内存还是吃磁盘"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【ES 底层】_source、doc_values 与 fielddata 深度解析：Elasticsearch 到底吃内存还是吃磁盘</div></div><div class="info-2"><div class="info-item-1">【ES 底层】_source、doc_values 与 fielddata 深度解析前言：一次”堆内存 32G 却天天 OOM”的排查线上一个 9 节点的 ES 集群，每个节点 -Xmx31g（31g 是压缩指针的临界点，这个数字后面还会出现），日均写入 2 亿条日志，某天开始每天下午 OOM 一次，hot_threads 显示大量线程卡在 GlobalOrdinalsStringTermsAggregator。 排查结果：一个”临时看板”需求给 message（text 类型）加了 terms 聚合。text 字段默认 fielddata=false，那位同学为了”让它能聚合”，直接开了 &quot;fielddata&quot;: true。于是 ES 把整个字段的所有 term 加载进堆，30 亿个文档的 message 字段，堆瞬间爆了。 这件事的本质，是没搞清楚一条文档在 ES 里到底被存了几份、每份存在哪、什么时候会被读进堆。 这篇文章就把这件事拆干净。  一、一条文档在 Lucene 里被存了几份假设有这样一个文档： 1&#123;&quot;id&quot;: 1...</div></div></div></a><a class="pagination-related" href="/2026/11/05/long-context-vs-rag-architecture-deep-dive/" title="【AI 体系】长上下文与 RAG 的边界深度解析：1M Token 时代还需要检索吗"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【AI 体系】长上下文与 RAG 的边界深度解析：1M Token 时代还需要检索吗</div></div><div class="info-2"><div class="info-item-1">【AI 体系】长上下文与 RAG 的边界深度解析前言2026 年，主流模型的上下文窗口已经到了 128K、200K，部分模型直接给到 1M 甚至 2M token。于是每次技术评审都会出现同一个问题：  「上下文都 1M 了，直接把文档全塞进去不就行了？还搞什么向量库、切分、重排，不是脱裤子放屁吗？」  这个问题不能靠信仰回答，得靠算账。 这篇文章把「长上下文」和「RAG」放在同一张表上，用成本、延迟、准确率、可运维性四个维度量化对比，给出一棵可以照着走的决策树，以及混合架构在 Java 侧怎么落地。  一、先算成本：这是最硬的一条线1.1 一个真实规模假设企业知识库问答：  知识库总量：5000 万字（约 7000 万 token，中文按 1.4 字&#x2F;token 估） 日请求量：20000 次 每次需要「相关上下文」约 3000 token 就够回答问题  三种方案的 token 消耗：    方案 单次输入 token 日输入 token 相对成本    全量塞入（不可能，超窗口） — — —   长上下文（单文档 15 万 token） 150,000 30 亿 ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/22/ai-coding-assistant-system-design/" title="【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-22</div><div class="info-item-2">【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路</div></div><div class="info-2"><div class="info-item-1">【系统设计】AI 编程助手架构设计：代码检索、上下文组装与补全链路前言AI 编程助手是过去两年最成功的 AI 应用形态，没有之一。但”能跑 Demo”和”能用在 IDE 里”之间隔着一条鸿沟：  Demo 里调用一次 GPT-4 要 2 秒，你能忍；IDE 里光标停下 2 秒才出补全，用户会直接关掉插件。 Demo 里把整个文件塞进 prompt 就行；真实仓库有几万个文件、单文件上万行，窗口根本装不下。 Demo 里模型答错无所谓；IDE 里补全出一个不存在的 API，用户会骂”这玩意儿在乱写”。  本文从系统设计视角拆解 AI 编程助手：补全链路、代码检索、上下文组装、成本与延迟预算、质量评估。这是”AI 系统设计”面试里非常容易考、但很少有人能讲全的题目。  一、先分清两类产品很多人把”代码补全”和”代码 Agent”混为一谈，但它们的架构完全不同：    维度 行内补全（Tab Completion） 对话式改码（Chat &#x2F; Agent）    触发 打字停顿时自动 用户显式提问&#x2F;下指令   延迟要求 P95 &lt; 300ms（体验生死线） 1~...</div></div></div></a><a class="pagination-related" href="/2026/11/03/java-mcp-server-production-deep-practice/" title="【Java AI】MCP Server 生产化深度实战：会话粘滞、工具级限流与审计闭环"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-03</div><div class="info-item-2">【Java AI】MCP Server 生产化深度实战：会话粘滞、工具级限流与审计闭环</div></div><div class="info-2"><div class="info-item-1">【Java AI】MCP Server 生产化深度实战前言MCP（Model Context Protocol）的教程已经很多了：写个 @Tool 方法，起个 SSE 端点，Claude Desktop 一连，工具就跑起来了。 但真把它放到生产环境，问题会成堆出现：  部署了 3 个副本，客户端一连就随机打到不同 Pod，initialize 之后的调用全部 400 某个 Agent 疯狂调 search_docs，把整个 MCP Server 拖垮，没有工具级限流 出事了要复盘：谁在什么时候调了什么工具、参数是什么、返回多大、耗时多少——一条审计都没有 一个租户的工具调用超时了，客户端取消，服务端还在跑，白烧 CPU 工具返回 5MB JSON，直接把模型上下文撑爆  这篇是「把 MCP Server 变成可运维服务」的工程笔记。协议基础（JSON-RPC 消息格式、capabilities 协商、transport）这里不重复，直接讲生产化要解决的六件事。  一、先理清 MCP 的有状态性这是所有生产问题的源头。 1.1 握手期建立了什么12345678Client     ...</div></div></div></a><a class="pagination-related" href="/2026/10/19/ai-application-engineer-interview-guide/" title="【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-19</div><div class="info-item-2">【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路</div></div><div class="info-2"><div class="info-item-1">【AI 面试】AI 应用开发岗面试指南：高频考点、答题框架与项目追问链路前言2026 年的 AI 应用开发岗（也叫 LLM 应用工程师、Agent 工程师、AI 平台工程师）已经过了”会调 OpenAI API 就能入职”的阶段。 现在的面试官普遍会做三件事：  用场景题筛掉”只会写 demo”的人：不是问”什么是 RAG”，而是问”你的 RAG 为什么召回不准，怎么定位”。 用追问链挖深度：一个问题连着问四层，看你是背的还是有真实工程经验。 用成本&#x2F;稳定性问题筛掉”没上过生产”的人：Token 账单、P99 延迟、幻觉率、灰度方案。  这篇文章把过去一年高频出现的题目按模块整理，并给出可以直接套用的答题框架。重点不是”标准答案”，而是答题的结构——面试官真正在评估的是你的思维方式。  一、面试流程与评估维度典型 4 轮：    轮次 时长 考察 通过关键    一面（基础） 45min LLM 基础、Prompt、RAG 概念、代码 概念准确、不装懂   二面（项目） 60min 你的项目细节、技术选型、踩坑 能讲清”为什么这么选”   三面（系统设计） 60min ...</div></div></div></a><a class="pagination-related" href="/2026/11/01/java-agent-tool-protocol-mcp-a2a-openapi-deep-practice/" title="【Java AI】工具调用协议深度对比：MCP、A2A 与 OpenAPI 的边界、选型与 Java 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-01</div><div class="info-item-2">【Java AI】工具调用协议深度对比：MCP、A2A 与 OpenAPI 的边界、选型与 Java 落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】工具调用协议深度对比：MCP、A2A 与 OpenAPI前言2025 年之后，Agent 圈子里的协议讨论几乎被三个词占满：MCP、A2A、OpenAPI。 但中文技术圈里有一个普遍的误解：把它们当成三选一的竞品。”是不是有了 MCP 就不用 OpenAPI 了？””A2A 会不会取代 MCP？”——这类问题本身就问错了。 真相是：它们处在三个不同的抽象层，解决三个不同的问题。    协议 解决的问题 类比    OpenAPI 一个服务如何用机器可读的方式描述自己的 HTTP 接口 “菜单”（有什么菜、怎么点）   MCP 一个 AI 应用如何动态发现并调用外部工具、读取资源、加载 Prompt “USB-C 接口”（插上就能用）   A2A 一个 Agent 如何委托任务给另一个 Agent，并跟踪长任务状态 “外包合同”（交给谁、进度如何、交付物在哪）   用一句话概括三者关系：  OpenAPI 描述”能力”，MCP 暴露”能力给模型”，A2A 编排”能力的使用者”。  这篇文章从 Java 工程师的视角，把三者的协议结构、Java 落地代码、选型边界讲...</div></div></div></a><a class="pagination-related" href="/2026/10/27/agentic-rag-deep-dive/" title="【RAG 进阶】Agentic RAG 深度解析：查询规划、自适应检索与自我纠错"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-27</div><div class="info-item-2">【RAG 进阶】Agentic RAG 深度解析：查询规划、自适应检索与自我纠错</div></div><div class="info-2"><div class="info-item-1">【RAG 进阶】Agentic RAG 深度解析前言如果你做过企业知识库，一定遇到过这些场景：  用户问「我们公司去年 Q3 的差旅报销标准和今年有什么区别」，一次向量检索只召回了今年的文档，模型答非所问； 用户问「订单服务超时怎么排查」，检索召回了「订单服务架构」和「超时重试配置」两篇无关文档，模型把两者强行拼在一起，编了个答案； 用户问「张三和李四谁的绩效更好」，检索到的文档里根本没有这两个人的对比，但模型依然给了一个看起来很像的结论。  这些问题的共同点是：问题需要多步推理、需要判断「检索到的内容够不够」、需要在不够时换个问法再查。而标准 RAG（一次检索 → 一次生成）是一条单行道，没有任何「判断」和「回退」的能力。 Agentic RAG 就是给 RAG 加上「决策循环」：让模型自己决定查不查、查什么、查几次、查到的东西够不够、不够怎么办。 这篇文章会讲清楚：标准 RAG 到底断在哪、Agentic RAG 的四种典型架构、用 Java（LangChain4j + Spring AI）怎么落地、以及成本和延迟怎么控住。  一、标准 RAG 的五个断点先明确定义。标准 R...</div></div></div></a><a class="pagination-related" href="/2026/11/02/agent-skills-progressive-disclosure-deep-dive/" title="【AI Agent】Agent Skills 深度解析：渐进式披露、技能加载器与 Java 工程化落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-02</div><div class="info-item-2">【AI Agent】Agent Skills 深度解析：渐进式披露、技能加载器与 Java 工程化落地</div></div><div class="info-2"><div class="info-item-1">【AI Agent】Agent Skills 深度解析：渐进式披露与 Java 落地前言2026 年 Agent 工程领域最重要的范式变化之一，是 Agent Skills（技能）的流行。它看起来只是「把一段提示词放进一个文件」，但它解决的是一个非常硬核的工程问题：上下文窗口有限，而 Agent 需要的能力无限。 先看一个真实的痛点。你做了一个企业内部的 Agent，接入 40 个工具（查订单、查库存、发邮件、建工单、查文档、调用内部 API……）。按传统做法，40 个工具的 JSON Schema 全部塞进 system prompt，光工具定义就占 15K token。后果是：  每轮对话固定消耗 15K token，成本是纯聊天的 10 倍； 模型要在 40 个工具里选，选择准确率显著下降（工具越多，误选越多）； 想加第 41 个工具，得重新回归所有场景。  Agent Skills 的思路完全不同：默认只暴露「技能的目录」（名字 + 一句话描述，约 100 token），模型判断需要时再加载完整内容。40 个技能目录只占 4K token，且模型只加载它真正要用的那 1~...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">882</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">994</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">247</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90AI-Agent%E3%80%91Human-in-the-Loop-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【AI Agent】Human-in-the-Loop 深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80%EF%BC%9AAgent-%E4%B8%80%E6%97%A6%E8%83%BD%E2%80%9D%E5%8A%A8%E6%89%8B%E2%80%9D%EF%BC%8C%E5%88%B9%E8%BD%A6%E5%B0%B1%E5%BF%85%E9%A1%BB%E6%98%AF%E8%AE%BE%E8%AE%A1%E7%9A%84%E4%B8%80%E9%83%A8%E5%88%86"><span class="toc-number">1.1.</span> <span class="toc-text">前言：Agent 一旦能”动手”，刹车就必须是设计的一部分</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%83%B3%E6%B8%85%E6%A5%9A%EF%BC%9A%E4%BB%80%E4%B9%88%E8%AF%A5%E6%8B%A6"><span class="toc-number">1.2.</span> <span class="toc-text">一、先想清楚：什么该拦</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%89%E7%A7%8D-HITL-%E5%BD%A2%E6%80%81%EF%BC%8C%E5%88%AB%E6%B7%B7%E7%94%A8"><span class="toc-number">1.3.</span> <span class="toc-text">二、三种 HITL 形态，别混用</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E7%8A%B6%E6%80%81%E6%9C%BA%EF%BC%9AHITL-%E7%9A%84%E6%A0%B8%E5%BF%83%E6%98%AF%E4%B8%80%E4%B8%AA%E6%8C%81%E4%B9%85%E5%8C%96%E7%8A%B6%E6%80%81%E6%9C%BA"><span class="toc-number">1.4.</span> <span class="toc-text">三、状态机：HITL 的核心是一个持久化状态机</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E7%8A%B6%E6%80%81%E5%AE%9A%E4%B9%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 状态定义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E8%A1%A8%E7%BB%93%E6%9E%84"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 表结构</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Java-%E5%AE%9E%E7%8E%B0%EF%BC%9A%E6%8C%82%E8%B5%B7%E4%B8%8E%E6%81%A2%E5%A4%8D"><span class="toc-number">1.5.</span> <span class="toc-text">四、Java 实现：挂起与恢复</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%8C%82%E8%B5%B7"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 挂起</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%86%B3%E7%AD%96%EF%BC%88%E5%B9%B6%E5%8F%91%E5%AE%89%E5%85%A8%EF%BC%89"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 决策（并发安全）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E6%81%A2%E5%A4%8D%E6%89%A7%E8%A1%8C%EF%BC%88%E5%B9%82%E7%AD%89%E6%98%AF%E7%94%9F%E5%91%BD%E7%BA%BF%EF%BC%89"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 恢复执行（幂等是生命线）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-%E8%B6%85%E6%97%B6%E5%A4%84%E7%90%86"><span class="toc-number">1.5.4.</span> <span class="toc-text">4.4 超时处理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8C%87%E6%A0%87%EF%BC%9A%E6%80%8E%E4%B9%88%E8%AF%81%E6%98%8E-HITL-%E7%9C%9F%E7%9A%84%E6%9C%89%E7%94%A8"><span class="toc-number">1.6.</span> <span class="toc-text">五、指标：怎么证明 HITL 真的有用</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BA%94%E4%B8%AA%E5%8F%8D%E6%A8%A1%E5%BC%8F"><span class="toc-number">1.7.</span> <span class="toc-text">六、五个反模式</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E8%90%BD%E5%9C%B0%E6%B8%85%E5%8D%95"><span class="toc-number">1.9.</span> <span class="toc-text">八、落地清单</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/06/agent-human-in-the-loop-approval-deep-dive/" title="【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计">【AI Agent】Human-in-the-Loop 深度解析：审批中断、超时恢复与人工介入的工程设计</a><time datetime="2026-11-06T00:00:00.000Z" title="发表于 2026-11-06 08:00:00">2026-11-06</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/06/elasticsearch-source-doc-values-fielddata-deep-dive/" title="【ES 底层】_source、doc_values 与 fielddata 深度解析：Elasticsearch 到底吃内存还是吃磁盘">【ES 底层】_source、doc_values 与 fielddata 深度解析：Elasticsearch 到底吃内存还是吃磁盘</a><time datetime="2026-11-06T00:00:00.000Z" title="发表于 2026-11-06 08:00:00">2026-11-06</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/06/java-mcp-tool-supply-chain-security-deep-practice/" title="【Java AI】MCP 工具供应链安全深度实战：工具投毒、影子覆盖与清单签名校验">【Java AI】MCP 工具供应链安全深度实战：工具投毒、影子覆盖与清单签名校验</a><time datetime="2026-11-06T00:00:00.000Z" title="发表于 2026-11-06 08:00:00">2026-11-06</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/06/jvm-jit-intrinsics-intrinsiccandidate-deep-dive/" title="【JVM 底层】JIT Intrinsic 内建函数深度解析：为什么 System.arraycopy 比手写循环快 8 倍">【JVM 底层】JIT Intrinsic 内建函数深度解析：为什么 System.arraycopy 比手写循环快 8 倍</a><time datetime="2026-11-06T00:00:00.000Z" title="发表于 2026-11-06 08:00:00">2026-11-06</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/06/redis-dict-progressive-rehash-scan-deep-dive/" title="【Redis 底层】dict 渐进式 rehash 与 SCAN 遍历语义深度解析：为什么你的 SCAN 会重复返回">【Redis 底层】dict 渐进式 rehash 与 SCAN 遍历语义深度解析：为什么你的 SCAN 会重复返回</a><time datetime="2026-11-06T00:00:00.000Z" title="发表于 2026-11-06 08:00:00">2026-11-06</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
