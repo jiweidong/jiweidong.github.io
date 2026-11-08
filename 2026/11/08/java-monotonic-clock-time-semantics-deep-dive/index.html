@@ -1,0 +1,513 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统前言先看四个真实事故，它们看起来毫不相关，根因却是同一个：  缓存提前失效：Redis TTL 明明设了 30 分钟，某批 key 在 12 分钟时就消失了。 Token 反复失效：JWT 的 exp 校验用的是服务端时间，两台机器相差 90 秒，用户在两台机器之间被反复踢下线。 雪">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统前言先看四个真实事故，它们看起来毫不相关，根因却是同一个：  缓存提前失效：Redis TTL 明明设了 30 分钟，某批 key 在 12 分钟时就消失了。 Token 反复失效：JWT 的 exp 校验用的是服务端时间，两台机器相差 90 秒，用户在两台机器之间被反复踢下线。 雪">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-08T00:05:00.000Z">
+<meta property="article:modified_time" content="2026-11-08T00:03:25.943Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="分布式">
+<meta property="article:tag" content="并发">
+<meta property="article:tag" content="面试">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统",
+  "url": "https://jiweidong.github.io/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-08T00:05:00.000Z",
+  "dateModified": "2026-11-08T00:03:25.943Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">892</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1001</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-08T00:05:00.000Z" title="发表于 2026-11-08 08:05:00">2026-11-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-08T00:03:25.943Z" title="更新于 2026-11-08 08:03:25">2026-11-08</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Java-%E5%9F%BA%E7%A1%80/">Java 基础</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Java-基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis-与被时间坑过的系统"><a href="#【Java-基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis-与被时间坑过的系统" class="headerlink" title="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统"></a>【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>先看四个真实事故，它们看起来毫不相关，根因却是同一个：</p>
+<ol>
+<li><strong>缓存提前失效</strong>：Redis TTL 明明设了 30 分钟，某批 key 在 12 分钟时就消失了。</li>
+<li><strong>Token 反复失效</strong>：JWT 的 <code>exp</code> 校验用的是服务端时间，两台机器相差 90 秒，用户在两台机器之间被反复踢下线。</li>
+<li><strong>雪花 ID 重复</strong>：凌晨 NTP 校时回拨 800ms，同一毫秒内两个节点生成了相同的 ID，主键冲突打爆了订单表。</li>
+<li><strong>定时任务漏跑</strong>：<code>ScheduledExecutorService</code> 的 <code>scheduleAtFixedRate</code> 在系统时间被向前跳了 5 分钟后，一次性补跑了 300 次任务。</li>
+</ol>
+<p>这四个坑的共同点：<strong>把”墙上时间”当成了”流逝的时间”</strong>。</p>
+<p>这篇从 JDK 实现一路讲到业务语义，把”该用哪个时钟”变成一条可以背诵的规则。</p>
+<hr>
+<h2 id="一、JDK-里到底有几个时钟"><a href="#一、JDK-里到底有几个时钟" class="headerlink" title="一、JDK 里到底有几个时钟"></a>一、JDK 里到底有几个时钟</h2><h3 id="1-1-三个入口"><a href="#1-1-三个入口" class="headerlink" title="1.1 三个入口"></a>1.1 三个入口</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">a</span> <span class="operator">=</span> System.currentTimeMillis();       <span class="comment">// 墙上时间（epoch 毫秒）</span></span><br><span class="line"><span class="type">long</span> <span class="variable">b</span> <span class="operator">=</span> System.nanoTime();                <span class="comment">// 单调时间（任意原点，纳秒）</span></span><br><span class="line"><span class="type">Instant</span> <span class="variable">c</span> <span class="operator">=</span> Instant.now();                 <span class="comment">// JSR-310，底层仍是墙上时间</span></span><br></pre></td></tr></table></figure>
+
+<p>三者的底层来源完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>Linux 底层</th>
+<th>语义</th>
+<th>会回退吗</th>
+<th>跨进程可比</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>currentTimeMillis()</code></td>
+<td><code>clock_gettime(CLOCK_REALTIME)</code></td>
+<td>Unix epoch</td>
+<td><strong>会</strong>（NTP 校时、手动改时间）</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>nanoTime()</code></td>
+<td><code>clock_gettime(CLOCK_MONOTONIC)</code></td>
+<td>任意原点</td>
+<td>不会（可保证单调非递减）</td>
+<td><strong>否</strong></td>
+</tr>
+<tr>
+<td><code>Instant.now()</code></td>
+<td>同 <code>currentTimeMillis</code>（JDK 9+ 走 <code>VM.getNanoTimeAdjustment</code>）</td>
+<td>Unix epoch</td>
+<td>会</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>LocalDateTime.now()</code></td>
+<td>同上 + 默认时区</td>
+<td>本地墙上时间</td>
+<td>会</td>
+<td>是（但受时区影响）</td>
+</tr>
+</tbody></table>
+<h3 id="1-2-nanoTime-的三个”不能”"><a href="#1-2-nanoTime-的三个”不能”" class="headerlink" title="1.2 nanoTime() 的三个”不能”"></a>1.2 <code>nanoTime()</code> 的三个”不能”</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">t1</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">doSomething();</span><br><span class="line"><span class="type">long</span> <span class="variable">costNs</span> <span class="operator">=</span> System.nanoTime() - t1;   <span class="comment">// ✅ 唯一正确用法</span></span><br></pre></td></tr></table></figure>
+
+<p>前面那张表里”跨进程不可比”需要展开，这是面试最容易被追问的点：</p>
+<ol>
+<li><strong>不能当时间戳用</strong>。它的原点是任意的（HotSpot 上通常是 JVM 启动时刻或某个固定点），转成日期毫无意义。</li>
+<li><strong>不能跨 JVM 比较</strong>。两个进程的 <code>nanoTime()</code> 基准不同，A 进程的 <code>nanoTime()</code> 减 B 进程的 <code>nanoTime()</code> 是纯粹的噪声。</li>
+<li><strong>不能假设分辨率是纳秒</strong>。方法名叫 nanoTime，但实际精度取决于硬件与 OS，可能是几十纳秒。要测极短耗时，用 JMH 的 <code>Blackhole</code> + 多次采样，不要相信单次差值。</li>
+</ol>
+<p>还有一个更隐蔽的点：<code>nanoTime()</code> <strong>不保证跨线程严格有序</strong>。在早期多核 x86 上，TSC 寄存器在各核之间有偏移，HotSpot 做了补偿（<code>invariant TSC</code> 检测），但在某些虚拟化环境下仍可能出现极小的乱序。工程结论是：<strong>同线程内做差值可靠，跨线程传 <code>nanoTime</code> 做先后判定不可靠</strong>——要判定先后，请用逻辑时钟或版本号。</p>
+<h3 id="1-3-为什么-currentTimeMillis-很快"><a href="#1-3-为什么-currentTimeMillis-很快" class="headerlink" title="1.3 为什么 currentTimeMillis() 很快"></a>1.3 为什么 <code>currentTimeMillis()</code> 很快</h3><p>在 Linux 上，<code>CLOCK_REALTIME</code> 和 <code>CLOCK_MONOTONIC</code> 都通过 <strong>vDSO</strong>（virtual dynamic shared object）在用户态直接读取，不陷入内核。所以 <code>currentTimeMillis()</code> 的开销大约 20–30ns，和一次普通方法调用差不多。</p>
+<p>这也解释了一个反直觉现象：<strong>某些容器&#x2F;虚拟化环境（比如某些 gVisor、旧版 Xen）不支持 vDSO，<code>currentTimeMillis()</code> 会退化成真实系统调用，QPS 高时日志时间戳本身成为瓶颈</strong>。如果你的服务在迁移到新运行时后 CPU 莫名上涨，值得怀疑这一点。</p>
+<hr>
+<h2 id="二、墙上时间会怎么”坏掉”"><a href="#二、墙上时间会怎么”坏掉”" class="headerlink" title="二、墙上时间会怎么”坏掉”"></a>二、墙上时间会怎么”坏掉”</h2><h3 id="2-1-NTP-的两种校时方式"><a href="#2-1-NTP-的两种校时方式" class="headerlink" title="2.1 NTP 的两种校时方式"></a>2.1 NTP 的两种校时方式</h3><table>
+<thead>
+<tr>
+<th>方式</th>
+<th>行为</th>
+<th>对 Java 的影响</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>slew（平滑调整）</td>
+<td>把时钟频率调快&#x2F;调慢一点点，慢慢追上</td>
+<td>时间变慢变快，但对业务通常无害</td>
+</tr>
+<tr>
+<td>step（跳变）</td>
+<td>直接跳到正确时间</td>
+<td><strong>可能回退</strong>，也可能前跳</td>
+</tr>
+</tbody></table>
+<p>ntpd 的默认策略是：偏差小于 128ms 用 slew，超过则 step。chrony 默认在启动初期允许 <code>makestep</code>。所以<strong>生产环境里时间回拨是必然会发生的，只是幅度问题</strong>，不是”理论上可能”。</p>
+<p>虚拟机的挂起&#x2F;恢复（比如 K8s 节点休眠、VM 快照回滚）是另一个大户：恢复瞬间，<code>CLOCK_REALTIME</code> 会跳回，而 <code>CLOCK_MONOTONIC</code> 也<strong>不包含</strong>挂起时间（这正是 <code>CLOCK_BOOTTIME</code> 存在的理由）。</p>
+<h3 id="2-2-三个经典受害场景"><a href="#2-2-三个经典受害场景" class="headerlink" title="2.2 三个经典受害场景"></a>2.2 三个经典受害场景</h3><p><strong>场景 A：用 <code>currentTimeMillis</code> 算耗时</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">callRemote();</span><br><span class="line"><span class="type">long</span> <span class="variable">cost</span> <span class="operator">=</span> System.currentTimeMillis() - start;  <span class="comment">// ❌ 可能为负</span></span><br></pre></td></tr></table></figure>
+
+<p>如果这期间发生 1 秒回拨，<code>cost</code> 会是负数，进而污染 P99 统计、触发错误的熔断判断。</p>
+<p><strong>场景 B：用 <code>currentTimeMillis</code> 做限流窗口</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 固定窗口限流，时间回拨后窗口边界错乱，可能放过 2 倍流量</span></span><br><span class="line"><span class="type">long</span> <span class="variable">window</span> <span class="operator">=</span> System.currentTimeMillis() / <span class="number">1000</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>场景 C：用 <code>currentTimeMillis</code> 做租约（lease）</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 回拨后租约&quot;永不过期&quot;，分布式锁形同虚设</span></span><br><span class="line"><span class="type">boolean</span> <span class="variable">expired</span> <span class="operator">=</span> System.currentTimeMillis() &gt; leaseExpireAt;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、选型规则：一张表定生死"><a href="#三、选型规则：一张表定生死" class="headerlink" title="三、选型规则：一张表定生死"></a>三、选型规则：一张表定生死</h2><table>
+<thead>
+<tr>
+<th>需求</th>
+<th>正确选择</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>测量耗时、超时、延迟</td>
+<td><code>System.nanoTime()</code></td>
+<td>单调，不受校时影响</td>
+</tr>
+<tr>
+<td>记录事件发生时刻、日志时间戳</td>
+<td><code>currentTimeMillis()</code> &#x2F; <code>Instant.now()</code></td>
+<td>需要人类可读、可跨系统对齐</td>
+</tr>
+<tr>
+<td>缓存 TTL（本地）</td>
+<td><code>nanoTime()</code> 算剩余时长，或 <code>Caffeine</code> 的 <code>expireAfterWrite</code></td>
+<td>库内部已用单调时钟</td>
+</tr>
+<tr>
+<td>缓存 TTL（Redis）</td>
+<td>绝对时间戳一般安全（Redis 单机时钟）</td>
+<td>跨节点时钟差异才是问题</td>
+</tr>
+<tr>
+<td>生成有序 ID</td>
+<td>墙上时间 + <strong>回拨保护</strong></td>
+<td>见下一节</td>
+</tr>
+<tr>
+<td>判断”谁先谁后”（跨节点）</td>
+<td>逻辑时钟 &#x2F; 版本号 &#x2F; fencing token</td>
+<td>物理时钟不可靠</td>
+</tr>
+<tr>
+<td>定时任务周期执行</td>
+<td><code>ScheduledExecutorService</code>（内部用 <code>nanoTime</code>）</td>
+<td>不受校时影响</td>
+</tr>
+<tr>
+<td>定时任务定点执行（每天 2 点）</td>
+<td>墙上时间 + 校时后重算</td>
+<td>语义就是”墙上几点”</td>
+</tr>
+</tbody></table>
+<p><strong>背诵版</strong>：<strong>算流逝用单调时钟，记时刻用墙上时钟，判先后用逻辑时钟。</strong></p>
+<hr>
+<h2 id="四、雪花-ID-与时间回拨"><a href="#四、雪花-ID-与时间回拨" class="headerlink" title="四、雪花 ID 与时间回拨"></a>四、雪花 ID 与时间回拨</h2><h3 id="4-1-标准雪花的结构"><a href="#4-1-标准雪花的结构" class="headerlink" title="4.1 标准雪花的结构"></a>4.1 标准雪花的结构</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">| 1 bit 符号(0) | 41 bit 毫秒时间戳 | 10 bit 机器 ID | 12 bit 序列号 |</span><br></pre></td></tr></table></figure>
+
+<p>41 位毫秒约 69.7 年；12 位序列号意味着<strong>单节点每毫秒最多 4096 个 ID</strong>。它的正确性完全建立在”时间单调递增”这个假设上。</p>
+<h3 id="4-2-回拨的三种处理策略"><a href="#4-2-回拨的三种处理策略" class="headerlink" title="4.2 回拨的三种处理策略"></a>4.2 回拨的三种处理策略</h3><table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>抛异常</td>
+<td>检测到回拨直接失败</td>
+<td>简单、绝不重复</td>
+<td>业务抖动，回拨 1 秒就报错</td>
+</tr>
+<tr>
+<td>等待追平</td>
+<td><code>while (now &lt; lastTimestamp) LockSupport.parkNanos(...)</code></td>
+<td>ID 连续、无重复</td>
+<td>回拨大时线程长时间阻塞</td>
+</tr>
+<tr>
+<td>借位&#x2F;换机器号</td>
+<td>回拨期间借用备用 workerId 或增加时间位偏移</td>
+<td>不阻塞</td>
+<td>位宽紧张，实现复杂</td>
+</tr>
+</tbody></table>
+<p>生产上最常用的是”<strong>小回拨等待 + 大回拨告警 + 极端情况切备用 workerId</strong>“：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">SafeSnowflake</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">EPOCH</span> <span class="operator">=</span> <span class="number">1_700_000_000_000L</span>;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">MAX_BACKWARD_MS</span> <span class="operator">=</span> <span class="number">5</span>;      <span class="comment">// 容忍 5ms</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">WAIT_THRESHOLD_MS</span> <span class="operator">=</span> <span class="number">2_000</span>; <span class="comment">// 超过 2s 直接失败告警</span></span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">long</span> workerId;</span><br><span class="line">    <span class="keyword">private</span> <span class="type">long</span> <span class="variable">lastTimestamp</span> <span class="operator">=</span> -<span class="number">1L</span>;</span><br><span class="line">    <span class="keyword">private</span> <span class="type">long</span> <span class="variable">sequence</span> <span class="operator">=</span> <span class="number">0L</span>;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">synchronized</span> <span class="type">long</span> <span class="title function_">nextId</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">now</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (now &lt; lastTimestamp) &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">offset</span> <span class="operator">=</span> lastTimestamp - now;</span><br><span class="line">            <span class="keyword">if</span> (offset &lt;= MAX_BACKWARD_MS) &#123;</span><br><span class="line">                <span class="comment">// 小回拨：自旋等时钟追平（用 nanoTime 计时，避免二次回拨导致死等）</span></span><br><span class="line">                <span class="type">long</span> <span class="variable">deadline</span> <span class="operator">=</span> System.nanoTime() + offset * <span class="number">1_000_000L</span>;</span><br><span class="line">                <span class="keyword">while</span> (System.currentTimeMillis() &lt; lastTimestamp</span><br><span class="line">                        &amp;&amp; System.nanoTime() &lt; deadline) &#123;</span><br><span class="line">                    Thread.onSpinWait();</span><br><span class="line">                &#125;</span><br><span class="line">                now = System.currentTimeMillis();</span><br><span class="line">            &#125;</span><br><span class="line">            <span class="keyword">if</span> (now &lt; lastTimestamp) &#123;</span><br><span class="line">                <span class="keyword">if</span> (offset &gt; WAIT_THRESHOLD_MS) &#123;</span><br><span class="line">                    <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(</span><br><span class="line">                        <span class="string">&quot;clock moved backwards &quot;</span> + offset + <span class="string">&quot;ms, refuse to generate id&quot;</span>);</span><br><span class="line">                &#125;</span><br><span class="line">                <span class="comment">// 仍在回拨中：用&quot;逻辑时间&quot;续上，牺牲物理顺序换取唯一性</span></span><br><span class="line">                now = lastTimestamp;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (now == lastTimestamp) &#123;</span><br><span class="line">            sequence = (sequence + <span class="number">1</span>) &amp; <span class="number">0xFFF</span>;   <span class="comment">// 4096</span></span><br><span class="line">            <span class="keyword">if</span> (sequence == <span class="number">0</span>) &#123;</span><br><span class="line">                <span class="comment">// 本毫秒用尽，借下一毫秒（逻辑推进）</span></span><br><span class="line">                now = waitNextMillis(lastTimestamp);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            sequence = <span class="number">0</span>;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        lastTimestamp = now;</span><br><span class="line">        <span class="keyword">return</span> ((now - EPOCH) &lt;&lt; <span class="number">22</span>) | (workerId &lt;&lt; <span class="number">12</span>) | sequence;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="type">long</span> <span class="title function_">waitNextMillis</span><span class="params">(<span class="type">long</span> last)</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">ts</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">        <span class="keyword">while</span> (ts &lt;= last) &#123;</span><br><span class="line">            Thread.onSpinWait();</span><br><span class="line">            ts = System.currentTimeMillis();</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> ts;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ 关键细节：<strong>自旋等待的截止时间必须用 <code>nanoTime()</code> 算</strong>。如果两处都用 <code>currentTimeMillis()</code>，回拨持续时 <code>deadline</code> 也会跟着回退，循环可能永远出不来。</p>
+<h3 id="4-3-更彻底的方案"><a href="#4-3-更彻底的方案" class="headerlink" title="4.3 更彻底的方案"></a>4.3 更彻底的方案</h3><p>真正要求 ID 严格单调递增的系统（比如数据库主键、binlog 位点），应该放弃”物理时间 + 位运算”，改用 <strong>号段模式</strong>（美团 Leaf-segment）或 <strong>TSO</strong>（TiDB 的 PD、Snowflake + 中心授时）。它们的共同点是：<strong>时间的单调性由一个中心化的、可持久化的组件保证</strong>，而不是靠机器本地时钟。</p>
+<hr>
+<h2 id="五、JSR-310-的-Clock：把时间变成依赖"><a href="#五、JSR-310-的-Clock：把时间变成依赖" class="headerlink" title="五、JSR-310 的 Clock：把时间变成依赖"></a>五、JSR-310 的 <code>Clock</code>：把时间变成依赖</h2><h3 id="5-1-为什么要注入-Clock"><a href="#5-1-为什么要注入-Clock" class="headerlink" title="5.1 为什么要注入 Clock"></a>5.1 为什么要注入 Clock</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 不可测：单元测试里没法控制&quot;现在&quot;</span></span><br><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">isExpired</span><span class="params">(Token t)</span> &#123;</span><br><span class="line">    <span class="keyword">return</span> Instant.now().isAfter(t.expireAt());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ✅ 依赖注入：测试里可以任意拨表</span></span><br><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TokenService</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Clock clock;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">TokenService</span><span class="params">(Clock clock)</span> &#123; <span class="built_in">this</span>.clock = clock; &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">isExpired</span><span class="params">(Token t)</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> clock.instant().isAfter(t.expireAt());</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Configuration</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ClockConfig</span> &#123;</span><br><span class="line">    <span class="meta">@Bean</span></span><br><span class="line">    <span class="keyword">public</span> Clock <span class="title function_">systemClock</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> Clock.systemUTC();           <span class="comment">// 生产</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="comment">// 测试</span></span><br><span class="line"><span class="type">Clock</span> <span class="variable">fixed</span> <span class="operator">=</span> Clock.fixed(Instant.parse(<span class="string">&quot;2026-11-08T00:00:00Z&quot;</span>), ZoneOffset.UTC);</span><br><span class="line">assertTrue(<span class="keyword">new</span> <span class="title class_">TokenService</span>(fixed).isExpired(token));</span><br></pre></td></tr></table></figure>
+
+<p><code>Clock</code> 的几个工厂方法：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Clock.systemUTC()</code></td>
+<td>生产默认，UTC</td>
+</tr>
+<tr>
+<td><code>Clock.system(ZoneId)</code></td>
+<td>需要本地时区语义</td>
+</tr>
+<tr>
+<td><code>Clock.fixed(instant, zone)</code></td>
+<td>测试固定时间</td>
+</tr>
+<tr>
+<td><code>Clock.offset(base, duration)</code></td>
+<td>测试”快进&#x2F;慢放”</td>
+</tr>
+<tr>
+<td><code>Clock.tick(base, duration)</code></td>
+<td>截断到指定精度（如 <code>tickMillis</code>），用于对齐</td>
+</tr>
+</tbody></table>
+<p>⚠️ 时区规则：<strong>内部一律用 <code>Instant</code> &#x2F; <code>UTC</code>，只在展示层转时区</strong>。<code>LocalDateTime</code> 不带时区信息，一旦跨服务传递就是定时炸弹——两个服务跑在不同时区的容器里，同一个 <code>LocalDateTime</code> 代表两个不同的瞬间。</p>
+<h3 id="5-2-Clock-的精度陷阱"><a href="#5-2-Clock-的精度陷阱" class="headerlink" title="5.2 Clock 的精度陷阱"></a>5.2 <code>Clock</code> 的精度陷阱</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">Instant</span> <span class="variable">a</span> <span class="operator">=</span> Clock.systemUTC().instant();</span><br><span class="line"><span class="comment">// JDK 8: 毫秒精度（底层 currentTimeMillis）</span></span><br><span class="line"><span class="comment">// JDK 9+: 微秒精度（底层 VM.getNanoTimeAdjustment）</span></span><br></pre></td></tr></table></figure>
+
+<p>如果你的代码依赖”相邻两次 <code>Instant.now()</code> 一定不同”来做幂等键，<strong>这在 JDK 9+ 上仍然会重复</strong>（微秒内两次调用可能相同），必须显式加序列号或直接用 <code>UUID</code>。</p>
+<hr>
+<h2 id="六、MySQL-时间字段：另一条时间线"><a href="#六、MySQL-时间字段：另一条时间线" class="headerlink" title="六、MySQL 时间字段：另一条时间线"></a>六、MySQL 时间字段：另一条时间线</h2><table>
+<thead>
+<tr>
+<th>类型</th>
+<th>存储</th>
+<th>时区行为</th>
+<th>范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DATETIME</code></td>
+<td>字面值，无时区</td>
+<td>原样存取，不做转换</td>
+<td>1000–9999</td>
+</tr>
+<tr>
+<td><code>TIMESTAMP</code></td>
+<td>UTC 秒数，4 字节</td>
+<td>按会话 <code>time_zone</code> 转换</td>
+<td>1970–2038</td>
+</tr>
+<tr>
+<td><code>DATETIME(6)</code></td>
+<td>微秒精度</td>
+<td>同上</td>
+<td>同上</td>
+</tr>
+</tbody></table>
+<p>三个生产建议：</p>
+<ol>
+<li><strong>统一用 <code>DATETIME(3)</code> 存业务时间，统一在应用层转 UTC</strong>。<code>TIMESTAMP</code> 的 2038 问题在”订单到期时间””会员有效期”这类场景是真实风险。</li>
+<li><strong><code>CURRENT_TIMESTAMP</code> 依赖数据库服务器时钟</strong>，和你的应用服务器时钟不是一个源。跨机器比较”应用生成的时间”和”数据库生成的时间”时，必须容忍时钟偏差，否则会出现”创建时间晚于更新时间”的诡异数据。</li>
+<li><strong><code>ON UPDATE CURRENT_TIMESTAMP</code> + 主从延迟</strong>：从库上的值可能比主库旧，做增量同步（比如 Canal）时不要用它做水位线，用 binlog 位点。</li>
+</ol>
+<hr>
+<h2 id="七、分布式场景：物理时钟不够用"><a href="#七、分布式场景：物理时钟不够用" class="headerlink" title="七、分布式场景：物理时钟不够用"></a>七、分布式场景：物理时钟不够用</h2><p>分布式锁的经典错误：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// ❌ 用本地时钟判断租约到期，节点 A 的时钟慢 10 秒 → 它认为自己还持有锁</span></span><br><span class="line"><span class="keyword">if</span> (System.currentTimeMillis() &gt; expireAt) &#123; renew(); &#125;</span><br></pre></td></tr></table></figure>
+
+<p>正确做法有两层：</p>
+<ol>
+<li><strong>本地续租用单调时钟</strong>：<code>leaseDeadlineNanos = System.nanoTime() + ttl</code>。</li>
+<li><strong>跨节点互斥用 fencing token</strong>：每次获取锁拿到一个单调递增的 token，写存储时带上它，存储侧拒绝比已见过的最大值更小的 token。这样即使旧持有者的时钟错乱，它的写也会被拒绝。</li>
+</ol>
+<p>这正是 Martin Kleppmann 与 antirez 关于 Redlock 那场著名争论的核心：<strong>Redlock 依赖各节点时钟速率大致准确</strong>，而”时钟速率”这件事在虚拟化环境里没有强保证。工程上，能用 fencing token 的地方就不要依赖时钟。</p>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：<code>System.nanoTime()</code> 和 <code>System.currentTimeMillis()</code> 的区别？</strong></p>
+<p><code>currentTimeMillis</code> 是墙上时间，返回 epoch 毫秒，会因 NTP&#x2F;手动改时间而回退；<code>nanoTime</code> 是单调时钟，原点任意，只适合做差值，跨进程不可比。一句话：<strong>前者记”几点”，后者量”多久”</strong>。</p>
+<p><strong>Q2：为什么 <code>nanoTime()</code> 不能跨 JVM 比较？</strong></p>
+<p>它的原点是各 JVM 独立确定的（不共享 epoch），所以两个 JVM 的 <code>nanoTime</code> 没有共同基准。要跨进程对齐耗时，只能各自测完再比对结果，不能拿两个原始值相减。</p>
+<p><strong>Q3：<code>Instant.now()</code> 的精度是多少？</strong></p>
+<p>JDK 8 上是毫秒（底层 <code>currentTimeMillis</code>）；JDK 9+ 在 Linux 上通过 <code>VM.getNanoTimeAdjustment</code> 提供微秒级精度。但精度 ≠ 准确性，墙上时间仍受 NTP 影响。</p>
+<p><strong>Q4：怎么设计一个不受时钟回拨影响的定时任务？</strong></p>
+<p>分两类：<strong>周期型</strong>用 <code>ScheduledExecutorService</code>（内部基于 <code>nanoTime</code> 的 <code>DelayedWorkQueue</code>）；<strong>定点型</strong>（每天 02:00）必须用墙上时间，但要监听时钟跳变（如通过 <code>ScheduledExecutorService</code> 每秒检查 <code>abs(now - expected)</code> 是否超阈值），发现跳变后重算下次触发点，并对”漏掉的窗口”做幂等补偿而不是全量补跑。</p>
+<p><strong>Q5：雪花 ID 遇到时钟回拨怎么办？</strong></p>
+<p>小回拨自旋等待（用 <code>nanoTime</code> 做超时），大回拨直接失败并告警，同时可切备用 workerId。根因层面，要么用号段&#x2F;TSO 方案把单调性中心化，要么接受”极短时间内 ID 不严格有序”。</p>
+<p><strong>Q6：为什么 JWT 的 <code>exp</code> 校验要留时钟偏移（clock skew）？</strong></p>
+<p>签发方与校验方的时钟不可能完全一致，<code>exp</code> 是绝对时间，因此校验时必须允许 <code>nbf - skew &lt;= now &lt;= exp + skew</code>，典型 skew 取 30–60 秒。Spring Security 的 <code>JwtTimestampValidator</code> 就提供了 <code>setClockSkew</code>。</p>
+<hr>
+<h2 id="九、踩坑清单"><a href="#九、踩坑清单" class="headerlink" title="九、踩坑清单"></a>九、踩坑清单</h2><ol>
+<li><strong><code>System.currentTimeMillis()</code> 算耗时</strong>——最常见的错误，回拨时得到负数。</li>
+<li><strong><code>Timer</code> 而不是 <code>ScheduledExecutorService</code></strong>——<code>Timer</code> 是单线程，且对系统时间敏感，早已不推荐。</li>
+<li><strong>日志时间戳与 Trace 时间戳来自不同机器</strong>——排障时把链路耗时算成负数，先怀疑时钟，再怀疑代码。</li>
+<li><strong><code>LocalDateTime</code> 跨服务传递</strong>——不同时区的容器会给出不同解释，统一用 <code>Instant</code> + ISO-8601 带偏移量。</li>
+<li><strong>容器内 <code>TZ</code> 未设置</strong>——<code>LocalDateTime.now()</code> 用 UTC，业务方看到”少了 8 小时”，这类问题在 K8s 上极高频。</li>
+<li><strong>NTP 只配了一个源</strong>——单源故障时可能大幅跳变，至少配 3 个源。</li>
+<li><strong>测试里 <code>Thread.sleep</code> 等异步结果</strong>——慢且不稳定，用 <code>Clock</code> + 可注入的调度器（<code>Awaitility</code> 也是好选择）。</li>
+<li><strong>Redis TTL + 应用侧过期时间双写</strong>——两边时钟源不同，必然出现”一侧已过期、另一侧还在用”的窗口，要么单一事实来源，要么留足容差。</li>
+</ol>
+<hr>
+<h2 id="十、总结"><a href="#十、总结" class="headerlink" title="十、总结"></a>十、总结</h2><p>时间是最容易被忽视的”隐式全局依赖”。它的危险在于：<strong>99.99% 的时间里它都是对的</strong>，所以你几乎不会在开发阶段发现用错了时钟，只会在某个凌晨的告警里遇见它。</p>
+<p>三条规则收尾：</p>
+<ol>
+<li><strong>量流逝用 <code>nanoTime</code>，记时刻用 <code>Instant</code>，判先后用逻辑时钟。</strong></li>
+<li><strong>所有时间来源都要可注入</strong>（<code>Clock</code>），否则你无法为”跨天””跨年””回拨”写测试。</li>
+<li><strong>任何依赖”时间单调”的 ID&#x2F;锁&#x2F;租约方案，都要显式回答”回拨了怎么办”</strong>。回答不出来，就说明它还没设计完。</li>
+</ol>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/">https://jiweidong.github.io/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E9%9D%A2%E8%AF%95/">面试</a><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F/">分布式</a><a class="post-meta__tags" href="/tags/%E5%B9%B6%E5%8F%91/">并发</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/" title="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</div></div><div class="info-2"><div class="info-item-1">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相前言一个很典型的求助场景：  8 核机器，Java 服务 CPU 使用率只有 25%，GC 日志干净得像教科书，JFR 里也没有长停顿，可是接口 P99 每隔几分钟就抖到 300ms，而且业务量并没有波动。  top 按 1 展开每核： 123%Cpu0  :  8.2 us,  0.0 sy,  0.0 ni, 55.0 id,  0.0 wa,  0.0 hi, 36.8 si,  0.0 st%Cpu1  : 18.4 us,  2.1 sy,  0.0 ni, 79.5 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st...  si（softirq）36.8%，而 us 只有 8%。CPU0 被软中断吃掉了三分之一，应用线程一旦被调度到这颗核上，就会莫名其妙地”变慢”。 这类问题的战场不在 JVM 里，在网卡到 socket 的那 200 微秒里。 这篇把中断 → 软中断 → NAPI → 协议栈 → socket 接收队列这条链路拆开，讲清楚它怎么变成 Java ...</div></div></div></a><a class="pagination-related" href="/2026/11/08/mysql-sql-mode-strict-mode-deep-dive/" title="【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪</div></div><div class="info-2"><div class="info-item-1">【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪前言两个真实事故，一个”太安静”，一个”太吵”。 事故一（静默截断）：某电商的订单表 receiver_phone VARCHAR(11)，上游改成支持国际号码后传入了 13 位。数据库没有报错，只有一条 warning。三个月后对账发现，几千条订单的手机号被截成了 11 位——用户收不到验证码，但系统一切正常。 事故二（迁移报错）：从 MySQL 5.6 迁到 8.0，一条统计 SQL 突然报： 1234ERROR 1055 (42000): Expression #3 of SELECT list is not in GROUP BY clauseand contains nonaggregated column &#x27;db.t.status&#x27; which is not functionallydependent on columns in GROUP BY clause; this is incompatible withsql_mode=...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/18/optimistic-pessimistic-lock-deep-dive/" title="【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-18</div><div class="info-item-2">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现</div></div><div class="info-2"><div class="info-item-1">【并发编程】乐观锁与悲观锁深度解析：CAS、版本号机制与数据库实现面试官：你项目里扣库存，用的乐观锁还是悲观锁？这是并发场景的”必考题”。很多人的答案是背出来的：”悲观锁就是锁住，乐观锁就是 CAS”。但一问到”什么场景选哪个、各自的坑在哪”，就露馅了。 本文把乐观锁和悲观锁从思想、实现、源码到实战场景一次讲透。  一、两种锁的哲学悲观锁（Pessimistic Lock）思想：冲突一定会发生，所以先锁再干。  操作数据前先加锁，其他事务&#x2F;线程必须等待； 数据库层面：SELECT ... FOR UPDATE、SELECT ... LOCK IN SHARE MODE； Java 层面：synchronized、ReentrantLock； 适用：写多读少、冲突概率高的场景。  乐观锁（Optimistic Lock）思想：冲突是少数，所以先干再验，冲突了重试。  不加锁，更新时校验数据是否被改过（版本号&#x2F;时间戳&#x2F;CAS）； 数据库层面：UPDATE ... SET version = version + 1 WHERE version = ?； J...</div></div></div></a><a class="pagination-related" href="/2026/08/19/synchronized-vs-reentrantlock-deep-comparison/" title="【面试必备】synchronized vs ReentrantLock 深度对比：8 大区别与源码级解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-19</div><div class="info-item-2">【面试必备】synchronized vs ReentrantLock 深度对比：8 大区别与源码级解析</div></div><div class="info-2"><div class="info-item-1">【面试必备】synchronized vs ReentrantLock 深度对比：8 大区别与源码级解析面试官：你平时用 synchronized 还是 ReentrantLock？它俩有什么区别？这是 Java 并发面试的”必考题”，但大部分候选人的回答停留在”一个是关键字一个是类、一个自动释放一个手动释放”这种表面层。今天我们从语法、功能、底层原理、性能四个维度，把这两个锁彻底掰开揉碎。  一、先看结论：8 大区别一览表   维度 synchronized ReentrantLock    1. 本质 JVM 关键字（语言级） JUC 类（API 级）   2. 锁的获取&#x2F;释放 自动（JVM 管理） 手动（lock&#x2F;unlock，必须 finally 释放）   3. 可中断性 不可中断（等待时无法响应 interrupt） 可中断（lockInterruptibly）   4. 超时获取 不支持 支持 tryLock(timeout, unit)   5. 公平性 非公平 默认非公平，可配公平   6. 多条件变量 只能 wait&#x2F;notify...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-threadpool-executor-deep-dive/" title="「彻底搞懂 ThreadPoolExecutor」核心源码、拒绝策略与实战调优"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「彻底搞懂 ThreadPoolExecutor」核心源码、拒绝策略与实战调优</div></div><div class="info-2"><div class="info-item-1">「彻底搞懂 ThreadPoolExecutor」核心源码、拒绝策略与实战调优线程池是 Java 并发编程中最常用的组件之一。无论是 Web 服务器的请求处理、异步任务的执行，还是消息队列的消费端，背后都离不开线程池。但你真的了解它吗？本文从源码到实战，帮你彻底搞懂 ThreadPoolExecutor。  一、为什么需要线程池？在没有线程池之前，我们创建一个线程来处理一个任务： 123new Thread(() -&gt; &#123;    // do something&#125;).start();  这种方式的三个致命问题：    问题 说明    频繁创建&#x2F;销毁 线程创建和销毁需要系统调用，开销大   资源无上限 大量并发时线程数爆炸，OOM 或系统崩溃   管理缺失 无法控制最大并发数，无法复用，无法监控   线程池解决了这些问题：复用线程、控制并发、统一管理。  二、ThreadPoolExecutor 核心构造参数1234567public ThreadPoolExecutor(int corePoolSize,                    ...</div></div></div></a><a class="pagination-related" href="/2026/09/06/simpledateformat-thread-safety-datetime-best-practice/" title="【面试必备】面试官：SimpleDateFormat 为什么线程不安全？Java 日期时间处理最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-06</div><div class="info-item-2">【面试必备】面试官：SimpleDateFormat 为什么线程不安全？Java 日期时间处理最佳实践</div></div><div class="info-2"><div class="info-item-1">【面试必备】面试官：SimpleDateFormat 为什么线程不安全？Java 日期时间处理最佳实践面试官：你项目里用过 SimpleDateFormat 吗？它线程安全吗？“用过，格式化日期很方便……线程安全？呃，好像不安全，但我们都是每次 new 一个用的。” “那你说说它为什么线程不安全？根源在哪？换成什么最好？” 很多同学背了结论”SimpleDateFormat 线程不安全，要用 DateTimeFormatter”，但一问到为什么不安全就卡壳。今天我们从 JDK 源码角度彻底讲透，顺便把 Java 日期时间处理的正确姿势梳理一遍。 一、先看事故现场先写个复现 Demo：多个线程共享一个 SimpleDateFormat 实例，并发解析日期字符串。 12345678910111213141516171819202122232425import java.text.ParseException;import java.text.SimpleDateFormat;import java.util.concurrent.ExecutorService;import java...</div></div></div></a><a class="pagination-related" href="/2026/07/02/java-concurrent-synchronizers-deep-dive/" title="【面试必备】Java 并发同步工具类深度解析：CountDownLatch、CyclicBarrier、Semaphore 与 Phaser"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-02</div><div class="info-item-2">【面试必备】Java 并发同步工具类深度解析：CountDownLatch、CyclicBarrier、Semaphore 与 Phaser</div></div><div class="info-2"><div class="info-item-1">【面试必备】Java 并发同步工具类深度解析：CountDownLatch、CyclicBarrier、Semaphore 与 Phaser引言在 Java 并发编程中，除了 synchronized、ReentrantLock 和 volatile 这些基础同步手段，java.util.concurrent 包还提供了一组强大的同步工具类。本文将深入剖析 CountDownLatch、CyclicBarrier、Semaphore 和 Phaser 四大同步器的核心原理、源码实现与典型应用场景。 一、CountDownLatch：倒计时门闩1.1 核心概念CountDownLatch 允许一个或多个线程等待，直到在其他线程中执行的一组操作完成。它像一个倒计时门闩——初始设置一个计数值，每当一个线程完成任务后调用 countDown() 使计数器减1，计数器归零时，等待的线程被唤醒。 1.2 典型应用场景场景一：主线程等待多个子线程完成初始化 1234567891011121314CountDownLatch latch = new CountDownLatch(3);// 启动...</div></div></div></a><a class="pagination-related" href="/2026/06/21/java-synchronized-lock-upgrade/" title="面试官：说说 Synchronized 的锁升级过程？"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-21</div><div class="info-item-2">面试官：说说 Synchronized 的锁升级过程？</div></div><div class="info-2"><div class="info-item-1">面试官：说说 Synchronized 的锁升级过程？面试官：先说说 Synchronized 的基本用法吧Synchronized 是 Java 最基础的同步机制，从 JDK 1.0 就有了。用法分三种：    用法 锁对象 作用范围    修饰实例方法 当前实例对象 this 整个方法   修饰静态方法 当前 Class 对象 整个方法   同步代码块 指定的任意对象 代码块内   123456789101112131415161718public class SyncDemo &#123;    // 实例方法锁 - 锁的是 this    public synchronized void instanceMethod() &#123;        // ...    &#125;        // 静态方法锁 - 锁的是 Class 对象    public static synchronized void staticMethod() &#123;        // ...    &#125;        // 代码块锁 - 锁的是指定对象    public ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">892</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1001</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Java-%E5%9F%BA%E7%A1%80%E3%80%91%E6%97%B6%E9%92%9F%E6%BA%90%E4%B8%8E%E6%97%B6%E9%97%B4%E8%AF%AD%E4%B9%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AnanoTime%E3%80%81currentTimeMillis-%E4%B8%8E%E8%A2%AB%E6%97%B6%E9%97%B4%E5%9D%91%E8%BF%87%E7%9A%84%E7%B3%BB%E7%BB%9F"><span class="toc-number">1.</span> <span class="toc-text">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81JDK-%E9%87%8C%E5%88%B0%E5%BA%95%E6%9C%89%E5%87%A0%E4%B8%AA%E6%97%B6%E9%92%9F"><span class="toc-number">1.2.</span> <span class="toc-text">一、JDK 里到底有几个时钟</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E4%B8%89%E4%B8%AA%E5%85%A5%E5%8F%A3"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 三个入口</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-nanoTime-%E7%9A%84%E4%B8%89%E4%B8%AA%E2%80%9D%E4%B8%8D%E8%83%BD%E2%80%9D"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 nanoTime() 的三个”不能”</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E4%B8%BA%E4%BB%80%E4%B9%88-currentTimeMillis-%E5%BE%88%E5%BF%AB"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 为什么 currentTimeMillis() 很快</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%A2%99%E4%B8%8A%E6%97%B6%E9%97%B4%E4%BC%9A%E6%80%8E%E4%B9%88%E2%80%9D%E5%9D%8F%E6%8E%89%E2%80%9D"><span class="toc-number">1.3.</span> <span class="toc-text">二、墙上时间会怎么”坏掉”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-NTP-%E7%9A%84%E4%B8%A4%E7%A7%8D%E6%A0%A1%E6%97%B6%E6%96%B9%E5%BC%8F"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 NTP 的两种校时方式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%89%E4%B8%AA%E7%BB%8F%E5%85%B8%E5%8F%97%E5%AE%B3%E5%9C%BA%E6%99%AF"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 三个经典受害场景</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E9%80%89%E5%9E%8B%E8%A7%84%E5%88%99%EF%BC%9A%E4%B8%80%E5%BC%A0%E8%A1%A8%E5%AE%9A%E7%94%9F%E6%AD%BB"><span class="toc-number">1.4.</span> <span class="toc-text">三、选型规则：一张表定生死</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E9%9B%AA%E8%8A%B1-ID-%E4%B8%8E%E6%97%B6%E9%97%B4%E5%9B%9E%E6%8B%A8"><span class="toc-number">1.5.</span> <span class="toc-text">四、雪花 ID 与时间回拨</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%A0%87%E5%87%86%E9%9B%AA%E8%8A%B1%E7%9A%84%E7%BB%93%E6%9E%84"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 标准雪花的结构</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E5%9B%9E%E6%8B%A8%E7%9A%84%E4%B8%89%E7%A7%8D%E5%A4%84%E7%90%86%E7%AD%96%E7%95%A5"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 回拨的三种处理策略</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E6%9B%B4%E5%BD%BB%E5%BA%95%E7%9A%84%E6%96%B9%E6%A1%88"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 更彻底的方案</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81JSR-310-%E7%9A%84-Clock%EF%BC%9A%E6%8A%8A%E6%97%B6%E9%97%B4%E5%8F%98%E6%88%90%E4%BE%9D%E8%B5%96"><span class="toc-number">1.6.</span> <span class="toc-text">五、JSR-310 的 Clock：把时间变成依赖</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%B8%BA%E4%BB%80%E4%B9%88%E8%A6%81%E6%B3%A8%E5%85%A5-Clock"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 为什么要注入 Clock</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-Clock-%E7%9A%84%E7%B2%BE%E5%BA%A6%E9%99%B7%E9%98%B1"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 Clock 的精度陷阱</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81MySQL-%E6%97%B6%E9%97%B4%E5%AD%97%E6%AE%B5%EF%BC%9A%E5%8F%A6%E4%B8%80%E6%9D%A1%E6%97%B6%E9%97%B4%E7%BA%BF"><span class="toc-number">1.7.</span> <span class="toc-text">六、MySQL 时间字段：另一条时间线</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%88%86%E5%B8%83%E5%BC%8F%E5%9C%BA%E6%99%AF%EF%BC%9A%E7%89%A9%E7%90%86%E6%97%B6%E9%92%9F%E4%B8%8D%E5%A4%9F%E7%94%A8"><span class="toc-number">1.8.</span> <span class="toc-text">七、分布式场景：物理时钟不够用</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/ai-engineer-career-ladder-competency-model/" title="【AI 转型】AI 应用开发职级能力模型：P5 到 P8 的能力矩阵、晋升证据链与定级实战">【AI 转型】AI 应用开发职级能力模型：P5 到 P8 的能力矩阵、晋升证据链与定级实战</a><time datetime="2026-11-08T00:20:00.000Z" title="发表于 2026-11-08 08:20:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/java-llm-token-rate-limiting-quota-deep-practice/" title="【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM/TPM 双维、预扣结算与 429 治理">【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM/TPM 双维、预扣结算与 429 治理</a><time datetime="2026-11-08T00:15:00.000Z" title="发表于 2026-11-08 08:15:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/" title="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</a><time datetime="2026-11-08T00:10:00.000Z" title="发表于 2026-11-08 08:10:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/" title="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</a><time datetime="2026-11-08T00:05:00.000Z" title="发表于 2026-11-08 08:05:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/mysql-sql-mode-strict-mode-deep-dive/" title="【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪">【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪</a><time datetime="2026-11-08T00:00:00.000Z" title="发表于 2026-11-08 08:00:00">2026-11-08</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

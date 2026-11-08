@@ -1,0 +1,437 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相前言一个很典型的求助场景：  8 核机器，Java 服务 CPU 使用率只有 25%，GC 日志干净得像教科书，JFR 里也没有长停顿，可是接口 P99 每隔几分钟就抖到 300ms，而且业务量并没有波动。  top 按 1 展开每核： 123%Cpu0  :  8.2 us,  0.0 sy,  0.0 ni, 55">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相前言一个很典型的求助场景：  8 核机器，Java 服务 CPU 使用率只有 25%，GC 日志干净得像教科书，JFR 里也没有长停顿，可是接口 P99 每隔几分钟就抖到 300ms，而且业务量并没有波动。  top 按 1 展开每核： 123%Cpu0  :  8.2 us,  0.0 sy,  0.0 ni, 55">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-08T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-11-08T00:04:11.857Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="Netty">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="网络">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相",
+  "url": "https://jiweidong.github.io/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-08T00:10:00.000Z",
+  "dateModified": "2026-11-08T00:04:11.857Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">892</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1001</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-08T00:10:00.000Z" title="发表于 2026-11-08 08:10:00">2026-11-08</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-08T00:04:11.857Z" title="更新于 2026-11-08 08:04:11">2026-11-08</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【性能调优】软中断与网卡多队列深度解析：Java-服务-P99-抖动的另一半真相"><a href="#【性能调优】软中断与网卡多队列深度解析：Java-服务-P99-抖动的另一半真相" class="headerlink" title="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相"></a>【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>一个很典型的求助场景：</p>
+<blockquote>
+<p>8 核机器，Java 服务 CPU 使用率只有 25%，GC 日志干净得像教科书，JFR 里也没有长停顿，可是接口 P99 每隔几分钟就抖到 300ms，而且业务量并没有波动。</p>
+</blockquote>
+<p><code>top</code> 按 <code>1</code> 展开每核：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">%Cpu0  :  8.2 us,  0.0 sy,  0.0 ni, 55.0 id,  0.0 wa,  0.0 hi, 36.8 si,  0.0 st</span><br><span class="line">%Cpu1  : 18.4 us,  2.1 sy,  0.0 ni, 79.5 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st</span><br><span class="line">...</span><br></pre></td></tr></table></figure>
+
+<p><code>si</code>（softirq）36.8%，而 <code>us</code> 只有 8%。CPU0 被软中断吃掉了三分之一，应用线程一旦被调度到这颗核上，就会莫名其妙地”变慢”。</p>
+<p><strong>这类问题的战场不在 JVM 里，在网卡到 socket 的那 200 微秒里。</strong> 这篇把中断 → 软中断 → NAPI → 协议栈 → socket 接收队列这条链路拆开，讲清楚它怎么变成 Java 服务的尾延迟。</p>
+<hr>
+<h2 id="一、一个包进来，内核做了什么"><a href="#一、一个包进来，内核做了什么" class="headerlink" title="一、一个包进来，内核做了什么"></a>一、一个包进来，内核做了什么</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">网卡 DMA 写 ring buffer</span><br><span class="line">      ↓  硬中断（上半部，只做登记，几十纳秒）</span><br><span class="line">      ↓  raise NET_RX_SOFTIRQ</span><br><span class="line">   ┌──────────────────────────────┐</span><br><span class="line">   │  软中断（下半部）             │</span><br><span class="line">   │  net_rx_action → NAPI poll   │</span><br><span class="line">   │  → GRO 合并 → 协议栈处理      │</span><br><span class="line">   │  → 找到 socket → sk_rmem     │</span><br><span class="line">   └──────────────────────────────┘</span><br><span class="line">      ↓  唤醒等待的进程</span><br><span class="line">   应用 read() / epoll_wait 返回</span><br></pre></td></tr></table></figure>
+
+<p>三层要点：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>执行上下文</th>
+<th>关键约束</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>硬中断（<code>hi</code>）</td>
+<td>中断上下文，关抢占</td>
+<td><strong>必须极短</strong>，只登记并触发软中断</td>
+</tr>
+<tr>
+<td>软中断（<code>si</code>）</td>
+<td>软中断上下文 &#x2F; <code>ksoftirqd/N</code> 线程</td>
+<td>有 budget 限制（<code>netdev_budget</code>），超预算转 <code>ksoftirqd</code></td>
+</tr>
+<tr>
+<td>协议栈 + socket</td>
+<td>同上</td>
+<td>接收队列满 → 丢包（<code>tcp_rmem</code>、backlog）</td>
+</tr>
+</tbody></table>
+<p>所以 <code>si</code> 高意味着：<strong>协议栈处理（校验和、路由查找、TCP 状态机、拷贝到 socket 缓冲）被压在了少数几颗 CPU 上</strong>。</p>
+<hr>
+<h2 id="二、默认配置为什么把压力堆到-CPU0"><a href="#二、默认配置为什么把压力堆到-CPU0" class="headerlink" title="二、默认配置为什么把压力堆到 CPU0"></a>二、默认配置为什么把压力堆到 CPU0</h2><p>绝大多数网卡在单队列模式下，<strong>所有 RX 中断都绑到 CPU0</strong>（或者 irqbalance 看似均衡但没起作用）。此时：</p>
+<ul>
+<li>100 万 PPS 的流量，全部由 CPU0 的一个软中断上下文处理；</li>
+<li>其他 7 颗核在空闲（<code>id</code> 高）；</li>
+<li>应用线程被调度到 CPU0 时，要么等软中断做完，要么频繁被抢占；</li>
+<li>表现出来就是：<strong>总 CPU 不高，但尾延迟很难看</strong>。</li>
+</ul>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 看每个 IRQ 落在哪颗 CPU：列是 CPU0..CPUn，数值是中断次数</span></span><br><span class="line"><span class="built_in">cat</span> /proc/interrupts | grep -E <span class="string">&quot;eth0|ens|nvme&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>典型的坏例子：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">42:  98123456   0   0   0   0   0   0   0   PCI-MSI-edge  eth0-TxRx-0</span><br></pre></td></tr></table></figure>
+
+<p>一个队列，全在 CPU0。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 看软中断分布</span></span><br><span class="line"><span class="built_in">cat</span> /proc/softirqs | <span class="built_in">head</span> -5</span><br><span class="line">watch -n1 <span class="string">&#x27;cat /proc/softirqs | grep NET_RX&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="三、RSS-RPS-RFS-XPS：四个容易混淆的机制"><a href="#三、RSS-RPS-RFS-XPS：四个容易混淆的机制" class="headerlink" title="三、RSS &#x2F; RPS &#x2F; RFS &#x2F; XPS：四个容易混淆的机制"></a>三、RSS &#x2F; RPS &#x2F; RFS &#x2F; XPS：四个容易混淆的机制</h2><table>
+<thead>
+<tr>
+<th>机制</th>
+<th>工作层</th>
+<th>是否改变物理队列</th>
+<th>目的</th>
+<th>配置位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>RSS</strong></td>
+<td>网卡硬件</td>
+<td>是</td>
+<td>多队列并行收包，硬件哈希分流</td>
+<td><code>ethtool -L eth0 combined N</code></td>
+</tr>
+<tr>
+<td><strong>RPS</strong></td>
+<td>内核软中断</td>
+<td>否</td>
+<td>单队列网卡也能把软中断摊到多核</td>
+<td><code>/sys/class/net/eth0/queues/rx-0/rps_cpus</code></td>
+</tr>
+<tr>
+<td><strong>RFS</strong></td>
+<td>内核软中断</td>
+<td>否</td>
+<td>让同一 flow 落到<strong>应用线程所在 CPU</strong>，提升 cache 命中</td>
+<td><code>rps_flow_cnt</code> + <code>rps_sock_flow_entries</code></td>
+</tr>
+<tr>
+<td><strong>XPS</strong></td>
+<td>内核发送侧</td>
+<td>否</td>
+<td>发送时选与中断同核的队列，减少跨核</td>
+<td><code>/sys/class/net/eth0/queues/tx-0/xps_cpus</code></td>
+</tr>
+</tbody></table>
+<p>一句话区分：<strong>RSS 是”多开几条收银台”，RPS 是”一条收银台但多个收银员分流”，RFS 是”让熟客去找他最熟悉的那位收银员”。</strong></p>
+<p>查看与开启：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1) 网卡是否支持多队列</span></span><br><span class="line">ethtool -l eth0</span><br><span class="line"><span class="comment"># Combined: 1  ← 只有 1 个队列，说明没开 RSS</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 2) 开启 8 个队列（需网卡/驱动支持，可能要重载驱动）</span></span><br><span class="line">ethtool -L eth0 combined 8</span><br><span class="line"></span><br><span class="line"><span class="comment"># 3) 确认中断已经分散（此时应有 eth0-TxRx-0..7）</span></span><br><span class="line">grep eth0 /proc/interrupts</span><br><span class="line"></span><br><span class="line"><span class="comment"># 4) 没有多队列硬件能力时，用 RPS 兜底：把 rx-0 的软中断摊到 CPU0-3</span></span><br><span class="line"><span class="built_in">echo</span> 0f &gt; /sys/class/net/eth0/queues/rx-0/rps_cpus</span><br><span class="line"></span><br><span class="line"><span class="comment"># 5) 开启 RFS（需内核 CONFIG_RPS + 应用侧 SO_INCOMING_CPU 配合）</span></span><br><span class="line">sysctl -w net.core.rps_sock_flow_entries=32768</span><br><span class="line"><span class="built_in">echo</span> 4096 &gt; /sys/class/net/eth0/queues/rx-0/rps_flow_cnt</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ <strong>RPS 的代价</strong>：包在内核里要经过一次跨 CPU 的队列传递（<code>process_queue</code>），会增加 cache miss 与延迟抖动。所以<strong>优先 RSS，RPS 只作为没有多队列硬件时的兜底</strong>。</p>
+<p>⚠️ <strong>容器里的坑</strong>：RPS 的 CPU 掩码是<strong>宿主机视角</strong>的 CPU 编号。如果容器只被分配了 cpuset <code>4-7</code>，你写 <code>0f</code> 是无效的（指向了容器外的核），必须写 <code>f0</code>。这个坑在 K8s 环境里非常常见——配置”看起来生效了”，实际包仍然堆在宿主机 CPU0 上。</p>
+<hr>
+<h2 id="四、诊断三件套：softnet-stat、ethtool-S、ss"><a href="#四、诊断三件套：softnet-stat、ethtool-S、ss" class="headerlink" title="四、诊断三件套：softnet_stat、ethtool -S、ss"></a>四、诊断三件套：<code>softnet_stat</code>、<code>ethtool -S</code>、<code>ss</code></h2><h3 id="4-1-proc-net-softnet-stat：软中断的账本"><a href="#4-1-proc-net-softnet-stat：软中断的账本" class="headerlink" title="4.1 /proc/net/softnet_stat：软中断的账本"></a>4.1 <code>/proc/net/softnet_stat</code>：软中断的账本</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">cat</span> /proc/net/softnet_stat</span><br><span class="line"><span class="comment"># 每行对应一颗 CPU，字段是十六进制</span></span><br><span class="line"><span class="comment"># 第1列 processed        处理过的包数</span></span><br><span class="line"><span class="comment"># 第2列 dropped          因为 backlog 满而丢弃（严重！）</span></span><br><span class="line"><span class="comment"># 第3列 time_squeeze     软中断预算耗尽、被迫让出 CPU 的次数</span></span><br></pre></td></tr></table></figure>
+
+<p>解读：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>含义</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>第 2 列在涨</td>
+<td><code>netdev_max_backlog</code> 不够，<strong>真的丢包了</strong></td>
+<td>调大 backlog，或上游限速</td>
+</tr>
+<tr>
+<td>第 3 列在涨</td>
+<td>单次软中断没处理完预算就超时</td>
+<td>调大 <code>netdev_budget</code> &#x2F; <code>netdev_budget_usecs</code>，或分摊到多核</td>
+</tr>
+<tr>
+<td>某一行远高于其他行</td>
+<td>软中断集中在一颗核</td>
+<td>检查 RSS&#x2F;RPS&#x2F;中断亲和性</td>
+</tr>
+</tbody></table>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">sysctl net.core.netdev_max_backlog   <span class="comment"># 默认 1000，万兆网卡建议 8192+</span></span><br><span class="line">sysctl net.core.netdev_budget        <span class="comment"># 默认 300 个包/轮</span></span><br><span class="line">sysctl net.core.netdev_budget_usecs  <span class="comment"># 默认 2000 微秒/轮</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-ethtool-S：网卡侧的丢包真相"><a href="#4-2-ethtool-S：网卡侧的丢包真相" class="headerlink" title="4.2 ethtool -S：网卡侧的丢包真相"></a>4.2 <code>ethtool -S</code>：网卡侧的丢包真相</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">ethtool -S eth0 | grep -Ei <span class="string">&quot;drop|err|miss|no_buffer|fifo&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>重点字段：</p>
+<ul>
+<li><code>rx_missed_errors</code> &#x2F; <code>rx_no_buffer_count</code>：<strong>网卡 ring buffer 满了</strong>，包在进入内核之前就被丢了 → 调大 <code>ethtool -G eth0 rx 4096</code>。</li>
+<li><code>rx_fifo_errors</code>：FIFO 溢出，同样是收不过来。</li>
+<li><code>tx_dropped</code>：发送侧队列满。</li>
+</ul>
+<p>这类丢包在应用侧表现为”TCP 重传 + 延迟尖刺”，而不是”连接失败”，所以很多人查不到。</p>
+<h3 id="4-3-ss-与-netstat-s：socket-层"><a href="#4-3-ss-与-netstat-s：socket-层" class="headerlink" title="4.3 ss 与 netstat -s：socket 层"></a>4.3 <code>ss</code> 与 <code>netstat -s</code>：socket 层</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">ss -lnt | <span class="built_in">head</span>            <span class="comment"># Send-Q 列 = listen backlog 上限；Recv-Q = 当前全连接队列长度</span></span><br><span class="line">netstat -s | grep -i -E <span class="string">&quot;overflow|retrans|pruned&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>Recv-Q</code> 长期接近 <code>Send-Q</code>，说明<strong>全连接队列快满了</strong>：不是网络慢，是你的 accept 速度跟不上（Java 侧 <code>accept</code> 线程或 Netty boss 线程不够）。这属于”应用层背压”，和软中断是两个不同环节，但现象都是”连接超时”。</p>
+<hr>
+<h2 id="五、把中断亲和性和应用线程绑核配合起来"><a href="#五、把中断亲和性和应用线程绑核配合起来" class="headerlink" title="五、把中断亲和性和应用线程绑核配合起来"></a>五、把中断亲和性和应用线程绑核配合起来</h2><p>这是本篇最容易被忽略、但收益最大的一节。</p>
+<p><strong>错误做法</strong>：中断分散到 8 颗核，Netty worker 也跑在 8 颗核。结果两边互相抢，<code>si</code> 抢占应用线程，尾延迟抖动。</p>
+<p><strong>正确做法</strong>：<strong>中断核与业务核物理隔离</strong>。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 例：8 核机器</span></span><br><span class="line"><span class="comment"># CPU0-1：留给系统与软中断</span></span><br><span class="line"><span class="comment"># CPU2-7：跑 Java 应用</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 1) 关掉 irqbalance，手工绑定</span></span><br><span class="line">systemctl stop irqbalance</span><br><span class="line"></span><br><span class="line"><span class="comment"># 2) 把 eth0 的 8 个队列中断绑到 CPU0-1（掩码 0x3）</span></span><br><span class="line"><span class="keyword">for</span> i <span class="keyword">in</span> $(grep eth0 /proc/interrupts | awk -F: <span class="string">&#x27;&#123;print $1&#125;&#x27;</span>); <span class="keyword">do</span></span><br><span class="line">  <span class="built_in">echo</span> 3 &gt; /proc/irq/<span class="variable">$i</span>/smp_affinity</span><br><span class="line"><span class="keyword">done</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 3) 应用绑到 CPU2-7</span></span><br><span class="line">taskset -c 2-7 java -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>在 K8s 上对应的做法是：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1) 用 cpuset 给 Pod 独占核（需 kubelet 开启 static CPU manager policy）</span></span><br><span class="line"><span class="attr">resources:</span></span><br><span class="line">  <span class="attr">limits:</span></span><br><span class="line">    <span class="attr">cpu:</span> <span class="string">&quot;6&quot;</span></span><br><span class="line">    <span class="attr">memory:</span> <span class="string">8Gi</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 2) 用 topologyManagerPolicy: single-numa-node 保证 NUMA 局部性</span></span><br><span class="line"><span class="comment"># 3) 使用 CNI 的多队列 + 中断亲和（多数云厂商的 Terway/Cilium 已有配套）</span></span><br></pre></td></tr></table></figure>
+
+<p>⚠️ 别用 <code>cpu: &quot;6&quot;</code> 这种<strong>十进制小数</strong>表达 CPU 数（K8s 里 <code>&quot;6&quot;</code> 是 6 核，<code>6.5</code> 是 6.5 核，但 <code>6000m</code> 与 <code>6</code> 在现代版本等价）。真正决定”独占核”的是 kubelet 的 <code>cpuManagerPolicy: static</code> + <strong>Guaranteed QoS</strong>（requests &#x3D;&#x3D; limits，且是整数核）。</p>
+<p>Java 侧对应的线程规模：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Netty：worker 线程数默认 = CPU * 2，绑核后要按&quot;可用核数&quot;配，而不是机器核数</span></span><br><span class="line"><span class="type">EventLoopGroup</span> <span class="variable">boss</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">NioEventLoopGroup</span>(<span class="number">1</span>);</span><br><span class="line"><span class="type">EventLoopGroup</span> <span class="variable">worker</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">NioEventLoopGroup</span>(</span><br><span class="line">        Integer.getInteger(<span class="string">&quot;io.netty.eventLoopThreads&quot;</span>,</span><br><span class="line">                Math.max(<span class="number">2</span>, Runtime.getRuntime().availableProcessors())));</span><br><span class="line"></span><br><span class="line"><span class="type">ServerBootstrap</span> <span class="variable">b</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ServerBootstrap</span>();</span><br><span class="line">b.group(boss, worker)</span><br><span class="line"> .channel(NioServerSocketChannel.class)   <span class="comment">// Linux 上可选 EpollServerSocketChannel</span></span><br><span class="line"> .option(ChannelOption.SO_BACKLOG, <span class="number">4096</span>)  <span class="comment">// 与 ss 看到的 Send-Q 对应</span></span><br><span class="line"> .childOption(ChannelOption.SO_RCVBUF, <span class="number">1</span> &lt;&lt; <span class="number">20</span>)</span><br><span class="line"> .childOption(ChannelOption.TCP_NODELAY, <span class="literal">true</span>);</span><br></pre></td></tr></table></figure>
+
+<p><code>Runtime.availableProcessors()</code> 在容器里读的是 <strong>cgroup CPU quota 换算值</strong>（JDK 10+ 支持 <code>UseContainerSupport</code>），在 cpuset 场景下读的是 cpuset 大小。这两个语义在混合部署时可能不一致，<strong>显式用参数覆盖</strong>比依赖默认值稳。</p>
+<hr>
+<h2 id="六、一次真实的调优记录"><a href="#六、一次真实的调优记录" class="headerlink" title="六、一次真实的调优记录"></a>六、一次真实的调优记录</h2><p><strong>环境</strong>：8C16G 云主机，万兆网卡单队列，Spring Cloud Gateway（WebFlux&#x2F;Netty），QPS 6 万，小包为主（平均 380 字节）。</p>
+<p><strong>现象</strong>：P99 从 40ms 抖到 300ms，<code>si</code> 在 CPU0 上到 35%，<code>softnet_stat</code> 第 3 列（time_squeeze）持续增长，<code>ethtool -S</code> 的 <code>rx_missed_errors</code> 每小时涨几百。</p>
+<p><strong>处置与效果</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>动作</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td><code>ethtool -L eth0 combined 8</code> 开多队列</td>
+<td><code>si</code> 从单核 35% 摊到 8 核各 5%，P99 → 90ms</td>
+</tr>
+<tr>
+<td>2</td>
+<td>中断绑 CPU0-1，应用 <code>taskset -c 2-7</code></td>
+<td>P99 → 55ms，抖动频率下降一个量级</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>netdev_max_backlog=16384</code>、<code>netdev_budget_usecs=4000</code></td>
+<td><code>time_squeeze</code> 归零</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>ethtool -G eth0 rx 4096</code></td>
+<td><code>rx_missed_errors</code> 停止增长</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>ethtool -C eth0 rx-usecs 32</code>（中断合并）</td>
+<td>P99 → 18ms，但<strong>平均延迟略升</strong></td>
+</tr>
+</tbody></table>
+<p>最后一步值得单独说：<strong>中断合并是拿延迟换 CPU</strong>。<code>rx-usecs</code> 调大后，一次中断处理更多包，中断次数下降、<code>si</code> 下降，但<strong>每个包的等待时间上升</strong>。低延迟场景（交易、实时推送）要往小调；高吞吐场景（日志采集、大数据管道）可以往大调。这个参数没有”最佳值”，只有”匹配你的 SLA”。</p>
+<hr>
+<h2 id="七、Java-工程师需要建立的三条直觉"><a href="#七、Java-工程师需要建立的三条直觉" class="headerlink" title="七、Java 工程师需要建立的三条直觉"></a>七、Java 工程师需要建立的三条直觉</h2><p><strong>直觉一：<code>si</code> 是”看不见的 CPU 消耗”。</strong><br><code>top</code> 里 <code>us + sy + si + wa</code> 才是完整账本。只看 <code>us</code> 会得出”CPU 很闲”的错误结论，然后去怀疑 GC、怀疑锁、怀疑数据库——全都查不到。</p>
+<p><strong>直觉二：网络问题的第一现场在 <code>/proc</code>，不在 JVM。</strong><br><code>jstack</code> 里看到线程卡在 <code>epollWait</code> 不代表”没问题”，只代表”没数据可读”。数据可能在上游就被丢了（<code>rx_missed_errors</code>）、在内核 backlog 里被丢了（<code>softnet_stat</code> 第 2 列）、在 listen 队列里被拒（<code>Recv-Q</code> 满）。</p>
+<p><strong>直觉三：绑核是双刃剑。</strong><br>绑核能消除抖动，但也会放大”单核打满”的风险。绑核之后必须重新评估线程数（GC 线程、Netty worker、业务线程池），否则原本被 8 核摊掉的峰值会集中到 2 核上。</p>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：硬中断和软中断的区别？</strong></p>
+<p>硬中断由硬件触发、在中断上下文执行、必须极短；软中断由内核在 <code>raise_softirq</code> 后延迟执行，可被硬中断抢占，NET_RX 软中断负责协议栈收包。软中断有 budget（<code>netdev_budget</code>），超预算后转由 <code>ksoftirqd/N</code> 内核线程继续处理。</p>
+<p><strong>Q2：RPS 和 RSS 有什么区别？</strong></p>
+<p>RSS 是网卡硬件多队列，真正的并行收包，包在各队列的 ring buffer 里；RPS 是单队列下的软件分流，在 <code>netif_receive_skb</code> 之后把包投递到其他 CPU 的 backlog 队列，会多一次跨核传递。<strong>能用 RSS 就不要用 RPS。</strong></p>
+<p><strong>Q3：<code>softnet_stat</code> 第 3 列在涨说明什么？</strong></p>
+<p><code>time_squeeze</code>：软中断一轮处理用完了 <code>netdev_budget</code> 或 <code>netdev_budget_usecs</code> 预算，还有包没处理完，被迫让出 CPU。持续增长会导致接收队列积压、最终丢包，尾延迟抖动。调大 budget 或增加队列&#x2F;分散中断。</p>
+<p><strong>Q4：TCP 全连接队列满了，应用侧看到什么？</strong></p>
+<p><code>ss -lnt</code> 的 <code>Recv-Q</code> 逼近 <code>Send-Q</code>，<code>netstat -s</code> 里 <code>listen queue overflowed</code> 增长。客户端表现为连接超时或 <code>Connection reset</code>。根因是 accept 速率不足：Java 侧 boss 线程太少、<code>accept</code> 后有同步阻塞操作、或者 <code>SO_BACKLOG</code> 设置过小。</p>
+<p><strong>Q5：为什么 GSO&#x2F;GRO 会影响延迟？</strong></p>
+<p>GRO 在接收侧把同一条流的多个小包合并成一个大包再交给协议栈，减少每包开销；但合并需要等待（微秒级），低延迟场景关掉 GRO（<code>ethtool -K eth0 gro off</code>）可以降低抖动、提高 CPU 消耗。生产上通常保持开启，除非有极端低延迟需求。</p>
+<hr>
+<h2 id="九、踩坑清单"><a href="#九、踩坑清单" class="headerlink" title="九、踩坑清单"></a>九、踩坑清单</h2><ol>
+<li><strong><code>ethtool -L</code> 改了队列数但中断没重新分布</strong>——驱动可能复位失败，必须回查 <code>/proc/interrupts</code>。</li>
+<li><strong>容器里 RPS 掩码写成宿主机 CPU0-3</strong>——cpuset 场景下无效，掩码要按宿主机编号写。</li>
+<li><strong><code>irqbalance</code> 和手工绑核打架</strong>——两者同时存在时，手工配置会被周期性覆盖。</li>
+<li><strong>只调 backlog 不调 ring buffer</strong>——<code>netdev_max_backlog</code> 是内核 backlog，<code>ethtool -G rx</code> 是网卡 ring，两者是不同环节的队列，丢包要看是哪一个在涨。</li>
+<li><strong><code>netdev_budget</code> 调太大</strong>——软中断会长时间占用 CPU，反而让应用线程饿死；配合 <code>netdev_budget_usecs</code> 一起调，保证单轮有时限。</li>
+<li><strong>绑核后 GC 线程数没跟着降</strong>——JVM 默认按 <code>availableProcessors</code> 起 GC 线程，绑到 2 核还开 8 个 GC 线程会加剧争抢。</li>
+<li><strong>把 <code>st</code>（steal）当成 <code>si</code></strong>——<code>st</code> 是虚拟化层的 CPU 被宿主机抢走，调内核参数没用，要找云厂商或换规格。</li>
+<li><strong>忽略网卡中断合并对 P99 的正向作用</strong>——很多团队只调 <code>si</code> 占比，不看实际尾延迟，<code>rx-usecs</code> 往往是最便宜的一档优化。</li>
+</ol>
+<hr>
+<h2 id="十、总结"><a href="#十、总结" class="headerlink" title="十、总结"></a>十、总结</h2><p>回到开头那个案例：那个”CPU 只有 25%、GC 干净、P99 抖动”的服务，最终定位于<strong>单队列网卡 + 软中断全压在 CPU0</strong>，通过开多队列、隔离中断核、调 backlog 与 ring buffer 解决。整个过程没改一行 Java 代码。</p>
+<p>这就是这一层知识的意义：<strong>当 JVM 里所有指标都正常，说明瓶颈已经不在 JVM 里了。</strong> 从 <code>si</code>、<code>softnet_stat</code>、<code>ethtool -S</code> 这三个入口往下看，你会发现很多”玄学抖动”其实都有非常确定的解释——只是它们不在你平时看的那些图表上。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/">https://jiweidong.github.io/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/Netty/">Netty</a><a class="post-meta__tags" href="/tags/%E7%BD%91%E7%BB%9C/">网络</a><a class="post-meta__tags" href="/tags/Linux/">Linux</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/08/java-llm-token-rate-limiting-quota-deep-practice/" title="【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM/TPM 双维、预扣结算与 429 治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM/TPM 双维、预扣结算与 429 治理</div></div><div class="info-2"><div class="info-item-1">【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM&#x2F;TPM 双维、预扣结算与 429 治理前言把 LLM 接进 Java 服务的第一版限流，几乎所有人都会这么写： 12@RateLimiter(name = &quot;llm&quot;, fallbackMethod = &quot;fallback&quot;)   // 每秒 50 次public String chat(String prompt) &#123; return chatClient.prompt(prompt).call().content(); &#125;  然后上线第二天就出事了：  有人上传了一份 20 万字的 PDF 做摘要，一次请求吃掉 30 万 token，直接把整分钟的 TPM 配额打满； 同一时刻，所有正常用户的请求全部 429； 重试风暴把 429 放大成 4290； 财务在月度账单上看到一个”没人预料到”的数字。  根因很简单：LLM 的”请求成本”差异是 1000 倍级别的，而 QPS 限流假设每次请求成本相同。 这篇讲清楚：为什么必须按 tok...</div></div></div></a><a class="pagination-related" href="/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/" title="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</div></div><div class="info-2"><div class="info-item-1">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统前言先看四个真实事故，它们看起来毫不相关，根因却是同一个：  缓存提前失效：Redis TTL 明明设了 30 分钟，某批 key 在 12 分钟时就消失了。 Token 反复失效：JWT 的 exp 校验用的是服务端时间，两台机器相差 90 秒，用户在两台机器之间被反复踢下线。 雪花 ID 重复：凌晨 NTP 校时回拨 800ms，同一毫秒内两个节点生成了相同的 ID，主键冲突打爆了订单表。 定时任务漏跑：ScheduledExecutorService 的 scheduleAtFixedRate 在系统时间被向前跳了 5 分钟后，一次性补跑了 300 次任务。  这四个坑的共同点：把”墙上时间”当成了”流逝的时间”。 这篇从 JDK 实现一路讲到业务语义，把”该用哪个时钟”变成一条可以背诵的规则。  一、JDK 里到底有几个时钟1.1 三个入口123long a = System.currentTimeMillis();       // 墙上时间（epoch ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/13/java-zero-copy-sendfile-transferto-deep-dive/" title="【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka&#x2F;Netty 中的落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-13</div><div class="info-item-2">【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo 在 Kafka&#x2F;Netty 中的落地</div></div><div class="info-2"><div class="info-item-1">【Java 性能】零拷贝深度解析：sendfile、mmap 与 FileChannel.transferTo前言几乎所有高性能中间件的源码里，你都会看到一个反复出现的词：零拷贝（Zero-Copy）。Kafka 号称单机百万级吞吐、Netty 号称百万连接、RocketMQ 号称高吞吐，背后都离不开零拷贝。 但很多 Java 工程师对它的理解停留在「少了一次拷贝」这句正确的废话上。面试官追问一句就会露馅：  零拷贝到底省掉的是哪几次拷贝？CPU 拷贝还是 DMA 拷贝？ FileChannel.transferTo 底层用的是 sendfile 还是别的？为什么它可能退化成普通读写？ mmap 和 sendfile 都叫零拷贝，它们的区别是什么？各自适合什么场景？ Kafka 的 FileRecords、TransportLayer 为什么不用 transferTo 全程？为什么还要有 MappedByteBuffer？  这篇文章从操作系统 I&#x2F;O 路径讲起，把零拷贝的三种实现方式掰开揉碎，最后落到 Java 代码与中间件源码，并补充面试高频追问与生产踩坑。  一、...</div></div></div></a><a class="pagination-related" href="/2026/07/22/java-vector-api-simd-deep-dive/" title="【Java 进阶】Java Vector API 深度解析：SIMD 向量化计算原理与实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-22</div><div class="info-item-2">【Java 进阶】Java Vector API 深度解析：SIMD 向量化计算原理与实战</div></div><div class="info-2"><div class="info-item-1">【Java 进阶】Java Vector API 深度解析：SIMD 向量化计算原理与实战一、从一道性能题说起假设我们需要计算两个数组的点积（Dot Product）： 12345678// 朴素实现float dotProduct(float[] a, float[] b) &#123;    float sum = 0;    for (int i = 0; i &lt; a.length; i++) &#123;        sum += a[i] * b[i];  // 每次循环只处理一个元素    &#125;    return sum;&#125;  这段代码每次循环只处理一个浮点数乘法。而现代 CPU 的 SIMD（Single Instruction, Multiple Data）指令集——如 AVX-512——一条指令就能同时处理 16 个 float！如果我们能用上这个能力，理论上能获得 16 倍的加速。 这就是 Java Vector API（JEP 426，孵化器 → 预览 → 正式）要做的事情。 二、SIMD 与向量计算基础2.1 什么是 SIMD？...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 System.gc() 产生千丝万缕的联系。 本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：  System.gc() 到底做了什么 JVM 在什么情况下会自动触发 GC -XX:+DisableExplicitGC 和其它 GC 相关参数的作用 DirectBuffer 回收与 System.gc() 的关系 如何正确进行 GC 调优   一、System.gc() 调用链全解析1.1 从 Java 代码到 JVM 实现先看一个最简单的调用链： 1234...</div></div></div></a><a class="pagination-related" href="/2026/11/05/numa-aware-jvm-performance-tuning-deep-dive/" title="【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-05</div><div class="info-item-2">【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战</div></div><div class="info-2"><div class="info-item-1">【JVM 性能】NUMA 架构与 JVM 调优深度解析前言一个很典型的线上怪象：两台机器，A 是 32 核 128G 单路，B 是 2×64 核 512G 双路。压测同一个 Spring Boot 服务，B 的 CPU 利用率上不去，P99 反而比 A 慢 30%，GC 次数还更多。 很多人第一反应是「GC 参数没调好」「线程池太小」，把 -Xmx、-XX:ParallelGCThreads、Tomcat 线程数全试了一遍，收益甚微。真实原因往往藏在 CPU 和内存的物理拓扑里——这台机器是 NUMA 架构，而 JVM 默认并不知道这件事。 这篇文章把 NUMA 的原理、JVM 在 NUMA 上的真实行为、四种落地方案、容器里的坑，以及面试会怎么问，一次讲清楚。  一、NUMA 到底是什么1.1 从 SMP 到 NUMA早期多核 server 是 SMP（Symmetric Multiprocessing）：所有 CPU 通过一条前端总线访问同一块内存，任意核访问任意内存地址的延迟都一样（UMA）。 核数一多，总线就成了瓶颈。于是有了 NUMA（Non-Uniform Memor...</div></div></div></a><a class="pagination-related" href="/2026/07/17/java-thread-dump-analysis-troubleshooting/" title="【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-17</div><div class="info-item-2">【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位引言：为什么需要线程 Dump？线上 Java 应用出现以下问题时，线程 Dump 是你最有力的武器：  ❌ CPU 100% —— 哪个线程在狂转？ ❌ 系统卡死&#x2F;无响应 —— 线程在等什么？ ❌ 死锁 —— 哪些线程互相等待？ ❌ 请求堆积 —— 线程池是否耗尽了？ ❌ 接口响应慢 —— 是卡在 I&#x2F;O 还是业务逻辑？  线程 Dump（又称线程快照、Thread Dump）就是 JVM 在某个时刻对所有线程状态的”快照”。它是非侵入式的，对生产环境几乎没有影响，是排查线上问题的首选手段。 一、获取线程 Dump 的 5 种方式1.1 jstack（最常用）1234567# 先找到 Java 进程IDjps -l# 或ps aux | grep java# 获取线程 Dumpjstack -l &lt;pid&gt; &gt; threaddump.txt  参数说明：  -l：显示锁信息（LockInfo），分析死锁必加 -e：显示详细信息  1.2 jcmd（JDK 8+ 推荐）12#...</div></div></div></a><a class="pagination-related" href="/2026/07/01/java-jit-compiler-deep-dive/" title="【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除</div></div><div class="info-2"><div class="info-item-1">【JVM 原理】JIT 即时编译深度解析：逃逸分析、栈上分配、标量替换与锁消除前言很多 Java 开发者知道 JVM 有「解释执行」和「编译执行」两种模式，但真正理解 JIT（Just-In-Time）即时编译 的人并不多。JIT 是 JVM 性能的核心引擎，它背后的逃逸分析、栈上分配、标量替换和锁消除等技术，能在 不写一行优化代码的情况下，让你的程序自动跑得更快。 本文从原理到实践，深度解析 JIT 编译的核心优化技术。  一、解释执行 vs 编译执行   模式 原理 速度 启动时间    解释执行 逐行翻译字节码 慢 快   JIT 编译 将热点代码编译为机器码 快 较慢（需预热）   混合模式（默认）：JVM 先用解释器快速启动，同时用 热点检测 识别高频执行的方法，交给 JIT 编译为机器码。 123# 查看 JVM 运行模式java -version# 输出包含：Mixed Mode   二、HotSpot 的两大编译器C1（Client Compiler） 编译速度快，优化程度低 适用于客户端应用或启动阶段 对应参数：-client  C2（Server Compil...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">892</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1001</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E3%80%91%E8%BD%AF%E4%B8%AD%E6%96%AD%E4%B8%8E%E7%BD%91%E5%8D%A1%E5%A4%9A%E9%98%9F%E5%88%97%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9AJava-%E6%9C%8D%E5%8A%A1-P99-%E6%8A%96%E5%8A%A8%E7%9A%84%E5%8F%A6%E4%B8%80%E5%8D%8A%E7%9C%9F%E7%9B%B8"><span class="toc-number">1.</span> <span class="toc-text">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%80%E4%B8%AA%E5%8C%85%E8%BF%9B%E6%9D%A5%EF%BC%8C%E5%86%85%E6%A0%B8%E5%81%9A%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、一个包进来，内核做了什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E9%BB%98%E8%AE%A4%E9%85%8D%E7%BD%AE%E4%B8%BA%E4%BB%80%E4%B9%88%E6%8A%8A%E5%8E%8B%E5%8A%9B%E5%A0%86%E5%88%B0-CPU0"><span class="toc-number">1.3.</span> <span class="toc-text">二、默认配置为什么把压力堆到 CPU0</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81RSS-RPS-RFS-XPS%EF%BC%9A%E5%9B%9B%E4%B8%AA%E5%AE%B9%E6%98%93%E6%B7%B7%E6%B7%86%E7%9A%84%E6%9C%BA%E5%88%B6"><span class="toc-number">1.4.</span> <span class="toc-text">三、RSS &#x2F; RPS &#x2F; RFS &#x2F; XPS：四个容易混淆的机制</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%AF%8A%E6%96%AD%E4%B8%89%E4%BB%B6%E5%A5%97%EF%BC%9Asoftnet-stat%E3%80%81ethtool-S%E3%80%81ss"><span class="toc-number">1.5.</span> <span class="toc-text">四、诊断三件套：softnet_stat、ethtool -S、ss</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-proc-net-softnet-stat%EF%BC%9A%E8%BD%AF%E4%B8%AD%E6%96%AD%E7%9A%84%E8%B4%A6%E6%9C%AC"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 &#x2F;proc&#x2F;net&#x2F;softnet_stat：软中断的账本</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-ethtool-S%EF%BC%9A%E7%BD%91%E5%8D%A1%E4%BE%A7%E7%9A%84%E4%B8%A2%E5%8C%85%E7%9C%9F%E7%9B%B8"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 ethtool -S：网卡侧的丢包真相</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-ss-%E4%B8%8E-netstat-s%EF%BC%9Asocket-%E5%B1%82"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 ss 与 netstat -s：socket 层</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8A%8A%E4%B8%AD%E6%96%AD%E4%BA%B2%E5%92%8C%E6%80%A7%E5%92%8C%E5%BA%94%E7%94%A8%E7%BA%BF%E7%A8%8B%E7%BB%91%E6%A0%B8%E9%85%8D%E5%90%88%E8%B5%B7%E6%9D%A5"><span class="toc-number">1.6.</span> <span class="toc-text">五、把中断亲和性和应用线程绑核配合起来</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%80%E6%AC%A1%E7%9C%9F%E5%AE%9E%E7%9A%84%E8%B0%83%E4%BC%98%E8%AE%B0%E5%BD%95"><span class="toc-number">1.7.</span> <span class="toc-text">六、一次真实的调优记录</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81Java-%E5%B7%A5%E7%A8%8B%E5%B8%88%E9%9C%80%E8%A6%81%E5%BB%BA%E7%AB%8B%E7%9A%84%E4%B8%89%E6%9D%A1%E7%9B%B4%E8%A7%89"><span class="toc-number">1.8.</span> <span class="toc-text">七、Java 工程师需要建立的三条直觉</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/ai-engineer-career-ladder-competency-model/" title="【AI 转型】AI 应用开发职级能力模型：P5 到 P8 的能力矩阵、晋升证据链与定级实战">【AI 转型】AI 应用开发职级能力模型：P5 到 P8 的能力矩阵、晋升证据链与定级实战</a><time datetime="2026-11-08T00:20:00.000Z" title="发表于 2026-11-08 08:20:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/java-llm-token-rate-limiting-quota-deep-practice/" title="【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM/TPM 双维、预扣结算与 429 治理">【Java AI】按 Token 计量的 LLM 限流与配额深度实战：RPM/TPM 双维、预扣结算与 429 治理</a><time datetime="2026-11-08T00:15:00.000Z" title="发表于 2026-11-08 08:15:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/linux-softirq-nic-multiqueue-latency-deep-dive/" title="【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相">【性能调优】软中断与网卡多队列深度解析：Java 服务 P99 抖动的另一半真相</a><time datetime="2026-11-08T00:10:00.000Z" title="发表于 2026-11-08 08:10:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/java-monotonic-clock-time-semantics-deep-dive/" title="【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统">【Java 基础】时钟源与时间语义深度解析：nanoTime、currentTimeMillis 与被时间坑过的系统</a><time datetime="2026-11-08T00:05:00.000Z" title="发表于 2026-11-08 08:05:00">2026-11-08</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/08/mysql-sql-mode-strict-mode-deep-dive/" title="【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪">【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪</a><time datetime="2026-11-08T00:00:00.000Z" title="发表于 2026-11-08 08:00:00">2026-11-08</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
