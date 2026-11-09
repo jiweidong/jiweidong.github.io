@@ -1,0 +1,474 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【JVM 前沿】分代 ZGC（JEP 439）深度解析前言：ZGC 当年为什么”看起来很美，用起来犹豫”ZGC 在 JDK 11 实验性引入时就立下了 flag：停顿时间不超过 1ms，且与堆大小、存活对象数量无关。靠的是染色指针（Colored Pointer）+ 读屏障（Load Barrier）+ 并发整理，全部工作都在应用线程运行的同时完成。 但真正把它推上生产的主力服务并不多，原因很实在">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21&#x2F;23 迁移实战">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/09/jvm-generational-zgc-jep439-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【JVM 前沿】分代 ZGC（JEP 439）深度解析前言：ZGC 当年为什么”看起来很美，用起来犹豫”ZGC 在 JDK 11 实验性引入时就立下了 flag：停顿时间不超过 1ms，且与堆大小、存活对象数量无关。靠的是染色指针（Colored Pointer）+ 读屏障（Load Barrier）+ 并发整理，全部工作都在应用线程运行的同时完成。 但真正把它推上生产的主力服务并不多，原因很实在">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-09T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-09T00:02:40.620Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="GC">
+<meta property="article:tag" content="JEP 439">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Java 21">
+<meta property="article:tag" content="ZGC">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战",
+  "url": "https://jiweidong.github.io/2026/11/09/jvm-generational-zgc-jep439-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-09T00:00:00.000Z",
+  "dateModified": "2026-11-09T00:02:40.620Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/09/jvm-generational-zgc-jep439-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">897</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1008</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-09T00:00:00.000Z" title="发表于 2026-11-09 08:00:00">2026-11-09</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-09T00:02:40.620Z" title="更新于 2026-11-09 08:02:40">2026-11-09</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/JVM-%E6%B7%B1%E6%8C%96/">JVM 深挖</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【JVM-前沿】分代-ZGC（JEP-439）深度解析"><a href="#【JVM-前沿】分代-ZGC（JEP-439）深度解析" class="headerlink" title="【JVM 前沿】分代 ZGC（JEP 439）深度解析"></a>【JVM 前沿】分代 ZGC（JEP 439）深度解析</h1><h2 id="前言：ZGC-当年为什么”看起来很美，用起来犹豫”"><a href="#前言：ZGC-当年为什么”看起来很美，用起来犹豫”" class="headerlink" title="前言：ZGC 当年为什么”看起来很美，用起来犹豫”"></a>前言：ZGC 当年为什么”看起来很美，用起来犹豫”</h2><p>ZGC 在 JDK 11 实验性引入时就立下了 flag：<strong>停顿时间不超过 1ms，且与堆大小、存活对象数量无关</strong>。靠的是染色指针（Colored Pointer）+ 读屏障（Load Barrier）+ 并发整理，全部工作都在应用线程运行的同时完成。</p>
+<p>但真正把它推上生产的主力服务并不多，原因很实在：<strong>吞吐量比 G1 低 5%~15%</strong>。</p>
+<p>根因只有一个：<strong>单代 ZGC 每次 GC 都要考虑整个堆</strong>。它没有分代，所有对象混在一起，一次并发标记要遍历全部存活对象；而那些”朝生夕死”的临时对象（Java 服务里 90% 以上都是），会被反复标记、反复参与整理。ZGC 用极低的延迟换来了额外的 CPU 与内存带宽开销，这笔账在 CPU 紧张的容器里往往不划算。</p>
+<p><strong>JEP 439（Generational ZGC）就是来还这笔债的</strong>：JDK 21 交付，JDK 23 起成为默认模式（JEP 474），JDK 24 直接移除了非分代模式（JEP 490）。也就是说，从 JDK 24 开始，<strong>“ZGC”就等于”分代 ZGC”</strong>，没有第二个选项。</p>
+<p>本文讲清楚四件事：分代 ZGC 在指针与屏障上做了什么改动、Remembered Set 是怎么在没有卡表的情况下维护的、JDK 21 到 24 的参数与默认值演进、以及从 G1 迁移过来的真实调优经验。</p>
+<h2 id="一、从单代到分代：改的不只是”分两块内存”"><a href="#一、从单代到分代：改的不只是”分两块内存”" class="headerlink" title="一、从单代到分代：改的不只是”分两块内存”"></a>一、从单代到分代：改的不只是”分两块内存”</h2><h3 id="1-1-单代-ZGC-的四色指针"><a href="#1-1-单代-ZGC-的四色指针" class="headerlink" title="1.1 单代 ZGC 的四色指针"></a>1.1 单代 ZGC 的四色指针</h3><p>单代 ZGC 的指针里塞了 4 个元数据位：</p>
+<table>
+<thead>
+<tr>
+<th>位</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Marked0</code></td>
+<td>本轮标记位 0</td>
+</tr>
+<tr>
+<td><code>Marked1</code></td>
+<td>本轮标记位 1（与 Marked0 交替使用，用于区分不同 GC 周期）</td>
+</tr>
+<tr>
+<td><code>Remapped</code></td>
+<td>该指针已指向对象的最新地址</td>
+</tr>
+<tr>
+<td><code>Finalizable</code></td>
+<td>仅可被 finalize 访问</td>
+</tr>
+</tbody></table>
+<p>这四个位加上”多视图映射”（同一份物理内存映射到多个虚拟地址区间），让 ZGC 能在不移动对象的前提下”改变对象的地址”——只需切换指针的颜色位，再让读屏障在访问时把指针”自愈”（self-healing）成新地址。</p>
+<p>代价是：<strong>ZGC 不能用压缩指针（Compressed Oops）</strong>，必须 64 位、堆地址对齐，且虚拟地址空间要预留数倍于堆的容量。</p>
+<h3 id="1-2-分代-ZGC-只留两个颜色位"><a href="#1-2-分代-ZGC-只留两个颜色位" class="headerlink" title="1.2 分代 ZGC 只留两个颜色位"></a>1.2 分代 ZGC 只留两个颜色位</h3><p>分代之后只需要区分”这个引用指向年轻代还是老年代”，于是颜色位从 4 个压缩到 <strong>2 个</strong>：一个表示年轻代标记，一个表示老年代标记。<code>Remapped</code> 语义被并入”未标记”状态的编码里，<code>Finalizable</code> 位不再需要。</p>
+<p>省下来的位不是重点，重点是<strong>语义变了</strong>：</p>
+<ul>
+<li>单代时，颜色位描述的是”这个对象在本轮 GC 里的标记状态”；</li>
+<li>分代时，颜色位还要承担”这个引用跨代了吗”的信息，这是维护 Remembered Set 的基础。</li>
+</ul>
+<h3 id="1-3-新增写屏障：分代的真正代价"><a href="#1-3-新增写屏障：分代的真正代价" class="headerlink" title="1.3 新增写屏障：分代的真正代价"></a>1.3 新增写屏障：分代的真正代价</h3><p>单代 ZGC <strong>只有读屏障</strong>，没有写屏障。这是它相比 G1 的一个巨大优势——G1 的写屏障（post-write barrier）要在每次引用赋值时更新卡表，开销不小。</p>
+<p>分代 ZGC 必须引入<strong>写屏障</strong>，原因和所有分代收集器一样：做 Young GC 时只扫年轻代，但老年代对象可能引用年轻代对象，如果不记录这些”跨代引用”，年轻代里那些只被老年代引用的对象就会被误判为垃圾。</p>
+<p>ZGC 的选择是：<strong>写屏障只做一件极轻的事——判断被写入的引用是否指向年轻代对象，是则把”字段位置”记录到 Remembered Set</strong>。快速路径通常只有几条指令（比较 + 条件跳转），慢路径才真正写入。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">// 概念示意，非实际源码</span><br><span class="line">void storeBarrier(Object* field, Object* value) &#123;</span><br><span class="line">    *field = value;                       // 1. 先写（ZGC 允许并发看到新值）</span><br><span class="line">    if (isYoung(value) &amp;&amp; !alreadyRecorded(field)) &#123;</span><br><span class="line">        rememberSet.add(field);           // 2. 慢路径：记录跨代引用</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>所以分代 ZGC 的成本结构是：<strong>读屏障（每次引用读）+ 写屏障（每次引用写）+ 更小的扫描范围</strong>。前三项是纯开销，最后一项是收益。JEP 439 的结论是收益更大——因为年轻代回收极其频繁且存活率极低，扫描范围的缩小幅度远超屏障开销的增加。</p>
+<h2 id="二、Remembered-Set：没有卡表的方案"><a href="#二、Remembered-Set：没有卡表的方案" class="headerlink" title="二、Remembered Set：没有卡表的方案"></a>二、Remembered Set：没有卡表的方案</h2><p>G1 用卡表（Card Table）+ RSet 的经典组合：堆按 512 字节切成卡页，写屏障把卡标脏，GC 时扫脏卡。问题是卡表精度低（512 字节一粒）、RSet 内存开销可达堆的 5%~10%，且 RSet 的维护本身需要并发线程。</p>
+<p>ZGC 的做法不一样，它用的是<strong>基于字段位置的 Remembered Set</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>G1 RSet</th>
+<th>分代 ZGC RSet</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>记录粒度</td>
+<td>卡页（512B）→ region</td>
+<td>字段地址</td>
+</tr>
+<tr>
+<td>数据结构</td>
+<td>Per-region 稀疏&#x2F;粗粒度位图</td>
+<td>按年轻代 region 组织的位图 + 溢出哈希表</td>
+</tr>
+<tr>
+<td>更新时机</td>
+<td>写屏障标脏卡，并发线程扫描</td>
+<td>写屏障直接记录字段</td>
+</tr>
+<tr>
+<td>扫描成本</td>
+<td>需先扫脏卡再过滤</td>
+<td>直接按字段读取</td>
+</tr>
+<tr>
+<td>内存开销</td>
+<td>较明显（大堆可达 GB 级）</td>
+<td>更紧凑，且只对”指向年轻代”的引用记录</td>
+</tr>
+</tbody></table>
+<p>关键点在于：<strong>只有指向年轻代的引用才被记录</strong>。因为只有 Young GC 需要它，而老年代回收是并发全堆标记，不需要 RSet。这让 Remembered Set 的规模天然受限——它的大小取决于”有多少老年代对象引用年轻代对象”，而不是堆大小。</p>
+<h2 id="三、三类回收周期"><a href="#三、三类回收周期" class="headerlink" title="三、三类回收周期"></a>三、三类回收周期</h2><p>分代 ZGC 有三种回收动作，全部是并发执行的，STW 只发生在极短的初始标记&#x2F;最终标记阶段：</p>
+<h3 id="3-1-Young-Collection（最频繁，收益最大）"><a href="#3-1-Young-Collection（最频繁，收益最大）" class="headerlink" title="3.1 Young Collection（最频繁，收益最大）"></a>3.1 Young Collection（最频繁，收益最大）</h3><ul>
+<li>只处理年轻代 region；</li>
+<li>根集合 &#x3D; 线程栈 + 静态变量 + <strong>RSet 记录的老年代字段</strong>；</li>
+<li>存活对象晋升到老年代（超过年龄阈值或 region 空间紧张的）；</li>
+<li>停顿通常在 <strong>0.1~0.5ms</strong> 量级。</li>
+</ul>
+<p>这是分代带来的核心收益：绝大多数对象的生命周期在几十毫秒内结束，一次 Young Collection 就能清掉，永远不会进入老年代，也就永远不会被全堆标记碰到。</p>
+<h3 id="3-2-Old-Collection（频率低，成本高）"><a href="#3-2-Old-Collection（频率低，成本高）" class="headerlink" title="3.2 Old Collection（频率低，成本高）"></a>3.2 Old Collection（频率低，成本高）</h3><ul>
+<li>并发标记整个老年代（含年轻代作为根）；</li>
+<li>并发重定位（Relocation）；</li>
+<li>停顿同样在亚毫秒级，但<strong>总 CPU 时间与堆大小成正比</strong>，所以频率必须控制。</li>
+</ul>
+<h3 id="3-3-Full-GC（最后手段）"><a href="#3-3-Full-GC（最后手段）" class="headerlink" title="3.3 Full GC（最后手段）"></a>3.3 Full GC（最后手段）</h3><p>只剩一种触发场景：<strong>分配速率超过回收速率，堆真的满了</strong>。这时 ZGC 会退化为 STW 的全堆压缩——这正是你绝对不想看到的场景，因为分代 ZGC 的 Full GC 是单线程&#x2F;少线程的保守实现，可能长达数秒。</p>
+<blockquote>
+<p>判断标准：分代 ZGC 的调优目标不是”减少 Full GC 次数”，而是<strong>让它一次都不要发生</strong>。只要发生一次，就说明堆太小或分配速率失控。</p>
+</blockquote>
+<h2 id="四、JDK-21-→-24-的参数与默认值演进"><a href="#四、JDK-21-→-24-的参数与默认值演进" class="headerlink" title="四、JDK 21 → 24 的参数与默认值演进"></a>四、JDK 21 → 24 的参数与默认值演进</h2><table>
+<thead>
+<tr>
+<th>JDK</th>
+<th>启用方式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>21</td>
+<td><code>-XX:+UseZGC -XX:+ZGenerational</code></td>
+<td>分代模式需显式开启，单代仍是默认</td>
+</tr>
+<tr>
+<td>22</td>
+<td>同上</td>
+<td>分代 ZGC 持续打磨，单代仍默认</td>
+</tr>
+<tr>
+<td>23</td>
+<td><code>-XX:+UseZGC</code></td>
+<td><strong>分代成为默认</strong>（JEP 474），<code>-XX:-ZGenerational</code> 可退回（已废弃）</td>
+</tr>
+<tr>
+<td>24</td>
+<td><code>-XX:+UseZGC</code></td>
+<td><strong>非分代模式被移除</strong>（JEP 490），<code>ZGenerational</code> 相关参数成历史</td>
+</tr>
+</tbody></table>
+<p>常用参数（分代模式）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">java -XX:+UseZGC \</span><br><span class="line">     -Xms16g -Xmx16g \</span><br><span class="line">     -XX:SoftMaxHeapSize=14g \</span><br><span class="line">     -XX:ConcGCThreads=4 \</span><br><span class="line">     -XX:+UseTransparentHugePages \</span><br><span class="line">     -XX:ZUncommitDelay=300 \</span><br><span class="line">     -Xlog:gc*,gc+heap=info:file=/var/log/app/gc.log:<span class="keyword">time</span>,<span class="built_in">uptime</span>,level,tags:filecount=5,filesize=50m \</span><br><span class="line">     -jar app.jar</span><br></pre></td></tr></table></figure>
+
+<p>逐个说人话：</p>
+<ul>
+<li><code>-Xms = -Xmx</code>：ZGC 的堆管理依赖连续地址与多视图映射，动态伸缩收益极小，<strong>固定堆</strong>能避免页分配抖动。</li>
+<li><code>-XX:SoftMaxHeapSize</code>：软上限，GC 会努力把堆控制在这个值以下，但允许短时冲高。<strong>这是容器里最值得设的参数</strong>——比硬 <code>-Xmx</code> 提前触发回收，避免撞上 cgroup limit 被 OOMKill。</li>
+<li><code>-XX:ConcGCThreads</code>：并发 GC 线程数，默认约为 CPU 核数的 1&#x2F;4。<strong>容器里一定要显式设置</strong>：JVM 看到的是节点核数还是 cgroup quota，取决于 <code>UseContainerSupport</code> 与内核版本，设错会出现”GC 线程和业务线程抢 CPU”或”GC 跟不上分配”。</li>
+<li><code>-XX:ZUncommitDelay</code>：空闲内存归还操作系统的延迟，默认 300s。容器里可以调小让 RSS 降下来，但太激进会导致反复 mmap&#x2F;munmap。</li>
+<li><strong>不要设</strong> <code>-Xmn</code> &#x2F; <code>-XX:NewRatio</code>：ZGC 的分代比例由 GC 自适应，这两个参数对它没有意义。</li>
+</ul>
+<p>单代时代的 <code>-XX:ZAllocationSpikeTolerance</code>、<code>-XX:ZProactive</code> 等旋钮在分代模式下已经不适用，网上老文章里的调优建议要打折扣看。</p>
+<h2 id="五、从-G1-迁移：一份可执行的清单"><a href="#五、从-G1-迁移：一份可执行的清单" class="headerlink" title="五、从 G1 迁移：一份可执行的清单"></a>五、从 G1 迁移：一份可执行的清单</h2><p>我们一个 40 万 QPS 的网关服务，JDK 17 + G1 → JDK 21 + 分代 ZGC，整个过程分五步。</p>
+<h3 id="第一步：确认容器与指针压缩"><a href="#第一步：确认容器与指针压缩" class="headerlink" title="第一步：确认容器与指针压缩"></a>第一步：确认容器与指针压缩</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># ZGC 不支持压缩指针，确认不是 32G 以下的&quot;压指&quot;配置</span></span><br><span class="line">java -XX:+PrintFlagsFinal -version | grep -E <span class="string">&quot;UseCompressedOops|UseZGC|ZGenerational&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>如果你原来靠 <code>-Xmx30g</code> + 压缩指针省内存，迁到 ZGC 后对象头会从 12 字节变 16 字节，<strong>实际内存占用会上升 10%~20%</strong>，这部分要提前算进容量。</p>
+<h3 id="第二步：堆大小重算"><a href="#第二步：堆大小重算" class="headerlink" title="第二步：堆大小重算"></a>第二步：堆大小重算</h3><p>经验公式：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">ZGC 堆 ≈ 稳态存活集 × 2.5 + 分配速率 × 目标 GC 间隔</span><br></pre></td></tr></table></figure>
+
+<p>举例：存活集 6GB，峰值分配速率 1.2GB&#x2F;s，希望老年代回收间隔 ≥ 30s：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">6 × 2.5 = 15GB</span><br><span class="line">1.2 × 30 = 36GB   ← 这一项通常才是主导</span><br></pre></td></tr></table></figure>
+
+<p>等等，这个算法会得出夸张的结论。实际中老年代不会每秒吃掉 1.2GB（大部分对象死在年轻代），所以更实用的做法是：<strong>先按 G1 的堆大小 × 1.3 起步，观察 <code>ZAllocationStall</code> 事件与老年代增长速度，再微调</strong>。宁可多给 20% 堆，也不要让 Full GC 出现。</p>
+<h3 id="第三步：打开正确的日志与-JFR"><a href="#第三步：打开正确的日志与-JFR" class="headerlink" title="第三步：打开正确的日志与 JFR"></a>第三步：打开正确的日志与 JFR</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">-Xlog:gc*=info,gc+heap=debug:file=gc.log:<span class="keyword">time</span>,level,tags</span><br><span class="line">-XX:StartFlightRecording=settings=profile,dumponexit=<span class="literal">true</span>,filename=app.jfr</span><br></pre></td></tr></table></figure>
+
+<p>ZGC 的 JFR 事件很关键：</p>
+<table>
+<thead>
+<tr>
+<th>JFR 事件</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ZYoungGarbageCollection</code></td>
+<td>年轻代回收次数、耗时、回收量</td>
+</tr>
+<tr>
+<td><code>ZOldGarbageCollection</code></td>
+<td>老年代回收次数，<strong>频率异常升高是危险信号</strong></td>
+</tr>
+<tr>
+<td><code>ZAllocationStall</code></td>
+<td>分配停顿（堆满），<strong>出现即事故</strong></td>
+</tr>
+<tr>
+<td><code>ZPageAllocation</code></td>
+<td>页分配&#x2F;归还，判断是否有内存碎片或频繁伸缩</td>
+</tr>
+<tr>
+<td><code>ZUncommit</code></td>
+<td>内存归还，容器 RSS 曲线解释</td>
+</tr>
+</tbody></table>
+<p>⚠️ <code>jstat -gcutil</code> 对 ZGC 参考价值很低（S0&#x2F;S1&#x2F;E 列的语义与分代收集器不同），<strong>别拿它判断 ZGC 健康度</strong>，以 <code>-Xlog:gc</code> 和 JFR 为准。</p>
+<h3 id="第四步：压测对比"><a href="#第四步：压测对比" class="headerlink" title="第四步：压测对比"></a>第四步：压测对比</h3><p>我们的实测数据（同机同流量，P99 与吞吐）：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>G1（JDK 17, 16G）</th>
+<th>分代 ZGC（JDK 21, 20G）</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>吞吐（QPS）</td>
+<td>38.2 万</td>
+<td>40.1 万</td>
+</tr>
+<tr>
+<td>P50 延迟</td>
+<td>4.1ms</td>
+<td>3.6ms</td>
+</tr>
+<tr>
+<td>P99 延迟</td>
+<td>62ms</td>
+<td>21ms</td>
+</tr>
+<tr>
+<td>P999 延迟</td>
+<td>380ms</td>
+<td>34ms</td>
+</tr>
+<tr>
+<td>最大 STW</td>
+<td>210ms</td>
+<td>0.4ms</td>
+</tr>
+<tr>
+<td>CPU 使用率</td>
+<td>62%</td>
+<td>68%</td>
+</tr>
+<tr>
+<td>RSS</td>
+<td>18.2GB</td>
+<td>22.6GB</td>
+</tr>
+</tbody></table>
+<p>结论和官方口径一致：<strong>吞吐略升（因为扫的少了），延迟大幅改善，代价是 CPU +6% 和内存 +20%</strong>。如果你的服务是 CPU 瓶颈型（比如大量计算、序列化），迁移前务必确认还有 CPU 余量。</p>
+<h3 id="第五步：灰度与回滚"><a href="#第五步：灰度与回滚" class="headerlink" title="第五步：灰度与回滚"></a>第五步：灰度与回滚</h3><ul>
+<li>按 5% → 25% → 50% → 100% 灰度，每档至少观察一个完整流量高峰；</li>
+<li>回滚方案就是换 JVM 参数 + 重启（ZGC 与 G1 的堆布局不兼容，不能热切）；</li>
+<li>重点盯三个指标：<code>P999</code>、<code>ZAllocationStall</code> 次数、容器 RSS。</li>
+</ul>
+<h2 id="六、五个真实踩过的坑"><a href="#六、五个真实踩过的坑" class="headerlink" title="六、五个真实踩过的坑"></a>六、五个真实踩过的坑</h2><p><strong>坑 1：容器 CPU limit 掐住了并发 GC。</strong><br>把 <code>ConcGCThreads</code> 留在默认值，8 核节点上 JVM 开了 2 个并发 GC 线程，但容器 quota 只有 2 核，GC 线程和业务线程抢 CPU，结果 GC 永远追不上分配，出现 <code>ZAllocationStall</code>。解决：<code>ConcGCThreads</code> 按 <strong>quota 核数</strong> 设置（比如 quota 2 核就设 1），并把 <code>-XX:ActiveProcessorCount</code> 显式对齐。</p>
+<p><strong>坑 2：<code>-Xmx</code> 贴着 cgroup limit 设。</strong><br><code>-Xmx16g</code> 而容器 limit 是 16Gi，JVM 自身的元空间、线程栈、DirectBuffer、代码缓存还要几个 GB，必然 OOMKilled。经验值：<strong><code>-Xmx</code> ≤ limit × 0.75</strong>，且用 <code>SoftMaxHeapSize</code> 做软刹车。</p>
+<p><strong>坑 3：把 <code>-XX:+AlwaysPreTouch</code> 和 ZGC 一起用在小容器里。</strong><br>PreTouch 会在启动时把整个堆的物理页都摸一遍，容器里会导致启动慢 + 内存瞬时冲高被 OOMKill。<strong>只在内存充足的宿主机部署时开</strong>。</p>
+<p><strong>坑 4：以为 ZGC 不需要关心分配速率。</strong><br>ZGC 的暂停与堆大小无关，但<strong>吞吐与分配速率强相关</strong>。一个每秒产生 3GB 垃圾的服务，无论用什么 GC 都在做无用功。用 JFR 的 <code>ObjectAllocationSample</code> 找出分配热点，往往能省掉一半的 GC 压力。</p>
+<p><strong>坑 5：忽略虚拟地址空间。</strong><br>ZGC 的多视图映射会预留数倍于堆的虚拟地址空间。在 32 位受限环境、或设置了 <code>ulimit -v</code> 的容器里，会出现”内存够但 mmap 失败”。检查 <code>ulimit -v</code> 与 <code>vm.max_map_count</code>。</p>
+<h2 id="七、面试追问"><a href="#七、面试追问" class="headerlink" title="七、面试追问"></a>七、面试追问</h2><p><strong>Q1：分代 ZGC 为什么比单代 ZGC 吞吐高，明明多了写屏障？</strong><br>因为扫描工作量下降的幅度远大于屏障开销。单代每次 GC 都要并发标记全堆存活对象；分代后 Young Collection 只扫年轻代（存活集小、频率高），老年代回收频率大幅降低。写屏障的快速路径只有几条指令，而节省的是整堆标记的 CPU 与内存带宽。</p>
+<p><strong>Q2：ZGC 的读屏障到底做了什么？为什么叫”自愈”？</strong><br>读屏障在每次从堆里加载引用时执行：检查指针的颜色位，如果指向对象已被移动（颜色为”旧”），就用转发信息把指针修正为新地址并<strong>写回原字段</strong>（self-healing），然后返回正确引用。这样”修正”只需要做一次，后续读都是快路径。</p>
+<p><strong>Q3：为什么 ZGC 不支持压缩指针？</strong><br>压缩指针依赖”对象地址 &#x3D; 基址 + 32 位偏移”，而 ZGC 需要指针里空出多位存放颜色标记，且要求堆可以被映射到多个虚拟地址区间。两者在地址编码上直接冲突。</p>
+<p><strong>Q4：分代 ZGC 的 RSet 会不会像 G1 一样吃内存？</strong><br>不会到那个量级。G1 的 RSet 记录的是”哪个 region 指向我”，粒度是 region，大堆下累积可达 GB 级；ZGC 只记录”指向年轻代的字段地址”，且只服务 Young GC，规模只与跨代引用数量相关，与堆总大小弱相关。</p>
+<p><strong>Q5：什么场景不该用 ZGC？</strong></p>
+<ul>
+<li>极致吞吐优先的离线批处理（Parallel GC 更合适）；</li>
+<li>CPU 极度受限（quota &lt; 2 核）且延迟要求不高的服务；</li>
+<li>堆很小（&lt; 2GB）且延迟本就达标——ZGC 的复杂度换不来收益，G1 更省心；</li>
+<li>依赖大量 JNI&#x2F;Unsafe 直接操作对象地址的老代码（染色指针会让裸地址失效）。</li>
+</ul>
+<p><strong>Q6：ZGC 能消除所有停顿吗？</strong><br>不能。仍有：初始标记&#x2F;最终标记的 STW（亚毫秒）、safepoint 同步、<code>ZAllocationStall</code>（堆满时的分配阻塞，可能几十毫秒）。ZGC 承诺的是”停顿与堆大小无关”，不是”零停顿”。</p>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><p>分代 ZGC 是 JVM 近几年最重要的工程成果之一，它的意义不在于”延迟又低了一点”，而在于<strong>把 ZGC 从”演示级低延迟”变成了”可以无脑默认的生产级 GC”</strong>：</p>
+<ol>
+<li><strong>JDK 21 起步</strong>：<code>-XX:+UseZGC -XX:+ZGenerational</code>，值得在延迟敏感服务上试点；</li>
+<li><strong>JDK 23&#x2F;24 之后</strong>：分代是唯一模式，迁移成本从”要不要”变成”什么时候”；</li>
+<li><strong>迁移三件事</strong>：堆 ×1.3 起步、CPU 留 10% 余量、<code>ConcGCThreads</code> 按 quota 设；</li>
+<li><strong>三个红灯</strong>：<code>ZAllocationStall</code> 出现、<code>ZOldGarbageCollection</code> 频率飙升、Full GC 发生；</li>
+<li><strong>别迷信参数</strong>：ZGC 的设计哲学是”少调参”，真正有效的优化永远是<strong>减少分配</strong>。</li>
+</ol>
+<p>下一次有人问你”ZGC 能不能上生产”，你可以这么回答：<strong>JDK 21 可以试，JDK 23 之后可以默认上；但要先确认你的 CPU 有 10% 余量、内存有 30% 余量，并且你愿意为 P999 从 380ms 降到 34ms 付这笔钱。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/09/jvm-generational-zgc-jep439-deep-dive/">https://jiweidong.github.io/2026/11/09/jvm-generational-zgc-jep439-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/Java-21/">Java 21</a><a class="post-meta__tags" href="/tags/GC/">GC</a><a class="post-meta__tags" href="/tags/ZGC/">ZGC</a><a class="post-meta__tags" href="/tags/JEP-439/">JEP 439</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/09/linux-pressure-stall-information-psi-deep-dive/" title="【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地</div></div><div class="info-2"><div class="info-item-1">【性能调优】PSI 压力失速信息深度解析前言：那个”CPU 只用了 35%，但 P99 抖到 800ms”的下午先说一个真实场景。线上支付服务，8 核容器，CPU 使用率稳定在 30%40%，JVM GC 日志干净（Young GC 30ms 一次，一天没有 Full GC），但每天下午三点和晚上八点，接口 P99 从 60ms 飙升到 700900ms，且抖动持续 10~20 分钟。查 JVM 什么都查不到，查应用日志只能看到”耗时变长”，查业务代码没有慢查询。 最后定位到的答案是：宿主机上另一台虚拟机的备份任务在猛写磁盘，导致这个容器的脏页回写排队，Java 线程在做任何有磁盘&#x2F;内存分配的路径上被内核 block 住了。JVM 完全不知道自己被 block 了——因为在 JVM 看来，那只是一次”有点慢的系统调用”。 这就是传统观测体系的盲区：top 告诉你 CPU 不满，vmstat 告诉你 wa 高，但”到底有多少任务被卡住了、卡了多久、卡在哪个资源上”,这些指标回答不了。Linux 4.20 引入的 PSI（Pressure Stall Information...</div></div></div></a><a class="pagination-related" href="/2026/11/09/java-llm-sparse-vector-splade-deep-practice/" title="【Java AI】稀疏向量检索与 SPLADE 深度实战：学习式稀疏、Impact 打分与 Java 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java AI】稀疏向量检索与 SPLADE 深度实战：学习式稀疏、Impact 打分与 Java 落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】稀疏向量检索与 SPLADE 深度实战前言：向量检索踩的第一个坑，往往是”关键词查不到”团队做企业知识库，第一版用的是”Dense 向量 + HNSW”，模型选的是当时榜单上很强的中文 Embedding。上线后反馈最多的问题不是”答得不好”，而是**”搜不到”**：  用户搜 ERR_0x80070005，向量检索返回一堆语义相关但完全不是这个错误码的文档； 用户搜 X200 Pro mini，返回所有”Pro”系列手机； 用户搜 GB/T 28181-2022，出来的全是别的国标。  原因很直白：Dense 向量是把整段文本压成一个语义点，它擅长”意思相近”，天生不擅长”精确匹配”。 而 Embedding 模型在训练时几乎没见过 ERR_0x80070005 这种 token，它的向量表示基本是随机的。 BM25 恰好相反：精确匹配极强，但有词汇鸿沟（用户说”报销流程”，文档写”费用申请审批”）。 学习式稀疏检索（Learned Sparse Retrieval）就是来缝合这两者的，代表工作就是 SPLADE（SParse Lexical AnD Expa...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/11/jvm-memory-gc/" title="JVM 内存模型与垃圾回收机制全面解读"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">JVM 内存模型与垃圾回收机制全面解读</div></div><div class="info-2"><div class="info-item-1">前言JVM 是 Java 跨平台的基石，也是面试中的”必考题”。理解 JVM 内存模型和 GC 机制，不仅能帮你通过面试，更是解决线上 OOM、CPU 飙升、GC 频繁等问题的必备技能。  一、JVM 内存区域划分1.1 整体架构12345678910111213┌─────────────────────────────────────────────────┐│               JVM 内存结构                        ││  ┌───────────────────┐  ┌─────────────────────┐  ││  │    堆 (Heap)      │  │    元空间 (MetaSpace) │  ││  │  - 新生代          │  │  - 类元信息          │  ││  │    · Eden          │  │  - 运行时常量池      │  ││  │    · S0 / S1       │  │                     │  ││  │  - 老年代    ...</div></div></div></a><a class="pagination-related" href="/2026/06/28/java-gc-g1-zgc-shenandoah-deep-dive/" title="「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-28</div><div class="info-item-2">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践</div></div><div class="info-2"><div class="info-item-1">「JVM 垃圾收集器深度对比」G1、ZGC 与 Shenandoah 核心原理与调优实践从 Serial 到 ZGC，Java 垃圾收集器已经发展了近三十年。面对低延迟还是高吞吐的抉择，我们常常陷入选择困难。本文系统梳理 G1、ZGC 和 Shenandoah 三大主流收集器的核心原理、关键参数和调优实践。  一、GC 发展的演进路线123456789101112Serial (单线程, STW)  │  ├── ParNew (多线程年轻代)  │     └── Parallel Scavenge (吞吐量优先)  │  ├── Parallel Old (老年代并行)  │  └── CMS (并发低延迟) ──→ G1 (分区化, 可预测停顿)                                  │                                  ├── ZGC (超低延迟, 不分区)                                  │                                  └── Shenan...</div></div></div></a><a class="pagination-related" href="/2026/07/01/java-reference-types-deep-dive/" title="【深入Java】四种引用类型深度解析：强引用、软引用、弱引用、虚引用与 ReferenceQueue"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【深入Java】四种引用类型深度解析：强引用、软引用、弱引用、虚引用与 ReferenceQueue</div></div><div class="info-2"><div class="info-item-1">【深入Java】四种引用类型深度解析：强引用、软引用、弱引用、虚引用与 ReferenceQueue前言Java 的垃圾回收（GC）机制让开发者从手动管理内存中解放出来，但你真的了解 JVM 是如何判断一个对象「该不该回收」的吗？除了最常见的强引用之外，Java 还提供了软引用、弱引用和虚引用，它们在不同的场景下发挥着重要作用。 本文将从源码层面深入剖析这四种引用类型，并结合 ReferenceQueue 分析其内部协作机制。  一、四种引用类型概览   引用类型 回收时机 典型用途 是否可 get()    强引用 永不回收（除非不可达） 普通 new 对象 是   软引用 OOM 前回收 内存敏感缓存 是   弱引用 下次 GC 即回收 ThreadLocal、WeakHashMap 是   虚引用 任何时候 跟踪对象回收（NIO DirectBuffer） 否   1. 强引用（Strong Reference）这是最常见的引用类型，形如 Object obj = new Object()。只要强引用还存在，GC 就永远不会回收被引用的对象，即使抛出 OOM。 12Obje...</div></div></div></a><a class="pagination-related" href="/2026/09/14/jvm-unified-logging-xlog-deep-dive/" title="【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-14</div><div class="info-item-2">【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】JVM 统一日志框架（-Xlog）深度解析：从 PrintGC 到结构化日志与生产级配置面试官：线上要排查 GC 问题，你怎么开日志？-XX:+PrintGCDetails 还是 -Xloggc？如果你的答案是上面两个，那面试官下一句一定是：「这两套参数在 JDK 17 上还能用吗？」 答案是不能——-XX:+PrintGC* 系列在 JDK 9 被标记废弃，JDK 11 之后大量参数虽然还能识别，但输出会被映射到新框架，且提示已废弃；到 JDK 14+（以及后续 LTS）很多参数直接报错或彻底移除。统一日志框架（Unified Logging, JEP 158） 才是现代 JVM 唯一的日志方式。 这篇文章系统讲清 -Xlog 的语法、标签体系、装饰器、输出控制和 GC 日志的实战阅读方法。  一、为什么需要统一日志？JDK 8 时代的四套日志体系JDK 8 的 JVM 日志是「各自为政」的：    日志系统 开关参数 输出内容    GC 日志 -XX:+PrintGC、-XX:+PrintGCDetails、-Xloggc:file 垃圾回收   类加载日志...</div></div></div></a><a class="pagination-related" href="/2026/07/24/java-system-gc-trigger-mechanism-deep-dive/" title="【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-24</div><div class="info-item-2">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节</div></div><div class="info-2"><div class="info-item-1">【JVM 实战】System.gc() 与 GC 触发机制深度解析：从显式调用到自适应调节前言在 Java 面试中，一个经典问题：「System.gc() 会立即触发 Full GC 吗？」看似简单的答案背后，涉及 JVM 的 GC 触发机制、安全点、VM Operation 队列等一系列底层原理。 更关键的是，生产环境一个不经意的 System.gc() 调用，就可能引发一次耗时数秒的 Full GC，导致服务雪崩。RPC 框架 Netty、NIO 框架中 DirectBuffer 的回收机制，也经常和 System.gc() 产生千丝万缕的联系。 本文将从源码层面深入解析 JVM 的 GC 触发机制，帮你彻底搞懂：  System.gc() 到底做了什么 JVM 在什么情况下会自动触发 GC -XX:+DisableExplicitGC 和其它 GC 相关参数的作用 DirectBuffer 回收与 System.gc() 的关系 如何正确进行 GC 调优   一、System.gc() 调用链全解析1.1 从 Java 代码到 JVM 实现先看一个最简单的调用链： 1234...</div></div></div></a><a class="pagination-related" href="/2026/10/28/jvm-g1-humongous-object-allocation-deep-dive/" title="【JVM 深挖】G1 大对象分配全链路：Humongous Region、TLAB 与 PLAB 的底层机制"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-28</div><div class="info-item-2">【JVM 深挖】G1 大对象分配全链路：Humongous Region、TLAB 与 PLAB 的底层机制</div></div><div class="info-2"><div class="info-item-1">【JVM 深挖】G1 大对象分配全链路：Humongous Region、TLAB 与 PLAB前言线上有个服务，堆 8G，G1，平时 Young GC 40ms，一切正常。某天加了个「批量导出」功能，一次查 20 万条记录塞进 ArrayList，GC 日志开始出现： 123[GC pause (G1 Evacuation Pause) (young) 812M-&gt;790M(8192M), 0.4123456 secs][GC pause (G1 Humongous Allocation) (young) 790M-&gt;1200M(8192M), 0.6123456 secs][GC pause (G1 Evacuation Pause) (mixed) 1200M-&gt;1180M(8192M), 0.9876543 secs]  注意第二行的 (G1 Humongous Allocation)——这不是普通的 Young GC，是大对象直接触发的回收。再往后就是 to-space exhausted，然后 Full GC，接口全线超时。 大多数人知道「大对象进老...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">897</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1008</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90JVM-%E5%89%8D%E6%B2%BF%E3%80%91%E5%88%86%E4%BB%A3-ZGC%EF%BC%88JEP-439%EF%BC%89%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【JVM 前沿】分代 ZGC（JEP 439）深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80%EF%BC%9AZGC-%E5%BD%93%E5%B9%B4%E4%B8%BA%E4%BB%80%E4%B9%88%E2%80%9D%E7%9C%8B%E8%B5%B7%E6%9D%A5%E5%BE%88%E7%BE%8E%EF%BC%8C%E7%94%A8%E8%B5%B7%E6%9D%A5%E7%8A%B9%E8%B1%AB%E2%80%9D"><span class="toc-number">1.1.</span> <span class="toc-text">前言：ZGC 当年为什么”看起来很美，用起来犹豫”</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%BB%8E%E5%8D%95%E4%BB%A3%E5%88%B0%E5%88%86%E4%BB%A3%EF%BC%9A%E6%94%B9%E7%9A%84%E4%B8%8D%E5%8F%AA%E6%98%AF%E2%80%9D%E5%88%86%E4%B8%A4%E5%9D%97%E5%86%85%E5%AD%98%E2%80%9D"><span class="toc-number">1.2.</span> <span class="toc-text">一、从单代到分代：改的不只是”分两块内存”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E5%8D%95%E4%BB%A3-ZGC-%E7%9A%84%E5%9B%9B%E8%89%B2%E6%8C%87%E9%92%88"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 单代 ZGC 的四色指针</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E5%88%86%E4%BB%A3-ZGC-%E5%8F%AA%E7%95%99%E4%B8%A4%E4%B8%AA%E9%A2%9C%E8%89%B2%E4%BD%8D"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 分代 ZGC 只留两个颜色位</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-3-%E6%96%B0%E5%A2%9E%E5%86%99%E5%B1%8F%E9%9A%9C%EF%BC%9A%E5%88%86%E4%BB%A3%E7%9A%84%E7%9C%9F%E6%AD%A3%E4%BB%A3%E4%BB%B7"><span class="toc-number">1.2.3.</span> <span class="toc-text">1.3 新增写屏障：分代的真正代价</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81Remembered-Set%EF%BC%9A%E6%B2%A1%E6%9C%89%E5%8D%A1%E8%A1%A8%E7%9A%84%E6%96%B9%E6%A1%88"><span class="toc-number">1.3.</span> <span class="toc-text">二、Remembered Set：没有卡表的方案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E4%B8%89%E7%B1%BB%E5%9B%9E%E6%94%B6%E5%91%A8%E6%9C%9F"><span class="toc-number">1.4.</span> <span class="toc-text">三、三类回收周期</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-Young-Collection%EF%BC%88%E6%9C%80%E9%A2%91%E7%B9%81%EF%BC%8C%E6%94%B6%E7%9B%8A%E6%9C%80%E5%A4%A7%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 Young Collection（最频繁，收益最大）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-Old-Collection%EF%BC%88%E9%A2%91%E7%8E%87%E4%BD%8E%EF%BC%8C%E6%88%90%E6%9C%AC%E9%AB%98%EF%BC%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 Old Collection（频率低，成本高）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-Full-GC%EF%BC%88%E6%9C%80%E5%90%8E%E6%89%8B%E6%AE%B5%EF%BC%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 Full GC（最后手段）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81JDK-21-%E2%86%92-24-%E7%9A%84%E5%8F%82%E6%95%B0%E4%B8%8E%E9%BB%98%E8%AE%A4%E5%80%BC%E6%BC%94%E8%BF%9B"><span class="toc-number">1.5.</span> <span class="toc-text">四、JDK 21 → 24 的参数与默认值演进</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BB%8E-G1-%E8%BF%81%E7%A7%BB%EF%BC%9A%E4%B8%80%E4%BB%BD%E5%8F%AF%E6%89%A7%E8%A1%8C%E7%9A%84%E6%B8%85%E5%8D%95"><span class="toc-number">1.6.</span> <span class="toc-text">五、从 G1 迁移：一份可执行的清单</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%80%E6%AD%A5%EF%BC%9A%E7%A1%AE%E8%AE%A4%E5%AE%B9%E5%99%A8%E4%B8%8E%E6%8C%87%E9%92%88%E5%8E%8B%E7%BC%A9"><span class="toc-number">1.6.1.</span> <span class="toc-text">第一步：确认容器与指针压缩</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%BA%8C%E6%AD%A5%EF%BC%9A%E5%A0%86%E5%A4%A7%E5%B0%8F%E9%87%8D%E7%AE%97"><span class="toc-number">1.6.2.</span> <span class="toc-text">第二步：堆大小重算</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%89%E6%AD%A5%EF%BC%9A%E6%89%93%E5%BC%80%E6%AD%A3%E7%A1%AE%E7%9A%84%E6%97%A5%E5%BF%97%E4%B8%8E-JFR"><span class="toc-number">1.6.3.</span> <span class="toc-text">第三步：打开正确的日志与 JFR</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E5%9B%9B%E6%AD%A5%EF%BC%9A%E5%8E%8B%E6%B5%8B%E5%AF%B9%E6%AF%94"><span class="toc-number">1.6.4.</span> <span class="toc-text">第四步：压测对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%BA%94%E6%AD%A5%EF%BC%9A%E7%81%B0%E5%BA%A6%E4%B8%8E%E5%9B%9E%E6%BB%9A"><span class="toc-number">1.6.5.</span> <span class="toc-text">第五步：灰度与回滚</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BA%94%E4%B8%AA%E7%9C%9F%E5%AE%9E%E8%B8%A9%E8%BF%87%E7%9A%84%E5%9D%91"><span class="toc-number">1.7.</span> <span class="toc-text">六、五个真实踩过的坑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/09/ai-data-analysis-agent-system-design/" title="【系统设计】AI 数据分析 Agent 架构设计：Text-to-SQL、语义层、执行沙箱与正确性保障">【系统设计】AI 数据分析 Agent 架构设计：Text-to-SQL、语义层、执行沙箱与正确性保障</a><time datetime="2026-11-09T00:00:00.000Z" title="发表于 2026-11-09 08:00:00">2026-11-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/09/java-llm-sparse-vector-splade-deep-practice/" title="【Java AI】稀疏向量检索与 SPLADE 深度实战：学习式稀疏、Impact 打分与 Java 落地">【Java AI】稀疏向量检索与 SPLADE 深度实战：学习式稀疏、Impact 打分与 Java 落地</a><time datetime="2026-11-09T00:00:00.000Z" title="发表于 2026-11-09 08:00:00">2026-11-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/09/jvm-generational-zgc-jep439-deep-dive/" title="【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战">【JVM 前沿】分代 ZGC（JEP 439）深度解析：两色指针、Remembered Set 与 JDK 21/23 迁移实战</a><time datetime="2026-11-09T00:00:00.000Z" title="发表于 2026-11-09 08:00:00">2026-11-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/09/linux-pressure-stall-information-psi-deep-dive/" title="【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地">【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地</a><time datetime="2026-11-09T00:00:00.000Z" title="发表于 2026-11-09 08:00:00">2026-11-09</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/09/transactional-outbox-pattern-deep-practice/" title="【分布式实战】事务性发件箱（Transactional Outbox）深度实战：双写不一致、SKIP LOCKED 投递与幂等消费">【分布式实战】事务性发件箱（Transactional Outbox）深度实战：双写不一致、SKIP LOCKED 投递与幂等消费</a><time datetime="2026-11-09T00:00:00.000Z" title="发表于 2026-11-09 08:00:00">2026-11-09</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
