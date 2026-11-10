@@ -1,0 +1,468 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 9】JavaScript 存储程序深度解析前言MySQL 9.0 干了一件在 MySQL 历史上挺反常识的事：把 JavaScript 引擎塞进了数据库服务器进程里。你可以在 CREATE FUNCTION &#x2F; CREATE PROCEDURE 里直接写 ECMAScript，用 GraalVM 执行，而不是写那段让所有人都不想维护的 SQL&#x2F;PSM 存储过程。">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/10/mysql-javascript-stored-program-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 9】JavaScript 存储程序深度解析前言MySQL 9.0 干了一件在 MySQL 历史上挺反常识的事：把 JavaScript 引擎塞进了数据库服务器进程里。你可以在 CREATE FUNCTION &#x2F; CREATE PROCEDURE 里直接写 ECMAScript，用 GraalVM 执行，而不是写那段让所有人都不想维护的 SQL&#x2F;PSM 存储过程。">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-10T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-10T00:01:55.331Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="GraalVM">
+<meta property="article:tag" content="JavaScript">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="存储过程">
+<meta property="article:tag" content="数据库">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍",
+  "url": "https://jiweidong.github.io/2026/11/10/mysql-javascript-stored-program-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-10T00:00:00.000Z",
+  "dateModified": "2026-11-10T00:01:55.331Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/10/mysql-javascript-stored-program-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">902</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1012</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-10T00:00:00.000Z" title="发表于 2026-11-10 08:00:00">2026-11-10</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-10T00:01:55.331Z" title="更新于 2026-11-10 08:01:55">2026-11-10</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-9】JavaScript-存储程序深度解析"><a href="#【MySQL-9】JavaScript-存储程序深度解析" class="headerlink" title="【MySQL 9】JavaScript 存储程序深度解析"></a>【MySQL 9】JavaScript 存储程序深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>MySQL 9.0 干了一件在 MySQL 历史上挺反常识的事：<strong>把 JavaScript 引擎塞进了数据库服务器进程里</strong>。你可以在 <code>CREATE FUNCTION</code> &#x2F; <code>CREATE PROCEDURE</code> 里直接写 ECMAScript，用 GraalVM 执行，而不是写那段让所有人都不想维护的 SQL&#x2F;PSM 存储过程。</p>
+<p>这个特性的定位很明确——<strong>干掉”为了几十行数据加工逻辑专门建一个中间服务”的尴尬</strong>。但它同时也带来了一堆必须想清楚的边界问题：能不能读文件？能不能发 HTTP？出错怎么排查？性能到底比 SQL 过程快还是慢？什么时候该用它，什么时候该老老实实回 Java 应用层写？</p>
+<p>这篇我们把这套机制从运行时、语法、能力边界、性能、生产治理到 Java 侧落地完整过一遍。<strong>注意：JavaScript 存储程序是 MySQL 企业版特性</strong>，社区版用不了，这一点在做技术选型时是第一道门槛。</p>
+<hr>
+<h2 id="一、为什么-MySQL-要引入-JavaScript"><a href="#一、为什么-MySQL-要引入-JavaScript" class="headerlink" title="一、为什么 MySQL 要引入 JavaScript"></a>一、为什么 MySQL 要引入 JavaScript</h2><p>先看一张”同一件事四种写法”的对比，这是理解这个特性价值的最快方式。</p>
+<p>需求：给订单打一个风控标签，输入是 JSON 明细，输出是等级。</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>代码位置</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>SQL 存储过程（PSM）</td>
+<td>数据库内</td>
+<td>无网络开销、事务内原子</td>
+<td>语法晦涩、无生态、JSON 处理痛苦、调试靠 SELECT</td>
+</tr>
+<tr>
+<td>JavaScript 存储程序</td>
+<td>数据库内</td>
+<td>无网络开销、JSON 原生、生态语法熟悉</td>
+<td>企业版限定、沙箱受限、调试弱、不可版本化</td>
+</tr>
+<tr>
+<td>Java UDF（<code>CREATE FUNCTION ... SONAME</code>）</td>
+<td>数据库内</td>
+<td>性能最好、可复用 Java 库</td>
+<td>需要编译 so、崩溃拖垮 mysqld、升级麻烦</td>
+</tr>
+<tr>
+<td>应用层 Service</td>
+<td>应用内</td>
+<td>可测试、可观测、可灰度</td>
+<td>多一次网络往返、跨服务事务难</td>
+</tr>
+</tbody></table>
+<p>JavaScript 存储程序吃的是中间那一格：<strong>比 SQL 过程好写，比 Java UDF 安全，比应用层少一跳</strong>。</p>
+<p>它的典型适用场景其实很窄，但很痛：</p>
+<ul>
+<li>数据清洗&#x2F;迁移脚本里的复杂字段变换（尤其是 JSON 嵌套结构重组）</li>
+<li>报表&#x2F;对账场景里的一次性聚合加工，不想为它发一次应用版本</li>
+<li>触发器里需要做条件分支 + 字符串&#x2F;正则处理</li>
+<li>ETL 前置的轻量加工，减少出库数据量</li>
+</ul>
+<hr>
+<h2 id="二、运行时：GraalVM-在-mysqld-里怎么跑"><a href="#二、运行时：GraalVM-在-mysqld-里怎么跑" class="headerlink" title="二、运行时：GraalVM 在 mysqld 里怎么跑"></a>二、运行时：GraalVM 在 mysqld 里怎么跑</h2><p>MySQL 的 JavaScript 支持基于 <strong>GraalVM 的 ECMAScript 实现</strong>，以”多语言引擎（MLE）”组件的形式加载进服务器进程。几个关键点：</p>
+<ol>
+<li><strong>同一进程、同一地址空间</strong>。JS 代码跑在 mysqld 进程内，不是外部子进程。所以它<strong>没有网络隔离之外的进程隔离</strong>，一个死循环就能拖住一个连接线程。</li>
+<li><strong>每个会话有独立的执行上下文</strong>。变量不跨会话共享，函数是”无状态”的（除非你读写表）。</li>
+<li><strong>能力被显式裁剪</strong>。没有 <code>fetch</code>、没有 <code>require</code>、没有 <code>fs</code>，标准库里只有纯计算部分。这是设计上的安全底线，不是配置项。</li>
+<li><strong>解释 + JIT</strong>。GraalVM 会在热点代码上做 JIT 编译，所以”第一次调用慢、后续变快”是正常现象，压测时要把 warmup 算进去。</li>
+</ol>
+<p>组件安装大致是这样（具体组件名以你的 9.x 版本为准）：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 需要企业版，且安装后通常要重启生效</span></span><br><span class="line">INSTALL COMPONENT <span class="string">&#x27;file://component_mle&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 确认已加载</span></span><br><span class="line"><span class="keyword">SELECT</span> component_urn <span class="keyword">FROM</span> mysql.component;</span><br></pre></td></tr></table></figure>
+
+<p>资源限制由 <code>mle.*</code> 系列系统变量控制（内存上限、执行超时等），默认值在共享实例上<strong>一定要调</strong>，否则一个写坏的 JS 递归能把整台实例的内存吃掉：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> VARIABLES <span class="keyword">LIKE</span> <span class="string">&#x27;mle%&#x27;</span>;</span><br><span class="line"><span class="comment">-- 典型治理：单会话内存上限 + 执行时间上限</span></span><br><span class="line"><span class="comment">-- SET GLOBAL mle.max_memory = 64;   -- 单位以官方文档为准</span></span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>生产建议：JS 存储程序<strong>只放在只读从库或专用实例上</strong>跑批处理，不要和核心交易实例混部。原因很简单——它和你的业务连接共享同一个 buffer pool 和同一份 CPU。</p>
+</blockquote>
+<hr>
+<h2 id="三、语法与实战"><a href="#三、语法与实战" class="headerlink" title="三、语法与实战"></a>三、语法与实战</h2><h3 id="3-1-一个最小函数"><a href="#3-1-一个最小函数" class="headerlink" title="3.1 一个最小函数"></a>3.1 一个最小函数</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE</span> <span class="keyword">FUNCTION</span> js_order_level(amount <span class="type">DECIMAL</span>(<span class="number">12</span>,<span class="number">2</span>), vip TINYINT)</span><br><span class="line"><span class="keyword">RETURNS</span> <span class="type">VARCHAR</span>(<span class="number">16</span>)</span><br><span class="line"><span class="keyword">LANGUAGE</span> JAVASCRIPT</span><br><span class="line"><span class="keyword">AS</span> $$</span><br><span class="line">  if (amount <span class="operator">&gt;=</span> <span class="number">10000</span> <span class="operator">||</span> (vip <span class="operator">=</span><span class="operator">=</span><span class="operator">=</span> <span class="number">1</span> <span class="operator">&amp;&amp;</span> amount <span class="operator">&gt;=</span> <span class="number">3000</span>)) &#123;</span><br><span class="line">    <span class="keyword">return</span> <span class="string">&#x27;HIGH&#x27;</span>;</span><br><span class="line">  &#125;</span><br><span class="line">  if (amount <span class="operator">&gt;=</span> <span class="number">1000</span>) &#123;</span><br><span class="line">    <span class="keyword">return</span> <span class="string">&#x27;MID&#x27;</span>;</span><br><span class="line">  &#125;</span><br><span class="line">  <span class="keyword">return</span> <span class="string">&#x27;LOW&#x27;</span>;</span><br><span class="line">$$;</span><br></pre></td></tr></table></figure>
+
+<p>调用和普通函数完全一致：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> id, js_order_level(amount, is_vip) <span class="keyword">AS</span> lvl</span><br><span class="line"><span class="keyword">FROM</span> t_order</span><br><span class="line"><span class="keyword">WHERE</span> created_at <span class="operator">&gt;=</span> <span class="string">&#x27;2026-11-01&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-JSON-加工才是它的主场"><a href="#3-2-JSON-加工才是它的主场" class="headerlink" title="3.2 JSON 加工才是它的主场"></a>3.2 JSON 加工才是它的主场</h3><p>SQL&#x2F;PSM 处理嵌套 JSON 要写一堆 <code>JSON_EXTRACT</code> + <code>JSON_UNQUOTE</code>，可读性极差。JS 里就是普通对象操作：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE</span> <span class="keyword">FUNCTION</span> js_flatten_items(payload JSON)</span><br><span class="line"><span class="keyword">RETURNS</span> JSON</span><br><span class="line"><span class="keyword">LANGUAGE</span> JAVASCRIPT</span><br><span class="line"><span class="keyword">AS</span> $$</span><br><span class="line">  const src <span class="operator">=</span> JSON.parse(payload);</span><br><span class="line">  const items <span class="operator">=</span> Array.isArray(src.items) ? src.items : [];</span><br><span class="line"></span><br><span class="line">  const merged <span class="operator">=</span> &#123;&#125;;</span><br><span class="line">  let total <span class="operator">=</span> <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">  <span class="keyword">for</span> (const it <span class="keyword">of</span> items) &#123;</span><br><span class="line">    const sku <span class="operator">=</span> String(it.sku <span class="operator">||</span> <span class="string">&#x27;&#x27;</span>).toUpperCase();</span><br><span class="line">    if (<span class="operator">!</span>sku) continue;</span><br><span class="line">    const qty <span class="operator">=</span> Number(it.qty) <span class="operator">||</span> <span class="number">0</span>;</span><br><span class="line">    const price <span class="operator">=</span> Number(it.price) <span class="operator">||</span> <span class="number">0</span>;</span><br><span class="line">    if (<span class="operator">!</span>merged[sku]) &#123;</span><br><span class="line">      merged[sku] <span class="operator">=</span> &#123; sku: sku, qty: <span class="number">0</span>, amount: <span class="number">0</span> &#125;;</span><br><span class="line">    &#125;</span><br><span class="line">    merged[sku].qty <span class="operator">+</span><span class="operator">=</span> qty;</span><br><span class="line">    merged[sku].amount <span class="operator">+</span><span class="operator">=</span> qty <span class="operator">*</span> price;</span><br><span class="line">    total <span class="operator">+</span><span class="operator">=</span> qty <span class="operator">*</span> price;</span><br><span class="line">  &#125;</span><br><span class="line"></span><br><span class="line">  <span class="keyword">return</span> JSON.stringify(&#123;</span><br><span class="line">    total: Math.round(total <span class="operator">*</span> <span class="number">100</span>) <span class="operator">/</span> <span class="number">100</span>,</span><br><span class="line">    count: Object.keys(merged).length,</span><br><span class="line">    lines: Object.values(merged).sort((a, b) <span class="operator">=</span><span class="operator">&gt;</span> b.amount <span class="operator">-</span> a.amount)</span><br><span class="line">  &#125;);</span><br><span class="line">$$;</span><br></pre></td></tr></table></figure>
+
+<p>同样逻辑写成 SQL 过程，长度至少翻三倍，而且没人愿意 review。</p>
+<h3 id="3-3-过程-事务边界"><a href="#3-3-过程-事务边界" class="headerlink" title="3.3 过程 + 事务边界"></a>3.3 过程 + 事务边界</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE</span> <span class="keyword">PROCEDURE</span> js_purge_stale_cart(<span class="keyword">IN</span> keep_days <span class="type">INT</span>)</span><br><span class="line"><span class="keyword">LANGUAGE</span> JAVASCRIPT</span><br><span class="line"><span class="keyword">AS</span> $$</span><br><span class="line">  const days <span class="operator">=</span> Number(keep_days) <span class="operator">||</span> <span class="number">7</span>;</span><br><span class="line"></span><br><span class="line">  <span class="operator">/</span><span class="operator">/</span> 只做计算不够，存储程序的价值在于能操作表</span><br><span class="line">  const rs <span class="operator">=</span> mysql.query(</span><br><span class="line">    <span class="string">&#x27;SELECT COUNT(*) AS c FROM t_cart WHERE updated_at &lt; NOW() - INTERVAL ? DAY&#x27;</span>,</span><br><span class="line">    [days]</span><br><span class="line">  );</span><br><span class="line">  const candidates <span class="operator">=</span> rs[<span class="number">0</span>].c;</span><br><span class="line"></span><br><span class="line">  if (candidates <span class="operator">&gt;</span> <span class="number">100000</span>) &#123;</span><br><span class="line">    <span class="operator">/</span><span class="operator">/</span> 大批量删除必须分批，否则一个长事务能把 undo 撑爆</span><br><span class="line">    throw <span class="keyword">new</span> Error(<span class="string">&#x27;too many rows: &#x27;</span> <span class="operator">+</span> candidates <span class="operator">+</span> <span class="string">&#x27;, use batched job instead&#x27;</span>);</span><br><span class="line">  &#125;</span><br><span class="line"></span><br><span class="line">  const r <span class="operator">=</span> mysql.query(</span><br><span class="line">    <span class="string">&#x27;DELETE FROM t_cart WHERE updated_at &lt; NOW() - INTERVAL ? DAY LIMIT 50000&#x27;</span>,</span><br><span class="line">    [days]</span><br><span class="line">  );</span><br><span class="line">  <span class="keyword">return</span> r.affectedRows;</span><br><span class="line">$$;</span><br></pre></td></tr></table></figure>
+
+<p>注意两点：</p>
+<ul>
+<li><code>mysql.query</code> 这类内置对象是 MLE 提供的数据库访问入口，<strong>具体 API 名称随版本可能不同</strong>，写之前先 <code>SELECT</code> 一个探针函数验证。</li>
+<li>存储程序里<strong>不要写长事务</strong>。它跟你手写 <code>BEGIN...COMMIT</code> 一样会持有 MDL 和行锁，且更容易因为逻辑复杂而忘记提交。</li>
+</ul>
+<h3 id="3-4-错误处理"><a href="#3-4-错误处理" class="headerlink" title="3.4 错误处理"></a>3.4 错误处理</h3><p>JS 里抛异常会被转成 SQL 错误：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE</span> <span class="keyword">FUNCTION</span> js_safe_div(a <span class="type">DECIMAL</span>(<span class="number">12</span>,<span class="number">4</span>), b <span class="type">DECIMAL</span>(<span class="number">12</span>,<span class="number">4</span>))</span><br><span class="line"><span class="keyword">RETURNS</span> <span class="type">DECIMAL</span>(<span class="number">12</span>,<span class="number">4</span>)</span><br><span class="line"><span class="keyword">LANGUAGE</span> JAVASCRIPT</span><br><span class="line"><span class="keyword">AS</span> $$</span><br><span class="line">  if (b <span class="operator">=</span><span class="operator">=</span><span class="operator">=</span> <span class="number">0</span> <span class="operator">||</span> b <span class="operator">=</span><span class="operator">=</span><span class="operator">=</span> <span class="keyword">null</span>) &#123;</span><br><span class="line">    <span class="operator">/</span><span class="operator">/</span> 自定义错误码，方便应用侧统一识别</span><br><span class="line">    const e <span class="operator">=</span> <span class="keyword">new</span> Error(<span class="string">&#x27;DIV_BY_ZERO&#x27;</span>);</span><br><span class="line">    e.sqlState <span class="operator">=</span> <span class="string">&#x27;45000&#x27;</span>;</span><br><span class="line">    throw e;</span><br><span class="line">  &#125;</span><br><span class="line">  <span class="keyword">return</span> a <span class="operator">/</span> b;</span><br><span class="line">$$;</span><br></pre></td></tr></table></figure>
+
+<p>Java 侧就能按 <code>SQLState = 45000</code> 做统一兜底，而不是去解析错误文本。</p>
+<hr>
+<h2 id="四、能力边界：它能做什么，绝对不能做什么"><a href="#四、能力边界：它能做什么，绝对不能做什么" class="headerlink" title="四、能力边界：它能做什么，绝对不能做什么"></a>四、能力边界：它能做什么，绝对不能做什么</h2><p>这是最容易踩坑的部分。很多同学看完 demo 就想”那我是不是可以把一些服务端逻辑搬进数据库”——答案是<strong>大部分不能</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>支持情况</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>纯计算 &#x2F; 字符串 &#x2F; 正则 &#x2F; JSON</td>
+<td>✅ 完整</td>
+<td>这是主战场</td>
+</tr>
+<tr>
+<td>读当前会话变量、执行 SQL</td>
+<td>✅</td>
+<td>通过内置数据库访问 API</td>
+</tr>
+<tr>
+<td>收发网络请求（HTTP&#x2F;RPC）</td>
+<td>❌ 禁止</td>
+<td>无 <code>fetch</code>、无 socket。数据库不该做服务调用</td>
+</tr>
+<tr>
+<td>读写文件系统</td>
+<td>❌ 禁止</td>
+<td>无 <code>fs</code>。想导数据用 <code>SELECT ... INTO OUTFILE</code></td>
+</tr>
+<tr>
+<td>引入第三方 npm 包</td>
+<td>❌ 禁止</td>
+<td>没有模块加载器，只能用内置标准库</td>
+</tr>
+<tr>
+<td>多线程 &#x2F; 异步回调</td>
+<td>❌ 禁止</td>
+<td>执行模型是同步的，<code>Promise</code> 基本没意义</td>
+</tr>
+<tr>
+<td>常驻内存缓存</td>
+<td>❌ 不保证</td>
+<td>会话级上下文，连接断开即丢</td>
+</tr>
+<tr>
+<td>访问其他数据库</td>
+<td>❌ 禁止</td>
+<td>只能访问本实例</td>
+</tr>
+<tr>
+<td>DDL</td>
+<td>⚠️ 受限</td>
+<td>不要在函数里做 DDL，可能引发元数据锁雪崩</td>
+</tr>
+<tr>
+<td>递归</td>
+<td>⚠️ 危险</td>
+<td>深度递归易栈溢出，配合内存上限才安全</td>
+</tr>
+</tbody></table>
+<p>一句话总结：<strong>它是一台”能碰本地表的纯函数计算器”，不是一个”跑在数据库里的应用服务器”。</strong></p>
+<p>这条边界直接决定了它的定位：<strong>就近计算，减少数据搬运</strong>，而不是”把微服务下沉到 DB”。</p>
+<hr>
+<h2 id="五、性能：什么时候真的更快"><a href="#五、性能：什么时候真的更快" class="headerlink" title="五、性能：什么时候真的更快"></a>五、性能：什么时候真的更快</h2><p>很多人以为”消除网络往返 &#x3D; 一定更快”，实测并非如此。影响因素有三个：</p>
+<ol>
+<li><strong>调用次数</strong>。如果一条 SQL 处理 10 万行、每行调用一次 JS 函数，那就是 10 万次跨语言调用（SQL 引擎 ↔ JS 引擎），开销远大于省下的网络往返。</li>
+<li><strong>JIT 是否预热</strong>。冷启动时是解释执行，第一批数据会明显慢。</li>
+<li><strong>数据搬运方向</strong>。真正的收益来自”不出库”：本来要把 5 万行 JSON 拉到应用层加工，现在在库里算完只返回汇总结果。</li>
+</ol>
+<p>一个粗略的经验判断：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>逐行调用的简单函数（如格式化、加解密）</td>
+<td>❌ 别用，SQL 表达式或应用层更快</td>
+</tr>
+<tr>
+<td>逐行调用的复杂 JSON 重组</td>
+<td>⚠️ 先测。批量场景用聚合写法一次处理多行更好</td>
+</tr>
+<tr>
+<td>全表&#x2F;大范围扫描后就地聚合</td>
+<td>✅ 收益最大，减少出库数据量</td>
+</tr>
+<tr>
+<td>触发器内的轻量分支</td>
+<td>✅ 可接受，但注意别放大写放大</td>
+</tr>
+<tr>
+<td>跨表复杂业务事务</td>
+<td>❌ 回应用层，可测性&#x2F;可观测性差太多</td>
+</tr>
+</tbody></table>
+<p>压测时一定要区分 <strong>warmup 后吞吐</strong> 和 <strong>首批延迟</strong>，并且和”应用层批处理 + 批量写入”的基线对比——后者往往才是最优解。</p>
+<hr>
+<h2 id="六、Java-侧怎么落地"><a href="#六、Java-侧怎么落地" class="headerlink" title="六、Java 侧怎么落地"></a>六、Java 侧怎么落地</h2><h3 id="6-1-调用方式：跟普通函数没区别"><a href="#6-1-调用方式：跟普通函数没区别" class="headerlink" title="6.1 调用方式：跟普通函数没区别"></a>6.1 调用方式：跟普通函数没区别</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Repository</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderLevelRepository</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> JdbcTemplate jdbc;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">OrderLevelRepository</span><span class="params">(JdbcTemplate jdbc)</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.jdbc = jdbc;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> Map&lt;Long, String&gt; <span class="title function_">batchLevel</span><span class="params">(List&lt;Long&gt; orderIds)</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (orderIds.isEmpty()) &#123;</span><br><span class="line">            <span class="keyword">return</span> Map.of();</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="type">String</span> <span class="variable">in</span> <span class="operator">=</span> orderIds.stream().map(id -&gt; <span class="string">&quot;?&quot;</span>).collect(Collectors.joining(<span class="string">&quot;,&quot;</span>));</span><br><span class="line">        <span class="type">String</span> <span class="variable">sql</span> <span class="operator">=</span> <span class="string">&quot;SELECT id, js_order_level(amount, is_vip) AS lvl FROM t_order WHERE id IN (&quot;</span> + in + <span class="string">&quot;)&quot;</span>;</span><br><span class="line">        Map&lt;Long, String&gt; result = <span class="keyword">new</span> <span class="title class_">HashMap</span>&lt;&gt;();</span><br><span class="line">        jdbc.query(sql, rs -&gt; &#123;</span><br><span class="line">            result.put(rs.getLong(<span class="string">&quot;id&quot;</span>), rs.getString(<span class="string">&quot;lvl&quot;</span>));</span><br><span class="line">        &#125;, orderIds.toArray());</span><br><span class="line">        <span class="keyword">return</span> result;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-一定要做的三件事"><a href="#6-2-一定要做的三件事" class="headerlink" title="6.2 一定要做的三件事"></a>6.2 一定要做的三件事</h3><p><strong>第一，函数不存在时不能让接口 500。</strong> 把”数据库能力”当作可选依赖：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">jsEnabled</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        jdbc.queryForObject(<span class="string">&quot;SELECT js_order_level(1, 0)&quot;</span>, String.class);</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">    &#125; <span class="keyword">catch</span> (DataAccessException e) &#123;</span><br><span class="line">        log.warn(<span class="string">&quot;JS stored program unavailable, fallback to java impl&quot;</span>, e);</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>第二，Java 侧保留一份等价实现。</strong> 这不是重复劳动，是<strong>可回滚能力</strong>。DB 侧逻辑出问题时，改配置切回 Java 实现，比发版回滚快得多。</p>
+<p><strong>第三，把 SQL 里的 JS 代码纳入版本管理。</strong> 它住在数据库里，天生游离于 Git 之外。建议：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">/db/functions/js_order_level.sql</span><br><span class="line">/db/functions/js_flatten_items.sql</span><br></pre></td></tr></table></figure>
+
+<p>用 Flyway&#x2F;Liquibase 管理，<code>CREATE OR REPLACE</code> 保证幂等。<strong>不要</strong>让人在客户端手敲 <code>CREATE FUNCTION</code> 改线上逻辑——这是最常见的”线上代码和仓库不一致”事故源。</p>
+<h3 id="6-3-什么时候我会明确劝阻"><a href="#6-3-什么时候我会明确劝阻" class="headerlink" title="6.3 什么时候我会明确劝阻"></a>6.3 什么时候我会明确劝阻</h3><ul>
+<li>团队没有 DBA 值守，数据库变更走不了审核流程</li>
+<li>逻辑需要单测、需要断点调试、需要 traceId 全链路日志</li>
+<li>逻辑将来可能需要访问外部服务（一旦需要，就得整体搬迁）</li>
+<li>用的是社区版（用不了，别设计进架构）</li>
+</ul>
+<hr>
+<h2 id="七、生产治理清单"><a href="#七、生产治理清单" class="headerlink" title="七、生产治理清单"></a>七、生产治理清单</h2><table>
+<thead>
+<tr>
+<th>项目</th>
+<th>做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>版本控制</td>
+<td>全部 DDL 入 Git，Flyway 管理，禁止手工改线上</td>
+</tr>
+<tr>
+<td>资源隔离</td>
+<td>专用实例&#x2F;只读从库，<code>mle.*</code> 内存与超时上限必须设置</td>
+</tr>
+<tr>
+<td>权限最小化</td>
+<td>执行函数的账号只给 <code>EXECUTE</code> + 必要的表 <code>SELECT</code>，不给 <code>FILE</code>、不给 <code>SUPER</code></td>
+</tr>
+<tr>
+<td>可观测</td>
+<td>慢查询日志 + <code>performance_schema</code> 里按 <code>PROCEDURE</code>&#x2F;<code>FUNCTION</code> 维度聚合</td>
+</tr>
+<tr>
+<td>灰度</td>
+<td>先在一个从库验证，用影子流量对比 Java 实现结果</td>
+</tr>
+<tr>
+<td>回滚</td>
+<td>Java 侧保留等价实现 + 开关</td>
+</tr>
+<tr>
+<td>禁止项</td>
+<td>网络调用、文件读写、DDL、长事务、深递归、按行调用百万次</td>
+</tr>
+</tbody></table>
+<h2 id="八、面试常见追问"><a href="#八、面试常见追问" class="headerlink" title="八、面试常见追问"></a>八、面试常见追问</h2><p><strong>Q1：MySQL 为什么要用 GraalVM 而不是 V8？</strong><br>A：GraalVM 本身就是多语言运行时，天然支持”宿主语言 + 嵌入语言”的互操作和统一内存管理，而且它能在同一个 VM 里做 JIT 和沙箱裁剪。V8 是独立引擎，嵌进 C++ 服务要自己处理隔离和资源配额，工程量更大。这里的关键不是”哪个 JS 引擎快”，而是”哪个更容易安全地嵌进已有进程”。</p>
+<p><strong>Q2：JS 存储程序能替代应用层逻辑吗？</strong><br>A：不能。它没有网络、没有文件、没有模块、没有异步，且无法单测和全链路追踪。它的价值是<strong>消除数据搬运</strong>，不是<strong>承载业务编排</strong>。判断标准：这段逻辑是否需要与外部系统交互、是否需要独立扩缩容、是否需要灰度——只要有一个”是”，就留在应用层。</p>
+<p><strong>Q3：为什么逐行调用 JS 函数可能比应用层还慢？</strong><br>A：跨语言调用有固定开销（参数封送、类型转换、上下文切换）。10 万行 × 每次调用 &#x3D; 10 万次穿越边界，这个开销可能远超一次网络往返摊到 10 万行上的成本。正确姿势是把”按行调用”改成”集合处理”：一次传入一批数据，返回一个结果集。</p>
+<p><strong>Q4：如何在数据库内保证这段 JS 逻辑和 Java 实现一致？</strong><br>A：双跑比对。用影子流量把同一批输入分别喂给 DB 函数和 Java 实现，落库比对差异率，差异率低于阈值再切流。这比”code review 觉得没问题”可靠一个量级。</p>
+<p><strong>Q5：这个特性和 <code>CREATE FUNCTION ... SONAME</code>（UDF）比怎么选？</strong><br>A：UDF 是原生代码，性能最好但<strong>崩溃会带走整个 mysqld</strong>，且升级要重启、要处理 so 依赖，安全审计几乎不可行。JS 存储程序跑在受控运行时里，异常是 SQL 错误而不是段错误。除非是极致性能的标量函数（比如加解密、哈希），否则优先 JS。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><ul>
+<li>JavaScript 存储程序解决的是”<strong>就近计算</strong>“问题，不是”服务下沉”问题。</li>
+<li>它的甜区是 <strong>JSON 重组、字段变换、批量清洗</strong>，并且<strong>企业版限定</strong>。</li>
+<li>能力边界非常硬：无网络、无文件、无模块、无异步。设计时先把这条记在脑门上。</li>
+<li>性能收益来自”减少出库数据量”，不是”消除网络往返”。逐行调用大概率更慢。</li>
+<li>Java 侧要保留等价实现 + 开关 + 版本化管理，否则它会变成一台没人敢动的黑盒。</li>
+</ul>
+<p>一句话给做技术选型的同学：<strong>当你的痛点是”为了 30 行 JSON 加工专门发一次应用版本”，它值得；当你的痛点是”微服务调用链太长”，它一点都不值得。</strong></p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/10/mysql-javascript-stored-program-deep-dive/">https://jiweidong.github.io/2026/11/10/mysql-javascript-stored-program-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><a class="post-meta__tags" href="/tags/GraalVM/">GraalVM</a><a class="post-meta__tags" href="/tags/JavaScript/">JavaScript</a><a class="post-meta__tags" href="/tags/%E5%AD%98%E5%82%A8%E8%BF%87%E7%A8%8B/">存储过程</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/10/flink-state-backend-checkpoint-deep-dive/" title="【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once</div></div><div class="info-2"><div class="info-item-1">【Flink 深挖】状态后端与 Checkpoint 全链路前言Flink 之所以能成为流计算的事实标准，核心不是”能算流”，而是它能在大状态 + 故障 + 反压的三角约束下，仍然给你一个可以承诺的一致性语义。而这个承诺的全部技术含量，集中在两个东西上：State Backend（状态存在哪、怎么读）和 Checkpoint（怎么在不停机的情况下拍一张全局一致的快照）。 很多同学对 Flink 的理解停留在”算子 + 窗口 + Watermark”，一到线上就开始翻车：checkpoint 一直超时、恢复要 40 分钟、RocksDB 本地磁盘打满、开了 Exactly-Once 但下游还是重复。这些问题的根因，几乎都能回溯到本文要讲的机制上。 这篇从状态分类讲到快照协议，再落到 RocksDB 调优和生产排查，最后给一套能直接抄的 Java 配置。  一、先搞清楚：Flink 里到底有几种状态1.1 Keyed State（按键分区）只有作用在 keyBy() 之后的算子才有 Keyed State。每个 key 独占一份状态，Flink 保证同一 key 一定路由到同一个并行...</div></div></div></a><a class="pagination-related" href="/2026/11/09/transactional-outbox-pattern-deep-practice/" title="【分布式实战】事务性发件箱（Transactional Outbox）深度实战：双写不一致、SKIP LOCKED 投递与幂等消费"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【分布式实战】事务性发件箱（Transactional Outbox）深度实战：双写不一致、SKIP LOCKED 投递与幂等消费</div></div><div class="info-2"><div class="info-item-1">【分布式实战】事务性发件箱（Transactional Outbox）深度实战前言：一个”偶发”的订单状态不一致订单服务下单成功后发一条 Kafka 消息通知库存服务扣减。代码长这样： 12345@Transactionalpublic void createOrder(Order order) &#123;    orderMapper.insert(order);          // 1. 写库    kafkaTemplate.send(&quot;order-created&quot;, order.getId());  // 2. 发消息&#125;  上线三个月，出现了 17 笔”订单已创建但库存没扣”的脏数据。排查日志发现两种失败：  消息发送失败（Broker 抖动 &#x2F; 网络超时），异常抛出 → 事务回滚。这种情况是对的。 消息发送成功但事务提交失败（数据库主从切换、连接被 kill、@Transactional 外层还有事务），或者消息发出后进程被 Kill -9 → 消息已投递，数据不存在。这就是不一致的来源。  很多人第一反应是”加重试”。重试...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/29/mysql-stored-procedure-trigger-deep-dive/" title="【MySQL 进阶】存储过程与触发器深度解析：语法、游标、事件调度与生产取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-29</div><div class="info-item-2">【MySQL 进阶】存储过程与触发器深度解析：语法、游标、事件调度与生产取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 进阶】存储过程与触发器深度解析：语法、游标、事件调度与生产取舍面试官：你们项目用存储过程吗？为什么？这是一个「没有标准答案，但答错立刻掉分」的问题。 答「用啊，所有业务逻辑都写在存储过程里」——面试官会怀疑你的架构能力；答「存储过程是落后技术，从来不用」——面试官会怀疑你没当过大流量系统的家。 真正得体的回答是：分清场景。存储过程适合「批量、离线、数据迁移、报表聚合」这类逻辑稳定、需要减少网络往返的场景；而在线事务型业务更适合放在应用层。这篇文章把 MySQL 的存储过程、函数、游标、触发器、事件调度器一次性讲透，并给出落地取舍。 一、存储过程基础语法存储过程（Stored Procedure）是一组预编译并保存在服务端的 SQL 集合。核心语法： 123456789101112131415161718192021222324252627282930DELIMITER $$CREATE PROCEDURE p_transfer(    IN  from_id BIGINT,    IN  to_id   BIGINT,    IN  amount  DECIMAL(...</div></div></div></a><a class="pagination-related" href="/2026/11/08/mysql-sql-mode-strict-mode-deep-dive/" title="【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-08</div><div class="info-item-2">【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪</div></div><div class="info-2"><div class="info-item-1">【MySQL 深挖】sql_mode 与严格模式深度解析：从静默截断到 ONLY_FULL_GROUP_BY 的迁移血泪前言两个真实事故，一个”太安静”，一个”太吵”。 事故一（静默截断）：某电商的订单表 receiver_phone VARCHAR(11)，上游改成支持国际号码后传入了 13 位。数据库没有报错，只有一条 warning。三个月后对账发现，几千条订单的手机号被截成了 11 位——用户收不到验证码，但系统一切正常。 事故二（迁移报错）：从 MySQL 5.6 迁到 8.0，一条统计 SQL 突然报： 1234ERROR 1055 (42000): Expression #3 of SELECT list is not in GROUP BY clauseand contains nonaggregated column &#x27;db.t.status&#x27; which is not functionallydependent on columns in GROUP BY clause; this is incompatible withsql_mode=...</div></div></div></a><a class="pagination-related" href="/2026/07/05/mysql-pagination-optimization-guide/" title="【MySQL优化】MySQL 分页查询优化实战：从 LIMIT 深分页到游标分页与延迟关联"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-05</div><div class="info-item-2">【MySQL优化】MySQL 分页查询优化实战：从 LIMIT 深分页到游标分页与延迟关联</div></div><div class="info-2"><div class="info-item-1">【MySQL优化】MySQL 分页查询优化实战：从 LIMIT 深分页到游标分页与延迟关联一、深入解析 MySQL 分页查询性能1.1 问题背景：深分页的噩梦我们来看一个最常见的分页查询： 1234SELECT id, title, content, create_time FROM article ORDER BY create_time DESC LIMIT 100000, 20;  这个查询看起来简单，但你有没有注意到——随着页码增大，查询越来越慢？ 当面页（第1页）可能 1ms 就返回了，翻到第 5000 页可能直接飙到 5 秒以上。这不是偶然，而是 MySQL 在处理 LIMIT M, N 时的固有行为。 面试官经典追问：”说说 LIMIT 100000, 20 在 MySQL 内部是怎么执行的？为什么越往后越慢？” 1.2 为什么会慢？——查一下执行计划先1234EXPLAIN SELECT id, title, content, create_time FROM article ORDER BY create_time DESC LIMIT 100000, 20; ...</div></div></div></a><a class="pagination-related" href="/2026/10/11/mysql-unique-index-duplicate-key-deep-dive/" title="【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-11</div><div class="info-item-2">【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】唯一索引与 Duplicate Key 深度解析：INSERT IGNORE、ON DUPLICATE KEY UPDATE 与并发冲突治理面试官：怎么保证用户名不重复？最直接的回答是”给 username 加唯一索引”，这句话只值 20 分。面试官接着会问：  加了唯一索引，并发注册两条同名怎么处理？ INSERT IGNORE、ON DUPLICATE KEY UPDATE、REPLACE INTO 有什么区别？ 唯一索引冲突时，为什么有时候会死锁？ 逻辑删除和唯一索引为什么会打架？  这四个问题，才是这道题从 20 分到 90 分的分水岭。本文一次性讲透。  一、唯一索引的底层：唯一性是怎么被保证的InnoDB 中，唯一索引也是 B+ 树，区别在于插入时多了一步唯一性校验：  先在索引树中定位到待插入位置； 检查该位置（以及相邻记录）是否存在相同键值； 不存在 → 插入；存在 → 报 ERROR 1062 (23000): Duplicate entry。  关键点：唯一性检查是在”加锁后、插入前”完成的，这决定了并发行为。 1.1 二级唯一索引 vs ...</div></div></div></a><a class="pagination-related" href="/2026/10/09/mysql-innodb-dirty-page-flush-checkpoint-deep-dive/" title="【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing面试官：你说 redo log 保证崩溃恢复，那 redo log 是不是可以无限写？不会。如果 redo log 能无限写下去，那崩溃恢复时要重放的日志量就是无止境的，恢复时间不可控。 面试官接着问：那当 redo log 写满的时候会发生什么？脏页是怎么被刷盘的？为什么有时候会突然出现”数据库抖动”，所有更新都卡住？ 答案就落在两个词上：Checkpoint（检查点） 和 脏页刷盘（Flushing）。这篇文章把 LSN、Checkpoint、Adaptive Flushing、刷脏线程、Doublewrite 的关系一次讲清楚。 一、先建立坐标系：LSN 是一切的基础InnoDB 里所有关于”进度”的话题都围绕 LSN（Log Sequence Number），它是一个全局单调递增的 uint64，单位是字节。  每产生一条 redo 记录，log_sys-&gt;lsn 就往前推进 len 字节。 redo 文件是环形的（innodb_lo...</div></div></div></a><a class="pagination-related" href="/2026/09/18/mysql-generated-column-virtual-index-deep-dive/" title="【MySQL 8.0】生成列（Generated Column）深度解析：虚拟列、存储列与索引实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-18</div><div class="info-item-2">【MySQL 8.0】生成列（Generated Column）深度解析：虚拟列、存储列与索引实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 8.0】生成列（Generated Column）深度解析：虚拟列、存储列与索引实战面试官：JSON 字段里的属性怎么建索引？如果你回答「MySQL 8 有函数索引」，面试官通常会追问：「函数索引底层是怎么实现的？它和生成列是什么关系？」 这时候能讲清楚「函数索引本质上就是隐藏的虚拟生成列」的人，就明显高出一档。 生成列（Generated Column）是 MySQL 5.7 引入、8.0 大幅增强的能力，但很多人只知道概念不会用。这篇从语法到执行计划、从存储差异到 DDL 成本，把它彻底讲清楚。  一、什么是生成列生成列的值 不由 INSERT &#x2F; UPDATE 显式指定，而是由列定义里的表达式计算得出。 1234567891011CREATE TABLE t_order (  id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,  order_no    VARCHAR(32) NOT NULL,  amount      DECIMAL(10,2) NOT NULL,  tax_rate  ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">902</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1012</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-9%E3%80%91JavaScript-%E5%AD%98%E5%82%A8%E7%A8%8B%E5%BA%8F%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 9】JavaScript 存储程序深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88-MySQL-%E8%A6%81%E5%BC%95%E5%85%A5-JavaScript"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么 MySQL 要引入 JavaScript</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E8%BF%90%E8%A1%8C%E6%97%B6%EF%BC%9AGraalVM-%E5%9C%A8-mysqld-%E9%87%8C%E6%80%8E%E4%B9%88%E8%B7%91"><span class="toc-number">1.3.</span> <span class="toc-text">二、运行时：GraalVM 在 mysqld 里怎么跑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E8%AF%AD%E6%B3%95%E4%B8%8E%E5%AE%9E%E6%88%98"><span class="toc-number">1.4.</span> <span class="toc-text">三、语法与实战</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%80%E4%B8%AA%E6%9C%80%E5%B0%8F%E5%87%BD%E6%95%B0"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 一个最小函数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-JSON-%E5%8A%A0%E5%B7%A5%E6%89%8D%E6%98%AF%E5%AE%83%E7%9A%84%E4%B8%BB%E5%9C%BA"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 JSON 加工才是它的主场</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E8%BF%87%E7%A8%8B-%E4%BA%8B%E5%8A%A1%E8%BE%B9%E7%95%8C"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 过程 + 事务边界</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E9%94%99%E8%AF%AF%E5%A4%84%E7%90%86"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 错误处理</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E8%83%BD%E5%8A%9B%E8%BE%B9%E7%95%8C%EF%BC%9A%E5%AE%83%E8%83%BD%E5%81%9A%E4%BB%80%E4%B9%88%EF%BC%8C%E7%BB%9D%E5%AF%B9%E4%B8%8D%E8%83%BD%E5%81%9A%E4%BB%80%E4%B9%88"><span class="toc-number">1.5.</span> <span class="toc-text">四、能力边界：它能做什么，绝对不能做什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%80%A7%E8%83%BD%EF%BC%9A%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E7%9C%9F%E7%9A%84%E6%9B%B4%E5%BF%AB"><span class="toc-number">1.6.</span> <span class="toc-text">五、性能：什么时候真的更快</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E4%BE%A7%E6%80%8E%E4%B9%88%E8%90%BD%E5%9C%B0"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 侧怎么落地</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E8%B0%83%E7%94%A8%E6%96%B9%E5%BC%8F%EF%BC%9A%E8%B7%9F%E6%99%AE%E9%80%9A%E5%87%BD%E6%95%B0%E6%B2%A1%E5%8C%BA%E5%88%AB"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 调用方式：跟普通函数没区别</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E4%B8%80%E5%AE%9A%E8%A6%81%E5%81%9A%E7%9A%84%E4%B8%89%E4%BB%B6%E4%BA%8B"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 一定要做的三件事</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E6%88%91%E4%BC%9A%E6%98%8E%E7%A1%AE%E5%8A%9D%E9%98%BB"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 什么时候我会明确劝阻</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E7%94%9F%E4%BA%A7%E6%B2%BB%E7%90%86%E6%B8%85%E5%8D%95"><span class="toc-number">1.8.</span> <span class="toc-text">七、生产治理清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/vector-quantization-index-memory-deep-dive/" title="【AI 体系】向量量化与索引内存治理：SQ/PQ/BQ 的原理取舍、召回损失评估与 Java 侧落地">【AI 体系】向量量化与索引内存治理：SQ/PQ/BQ 的原理取舍、召回损失评估与 Java 侧落地</a><time datetime="2026-11-10T00:20:00.000Z" title="发表于 2026-11-10 08:20:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/spring-ai-advisors-interceptor-chain-deep-practice/" title="【Java AI】Spring AI Advisors 拦截链深度实战：ChatMemory、RAG 与自定义 Advisor 的执行顺序与上下文改写">【Java AI】Spring AI Advisors 拦截链深度实战：ChatMemory、RAG 与自定义 Advisor 的执行顺序与上下文改写</a><time datetime="2026-11-10T00:15:00.000Z" title="发表于 2026-11-10 08:15:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/linux-file-descriptor-exhaustion-java-deep-dive/" title="【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算">【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算</a><time datetime="2026-11-10T00:10:00.000Z" title="发表于 2026-11-10 08:10:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/flink-state-backend-checkpoint-deep-dive/" title="【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once">【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once</a><time datetime="2026-11-10T00:05:00.000Z" title="发表于 2026-11-10 08:05:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/mysql-javascript-stored-program-deep-dive/" title="【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍">【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍</a><time datetime="2026-11-10T00:00:00.000Z" title="发表于 2026-11-10 08:00:00">2026-11-10</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

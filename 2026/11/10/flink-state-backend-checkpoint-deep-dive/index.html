@@ -1,0 +1,472 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Flink 深挖】状态后端与 Checkpoint 全链路前言Flink 之所以能成为流计算的事实标准，核心不是”能算流”，而是它能在大状态 + 故障 + 反压的三角约束下，仍然给你一个可以承诺的一致性语义。而这个承诺的全部技术含量，集中在两个东西上：State Backend（状态存在哪、怎么读）和 Checkpoint（怎么在不停机的情况下拍一张全局一致的快照）。 很多同学对 Flink 的">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/10/flink-state-backend-checkpoint-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Flink 深挖】状态后端与 Checkpoint 全链路前言Flink 之所以能成为流计算的事实标准，核心不是”能算流”，而是它能在大状态 + 故障 + 反压的三角约束下，仍然给你一个可以承诺的一致性语义。而这个承诺的全部技术含量，集中在两个东西上：State Backend（状态存在哪、怎么读）和 Checkpoint（怎么在不停机的情况下拍一张全局一致的快照）。 很多同学对 Flink 的">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-10T00:05:00.000Z">
+<meta property="article:modified_time" content="2026-11-10T00:04:55.286Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Checkpoint">
+<meta property="article:tag" content="Flink">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="RocksDB">
+<meta property="article:tag" content="流计算">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once",
+  "url": "https://jiweidong.github.io/2026/11/10/flink-state-backend-checkpoint-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-10T00:05:00.000Z",
+  "dateModified": "2026-11-10T00:04:55.286Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/10/flink-state-backend-checkpoint-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">902</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1012</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-10T00:05:00.000Z" title="发表于 2026-11-10 08:05:00">2026-11-10</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-10T00:04:55.286Z" title="更新于 2026-11-10 08:04:55">2026-11-10</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Flink-深挖】状态后端与-Checkpoint-全链路"><a href="#【Flink-深挖】状态后端与-Checkpoint-全链路" class="headerlink" title="【Flink 深挖】状态后端与 Checkpoint 全链路"></a>【Flink 深挖】状态后端与 Checkpoint 全链路</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>Flink 之所以能成为流计算的事实标准，核心不是”能算流”，而是<strong>它能在大状态 + 故障 + 反压的三角约束下，仍然给你一个可以承诺的一致性语义</strong>。而这个承诺的全部技术含量，集中在两个东西上：<strong>State Backend</strong>（状态存在哪、怎么读）和 <strong>Checkpoint</strong>（怎么在不停机的情况下拍一张全局一致的快照）。</p>
+<p>很多同学对 Flink 的理解停留在”算子 + 窗口 + Watermark”，一到线上就开始翻车：checkpoint 一直超时、恢复要 40 分钟、RocksDB 本地磁盘打满、开了 Exactly-Once 但下游还是重复。这些问题的根因，几乎都能回溯到本文要讲的机制上。</p>
+<p>这篇从状态分类讲到快照协议，再落到 RocksDB 调优和生产排查，最后给一套能直接抄的 Java 配置。</p>
+<hr>
+<h2 id="一、先搞清楚：Flink-里到底有几种状态"><a href="#一、先搞清楚：Flink-里到底有几种状态" class="headerlink" title="一、先搞清楚：Flink 里到底有几种状态"></a>一、先搞清楚：Flink 里到底有几种状态</h2><h3 id="1-1-Keyed-State（按键分区）"><a href="#1-1-Keyed-State（按键分区）" class="headerlink" title="1.1 Keyed State（按键分区）"></a>1.1 Keyed State（按键分区）</h3><p>只有作用在 <code>keyBy()</code> 之后的算子才有 Keyed State。每个 key 独占一份状态，Flink 保证同一 key 一定路由到同一个并行子任务。</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>语义</th>
+<th>典型用途</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ValueState&lt;T&gt;</code></td>
+<td>单值</td>
+<td>上次登录时间、累计金额</td>
+<td>需设置 TTL</td>
+</tr>
+<tr>
+<td><code>ListState&lt;T&gt;</code></td>
+<td>列表</td>
+<td>最近 N 条行为</td>
+<td>无界增长是头号事故源</td>
+</tr>
+<tr>
+<td><code>MapState&lt;K,V&gt;</code></td>
+<td>哈希表</td>
+<td>用户画像标签</td>
+<td>大 map 单 key 会倾斜</td>
+</tr>
+<tr>
+<td><code>ReducingState&lt;T&gt;</code></td>
+<td>归约聚合</td>
+<td>累加求和</td>
+<td>只存聚合结果，省内存</td>
+</tr>
+<tr>
+<td><code>AggregatingState&lt;IN,OUT&gt;</code></td>
+<td>聚合</td>
+<td>平均值（sum+count）</td>
+<td>比 ReducingState 灵活</td>
+</tr>
+</tbody></table>
+<p><strong>关键认知</strong>：<code>ListState</code> 和 <code>MapState</code> 是<strong>无界</strong>的。写的时候一定要问自己”这个 key 的状态会不会无限增长”，如果会，就必须配 State TTL，否则你的 checkpoint 会在三个月后突然从 200MB 涨到 20GB。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">StateTtlConfig</span> <span class="variable">ttl</span> <span class="operator">=</span> StateTtlConfig</span><br><span class="line">        .newBuilder(Duration.ofDays(<span class="number">7</span>))</span><br><span class="line">        .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)</span><br><span class="line">        .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)</span><br><span class="line">        .cleanupInRocksdbCompactFilter(<span class="number">1000</span>)   <span class="comment">// RocksDB 下用 compaction filter 清理，别用全量遍历</span></span><br><span class="line">        .build();</span><br><span class="line"></span><br><span class="line">ValueStateDescriptor&lt;UserProfile&gt; desc =</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">ValueStateDescriptor</span>&lt;&gt;(<span class="string">&quot;profile&quot;</span>, UserProfile.class);</span><br><span class="line">desc.enableTimeToLive(ttl);</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>坑点：<code>cleanupInRocksdbCompactFilter</code> 只在 RocksDB backend 有效；堆内 backend 用的是增量清理，靠后台扫描，<strong>过期数据在被清理前仍然占内存</strong>。所以”配了 TTL 内存没降”是正常现象，别急着怀疑人生。</p>
+</blockquote>
+<h3 id="1-2-Operator-State（算子级）"><a href="#1-2-Operator-State（算子级）" class="headerlink" title="1.2 Operator State（算子级）"></a>1.2 Operator State（算子级）</h3><p>和 key 无关，绑定在并行实例上。常见三种：</p>
+<ul>
+<li><code>ListState</code>：每个 subtask 存一个列表，典型如 Kafka Source 的分区 offset 分配</li>
+<li><code>UnionListState</code>：恢复时全量广播给所有 subtask，用于”必须全量重建”的场景</li>
+<li><code>BroadcastState</code>：广播流状态，用于动态规则&#x2F;配置下发（维表 join 的常见变体）</li>
+</ul>
+<p>Operator State 的 redistribute 模式很重要：<code>EVEN_SPLIT</code>（均分）、<code>UNION</code>（全量广播）、自定义。<strong>当并行度变化时，Operator State 怎么重新分配，是你恢复后数据重复&#x2F;丢失的隐藏原因。</strong></p>
+<hr>
+<h2 id="二、State-Backend：堆内还是-RocksDB"><a href="#二、State-Backend：堆内还是-RocksDB" class="headerlink" title="二、State Backend：堆内还是 RocksDB"></a>二、State Backend：堆内还是 RocksDB</h2><h3 id="2-1-两种后端"><a href="#2-1-两种后端" class="headerlink" title="2.1 两种后端"></a>2.1 两种后端</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>HashMapStateBackend</th>
+<th>EmbeddedRocksDBStateBackend</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>存储位置</td>
+<td>JVM 堆内</td>
+<td>TaskManager 本地磁盘（+ 堆内 cache）</td>
+</tr>
+<tr>
+<td>状态上限</td>
+<td>受堆大小限制（几十 GB 就危险）</td>
+<td>受本地磁盘限制（TB 级）</td>
+</tr>
+<tr>
+<td>读写性能</td>
+<td>纳秒级（直接对象访问）</td>
+<td>微秒级（序列化 + 磁盘&#x2F;页缓存）</td>
+</tr>
+<tr>
+<td>快照方式</td>
+<td>全量</td>
+<td><strong>支持增量</strong>（依赖 SST 文件）</td>
+</tr>
+<tr>
+<td>GC 压力</td>
+<td>大（大状态直接压垮 GC）</td>
+<td>小（数据在堆外&#x2F;磁盘）</td>
+</tr>
+<tr>
+<td>适用场景</td>
+<td>小状态、低延迟、简单作业</td>
+<td>大状态、长窗口、需要增量快照</td>
+</tr>
+</tbody></table>
+<p>选择逻辑其实很简单：<strong>状态能不能装进堆，并且 GC 能扛住。</strong> 一个 10GB 状态的作业用 HashMapStateBackend，Full GC 一次就是几秒，checkpoint 必然超时。</p>
+<h3 id="2-2-一个常被忽略的事实"><a href="#2-2-一个常被忽略的事实" class="headerlink" title="2.2 一个常被忽略的事实"></a>2.2 一个常被忽略的事实</h3><p>RocksDB 不是”免费的午餐”。它的读写要经过 <strong>序列化 → 写 memtable → flush 成 SST → compaction</strong>。所以：</p>
+<ul>
+<li>每次 <code>state.value()</code> 都可能触发反序列化，<strong>热路径上别反复读同一个 key</strong></li>
+<li>写放大来自 compaction，<strong>状态更新频繁的作业本地磁盘 IO 会很高</strong></li>
+<li>增量 checkpoint 之所以快，是因为只上传”新增的 SST 文件”，但<strong>它依赖上一份快照的 SST 还在</strong>，所以快照保留策略和本地磁盘容量必须一起算</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// RocksDB 本地目录务必放在独立盘，别和日志/系统盘混用</span></span><br><span class="line"><span class="type">Configuration</span> <span class="variable">conf</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Configuration</span>();</span><br><span class="line">conf.setString(<span class="string">&quot;state.backend&quot;</span>, <span class="string">&quot;rocksdb&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.incremental&quot;</span>, <span class="string">&quot;true&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;state.checkpoints.dir&quot;</span>, <span class="string">&quot;hdfs://nn/flink/ckp&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;state.savepoints.dir&quot;</span>, <span class="string">&quot;hdfs://nn/flink/sp&quot;</span>);</span><br><span class="line"><span class="comment">// 本地恢复：故障后优先从本地残存状态恢复，避免全量拉远程</span></span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.rocksdb.localdir&quot;</span>, <span class="string">&quot;/data1/flink/rocksdb,/data2/flink/rocksdb&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;cluster.local-recovery&quot;</span>, <span class="string">&quot;true&quot;</span>);</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p><code>localdir</code> 配多个目录时 Flink 会做简单的轮询&#x2F;容量选择，<strong>多盘能显著提升 compaction 吞吐</strong>。这是大状态作业最便宜的一次性能优化。</p>
+</blockquote>
+<hr>
+<h2 id="三、Checkpoint-全链路：一张图看懂"><a href="#三、Checkpoint-全链路：一张图看懂" class="headerlink" title="三、Checkpoint 全链路：一张图看懂"></a>三、Checkpoint 全链路：一张图看懂</h2><h3 id="3-1-协议本质：Chandy-Lamport-的工程实现"><a href="#3-1-协议本质：Chandy-Lamport-的工程实现" class="headerlink" title="3.1 协议本质：Chandy-Lamport 的工程实现"></a>3.1 协议本质：Chandy-Lamport 的工程实现</h3><ol>
+<li><strong>JobManager 的 CheckpointCoordinator</strong> 按间隔触发，生成 <code>checkpointId</code>，向所有 Source 下发 trigger</li>
+<li><strong>Source 注入 Barrier</strong>，并快照自己的状态（如 Kafka offset），barrier 随数据流向下游</li>
+<li><strong>中间算子收到 barrier</strong>：<ul>
+<li><strong>对齐（aligned）</strong>：等所有输入通道的 barrier 都到齐，先缓冲后到的数据，再快照</li>
+<li><strong>非对齐（unaligned）</strong>：不等，直接把”已处理位置 + 通道里的在途数据”一起写进快照</li>
+</ul>
+</li>
+<li><strong>每个算子快照完成后向 JM 回报 ack</strong>，同时把状态写到配置的存储（HDFS&#x2F;S3）</li>
+<li><strong>所有算子 ack 齐 → checkpoint 完成</strong>，JM 记录 <code>CompletedCheckpointStore</code>，并通知实现了 <code>CheckpointListener</code> 的算子（<strong>两阶段提交 sink 就是在这里 commit 的</strong>）</li>
+</ol>
+<h3 id="3-2-对齐-vs-非对齐：反压下的生死线"><a href="#3-2-对齐-vs-非对齐：反压下的生死线" class="headerlink" title="3.2 对齐 vs 非对齐：反压下的生死线"></a>3.2 对齐 vs 非对齐：反压下的生死线</h3><p>这是生产环境最常见的分水岭。</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Aligned Checkpoint</th>
+<th>Unaligned Checkpoint</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>是否等待 barrier 对齐</td>
+<td>是</td>
+<td>否</td>
+</tr>
+<tr>
+<td>反压下的表现</td>
+<td>barrier 卡在缓冲区里 → <strong>checkpoint 时间无上限增长</strong></td>
+<td>不受反压影响，快照时间稳定</td>
+</tr>
+<tr>
+<td>快照大小</td>
+<td>只含状态</td>
+<td>状态 + <strong>在途数据</strong>，明显变大</td>
+</tr>
+<tr>
+<td>恢复语义</td>
+<td>Exactly-Once</td>
+<td>Exactly-Once（在途数据会重放）</td>
+</tr>
+<tr>
+<td>适用</td>
+<td>无反压、状态大</td>
+<td>持续反压、要求稳定 checkpoint</td>
+</tr>
+</tbody></table>
+<p><strong>症状识别</strong>：如果你的 checkpoint duration 曲线和 busy time（反压指标）高度相关，且 <code>checkpointAlignmentTime</code> 占了绝大部分，那就是对齐在拖。这时候要么解决反压根因，要么上非对齐。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 反压场景下的非对齐配置（Flink 1.11+，1.16 后 API 有调整，注意版本）</span></span><br><span class="line">conf.setString(<span class="string">&quot;execution.checkpointing.unaligned&quot;</span>, <span class="string">&quot;true&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;execution.checkpointing.unaligned.forced&quot;</span>, <span class="string">&quot;true&quot;</span>);</span><br><span class="line"><span class="comment">// 在途数据上限，防止快照无限膨胀</span></span><br><span class="line">conf.setString(<span class="string">&quot;execution.checkpointing.unaligned.max-subtasks-per-channel-state-file&quot;</span>, <span class="string">&quot;4&quot;</span>);</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>非对齐不是银弹：它把”checkpoint 变慢”换成了”快照变大 + 恢复变慢”。<strong>根因永远是反压</strong>，非对齐只是给你争取排查时间。</p>
+</blockquote>
+<h3 id="3-3-一次的耗时构成"><a href="#3-3-一次的耗时构成" class="headerlink" title="3.3 一次的耗时构成"></a>3.3 一次的耗时构成</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">checkpointDuration ≈ trigger 延迟 + alignmentTime + syncTime + asyncTime + uploadTime</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>syncTime</code>：算子在主线程做状态快照的时间（RocksDB 下很短，只是拿快照句柄）</li>
+<li><code>asyncTime</code>：后台线程把状态写到本地&#x2F;上传的时间（RocksDB 大头）</li>
+<li><code>alignmentTime</code>：等 barrier（<strong>反压时爆炸</strong>）</li>
+</ul>
+<p>排查时先看 <code>CheckpointStats</code> 的细分，而不是只看总时长。<code>syncTime</code> 长 → 状态太大或堆内 backend；<code>alignmentTime</code> 长 → 反压；<code>asyncTime</code> 长 → 本地磁盘 IO 或网络带宽。</p>
+<hr>
+<h2 id="四、端到端-Exactly-Once：光有-checkpoint-不够"><a href="#四、端到端-Exactly-Once：光有-checkpoint-不够" class="headerlink" title="四、端到端 Exactly-Once：光有 checkpoint 不够"></a>四、端到端 Exactly-Once：光有 checkpoint 不够</h2><p>这是面试最高频的追问：<strong>Flink 内部 Exactly-Once，为什么下游还会重复？</strong></p>
+<p>因为端到端要三段都成立：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">Source 可重放（记录 offset） + Flink 状态一致（checkpoint） + Sink 幂等/事务（两阶段提交）</span><br></pre></td></tr></table></figure>
+
+<p>中间那段 Flink 帮你保证，两头的锅得自己背。</p>
+<h3 id="4-1-两阶段提交-Sink-的实现骨架"><a href="#4-1-两阶段提交-Sink-的实现骨架" class="headerlink" title="4.1 两阶段提交 Sink 的实现骨架"></a>4.1 两阶段提交 Sink 的实现骨架</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br><span class="line">55</span><br><span class="line">56</span><br><span class="line">57</span><br><span class="line">58</span><br><span class="line">59</span><br><span class="line">60</span><br><span class="line">61</span><br><span class="line">62</span><br><span class="line">63</span><br><span class="line">64</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TransactionalJdbcSink</span> <span class="keyword">extends</span> <span class="title class_">RichSinkFunction</span>&lt;Event&gt;</span><br><span class="line">        <span class="keyword">implements</span> <span class="title class_">CheckpointedFunction</span>, CheckpointListener &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">transient</span> ListState&lt;Long&gt; pendingTxIds;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> List&lt;Long&gt; pending = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line">    <span class="keyword">private</span> Connection conn;</span><br><span class="line">    <span class="keyword">private</span> <span class="type">long</span> currentTxId;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">open</span><span class="params">(Configuration parameters)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        conn = DriverManager.getConnection(url, user, pwd);</span><br><span class="line">        conn.setAutoCommit(<span class="literal">false</span>);</span><br><span class="line">        currentTxId = System.currentTimeMillis();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">invoke</span><span class="params">(Event value, Context ctx)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="comment">// 业务写入，participate in current transaction</span></span><br><span class="line">        <span class="keyword">try</span> (<span class="type">PreparedStatement</span> <span class="variable">ps</span> <span class="operator">=</span> conn.prepareStatement(</span><br><span class="line">                <span class="string">&quot;INSERT INTO t_event(id, type, amount) VALUES (?,?,?) ON DUPLICATE KEY UPDATE amount=VALUES(amount)&quot;</span>)) &#123;</span><br><span class="line">            ps.setLong(<span class="number">1</span>, value.id());</span><br><span class="line">            ps.setString(<span class="number">2</span>, value.type());</span><br><span class="line">            ps.setBigDecimal(<span class="number">3</span>, value.amount());</span><br><span class="line">            ps.addBatch();</span><br><span class="line">            ps.executeBatch();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">snapshotState</span><span class="params">(FunctionSnapshotContext ctx)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="comment">// 1. 预提交：把当前事务&quot;封口&quot;，但先不 commit</span></span><br><span class="line">        conn.prepareStatement(<span class="string">&quot;PREPARE TRANSACTION &#x27;&quot;</span> + currentTxId + <span class="string">&quot;&#x27;&quot;</span>).execute();</span><br><span class="line">        pending.add(currentTxId);</span><br><span class="line">        pendingTxIds.clear();</span><br><span class="line">        pendingTxIds.addAll(pending);</span><br><span class="line">        <span class="comment">// 2. 开新事务，proceeding 数据写到新事务里</span></span><br><span class="line">        conn.setAutoCommit(<span class="literal">false</span>);</span><br><span class="line">        currentTxId = System.currentTimeMillis();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">notifyCheckpointComplete</span><span class="params">(<span class="type">long</span> checkpointId)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="comment">// 3. checkpoint 完成后再真正提交（幂等：重复提交要能容忍）</span></span><br><span class="line">        <span class="keyword">for</span> (Long tx : <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;(pending)) &#123;</span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                conn.prepareStatement(<span class="string">&quot;COMMIT PREPARED &#x27;&quot;</span> + tx + <span class="string">&quot;&#x27;&quot;</span>).execute();</span><br><span class="line">                pending.remove(tx);</span><br><span class="line">            &#125; <span class="keyword">catch</span> (SQLException e) &#123;</span><br><span class="line">                log.warn(<span class="string">&quot;commit prepared &#123;&#125; failed, will retry&quot;</span>, tx, e);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        pendingTxIds.clear();</span><br><span class="line">        pendingTxIds.addAll(pending);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">initializeState</span><span class="params">(FunctionInitializationContext ctx)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        pendingTxIds = ctx.getOperatorStateStore()</span><br><span class="line">                .getListState(<span class="keyword">new</span> <span class="title class_">ListStateDescriptor</span>&lt;&gt;(<span class="string">&quot;pending-tx&quot;</span>, Long.class));</span><br><span class="line">        <span class="keyword">for</span> (Long tx : pendingTxIds.get()) &#123;</span><br><span class="line">            pending.add(tx);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>三个必须注意的点：</p>
+<ol>
+<li><strong><code>notifyCheckpointComplete</code> 可能丢失</strong>（JM 通知失败）。所以 sink 侧必须<strong>幂等</strong>，重启后靠 <code>pending</code> 列表重放提交。</li>
+<li><strong><code>snapshotState</code> 里不能做重 IO</strong>，它跑在 checkpoint 线程的同步阶段，会直接拉长 <code>syncTime</code>。</li>
+<li><strong>下游必须支持 XA 或幂等写</strong>。Kafka 用事务、MySQL 用 XA、ClickHouse&#x2F;Doris 用幂等键去重。</li>
+</ol>
+<h3 id="4-2-更省事的做法：幂等-去重键"><a href="#4-2-更省事的做法：幂等-去重键" class="headerlink" title="4.2 更省事的做法：幂等 + 去重键"></a>4.2 更省事的做法：幂等 + 去重键</h3><p>大部分团队的”Exactly-Once”其实是 <strong>At-Least-Once + 下游幂等</strong>，这在工程上更可靠。前提是：</p>
+<ul>
+<li>每条消息带全局唯一 <code>eventId</code>（不是 UUID，要能重放稳定）</li>
+<li>下游有唯一索引或 <code>ReplacingMergeTree</code> 这类去重能力</li>
+<li>允许”短暂重复”（秒级）</li>
+</ul>
+<p>如果你的业务能接受这个，<strong>别上 XA</strong>——XA 的性能损失和运维复杂度远超收益。</p>
+<hr>
+<h2 id="五、Savepoint-vs-Checkpoint：别混用"><a href="#五、Savepoint-vs-Checkpoint：别混用" class="headerlink" title="五、Savepoint vs Checkpoint：别混用"></a>五、Savepoint vs Checkpoint：别混用</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Checkpoint</th>
+<th>Savepoint</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>触发方</td>
+<td>框架自动</td>
+<td>人工&#x2F;脚本</td>
+</tr>
+<tr>
+<td>目的</td>
+<td>故障恢复</td>
+<td>升级、扩缩容、迁移、A&#x2F;B</td>
+</tr>
+<tr>
+<td>格式</td>
+<td>可增量、可压缩</td>
+<td>全量、标准化（可跨版本）</td>
+</tr>
+<tr>
+<td>生命周期</td>
+<td>按保留策略自动删</td>
+<td>手动管理</td>
+</tr>
+<tr>
+<td>并行度变更</td>
+<td>不保证</td>
+<td>支持（配合 <code>--allowNonRestoredState</code>）</td>
+</tr>
+</tbody></table>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 升级前打 savepoint（务必确认状态大小和耗时，大状态可能几十分钟）</span></span><br><span class="line">flink savepoint &lt;jobId&gt; hdfs://nn/flink/sp/job-20261110 --parallelism 32</span><br><span class="line"></span><br><span class="line"><span class="comment"># 从 savepoint 恢复</span></span><br><span class="line">flink run -s hdfs://nn/flink/sp/job-20261110 \</span><br><span class="line">  -p 32 -c com.example.Job app.jar</span><br></pre></td></tr></table></figure>
+
+<p><strong>重要约束</strong>：算子的 <code>uid()</code> 必须显式设置，且<strong>上线后不许改</strong>。<code>uid</code> 是状态与算子之间的唯一绑定，改了等于状态全部丢失（<code>--allowNonRestoredState</code> 能让你”跑起来”，但状态是空的，隐性数据丢失）。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">env.addSource(kafkaSource)</span><br><span class="line">   .uid(<span class="string">&quot;kafka-source-v1&quot;</span>)        <span class="comment">// 一旦上线，永久不变</span></span><br><span class="line">   .keyBy(Event::userId)</span><br><span class="line">   .process(<span class="keyword">new</span> <span class="title class_">UserAggregator</span>())</span><br><span class="line">   .uid(<span class="string">&quot;user-agg-v1&quot;</span>)</span><br><span class="line">   .addSink(sink)</span><br><span class="line">   .uid(<span class="string">&quot;jdbc-sink-v1&quot;</span>);</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、RocksDB-调优与生产踩坑"><a href="#六、RocksDB-调优与生产踩坑" class="headerlink" title="六、RocksDB 调优与生产踩坑"></a>六、RocksDB 调优与生产踩坑</h2><h3 id="6-1-三个最有效的参数"><a href="#6-1-三个最有效的参数" class="headerlink" title="6.1 三个最有效的参数"></a>6.1 三个最有效的参数</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 写缓冲：越大写越快，但 checkpoint 的 syncTime 也会变长</span></span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.rocksdb.writebuffer.size&quot;</span>, <span class="string">&quot;64mb&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.rocksdb.writebuffer.count&quot;</span>, <span class="string">&quot;4&quot;</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 2. 块缓存：读热点靠它，吃的是堆外内存（要算进 TaskManager 内存）</span></span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.rocksdb.block.cache-size&quot;</span>, <span class="string">&quot;256mb&quot;</span>);</span><br><span class="line"></span><br><span class="line"><span class="comment">// 3. compaction：大状态作业的头号 IO 来源</span></span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.rocksdb.compaction.style&quot;</span>, <span class="string">&quot;LEVEL&quot;</span>);</span><br><span class="line">conf.setString(<span class="string">&quot;state.backend.rocksdb.thread.num&quot;</span>, <span class="string">&quot;4&quot;</span>);</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-五个高频事故"><a href="#6-2-五个高频事故" class="headerlink" title="6.2 五个高频事故"></a>6.2 五个高频事故</h3><p><strong>① checkpoint 越来越大</strong><br>→ 状态无界增长。查 <code>MapState</code>&#x2F;<code>ListState</code> 的 key 基数，加 TTL，或改成 <code>ReducingState</code>。</p>
+<p><strong>② checkpoint 一直超时</strong><br>→ 看 <code>alignmentTime</code>。反压导致对齐卡死，先治反压（加并行度&#x2F;扩资源&#x2F;削峰），临时开非对齐。</p>
+<p><strong>③ 恢复时间超长（几十分钟）</strong><br>→ 全量从远程拉状态。开 <code>cluster.local-recovery</code>，并保证 TaskManager 本地盘不被清。大状态作业要把”恢复时间”当成 SLA 指标来设计。</p>
+<p><strong>④ 本地磁盘打满</strong><br>→ RocksDB 的 SST + 增量快照保留 + 老 checkpoint 文件。算容量：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">本地磁盘 ≈ 状态大小 × 1.5（LSM 放大） + 增量快照保留份数 × 单次增量大小 + 20% buffer</span><br></pre></td></tr></table></figure>
+
+<p><strong>⑤ 开了 Exactly-Once 下游还重复</strong><br>→ 检查 sink 的 <code>notifyCheckpointComplete</code> 是否幂等、Source 是否真的可重放（Kafka 要提交 offset 到 checkpoint，不是手动 commit）。</p>
+<hr>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：Checkpoint 和 Savepoint 的本质区别是什么？</strong><br>A：Checkpoint 是<strong>运行时快照</strong>，为故障恢复服务，可增量、可丢弃、格式随版本变；Savepoint 是<strong>运维快照</strong>，为升级&#x2F;扩缩容&#x2F;迁移服务，必须全量、格式稳定、可跨版本恢复。所以 Savepoint 更慢、更大，但更”可携带”。</p>
+<p><strong>Q2：为什么非对齐 checkpoint 能在反压下保持稳定？</strong><br>A：对齐 checkpoint 要求 barrier 在所有输入通道上”排队等到齐”，而反压时数据在缓冲区里堆积，barrier 排在后面，等待时间无上限。非对齐直接把”通道里在途的数据”一起打进快照，跳过等待，代价是快照变大、恢复时要重放这些在途数据。它把”时间不可控”换成了”空间可预估”。</p>
+<p><strong>Q3：状态 TTL 配了，为什么内存没降？</strong><br>A：TTL 是”逻辑过期”，不是”立即物理删除”。堆内 backend 靠后台增量清理（惰性 + 周期），RocksDB 靠 compaction filter。过期数据在被覆盖&#x2F;compaction 之前仍占用空间。想立刻回收只能做全量 compaction 或重启。</p>
+<p><strong>Q4：并行度从 16 改到 32，状态怎么重新分配？</strong><br>A：Keyed State 按 key group 重新映射（默认 <code>maxParallelism=128</code>，key group 数固定，所以能重分配）；Operator State 按 <code>RedistributeMode</code>（EVEN_SPLIT&#x2F;UNION）。注意 <code>maxParallelism</code> 一旦确定不能改，否则 key group 数量变化会导致状态无法映射。</p>
+<p><strong>Q5：如何做到真正的端到端 Exactly-Once？</strong><br>A：三段缺一不可——Source 可重放、Flink 状态一致（checkpoint 保证）、Sink 事务或幂等。工程上更推荐”At-Least-Once + 下游幂等键去重”，比 XA 两阶段提交可靠且快得多。面试时能把”为什么 XA 不流行”讲清楚（协调者单点、长事务锁、prepare 阶段崩溃恢复复杂）比背概念加分。</p>
+<hr>
+<h2 id="八、总结"><a href="#八、总结" class="headerlink" title="八、总结"></a>八、总结</h2><ul>
+<li>状态设计先问”会不会无界”，再谈 backend。<code>ListState</code>&#x2F;<code>MapState</code> 必须配 TTL。</li>
+<li>堆内 vs RocksDB 的判断标准是”状态能不能装进堆且 GC 扛得住”，不是”哪个更新”。</li>
+<li>Checkpoint 的耗时拆成四段看，<code>alignmentTime</code> 高就是反压，别盲目调大超时。</li>
+<li>非对齐 checkpoint 是”用空间换时间”，不是反压的解药。</li>
+<li>端到端 Exactly-Once 的锅在两头，Flink 只保证中间那段。幂等键比 XA 更工程化。</li>
+<li><code>uid()</code> 上线即冻结，<code>maxParallelism</code> 定了别改，Savepoint 是升级唯一安全通道。</li>
+</ul>
+<p>把这六条记住，你已经能避开大状态流作业 80% 的线上事故。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/10/flink-state-backend-checkpoint-deep-dive/">https://jiweidong.github.io/2026/11/10/flink-state-backend-checkpoint-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Flink/">Flink</a><a class="post-meta__tags" href="/tags/%E6%B5%81%E8%AE%A1%E7%AE%97/">流计算</a><a class="post-meta__tags" href="/tags/Checkpoint/">Checkpoint</a><a class="post-meta__tags" href="/tags/RocksDB/">RocksDB</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/10/linux-file-descriptor-exhaustion-java-deep-dive/" title="【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算</div></div><div class="info-2"><div class="info-item-1">【性能调优】文件描述符耗尽深度治理前言java.io.IOException: Too many open files 这个异常，几乎每个 Java 工程师都在某次深夜告警里见过。它的迷惑性在于：代码看起来没问题，连接池也配了上限，但 fd 就是一直涨。 更麻烦的是，它的表现形式千奇百怪：  接口偶发 500，重启就好，过几天再犯 accept 失败但 connect 正常（新连接进不来，老连接还在用） 日志突然不写了（logback 打不开新文件） 明明 lsof 只有 3000 个 fd，ulimit -n 是 65535，却还是报错  这篇把 fd 从内核数据结构讲到 Java 侧泄漏点，给一套能在 5 分钟内定位到具体泄漏源的排查方法论，最后给容量估算公式。  一、fd 到底是什么：三层配额先建立一个模型。一个进程能打开多少文件，受三层限制，任何一层撞墙都会报 EMFILE 或 ENFILE：    层级 限制项 查看方式 超出后果    进程级（soft） RLIMIT_NOFILE ulimit -Sn &#x2F; cat /proc/&lt;pid&gt;/lim...</div></div></div></a><a class="pagination-related" href="/2026/11/10/mysql-javascript-stored-program-deep-dive/" title="【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 9】JavaScript 存储程序深度解析前言MySQL 9.0 干了一件在 MySQL 历史上挺反常识的事：把 JavaScript 引擎塞进了数据库服务器进程里。你可以在 CREATE FUNCTION &#x2F; CREATE PROCEDURE 里直接写 ECMAScript，用 GraalVM 执行，而不是写那段让所有人都不想维护的 SQL&#x2F;PSM 存储过程。 这个特性的定位很明确——干掉”为了几十行数据加工逻辑专门建一个中间服务”的尴尬。但它同时也带来了一堆必须想清楚的边界问题：能不能读文件？能不能发 HTTP？出错怎么排查？性能到底比 SQL 过程快还是慢？什么时候该用它，什么时候该老老实实回 Java 应用层写？ 这篇我们把这套机制从运行时、语法、能力边界、性能、生产治理到 Java 侧落地完整过一遍。注意：JavaScript 存储程序是 MySQL 企业版特性，社区版用不了，这一点在做技术选型时是第一道门槛。  一、为什么 MySQL 要引入 JavaScript先看一张”同一件事四种写法”的对比，这是理解这个特性价值的最快方式。 需...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/06/17/flink-stream-processing-guide/" title="Apache Flink 流式计算入门与实时处理实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">Apache Flink 流式计算入门与实时处理实践</div></div><div class="info-2"><div class="info-item-1">Apache Flink 流式计算入门与实时处理实践一、引言在大数据时代，数据的价值随着时间递减。传统 Lambda 架构（批处理 + 流处理）面临维护两套代码、数据口径不一致的痛点。Apache Flink 作为新一代流式计算引擎，凭借真正的流式处理、Exactly-Once 语义和卓越的容错机制，已成为实时计算领域的首选。 本文将系统介绍 Flink 的架构设计与核心概念，通过 DataStream API 和 Flink SQL 两种编程模型演示实时处理实战，深入讲解时间语义、状态管理、Checkpoint 机制、Exactly-Once 保证以及与 Kafka 的集成方案。 二、Flink 架构与核心概念2.1 Flink 整体架构123456789101112131415          Client            │            ▼     ┌──────────────┐     │  JobManager  │ (Master - 调度、协调)     └──────┬───────┘            │    ┌───────┴────...</div></div></div></a><a class="pagination-related" href="/2026/10/11/ab-testing-experiment-platform-architecture-design/" title="【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-11</div><div class="info-item-2">【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析</div></div><div class="info-2"><div class="info-item-1">【系统设计】A&#x2F;B 实验平台架构设计：流量分桶、指标计算与显著性检验全解析面试官：设计一个 A&#x2F;B 实验平台，让产品经理能自己配置实验这是一道考工程架构 + 数据统计 + 业务理解的综合题。它不像”设计秒杀”那样有标准答案，面试官真正在观察的是：  你知不知道实验平台的核心是分流而不是”配置界面”？ 你分得清 AA 实验、样本量、显著性 这些统计概念吗？ 你能不能说出”同一用户必须稳定命中同一个实验组”这种工程约束？  下面按面试节奏，从需求澄清到落地细节，完整推一遍。  一、需求澄清：先问清楚再设计Q1：实验的粒度是什么？ 用户级、设备级、请求级、还是租户级？绝大多数是用户级（同一用户在一次实验周期内体验一致）。 Q2：一个用户能同时参与几个实验？ 通常分层（Layer）后可以几十个，但同一层内的多个实验必须互斥。 Q3：指标谁来定义？ 产品定义业务指标（点击率、转化率、GMV），平台提供指标计算框架。 Q4：QPS 和延迟要求？ 分流是在线链路，必须做到毫秒级、高可用——实验系统挂了不能影响主站。 Q5：谁能看到什么？ 实验数据权限隔离，避免”产品看到别组...</div></div></div></a><a class="pagination-related" href="/2026/07/01/java-reference-types-deep-dive/" title="【深入Java】四种引用类型深度解析：强引用、软引用、弱引用、虚引用与 ReferenceQueue"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【深入Java】四种引用类型深度解析：强引用、软引用、弱引用、虚引用与 ReferenceQueue</div></div><div class="info-2"><div class="info-item-1">【深入Java】四种引用类型深度解析：强引用、软引用、弱引用、虚引用与 ReferenceQueue前言Java 的垃圾回收（GC）机制让开发者从手动管理内存中解放出来，但你真的了解 JVM 是如何判断一个对象「该不该回收」的吗？除了最常见的强引用之外，Java 还提供了软引用、弱引用和虚引用，它们在不同的场景下发挥着重要作用。 本文将从源码层面深入剖析这四种引用类型，并结合 ReferenceQueue 分析其内部协作机制。  一、四种引用类型概览   引用类型 回收时机 典型用途 是否可 get()    强引用 永不回收（除非不可达） 普通 new 对象 是   软引用 OOM 前回收 内存敏感缓存 是   弱引用 下次 GC 即回收 ThreadLocal、WeakHashMap 是   虚引用 任何时候 跟踪对象回收（NIO DirectBuffer） 否   1. 强引用（Strong Reference）这是最常见的引用类型，形如 Object obj = new Object()。只要强引用还存在，GC 就永远不会回收被引用的对象，即使抛出 OOM。 12Obje...</div></div></div></a><a class="pagination-related" href="/2026/07/17/java-thread-dump-analysis-troubleshooting/" title="【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-17</div><div class="info-item-2">【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位</div></div><div class="info-2"><div class="info-item-1">【生产实战】Java 线程 Dump 分析：从线程快照到性能问题定位引言：为什么需要线程 Dump？线上 Java 应用出现以下问题时，线程 Dump 是你最有力的武器：  ❌ CPU 100% —— 哪个线程在狂转？ ❌ 系统卡死&#x2F;无响应 —— 线程在等什么？ ❌ 死锁 —— 哪些线程互相等待？ ❌ 请求堆积 —— 线程池是否耗尽了？ ❌ 接口响应慢 —— 是卡在 I&#x2F;O 还是业务逻辑？  线程 Dump（又称线程快照、Thread Dump）就是 JVM 在某个时刻对所有线程状态的”快照”。它是非侵入式的，对生产环境几乎没有影响，是排查线上问题的首选手段。 一、获取线程 Dump 的 5 种方式1.1 jstack（最常用）1234567# 先找到 Java 进程IDjps -l# 或ps aux | grep java# 获取线程 Dumpjstack -l &lt;pid&gt; &gt; threaddump.txt  参数说明：  -l：显示锁信息（LockInfo），分析死锁必加 -e：显示详细信息  1.2 jcmd（JDK 8+ 推荐）12#...</div></div></div></a><a class="pagination-related" href="/2026/10/30/java-llm-prompt-caching-deep-practice/" title="【Java AI】Prompt Caching 深度实战：前缀缓存、命中率治理与 Spring AI&#x2F;LangChain4j 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-30</div><div class="info-item-2">【Java AI】Prompt Caching 深度实战：前缀缓存、命中率治理与 Spring AI&#x2F;LangChain4j 落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】Prompt Caching 深度实战：前缀缓存、命中率治理与 Spring AI&#x2F;LangChain4j 落地前言做 AI 应用的成本结构，往往和直觉相反：贵的不一定是”生成”，而是”每次都在重复传同一大段输入”。 一个典型的 RAG 问答服务，请求体长这样： 12345[System Prompt: 角色定义 + 输出规范 + 安全条款]   ~1500 tokens[工具定义: 12 个 Function Calling schema]          ~2000 tokens[知识库上下文: top-5 文档片段]                     ~6000 tokens[对话历史: 最近 6 轮]                              ~2000 tokens[用户问题]                                         ~50 tokens  每次请求，前 9500 个 token 里有 3500 个是一模一样的。如果每天 10 万次请求，光这 3500 token 的重复输入就是...</div></div></div></a><a class="pagination-related" href="/2026/08/09/adapter-pattern-deep-dive/" title="【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-09</div><div class="info-item-2">【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter</div></div><div class="info-2"><div class="info-item-1">【设计模式】适配器模式深度解析：从接口兼容到 Spring MVC HandlerAdapter面试官：适配器模式和装饰器模式有什么区别？Spring MVC 里的 HandlerAdapter 是适配器吗？适配器模式（Adapter Pattern）是最「接地气」的设计模式——它解决的就是日常开发里最常见的痛点：接口不兼容。充电器转接头、插座转换器、读卡器，全都是适配器。 但面试官不会满足于「转接头」的比喻，他更想听你讲：适配器模式有哪两种实现方式？适配器、装饰器、代理三个模式的区分？以及 Spring MVC 的 HandlerAdapter 为什么是适配器模式最经典的框架级应用。 一、适配器模式的核心思想1.1 问题场景12345678910你的系统里有一个「统一支付接口」：    interface Payment &#123; void pay(double amount); &#125;但第三方微信支付 SDK 提供的接口是：    class WechatPaySDK &#123; void wechatPay(double amount, String appId...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">902</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1012</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">248</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Flink-%E6%B7%B1%E6%8C%96%E3%80%91%E7%8A%B6%E6%80%81%E5%90%8E%E7%AB%AF%E4%B8%8E-Checkpoint-%E5%85%A8%E9%93%BE%E8%B7%AF"><span class="toc-number">1.</span> <span class="toc-text">【Flink 深挖】状态后端与 Checkpoint 全链路</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%90%9E%E6%B8%85%E6%A5%9A%EF%BC%9AFlink-%E9%87%8C%E5%88%B0%E5%BA%95%E6%9C%89%E5%87%A0%E7%A7%8D%E7%8A%B6%E6%80%81"><span class="toc-number">1.2.</span> <span class="toc-text">一、先搞清楚：Flink 里到底有几种状态</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-Keyed-State%EF%BC%88%E6%8C%89%E9%94%AE%E5%88%86%E5%8C%BA%EF%BC%89"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 Keyed State（按键分区）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-Operator-State%EF%BC%88%E7%AE%97%E5%AD%90%E7%BA%A7%EF%BC%89"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 Operator State（算子级）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81State-Backend%EF%BC%9A%E5%A0%86%E5%86%85%E8%BF%98%E6%98%AF-RocksDB"><span class="toc-number">1.3.</span> <span class="toc-text">二、State Backend：堆内还是 RocksDB</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%A4%E7%A7%8D%E5%90%8E%E7%AB%AF"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 两种后端</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%80%E4%B8%AA%E5%B8%B8%E8%A2%AB%E5%BF%BD%E7%95%A5%E7%9A%84%E4%BA%8B%E5%AE%9E"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 一个常被忽略的事实</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81Checkpoint-%E5%85%A8%E9%93%BE%E8%B7%AF%EF%BC%9A%E4%B8%80%E5%BC%A0%E5%9B%BE%E7%9C%8B%E6%87%82"><span class="toc-number">1.4.</span> <span class="toc-text">三、Checkpoint 全链路：一张图看懂</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%8D%8F%E8%AE%AE%E6%9C%AC%E8%B4%A8%EF%BC%9AChandy-Lamport-%E7%9A%84%E5%B7%A5%E7%A8%8B%E5%AE%9E%E7%8E%B0"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 协议本质：Chandy-Lamport 的工程实现</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%AF%B9%E9%BD%90-vs-%E9%9D%9E%E5%AF%B9%E9%BD%90%EF%BC%9A%E5%8F%8D%E5%8E%8B%E4%B8%8B%E7%9A%84%E7%94%9F%E6%AD%BB%E7%BA%BF"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 对齐 vs 非对齐：反压下的生死线</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E4%B8%80%E6%AC%A1%E7%9A%84%E8%80%97%E6%97%B6%E6%9E%84%E6%88%90"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 一次的耗时构成</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E7%AB%AF%E5%88%B0%E7%AB%AF-Exactly-Once%EF%BC%9A%E5%85%89%E6%9C%89-checkpoint-%E4%B8%8D%E5%A4%9F"><span class="toc-number">1.5.</span> <span class="toc-text">四、端到端 Exactly-Once：光有 checkpoint 不够</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%B8%A4%E9%98%B6%E6%AE%B5%E6%8F%90%E4%BA%A4-Sink-%E7%9A%84%E5%AE%9E%E7%8E%B0%E9%AA%A8%E6%9E%B6"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 两阶段提交 Sink 的实现骨架</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%9B%B4%E7%9C%81%E4%BA%8B%E7%9A%84%E5%81%9A%E6%B3%95%EF%BC%9A%E5%B9%82%E7%AD%89-%E5%8E%BB%E9%87%8D%E9%94%AE"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 更省事的做法：幂等 + 去重键</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81Savepoint-vs-Checkpoint%EF%BC%9A%E5%88%AB%E6%B7%B7%E7%94%A8"><span class="toc-number">1.6.</span> <span class="toc-text">五、Savepoint vs Checkpoint：别混用</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81RocksDB-%E8%B0%83%E4%BC%98%E4%B8%8E%E7%94%9F%E4%BA%A7%E8%B8%A9%E5%9D%91"><span class="toc-number">1.7.</span> <span class="toc-text">六、RocksDB 调优与生产踩坑</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E4%B8%89%E4%B8%AA%E6%9C%80%E6%9C%89%E6%95%88%E7%9A%84%E5%8F%82%E6%95%B0"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 三个最有效的参数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E4%BA%94%E4%B8%AA%E9%AB%98%E9%A2%91%E4%BA%8B%E6%95%85"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 五个高频事故</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/vector-quantization-index-memory-deep-dive/" title="【AI 体系】向量量化与索引内存治理：SQ/PQ/BQ 的原理取舍、召回损失评估与 Java 侧落地">【AI 体系】向量量化与索引内存治理：SQ/PQ/BQ 的原理取舍、召回损失评估与 Java 侧落地</a><time datetime="2026-11-10T00:20:00.000Z" title="发表于 2026-11-10 08:20:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/spring-ai-advisors-interceptor-chain-deep-practice/" title="【Java AI】Spring AI Advisors 拦截链深度实战：ChatMemory、RAG 与自定义 Advisor 的执行顺序与上下文改写">【Java AI】Spring AI Advisors 拦截链深度实战：ChatMemory、RAG 与自定义 Advisor 的执行顺序与上下文改写</a><time datetime="2026-11-10T00:15:00.000Z" title="发表于 2026-11-10 08:15:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/linux-file-descriptor-exhaustion-java-deep-dive/" title="【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算">【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算</a><time datetime="2026-11-10T00:10:00.000Z" title="发表于 2026-11-10 08:10:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/flink-state-backend-checkpoint-deep-dive/" title="【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once">【Flink 深挖】状态后端与 Checkpoint 全链路：RocksDB 增量快照、非对齐检查点与端到端 Exactly-Once</a><time datetime="2026-11-10T00:05:00.000Z" title="发表于 2026-11-10 08:05:00">2026-11-10</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/10/mysql-javascript-stored-program-deep-dive/" title="【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍">【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍</a><time datetime="2026-11-10T00:00:00.000Z" title="发表于 2026-11-10 08:00:00">2026-11-10</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
