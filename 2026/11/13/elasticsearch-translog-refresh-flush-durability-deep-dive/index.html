@@ -1,0 +1,450 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口前言「文档写进 ES 了，为什么搜不到？」「明明返回 200 了，机器掉电后数据怎么丢了？」「集群重启要 40 分钟，卡在 translog recovery 上。」 这三个问题指向同一个子系统：Lucene 的不可变段模型 + Elasticsearch 的三层持久化机制。很多人能背出「re">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/13/elasticsearch-translog-refresh-flush-durability-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口前言「文档写进 ES 了，为什么搜不到？」「明明返回 200 了，机器掉电后数据怎么丢了？」「集群重启要 40 分钟，卡在 translog recovery 上。」 这三个问题指向同一个子系统：Lucene 的不可变段模型 + Elasticsearch 的三层持久化机制。很多人能背出「re">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-13T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-11-13T00:03:13.040Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="Lucene">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="持久化">
+<meta property="article:tag" content="数据可靠性">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口",
+  "url": "https://jiweidong.github.io/2026/11/13/elasticsearch-translog-refresh-flush-durability-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-13T00:20:00.000Z",
+  "dateModified": "2026-11-13T00:03:13.040Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/13/elasticsearch-translog-refresh-flush-durability-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">917</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1021</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-13T00:20:00.000Z" title="发表于 2026-11-13 08:20:00">2026-11-13</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-13T00:03:13.040Z" title="更新于 2026-11-13 08:03:13">2026-11-13</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/Elasticsearch/">Elasticsearch</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【ES-底层】translog、refresh-与-flush-深度解析：写入可见性、持久性与数据丢失窗口"><a href="#【ES-底层】translog、refresh-与-flush-深度解析：写入可见性、持久性与数据丢失窗口" class="headerlink" title="【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口"></a>【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>「文档写进 ES 了，为什么搜不到？」「明明返回 200 了，机器掉电后数据怎么丢了？」「集群重启要 40 分钟，卡在 translog recovery 上。」</p>
+<p>这三个问题指向同一个子系统：<strong>Lucene 的不可变段模型 + Elasticsearch 的三层持久化机制</strong>。很多人能背出「refresh 是 1 秒、flush 是刷盘」，但说不清三件事的边界：</p>
+<ol>
+<li><strong>可见性</strong>（能搜到）和<strong>持久性</strong>（掉电不丢）是两件完全不同的事；</li>
+<li><code>refresh</code> 只解决前者，<code>translog</code> 才解决后者；</li>
+<li><code>durability=request</code> 保证的是「fsync 完成后才 ack」，代价是每请求一次 fsync。</li>
+</ol>
+<p>这篇文章从 Lucene 的写入模型讲起，把 translog 文件结构、generation 递增、commit point、崩溃恢复、<code>flush_threshold_size</code> 与恢复时间的关系全部拆开，最后给出 Java 客户端侧的批量写入模板和一份面试追问清单。</p>
+<h2 id="一、先理解-Lucene-为什么「写入不能立刻搜」"><a href="#一、先理解-Lucene-为什么「写入不能立刻搜」" class="headerlink" title="一、先理解 Lucene 为什么「写入不能立刻搜」"></a>一、先理解 Lucene 为什么「写入不能立刻搜」</h2><p>Lucene 的索引是<strong>不可变段（immutable segment）<strong>的集合。这个设计带来极高的查询性能（无锁、可缓存、可并发），代价是</strong>写入路径被拉长</strong>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">文档写入</span><br><span class="line">  │</span><br><span class="line">  ├─ 1. 写 translog（append，durability=request 时 fsync）</span><br><span class="line">  │</span><br><span class="line">  ├─ 2. 写入内存 buffer（IndexWriter 的 RAM buffer，默认 10% 堆 / 或 index_buffer_size）</span><br><span class="line">  │</span><br><span class="line">  ├─ 3. refresh：buffer → 新段（segment）→ 打开 reader → 可被搜索</span><br><span class="line">  │        新段先写到文件系统缓存，不一定 fsync</span><br><span class="line">  │</span><br><span class="line">  ├─ 4. flush：Lucene commit（fsync 段文件 + 写 segments_N）→ translog 截断</span><br><span class="line">  │</span><br><span class="line">  └─ 5. merge：多个小段合并成大段（后台，产生写放大）</span><br></pre></td></tr></table></figure>
+
+<p>三个动作的职责必须分清：</p>
+<table>
+<thead>
+<tr>
+<th>动作</th>
+<th>解决什么</th>
+<th>是否 fsync</th>
+<th>默认触发</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>refresh</code></td>
+<td><strong>可见性</strong>：让新写入能被搜索到</td>
+<td>否（只到 page cache）</td>
+<td>每 1s（<code>refresh_interval</code>）</td>
+</tr>
+<tr>
+<td><code>flush</code></td>
+<td><strong>可恢复性</strong>：生成新的 commit point，清空 translog</td>
+<td>是</td>
+<td>translog 达 <code>flush_threshold_size</code>（512MB）或显式调用</td>
+</tr>
+<tr>
+<td>translog fsync</td>
+<td><strong>持久性</strong>：保证已 ack 的写不丢</td>
+<td>是</td>
+<td><code>durability=request</code> 每请求</td>
+</tr>
+</tbody></table>
+<p>一句话总结：<strong>refresh 让你看得见，translog 让你不丢，flush 让你重启快。</strong></p>
+<h2 id="二、translog-到底存了什么"><a href="#二、translog-到底存了什么" class="headerlink" title="二、translog 到底存了什么"></a>二、translog 到底存了什么</h2><p>每个分片一个 translog 目录：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">$ tree data/nodes/0/indices/&lt;indexUUID&gt;/0/translog/</span><br><span class="line">translog/</span><br><span class="line">├── translog-3.tlog</span><br><span class="line">├── translog-4.tlog</span><br><span class="line">└── translog.ckp        # checkpoint：记录已 fsync 的偏移</span><br></pre></td></tr></table></figure>
+
+<p>文件内容是一条条的 operation：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">[header]  version, uuid, primaryTerm</span><br><span class="line">[op]      Index / Delete / NoOp</span><br><span class="line">          _id, routing, source(可选), version, seqNo, primaryTerm</span><br><span class="line">[footer]  CRC32 校验</span><br></pre></td></tr></table></figure>
+
+<p>关键设计：</p>
+<ul>
+<li><strong><code>seqNo</code> + <code>primaryTerm</code></strong> 是复制的基石。副本按 <code>seqNo</code> 请求补齐，主分片按 <code>seqNo</code> 判断「这条操作我处理过没有」（幂等）。</li>
+<li><strong><code>translog.ckp</code></strong> 记录「已 fsync 到哪里」。崩溃恢复时从 checkpoint 之后开始重放，前面的跳过。</li>
+<li><strong>translog 里存不存 <code>_source</code></strong> 取决于操作类型：<code>index</code> 操作带 source（用于重放），<code>delete</code> 不带。</li>
+<li><strong>generation 递增</strong>：每次 flush 后新的 translog 文件 generation +1，旧的在所有分片确认后删除。</li>
+</ul>
+<p><code>generation</code> 与 <code>commit point</code> 的关系是恢复逻辑的核心：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">segments_5 (commit point) 声明：段 A, B, C 有效，translog generation = 4</span><br><span class="line">translog-4.tlog            该 commit 之后的所有操作</span><br></pre></td></tr></table></figure>
+
+<p>崩溃后恢复流程：</p>
+<ol>
+<li>读最新的 <code>segments_N</code>，加载声明的段。</li>
+<li>找到对应的 translog generation（N-1 及更早的可以忽略）。</li>
+<li>从 <code>translog.ckp</code> 记录的偏移开始重放，重建内存 buffer。</li>
+<li>重放完成后再 refresh，然后 flush 出新的 commit point。</li>
+</ol>
+<p>所以：<strong>translog 越大，恢复越慢</strong>。一个 20GB translog 的索引，重启时单分片重放可能要几分钟。</p>
+<h2 id="三、durability：request-与-async-的真实代价"><a href="#三、durability：request-与-async-的真实代价" class="headerlink" title="三、durability：request 与 async 的真实代价"></a>三、durability：request 与 async 的真实代价</h2><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">PUT /orders/_settings</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;index.translog.durability&quot;</span><span class="punctuation">:</span> <span class="string">&quot;request&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;index.translog.sync_interval&quot;</span><span class="punctuation">:</span> <span class="string">&quot;5s&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;index.translog.flush_threshold_size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;512mb&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;index.translog.retention.size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;1gb&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;index.translog.retention.age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;12h&quot;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="3-1-request（默认）"><a href="#3-1-request（默认）" class="headerlink" title="3.1 request（默认）"></a>3.1 <code>request</code>（默认）</h3><p>每个 index&#x2F;bulk&#x2F;delete 请求，<strong>在主分片完成 translog fsync 后才返回 200</strong>。</p>
+<p>代价量化（这是很多人没算过的账）：</p>
+<ul>
+<li>一块普通云盘 SSD 的 fsync 延迟约 0.5~2ms（有电池保护的 RAID 卡更快）。</li>
+<li>单分片串行 fsync → 单分片写入上限约 <strong>500~2000 次&#x2F;秒</strong>。</li>
+<li>一个 bulk 请求包含 5000 条文档，只 fsync 一次 → 摊薄后成本可忽略。</li>
+<li>一个 bulk 请求只包含 1 条文档 → 每条一次 fsync，吞吐直接掉到几百 TPS。</li>
+</ul>
+<p><strong>结论：<code>durability=request</code> 的性能完全取决于「单次请求装了多少条文档」。</strong> 这解释了为什么「小批量高频写」的 ES 集群 CPU 不高但写入上不去——瓶颈在 fsync 的 IOPS 和延迟上。</p>
+<h3 id="3-2-async"><a href="#3-2-async" class="headerlink" title="3.2 async"></a>3.2 <code>async</code></h3><p>每 <code>sync_interval</code>（默认 5s）fsync 一次，请求立即返回。</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>数据丢失窗口</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>request</code></td>
+<td>0（已 ack 的不丢）</td>
+<td>订单、支付、账务</td>
+</tr>
+<tr>
+<td><code>async</code> + 5s</td>
+<td>最多 5s</td>
+<td>日志、指标、可重放数据</td>
+</tr>
+</tbody></table>
+<p>注意一个常见误解：<strong><code>async</code> 不等于「不持久」</strong>。操作系统崩溃（进程被杀、JVM OOM）不会丢——page cache 还在；只有<strong>机器掉电&#x2F;内核 panic</strong>才会丢。所以 <code>async</code> 的风险等级是「宿主机级故障」，不是「进程级故障」。</p>
+<h3 id="3-3-副本能不能兜底？"><a href="#3-3-副本能不能兜底？" class="headerlink" title="3.3 副本能不能兜底？"></a>3.3 副本能不能兜底？</h3><p>不能这么算。写请求的 ack 条件是「主分片成功 + 活跃副本数达到 <code>wait_for_active_shards</code>」，但<strong>副本的 translog 落盘时机与主分片不保证同步</strong>。把可靠性寄托在「副本总有一个活着」上，在整机架掉电、存储网络抖动时会被打脸。</p>
+<p>正确做法：<strong>按数据价值选 durability，而不是按「反正有副本」选</strong>。</p>
+<h2 id="四、refresh：可见性的代价被严重低估"><a href="#四、refresh：可见性的代价被严重低估" class="headerlink" title="四、refresh：可见性的代价被严重低估"></a>四、refresh：可见性的代价被严重低估</h2><p><code>refresh_interval=1s</code> 意味着每秒为每个分片生成一个新段。一个 30 分片、日增 100GB 的索引，一天产生：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">30 分片 × 86400 秒 = 259 万个段（理论值）</span><br></pre></td></tr></table></figure>
+
+<p>实际上 Lucene 的 <code>IndexWriter</code> 有 <code>RAM buffer</code> 与 merge 策略兜底，不会真的产生 259 万个段，但<strong>短时间内的段数量爆炸</strong>是真实存在的，后果是：</p>
+<ol>
+<li>每次搜索要遍历所有段 → 查询变慢。</li>
+<li>段越多，merge 越频繁 → 写放大 8~10 倍。</li>
+<li>文件句柄与内存（每个段有独立的 terms dict、doc values）暴涨。</li>
+</ol>
+<p>三个必须知道的配置：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 批量导入：关掉自动刷新，导入后手动 refresh</span></span><br><span class="line">PUT /orders/_settings <span class="punctuation">&#123;</span> <span class="attr">&quot;index.refresh_interval&quot;</span><span class="punctuation">:</span> <span class="string">&quot;-1&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line">POST /orders/_refresh</span><br><span class="line">PUT /orders/_settings <span class="punctuation">&#123;</span> <span class="attr">&quot;index.refresh_interval&quot;</span><span class="punctuation">:</span> <span class="string">&quot;1s&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// bulk 请求里不要带 refresh=true（每条都刷，等于灾难）</span></span><br><span class="line">POST /_bulk?refresh=<span class="literal"><span class="keyword">false</span></span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 写入后需要立刻可见：一次 refresh 覆盖整批</span></span><br><span class="line">POST /_bulk</span><br><span class="line"><span class="punctuation">&#123;</span><span class="attr">&quot;index&quot;</span><span class="punctuation">:</span><span class="punctuation">&#123;</span><span class="attr">&quot;_index&quot;</span><span class="punctuation">:</span><span class="string">&quot;orders&quot;</span><span class="punctuation">,</span><span class="attr">&quot;_id&quot;</span><span class="punctuation">:</span><span class="string">&quot;1&quot;</span><span class="punctuation">&#125;</span><span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#123;</span>...<span class="punctuation">&#125;</span></span><br><span class="line">POST /orders/_refresh</span><br></pre></td></tr></table></figure>
+
+<p><code>refresh=true</code> 与 <code>refresh=wait_for</code> 的区别：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>语义</th>
+<th>延迟</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>refresh=true</code></td>
+<td>立即强制刷新所有相关分片</td>
+<td>高（可能几百 ms）</td>
+</tr>
+<tr>
+<td><code>refresh=wait_for</code></td>
+<td>等下一次自然刷新完成再返回</td>
+<td>最多 1 个 refresh_interval</td>
+</tr>
+</tbody></table>
+<p><code>wait_for</code> 是「读己之写」场景的正确选择，它把刷新成本摊到自然周期上。</p>
+<h2 id="五、flush-触发条件与「重启为什么慢」"><a href="#五、flush-触发条件与「重启为什么慢」" class="headerlink" title="五、flush 触发条件与「重启为什么慢」"></a>五、flush 触发条件与「重启为什么慢」</h2><p>flush 由四个条件触发：</p>
+<ol>
+<li>translog 大小超过 <code>index.translog.flush_threshold_size</code>（默认 512MB）。</li>
+<li>显式 <code>POST /&lt;index&gt;/_flush</code>。</li>
+<li>分片迁走前（recovery 需要干净的 commit point）。</li>
+<li>定期（<code>index.translog.flush_threshold_period</code>，默认 30min，防止小索引永远不 flush）。</li>
+</ol>
+<p>flush 做了什么：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">1. refresh（把 buffer 落成段）</span><br><span class="line">2. fsync 所有段文件</span><br><span class="line">3. 写新的 segments_N（commit point）并 fsync 目录</span><br><span class="line">4. 新建 generation+1 的 translog</span><br><span class="line">5. 删除旧 generation 的 translog（等所有相关分片确认）</span><br></pre></td></tr></table></figure>
+
+<p>所以<strong>恢复时间 ≈ 最后一个 commit point 之后累积的 translog 大小 &#x2F; 重放速度</strong>。控制手段：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;index.translog.flush_threshold_size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;256mb&quot;</span><span class="punctuation">,</span>   <span class="comment">// 调小 → 恢复快，但 flush 更频繁</span></span><br><span class="line">  <span class="attr">&quot;index.translog.retention.size&quot;</span><span class="punctuation">:</span> <span class="string">&quot;512mb&quot;</span><span class="punctuation">,</span>          <span class="comment">// 保留上限，超出强制 flush</span></span><br><span class="line">  <span class="attr">&quot;index.translog.retention.age&quot;</span><span class="punctuation">:</span> <span class="string">&quot;12h&quot;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>生产经验值：</p>
+<table>
+<thead>
+<tr>
+<th>数据量级</th>
+<th>flush_threshold_size</th>
+<th>恢复时间量级</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>&lt; 10GB&#x2F;分片</td>
+<td>512mb（默认）</td>
+<td>秒级~1 分钟</td>
+</tr>
+<tr>
+<td>10~50GB&#x2F;分片</td>
+<td>256mb</td>
+<td>1~3 分钟</td>
+</tr>
+<tr>
+<td>&gt; 50GB&#x2F;分片</td>
+<td>128~256mb + 控制分片大小 ≤ 50GB</td>
+<td>3~10 分钟</td>
+</tr>
+</tbody></table>
+<p><strong>分片大小比 flush 参数更重要</strong>。一个 200GB 的分片，恢复时要重放巨量 translog、重建巨量段元数据，怎么调都慢。</p>
+<h2 id="六、Java-客户端：一份能打的批量写入模板"><a href="#六、Java-客户端：一份能打的批量写入模板" class="headerlink" title="六、Java 客户端：一份能打的批量写入模板"></a>六、Java 客户端：一份能打的批量写入模板</h2><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Configuration</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">EsBulkConfig</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Bean(destroyMethod = &quot;close&quot;)</span></span><br><span class="line">    <span class="keyword">public</span> RestClient <span class="title function_">restClient</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> RestClient.builder(HttpHost.create(<span class="string">&quot;http://es-node:9200&quot;</span>))</span><br><span class="line">                .setRequestConfigCallback(c -&gt; c</span><br><span class="line">                        .setConnectTimeout(<span class="number">2_000</span>)</span><br><span class="line">                        .setSocketTimeout(<span class="number">30_000</span>)</span><br><span class="line">                        .setConnectionRequestTimeout(<span class="number">1_000</span>))</span><br><span class="line">                .setHttpClientConfigCallback(c -&gt; c</span><br><span class="line">                        .setMaxConnTotal(<span class="number">100</span>)</span><br><span class="line">                        .setMaxConnPerRoute(<span class="number">50</span>)</span><br><span class="line">                        .setKeepAliveStrategy((resp, ctx) -&gt; <span class="number">30_000</span>))</span><br><span class="line">                .build();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">OrderIndexWriter</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> RestClient client;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">ObjectMapper</span> <span class="variable">mapper</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ObjectMapper</span>();</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 按 5MB / 2000 条双阈值切批：单请求 fsync 摊薄，又不至于请求体过大 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">bulkIndex</span><span class="params">(List&lt;OrderDoc&gt; docs)</span> &#123;</span><br><span class="line">        <span class="type">int</span> <span class="variable">batchSize</span> <span class="operator">=</span> <span class="number">2000</span>;</span><br><span class="line">        <span class="keyword">for</span> (<span class="type">int</span> <span class="variable">i</span> <span class="operator">=</span> <span class="number">0</span>; i &lt; docs.size(); i += batchSize) &#123;</span><br><span class="line">            List&lt;OrderDoc&gt; batch = docs.subList(i, Math.min(i + batchSize, docs.size()));</span><br><span class="line">            <span class="type">String</span> <span class="variable">body</span> <span class="operator">=</span> buildNdjson(batch);</span><br><span class="line">            client.performRequest(<span class="keyword">new</span> <span class="title class_">Request</span>(<span class="string">&quot;POST&quot;</span>, <span class="string">&quot;/orders/_bulk?refresh=false&quot;</span>,</span><br><span class="line">                    Map.of(<span class="string">&quot;Content-Type&quot;</span>, <span class="string">&quot;application/x-ndjson&quot;</span>),</span><br><span class="line">                    <span class="keyword">new</span> <span class="title class_">StringEntity</span>(body, ContentType.APPLICATION_NDJSON)));</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> String <span class="title function_">buildNdjson</span><span class="params">(List&lt;OrderDoc&gt; batch)</span> &#123;</span><br><span class="line">        <span class="type">StringBuilder</span> <span class="variable">sb</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">StringBuilder</span>(batch.size() * <span class="number">256</span>);</span><br><span class="line">        <span class="keyword">for</span> (OrderDoc d : batch) &#123;</span><br><span class="line">            sb.append(<span class="string">&quot;&#123;\&quot;index\&quot;:&#123;\&quot;_id\&quot;:\&quot;&quot;</span>).append(d.id()).append(<span class="string">&quot;\&quot;&#125;&#125;\n&quot;</span>);</span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                sb.append(mapper.writeValueAsString(d)).append(<span class="string">&#x27;\n&#x27;</span>);</span><br><span class="line">            &#125; <span class="keyword">catch</span> (JsonProcessingException e) &#123;</span><br><span class="line">                <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalArgumentException</span>(<span class="string">&quot;serialize failed: &quot;</span> + d.id(), e);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> sb.toString();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-1-必须处理-items-error"><a href="#6-1-必须处理-items-error" class="headerlink" title="6.1 必须处理 items[].error"></a>6.1 必须处理 <code>items[].error</code></h3><p><code>_bulk</code> 的整体 HTTP 状态码经常是 200，但<strong>单条可能失败</strong>（mapping 冲突、<code>version_conflict</code>、<code>rejected</code>）。不检查 <code>items</code> 等于埋雷：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">JsonNode</span> <span class="variable">resp</span> <span class="operator">=</span> mapper.readTree(entity.getContent());</span><br><span class="line"><span class="type">boolean</span> <span class="variable">hasFailure</span> <span class="operator">=</span> <span class="literal">false</span>;</span><br><span class="line"><span class="keyword">for</span> (JsonNode item : resp.path(<span class="string">&quot;items&quot;</span>)) &#123;</span><br><span class="line">    <span class="type">JsonNode</span> <span class="variable">result</span> <span class="operator">=</span> item.elements().next();</span><br><span class="line">    <span class="keyword">if</span> (result.has(<span class="string">&quot;error&quot;</span>)) &#123;</span><br><span class="line">        hasFailure = <span class="literal">true</span>;</span><br><span class="line">        <span class="type">String</span> <span class="variable">id</span> <span class="operator">=</span> result.path(<span class="string">&quot;_id&quot;</span>).asText();</span><br><span class="line">        <span class="type">String</span> <span class="variable">type</span> <span class="operator">=</span> result.path(<span class="string">&quot;error&quot;</span>).path(<span class="string">&quot;type&quot;</span>).asText();</span><br><span class="line">        <span class="comment">// 只重试可恢复的：es_rejected_execution_exception / 429 / 503</span></span><br><span class="line">        <span class="keyword">if</span> (type.contains(<span class="string">&quot;rejected&quot;</span>) || type.contains(<span class="string">&quot;unavailable&quot;</span>)) &#123;</span><br><span class="line">            retryQueue.add(id);</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            deadLetter.add(id);   <span class="comment">// mapping 冲突等不可恢复错误</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-2-背压与重试"><a href="#6-2-背压与重试" class="headerlink" title="6.2 背压与重试"></a>6.2 背压与重试</h3><ul>
+<li><strong><code>es_rejected_execution_exception</code></strong> 是写队列满，必须退避（指数 + 抖动），不能立刻重试。</li>
+<li><strong><code>version_conflict_engine_exception</code></strong> 是并发写同一条，业务侧要么重读改，要么用 <code>_update</code> 脚本。</li>
+<li><strong>超时重试必须幂等</strong>：用业务主键做 <code>_id</code>，重试就是覆盖，天然幂等；用 ES 自动生成 <code>_id</code> 会写重。</li>
+</ul>
+<h2 id="七、观测：四个必须看的指标"><a href="#七、观测：四个必须看的指标" class="headerlink" title="七、观测：四个必须看的指标"></a>七、观测：四个必须看的指标</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1. translog 大小与操作数（判断 flush 是否及时）</span></span><br><span class="line">GET /orders/_stats/translog?human</span><br><span class="line"><span class="comment">#   translog.size_in_bytes / operations / uncommitted_operations</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 2. refresh 开销</span></span><br><span class="line">GET /orders/_stats/refresh?human</span><br><span class="line"><span class="comment">#   total_time_in_millis 持续上涨 → 段爆炸</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 3. flush 次数与耗时</span></span><br><span class="line">GET /orders/_stats/flush</span><br><span class="line"></span><br><span class="line"><span class="comment"># 4. 段数量（核心健康指标）</span></span><br><span class="line">GET /orders/_stats/segments</span><br><span class="line"><span class="comment">#   count 长期 &gt; 100/分片 → 需要 force merge 或调 refresh_interval</span></span><br></pre></td></tr></table></figure>
+
+<p>线上阈值参考：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>健康</th>
+<th>告警</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>segments.count / 分片</code></td>
+<td>&lt; 50</td>
+<td>&gt; 150</td>
+</tr>
+<tr>
+<td><code>translog.size_in_bytes</code></td>
+<td>&lt; 512MB</td>
+<td>&gt; 2GB（恢复会很慢）</td>
+</tr>
+<tr>
+<td><code>refresh.total_time / 分钟</code></td>
+<td>稳定</td>
+<td>持续上升</td>
+</tr>
+<tr>
+<td><code>flush.periodic</code></td>
+<td>正常触发</td>
+<td>从不触发（说明 translog 一直没清）</td>
+</tr>
+</tbody></table>
+<h2 id="八、五个真实踩坑"><a href="#八、五个真实踩坑" class="headerlink" title="八、五个真实踩坑"></a>八、五个真实踩坑</h2><p><strong>坑 1：<code>refresh_interval=-1</code> 之后忘了改回来。</strong> 批量导入脚本异常退出，索引永久不可搜，第二天业务方来问「数据怎么没了」。</p>
+<p><strong>坑 2：bulk 里每条都带 <code>refresh=true</code>。</strong> 每秒几千个小段，merge 打满磁盘，整集群写入雪崩。</p>
+<p><strong>坑 3：把 <code>durability=async</code> 当成「性能优化」全局打开。</strong> 订单数据在机房掉电时丢了 5 秒，对账时才发现。</p>
+<p><strong>坑 4：分片设计成 200GB。</strong> 重启恢复 40 分钟，主从切换期间整个索引不可用。</p>
+<p><strong>坑 5：以为返回 200 就是落盘了。</strong> <code>durability=async</code> 下 200 只代表「写进 translog 的 page cache」，掉电就丢。</p>
+<h2 id="九、面试常见追问"><a href="#九、面试常见追问" class="headerlink" title="九、面试常见追问"></a>九、面试常见追问</h2><p><strong>Q1：refresh 和 flush 的区别？</strong></p>
+<p>refresh 把内存 buffer 变成可搜索的新段（不保证落盘），解决「可见性」；flush 触发 Lucene commit（fsync 段 + 写 segments_N）并清空 translog，解决「可恢复性」。flush 内部会先做一次 refresh。</p>
+<p><strong>Q2：为什么 ES 是「近实时」而不是实时？</strong></p>
+<p>因为写入先落在 buffer 和 translog，需要 refresh 才能被搜索，默认 1 秒一次。这是为了批量攒段、避免小段爆炸而做的吞吐权衡。</p>
+<p><strong>Q3：<code>durability=request</code> 就绝对不会丢数据吗？</strong></p>
+<p>在「已返回 200」的前提下，主分片 translog 已 fsync，单机掉电不丢。但如果整个机房掉电且副本也没落盘，仍可能丢。另外 <code>wait_for_active_shards=1</code> 时副本没写成功也返回 200，此时副本落后。</p>
+<p><strong>Q4：translog 会不会无限增长？</strong></p>
+<p>不会。三个闸门：<code>flush_threshold_size</code>（默认 512MB 触发 flush）、<code>retention.size</code>、<code>retention.age</code>。但 <code>refresh_interval=-1</code> + 低写入量时，可能长时间不触发 flush，靠 <code>flush_threshold_period</code>（30min）兜底。</p>
+<p><strong>Q5：集群重启慢，怎么优化？</strong></p>
+<p>① 控制分片大小 ≤ 50GB；② 调小 <code>flush_threshold_size</code> 减少单次重放量；③ 避免大量小分片（每个分片恢复都有固定开销）；④ 用 <code>index.recovery.type</code> 与 <code>cluster.routing.allocation.node_concurrent_recoveries</code> 控制并发恢复的带宽，避免恢复把集群打挂；⑤ 冷数据用可搜索快照而不是常驻分片。</p>
+<h2 id="十、总结"><a href="#十、总结" class="headerlink" title="十、总结"></a>十、总结</h2><ul>
+<li>ES 写入是「translog（持久）+ buffer（内存）+ 段（可搜）」三件套，<strong>可见性靠 refresh，持久性靠 translog fsync，恢复速度靠 flush</strong>。</li>
+<li><code>durability=request</code> 的性能取决于「单请求多少条文档」，小批量高频写会被 fsync 卡死。</li>
+<li><code>durability=async</code> 的丢失窗口是 <code>sync_interval</code>，只适合可重放数据。</li>
+<li>段数量是核心健康指标，<code>refresh_interval</code> 与 bulk 的 <code>refresh</code> 参数是最常见的两个误用点。</li>
+<li>重启慢的根因通常不是 translog 参数，而是<strong>分片太大 + 小分片太多</strong>。</li>
+</ul>
+<p>把这套机制搞清楚，你就能在「写入 200 但搜不到」「掉电丢数据」「重启一小时」这三类问题上，第一句话就说中根因。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/13/elasticsearch-translog-refresh-flush-durability-deep-dive/">https://jiweidong.github.io/2026/11/13/elasticsearch-translog-refresh-flush-durability-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/Lucene/">Lucene</a><a class="post-meta__tags" href="/tags/%E6%8C%81%E4%B9%85%E5%8C%96/">持久化</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%8F%AF%E9%9D%A0%E6%80%A7/">数据可靠性</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/13/java-llm-deterministic-replay-vcr-testing-deep-practice/" title="【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁</div></div><div class="info-2"><div class="info-item-1">【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁前言给大模型写单元测试，是所有 AI 应用团队都会撞上的墙：  输出是概率性的，assertEquals 根本没法写； 每次 CI 都真调 API，慢、贵、还依赖网络； 改了一行 prompt，不知道会影响哪些 case； 模型厂商悄悄升级了版本，线上效果变了却没人发现。  传统做法是 mock 掉 SDK，但 mock 出来的响应是「人编的」，跟真实输出分布完全不一致，测了等于没测。业界成熟的解法是 VCR（Video Cassette Recorder）模式：第一次真实调用时把「请求 + 响应」录成磁带（cassette），之后所有测试都从磁带回放。这个模式在 HTTP 客户端领域（Ruby 的 VCR、Java 的 WireMock 录制）已经用了十几年，搬到 LLM 场景需要额外解决三个问题：  流式响应（SSE）怎么录——chunk 边界本身就是被测逻辑的一部分； 请求指纹怎么算——消息数组、工具定义、参数顺序都会变； 断言怎么写——不能用全文相等，否则模型一升级全...</div></div></div></a><a class="pagination-related" href="/2026/11/13/dns-resolution-jvm-container-timeout-deep-dive/" title="【Java 网络】DNS 解析与 JVM 深度解析：InetAddress 缓存、ndots 陷阱与容器内 5 秒超时归因"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 网络】DNS 解析与 JVM 深度解析：InetAddress 缓存、ndots 陷阱与容器内 5 秒超时归因</div></div><div class="info-2"><div class="info-item-1">【Java 网络】DNS 解析与 JVM 深度解析：InetAddress 缓存、ndots 陷阱与容器内 5 秒超时归因前言有一类故障特别折磨人：服务本身逻辑没问题，压测也过，但线上偶发 UnknownHostException，或者每隔一段时间有几个请求「凭空」多了 5 秒、10 秒；curl 手动访问秒回，Java 客户端却慢；K8s 里 Service 滚动更新后，部分实例一直连老 IP，重启才好。 这些现象背后几乎都是同一件事：DNS 解析。而 DNS 在 Java 里是一条特别长的链路——JVM 有自己的缓存、glibc&#x2F;musl 有自己的搜索域逻辑、/etc/resolv.conf 有 ndots 和超时重试、下层的 DNS 服务器还有 UDP 截断转 TCP 的行为。任何一层出问题，表现都是「网络慢」，但根因完全不同。 这篇文章把这条链路完整拆开，包括 JVM 缓存的两个 ttl、ndots:5 为什么会放大成 5 倍查询、Alpine 镜像（musl）与 glibc 的行为差异、Netty&#x2F;gRPC 自己的 NameResolver，以及一套...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/06/elasticsearch-source-doc-values-fielddata-deep-dive/" title="【ES 底层】_source、doc_values 与 fielddata 深度解析：Elasticsearch 到底吃内存还是吃磁盘"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-06</div><div class="info-item-2">【ES 底层】_source、doc_values 与 fielddata 深度解析：Elasticsearch 到底吃内存还是吃磁盘</div></div><div class="info-2"><div class="info-item-1">【ES 底层】_source、doc_values 与 fielddata 深度解析前言：一次”堆内存 32G 却天天 OOM”的排查线上一个 9 节点的 ES 集群，每个节点 -Xmx31g（31g 是压缩指针的临界点，这个数字后面还会出现），日均写入 2 亿条日志，某天开始每天下午 OOM 一次，hot_threads 显示大量线程卡在 GlobalOrdinalsStringTermsAggregator。 排查结果：一个”临时看板”需求给 message（text 类型）加了 terms 聚合。text 字段默认 fielddata=false，那位同学为了”让它能聚合”，直接开了 &quot;fielddata&quot;: true。于是 ES 把整个字段的所有 term 加载进堆，30 亿个文档的 message 字段，堆瞬间爆了。 这件事的本质，是没搞清楚一条文档在 ES 里到底被存了几份、每份存在哪、什么时候会被读进堆。 这篇文章就把这件事拆干净。  一、一条文档在 Lucene 里被存了几份假设有这样一个文档： 1&#123;&quot;id&quot;: 1...</div></div></div></a><a class="pagination-related" href="/2026/10/10/lucene-full-text-search-deep-practice/" title="【中间件实战】Lucene 全文检索深度实战：IndexWriter、分词器与查询解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-10</div><div class="info-item-2">【中间件实战】Lucene 全文检索深度实战：IndexWriter、分词器与查询解析</div></div><div class="info-2"><div class="info-item-1">【中间件实战】Lucene 全文检索深度实战：IndexWriter、分词器与查询解析面试官：你说你会 Elasticsearch，那 ES 底层的 Lucene 你了解多少？大部分人的 ES 经验停留在”会用 DSL 查数据”，但真正区分深度的是：你知不知道一条文档进来之后，Lucene 到底做了什么？ 这个问题的价值在于——ES 的所有性能问题，最终都能追溯到 Lucene 的段（Segment）、缓冲（Buffer）、合并（Merge）这三个概念上。 本文不依赖 ES，直接把 Lucene 当作一个 Java 库来用，从建索引到查询全流程走一遍，讲清楚倒排索引、分词、段合并这些底层机制。  一、Lucene 是什么Lucene 是一个纯 Java 的全文检索库，不是一个可以独立运行的服务。    对比项 Lucene Elasticsearch &#x2F; Solr    形态 嵌入式 Java 库 独立服务   分布式 无 有   REST API 无（Java API） 有   运维 无 复杂   适用 单机、嵌入式搜索、自研搜索引擎 大规模、需要分布式   所以 E...</div></div></div></a><a class="pagination-related" href="/2026/10/07/elasticsearch-alias-zero-downtime-reindex-deep-dive/" title="【ES 实战】索引别名与零停机重建索引深度实战：Alias、_reindex 与原子切换"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-07</div><div class="info-item-2">【ES 实战】索引别名与零停机重建索引深度实战：Alias、_reindex 与原子切换</div></div><div class="info-2"><div class="info-item-1">【ES 实战】索引别名与零停机重建索引深度实战：Alias、_reindex 与原子切换面试官：线上索引要改 mapping，怎么做到不停服？ “index order_v1 里 remark 字段是 text，现在要做聚合统计需要 keyword。数据量 2 亿条，业务 7×24 小时不能停。你怎么改？”  很多人第一反应是”改成 keyword 就行”，但 Elasticsearch 的底层是 Lucene，已写入的段（segment）不可变，mapping 不能直接修改字段类型（除少数例外，如新增字段、ignore_above 等）。 能改的情况极少，绝大多数类型变更只能走同一条路：  建一个新索引 → 把数据搬过去 → 用别名原子切换 → 删掉旧索引。  而这套流程能做到”零停机”的关键，就是 Index Alias（索引别名）。这一篇把 Alias + _reindex + 原子切换讲成一套可复制的生产方案。 一、Alias 是什么，为什么它能实现零停机别名就是指向一个或多个索引的”指针”，应用只认别名，不认真实索引名： 123456POST /_aliases&#12...</div></div></div></a><a class="pagination-related" href="/2026/09/19/elasticsearch-shard-allocation-rebalance-deep-practice/" title="【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析</div></div><div class="info-2"><div class="info-item-1">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析面试官：集群是 yellow 状态，你怎么办？Yellow 是 Elasticsearch 生产环境最常见的”半故障”：主分片全部就绪，副本分片没能分配。它不阻塞读写，所以很多人选择无视——直到某天一个节点宕机，yellow 变成 red，业务直接不可用。 要真正解决 yellow 和 red，必须理解 ES 的**分片分配（Shard Allocation）**机制：谁在决策、依据什么决策、什么时候会拒绝分配。这篇文章从集群规划讲到故障处置，把分配链路完整拆开。 一、先搞清楚：分片分配的决策者是谁ES 7.x 之后，分配决策由 Master 节点的 AllocationService 负责，配合三个组件：    组件 职责    AllocationDeciders 一串”是否允许分配”的过滤器（过滤器模式），任何一个否决就跳过   ShardsAllocator 在通过决策器的节点中，选一个”最合适”的（均衡度、磁盘水位）   BalancedShardsAllocato...</div></div></div></a><a class="pagination-related" href="/2026/11/11/lucene-tiered-merge-policy-forcemerge-deep-dive/" title="【Java 底层】Lucene 索引合并策略深度解析：TieredMergePolicy、写入放大与 forceMerge 治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-11</div><div class="info-item-2">【Java 底层】Lucene 索引合并策略深度解析：TieredMergePolicy、写入放大与 forceMerge 治理</div></div><div class="info-2"><div class="info-item-1">【Java 底层】Lucene 索引合并策略深度解析：TieredMergePolicy、写入放大与 forceMerge 治理前言线上 ES 集群最常见的一类”玄学问题”：白天写入正常，凌晨却出现查询 P99 翻倍、节点 IO util 打满、write 线程池队列堆积；运维看一眼监控说”段合并（merge）在跑，正常现象”，然后就没有然后了。 另一类更危险的操作是：为了让查询”更快”，有人对着线上索引执行 POST /idx/_forcemerge?max_num_segments=1。结果磁盘没降、内存 page cache 被大段挤爆、查询反而变慢，甚至触发集群熔断。 这两个现象背后是同一套机制：Lucene 的段（segment）不可变 + 后台合并（merge）。合并策略决定了写放大、查询延迟、磁盘占用三者的平衡点。本文从 IndexWriter 的 flush&#x2F;merge 主链路讲到 TieredMergePolicy 的打分公式，再给出一套可落地的 forceMerge 治理规范与监控指标。  一、段、flush 与 merge：先把链路走通Lucene...</div></div></div></a><a class="pagination-related" href="/2026/07/18/redis-persistence-rdb-aof-deep-dive/" title="Redis 持久化机制深度解析：RDB vs AOF 原理、配置与生产最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-18</div><div class="info-item-2">Redis 持久化机制深度解析：RDB vs AOF 原理、配置与生产最佳实践</div></div><div class="info-2"><div class="info-item-1">Redis 持久化机制深度解析：RDB vs AOF 原理、配置与生产最佳实践一、为什么 Redis 需要持久化？Redis 是内存数据库，所有数据都存储在内存中。一旦进程退出或宕机，如果不做持久化，所有数据都将丢失。  面试官：Redis 不是缓存吗，数据丢了有什么关系？  这就是很多人的理解误区。Redis 的典型使用场景包括：  缓存：丢了可从 DB 恢复，容忍丢失 分布式锁：丢了会导致锁失效，可能引发并发问题 计数&#x2F;排行榜：丢了需要重新计算 会话&#x2F;Token：丢了会导致用户强制下线 消息队列（Stream）：丢了可能导致消息丢失  所以，持久化不是可选项，而是必选项。问题只在于：应该选 RDB 还是 AOF？如何配置才能兼顾性能和数据安全？  二、RDB 持久化（Redis DataBase）RDB 是 Redis 默认的持久化方式，以快照（snapshot） 的形式保存某一时刻的完整数据。 2.1 原理：Copy-on-Write（写时复制）RDB 的核心机制是 fork() + 写时复制（COW）： 123456789101112131415Red...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">917</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1021</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90ES-%E5%BA%95%E5%B1%82%E3%80%91translog%E3%80%81refresh-%E4%B8%8E-flush-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E5%86%99%E5%85%A5%E5%8F%AF%E8%A7%81%E6%80%A7%E3%80%81%E6%8C%81%E4%B9%85%E6%80%A7%E4%B8%8E%E6%95%B0%E6%8D%AE%E4%B8%A2%E5%A4%B1%E7%AA%97%E5%8F%A3"><span class="toc-number">1.</span> <span class="toc-text">【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E7%90%86%E8%A7%A3-Lucene-%E4%B8%BA%E4%BB%80%E4%B9%88%E3%80%8C%E5%86%99%E5%85%A5%E4%B8%8D%E8%83%BD%E7%AB%8B%E5%88%BB%E6%90%9C%E3%80%8D"><span class="toc-number">1.2.</span> <span class="toc-text">一、先理解 Lucene 为什么「写入不能立刻搜」</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81translog-%E5%88%B0%E5%BA%95%E5%AD%98%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.</span> <span class="toc-text">二、translog 到底存了什么</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81durability%EF%BC%9Arequest-%E4%B8%8E-async-%E7%9A%84%E7%9C%9F%E5%AE%9E%E4%BB%A3%E4%BB%B7"><span class="toc-number">1.4.</span> <span class="toc-text">三、durability：request 与 async 的真实代价</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-request%EF%BC%88%E9%BB%98%E8%AE%A4%EF%BC%89"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 request（默认）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-async"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 async</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%89%AF%E6%9C%AC%E8%83%BD%E4%B8%8D%E8%83%BD%E5%85%9C%E5%BA%95%EF%BC%9F"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 副本能不能兜底？</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81refresh%EF%BC%9A%E5%8F%AF%E8%A7%81%E6%80%A7%E7%9A%84%E4%BB%A3%E4%BB%B7%E8%A2%AB%E4%B8%A5%E9%87%8D%E4%BD%8E%E4%BC%B0"><span class="toc-number">1.5.</span> <span class="toc-text">四、refresh：可见性的代价被严重低估</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81flush-%E8%A7%A6%E5%8F%91%E6%9D%A1%E4%BB%B6%E4%B8%8E%E3%80%8C%E9%87%8D%E5%90%AF%E4%B8%BA%E4%BB%80%E4%B9%88%E6%85%A2%E3%80%8D"><span class="toc-number">1.6.</span> <span class="toc-text">五、flush 触发条件与「重启为什么慢」</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E5%AE%A2%E6%88%B7%E7%AB%AF%EF%BC%9A%E4%B8%80%E4%BB%BD%E8%83%BD%E6%89%93%E7%9A%84%E6%89%B9%E9%87%8F%E5%86%99%E5%85%A5%E6%A8%A1%E6%9D%BF"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 客户端：一份能打的批量写入模板</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%BF%85%E9%A1%BB%E5%A4%84%E7%90%86-items-error"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 必须处理 items[].error</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E8%83%8C%E5%8E%8B%E4%B8%8E%E9%87%8D%E8%AF%95"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 背压与重试</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E8%A7%82%E6%B5%8B%EF%BC%9A%E5%9B%9B%E4%B8%AA%E5%BF%85%E9%A1%BB%E7%9C%8B%E7%9A%84%E6%8C%87%E6%A0%87"><span class="toc-number">1.8.</span> <span class="toc-text">七、观测：四个必须看的指标</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E4%BA%94%E4%B8%AA%E7%9C%9F%E5%AE%9E%E8%B8%A9%E5%9D%91"><span class="toc-number">1.9.</span> <span class="toc-text">八、五个真实踩坑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">十、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/13/llm-batch-api-offline-inference-cost-deep-dive/" title="【AI 工程化】Batch API 与离线批量推理深度解析：五折成本的编排、对账与容错设计">【AI 工程化】Batch API 与离线批量推理深度解析：五折成本的编排、对账与容错设计</a><time datetime="2026-11-13T00:40:00.000Z" title="发表于 2026-11-13 08:40:00">2026-11-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/13/java-llm-deterministic-replay-vcr-testing-deep-practice/" title="【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁">【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁</a><time datetime="2026-11-13T00:30:00.000Z" title="发表于 2026-11-13 08:30:00">2026-11-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/13/elasticsearch-translog-refresh-flush-durability-deep-dive/" title="【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口">【ES 底层】translog、refresh 与 flush 深度解析：写入可见性、持久性与数据丢失窗口</a><time datetime="2026-11-13T00:20:00.000Z" title="发表于 2026-11-13 08:20:00">2026-11-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/13/dns-resolution-jvm-container-timeout-deep-dive/" title="【Java 网络】DNS 解析与 JVM 深度解析：InetAddress 缓存、ndots 陷阱与容器内 5 秒超时归因">【Java 网络】DNS 解析与 JVM 深度解析：InetAddress 缓存、ndots 陷阱与容器内 5 秒超时归因</a><time datetime="2026-11-13T00:10:00.000Z" title="发表于 2026-11-13 08:10:00">2026-11-13</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/13/cgroup-v2-io-throttling-java-deep-dive/" title="【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理">【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理</a><time datetime="2026-11-13T00:00:00.000Z" title="发表于 2026-11-13 08:00:00">2026-11-13</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
