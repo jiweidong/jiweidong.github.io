@@ -1,0 +1,498 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【性能调优】overlayfs 与容器写放大深度解析前言一个很典型的生产故障：Java 服务在虚拟机里跑得好好的，迁到 Kubernetes 之后，日志一多就 No space left on device，节点磁盘明明还有空间；或者某个服务启动特别慢，strace 一看全耗在 openat 上；再或者容器内存莫名其妙翻倍，jcmd GC.heap_info 显示堆只用了 1G，cgroup 却记">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/14/overlayfs-container-write-amplification-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【性能调优】overlayfs 与容器写放大深度解析前言一个很典型的生产故障：Java 服务在虚拟机里跑得好好的，迁到 Kubernetes 之后，日志一多就 No space left on device，节点磁盘明明还有空间；或者某个服务启动特别慢，strace 一看全耗在 openat 上；再或者容器内存莫名其妙翻倍，jcmd GC.heap_info 显示堆只用了 1G，cgroup 却记">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-14T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-11-14T00:02:41.301Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Docker">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="overlayfs">
+<meta property="article:tag" content="容器">
+<meta property="article:tag" content="性能调优">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因",
+  "url": "https://jiweidong.github.io/2026/11/14/overlayfs-container-write-amplification-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-14T00:20:00.000Z",
+  "dateModified": "2026-11-14T00:02:41.301Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/14/overlayfs-container-write-amplification-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">922</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1028</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-14T00:20:00.000Z" title="发表于 2026-11-14 08:20:00">2026-11-14</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-14T00:02:41.301Z" title="更新于 2026-11-14 08:02:41">2026-11-14</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【性能调优】overlayfs-与容器写放大深度解析"><a href="#【性能调优】overlayfs-与容器写放大深度解析" class="headerlink" title="【性能调优】overlayfs 与容器写放大深度解析"></a>【性能调优】overlayfs 与容器写放大深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>一个很典型的生产故障：Java 服务在虚拟机里跑得好好的，迁到 Kubernetes 之后，日志一多就 <code>No space left on device</code>，节点磁盘明明还有空间；或者某个服务启动特别慢，<code>strace</code> 一看全耗在 <code>openat</code> 上；再或者容器内存莫名其妙翻倍，<code>jcmd GC.heap_info</code> 显示堆只用了 1G，cgroup 却记账 2.5G。</p>
+<p>这三个现象背后经常是同一个东西：<strong>overlayfs 的写时复制（copy-up）</strong>。</p>
+<p>容器镜像分层是 Docker 的核心设计，但很多人只记住了「分层省空间」，没意识到<strong>任何对镜像层文件的写操作，都会先把整个文件复制到可写层</strong>。这个「整文件复制」就是写放大的源头。</p>
+<p>这篇从 overlay2 的目录结构讲起，把 copy-up 的触发条件、放大倍数、page cache 双份、观测手段和 Java 侧治理讲透。</p>
+<hr>
+<h2 id="一、overlay2-的四层结构"><a href="#一、overlay2-的四层结构" class="headerlink" title="一、overlay2 的四层结构"></a>一、overlay2 的四层结构</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">$ mount | grep overlay</span><br><span class="line">overlay on /var/lib/docker/overlay2/xxxx/merged <span class="built_in">type</span> overlay</span><br><span class="line">  (rw,relatime,lowerdir=/var/lib/docker/overlay2/l/AAA:/var/lib/docker/overlay2/l/BBB,</span><br><span class="line">   upperdir=/var/lib/docker/overlay2/xxxx/diff,</span><br><span class="line">   workdir=/var/lib/docker/overlay2/xxxx/work)</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>目录</th>
+<th>角色</th>
+<th>可写</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lowerdir</code></td>
+<td>镜像层（可能多层）</td>
+<td>❌</td>
+<td>只读，多个用 <code>:</code> 分隔，<strong>右边的优先级低</strong></td>
+</tr>
+<tr>
+<td><code>upperdir</code></td>
+<td>容器可写层</td>
+<td>✅</td>
+<td>容器生命周期内所有写都落这里</td>
+</tr>
+<tr>
+<td><code>workdir</code></td>
+<td>内部工作目录</td>
+<td>—</td>
+<td>overlayfs 自己用，必须与 upperdir 同文件系统</td>
+</tr>
+<tr>
+<td><code>merged</code></td>
+<td>挂载点（容器看到的根）</td>
+<td>✅</td>
+<td>合并视图</td>
+</tr>
+</tbody></table>
+<p>读文件时，overlayfs 从上往下找第一个存在的层；写文件时：</p>
+<ul>
+<li>文件只在 upperdir → 直接写；</li>
+<li>文件在 lowerdir → <strong>先 copy-up 整个文件到 upperdir</strong>，再写。</li>
+</ul>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line">读：merged/app/config.yml</span><br><span class="line">      ├─ upperdir 有？ 有 → 用</span><br><span class="line">      └─ 没有 → 逐层往下找 lowerdir</span><br><span class="line"></span><br><span class="line">写：merged/app/config.yml（只在 lowerdir）</span><br><span class="line">      └─ copy-up：整个 config.yml → upperdir/diff/app/config.yml</span><br><span class="line">                  （连同元数据、扩展属性）</span><br><span class="line">         然后才在 upperdir 的副本上写</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="二、copy-up-的四个触发条件（比你想的多）"><a href="#二、copy-up-的四个触发条件（比你想的多）" class="headerlink" title="二、copy-up 的四个触发条件（比你想的多）"></a>二、copy-up 的四个触发条件（比你想的多）</h2><p>不只是 <code>write()</code> 会触发：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>是否 copy-up</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>open(O_WRONLY)</code> &#x2F; <code>O_RDWR</code></td>
+<td>✅</td>
+<td>打开即复制，还没写也算</td>
+</tr>
+<tr>
+<td><code>truncate</code> &#x2F; <code>ftruncate</code></td>
+<td>✅</td>
+<td>改大小</td>
+</tr>
+<tr>
+<td><code>chmod</code> &#x2F; <code>chown</code> &#x2F; <code>setxattr</code></td>
+<td>✅</td>
+<td>改元数据也复制整个文件</td>
+</tr>
+<tr>
+<td><code>rename</code> 下层文件</td>
+<td>✅</td>
+<td>需要在新层有实体</td>
+</tr>
+<tr>
+<td><strong>删除</strong>下层文件</td>
+<td>❌（创建 whiteout）</td>
+<td>upperdir 里建 0&#x2F;0 字符设备</td>
+</tr>
+<tr>
+<td>只读 <code>open(O_RDONLY)</code></td>
+<td>❌</td>
+<td>直接用下层</td>
+</tr>
+</tbody></table>
+<p>两个高频误伤场景：</p>
+<ol>
+<li><strong>日志框架打开文件时用 <code>O_APPEND|O_CREAT|O_WRONLY</code></strong> → 触发 copy-up。如果镜像里预置了一个 500MB 的历史日志文件，容器每次启动都要复制 500MB。</li>
+<li><strong><code>chown -R</code> 镜像里的目录</strong> → 目录下每个文件都 copy-up。很多 Dockerfile 里一句 <code>RUN chown -R app:app /app</code> 就把镜像层里的所有文件复制了一遍，镜像体积直接翻倍。</li>
+</ol>
+<hr>
+<h2 id="三、写放大到底放大多少"><a href="#三、写放大到底放大多少" class="headerlink" title="三、写放大到底放大多少"></a>三、写放大到底放大多少</h2><p>设文件在镜像层的大小为 <code>S</code>，应用写入 <code>w</code> 字节：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">实际落盘写 = S（copy-up） + w（业务写） + 元数据</span><br><span class="line">放大倍数 ≈ (S + w) / w</span><br></pre></td></tr></table></figure>
+
+<p>举几个真实量级（NVMe，overlay2 on xfs）：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>文件在镜像层大小</th>
+<th>业务写</th>
+<th>实际写盘</th>
+<th>放大</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>追加日志到 1GB 历史文件</td>
+<td>1 GB</td>
+<td>4 KB</td>
+<td>~1 GB</td>
+<td><strong>25 万倍</strong></td>
+</tr>
+<tr>
+<td>改 200MB 配置包里的一个文件</td>
+<td>200 MB</td>
+<td>1 KB</td>
+<td>~200 MB</td>
+<td>20 万倍</td>
+</tr>
+<tr>
+<td>写入全新文件（不在镜像层）</td>
+<td>0</td>
+<td>100 MB</td>
+<td>100 MB</td>
+<td>1 倍</td>
+</tr>
+<tr>
+<td>写挂载卷（volume）</td>
+<td>—</td>
+<td>100 MB</td>
+<td>100 MB</td>
+<td>1 倍</td>
+</tr>
+<tr>
+<td>随机写 1GB 已存在的数据库文件</td>
+<td>1 GB</td>
+<td>1 GB</td>
+<td>~2 GB</td>
+<td>2 倍</td>
+</tr>
+</tbody></table>
+<p>所以判断标准很简单：<strong>文件是不是来自镜像层</strong>。来自镜像层的大文件，第一次写就是灾难。</p>
+<h3 id="3-1-目录-rename-的隐藏放大"><a href="#3-1-目录-rename-的隐藏放大" class="headerlink" title="3.1 目录 rename 的隐藏放大"></a>3.1 目录 rename 的隐藏放大</h3><p>overlayfs 的 <code>redirect_dir</code> 默认关闭（<code>redirect_dir=off</code>）时，<code>rename</code> 一个来自下层的目录会退化成「递归 copy-up 整棵子树」：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 镜像层有 /opt/app/data/（10 万个文件，20GB）</span></span><br><span class="line">$ <span class="built_in">mv</span> /opt/app/data /opt/app/data.bak   <span class="comment"># 触发整树 copy-up</span></span><br></pre></td></tr></table></figure>
+
+<p>容器启动脚本里做「备份旧目录」是常见操作，代价可能是几十 GB 写入。解法：挂 volume，或在 Dockerfile 里就不要把可变目录放进镜像层。</p>
+<hr>
+<h2 id="四、page-cache-双份：内存记账翻倍的真相"><a href="#四、page-cache-双份：内存记账翻倍的真相" class="headerlink" title="四、page cache 双份：内存记账翻倍的真相"></a>四、page cache 双份：内存记账翻倍的真相</h2><p>这是最容易被误判为「JVM 内存泄漏」的问题。</p>
+<p>当进程 A 只读打开下层文件（page cache 挂在 lower inode 上），进程 B 以写方式打开同一文件触发 copy-up 后，<strong>upperdir 里是一个新 inode</strong>，page cache 是<strong>按 inode 记账</strong>的 → 同一份内容在内存里存了两份。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">进程 A  read-only → lower inode  → page cache 页组 #1</span><br><span class="line">进程 B  open(RW)  → copy-up → upper inode → page cache 页组 #2</span><br></pre></td></tr></table></figure>
+
+<p>在 cgroup v2 下，这两份都算在容器的 <code>memory.current</code> 的 file 部分。于是一个 2GB 的镜像层文件被容器里两个进程分别读写，可能记账 4GB+。</p>
+<p>判断方法：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 容器内看 file 页缓存</span></span><br><span class="line"><span class="built_in">cat</span> /sys/fs/cgroup/memory.stat | grep -E <span class="string">&quot;^(file|inactive_file|active_file) &quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 宿主机看某个文件的 page cache（需要 fincore/vmtouch）</span></span><br><span class="line">fincore /var/lib/docker/overlay2/xxxx/diff/app/big.dat</span><br></pre></td></tr></table></figure>
+
+<p>注意：page cache 是<strong>可回收</strong>的，<code>memory.current</code> 高不等于 OOM。判断 OOM 风险要看 <code>memory.stat</code> 里的 <code>anon</code>，以及 <code>memory.events</code> 的 <code>oom</code> 计数。</p>
+<hr>
+<h2 id="五、观测：五条命令定位写放大"><a href="#五、观测：五条命令定位写放大" class="headerlink" title="五、观测：五条命令定位写放大"></a>五、观测：五条命令定位写放大</h2><h3 id="5-1-容器可写层有多大"><a href="#5-1-容器可写层有多大" class="headerlink" title="5.1 容器可写层有多大"></a>5.1 容器可写层有多大</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">$ docker ps -s</span><br><span class="line">CONTAINER ID   SIZE       VIRTUAL SIZE</span><br><span class="line">a1b2c3d4       1.82GB     3.4GB</span><br></pre></td></tr></table></figure>
+
+<p><code>SIZE</code> 就是 upperdir 的大小。如果它随时间线性增长，先查是谁在写。</p>
+<h3 id="5-2-谁在写"><a href="#5-2-谁在写" class="headerlink" title="5.2 谁在写"></a>5.2 谁在写</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 容器内</span></span><br><span class="line">$ <span class="built_in">du</span> -sh /var/lib/docker/overlay2/&lt;<span class="built_in">id</span>&gt;/diff/* 2&gt;/dev/null | <span class="built_in">sort</span> -h | <span class="built_in">tail</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 或者进了容器直接找大文件（注意会触发 atime/元数据，慎用）</span></span><br><span class="line">$ find / -xdev -<span class="built_in">type</span> f -size +100M -<span class="built_in">exec</span> <span class="built_in">ls</span> -lh &#123;&#125; \;</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-3-cgroup-v2-的-IO-记账"><a href="#5-3-cgroup-v2-的-IO-记账" class="headerlink" title="5.3 cgroup v2 的 IO 记账"></a>5.3 cgroup v2 的 IO 记账</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">$ <span class="built_in">cat</span> /sys/fs/cgroup/io.stat</span><br><span class="line">8:16 rbytes=1200349184 wbytes=8842190336 rios=42113 wios=201884 dbytes=0 dios=0</span><br></pre></td></tr></table></figure>
+
+<p><code>wbytes</code> 是「发到块设备的字节数」，包含 copy-up。对比容器内应用自己统计的写入量，差值就是放大。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">$ <span class="built_in">cat</span> /sys/fs/cgroup/io.pressure</span><br><span class="line">some avg10=12.31 avg60=8.02 avg300=3.11 total=88421903</span><br><span class="line">full avg10=9.87  avg60=6.44 avg300=2.05 total=70112334</span><br></pre></td></tr></table></figure>
+
+<p><code>full</code> 高说明所有任务都在等 IO，不是个别慢。</p>
+<h3 id="5-4-确认挂载类型"><a href="#5-4-确认挂载类型" class="headerlink" title="5.4 确认挂载类型"></a>5.4 确认挂载类型</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">$ findmnt -T /app/logs -o TARGET,SOURCE,FSTYPE</span><br><span class="line">TARGET     SOURCE                          FSTYPE</span><br><span class="line">/app/logs  /dev/nvme0n1p1[/var/lib/...]    xfs     ← 其实是 overlay 上的目录</span><br></pre></td></tr></table></figure>
+
+<p>最可靠的是看 <code>/proc/self/mountinfo</code>：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ grep -m1 overlay /proc/self/mountinfo</span><br></pre></td></tr></table></figure>
+
+<h3 id="5-5-用-bpftrace-抓-copy-up（内核-5-x-支持-BTF）"><a href="#5-5-用-bpftrace-抓-copy-up（内核-5-x-支持-BTF）" class="headerlink" title="5.5 用 bpftrace 抓 copy-up（内核 5.x + 支持 BTF）"></a>5.5 用 bpftrace 抓 copy-up（内核 5.x + 支持 BTF）</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">bpftrace -e <span class="string">&#x27;kprobe:ovl_copy_up_one &#123; @[comm] = count(); &#125;&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="六、Java-应用为什么特别容易踩"><a href="#六、Java-应用为什么特别容易踩" class="headerlink" title="六、Java 应用为什么特别容易踩"></a>六、Java 应用为什么特别容易踩</h2><p>Java 服务的典型形态是「启动时读一堆配置文件、写一堆日志、偶尔 dump 堆」，每一条都踩在 copy-up 上。</p>
+<table>
+<thead>
+<tr>
+<th>Java 行为</th>
+<th>风险</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>logback 写 <code>/app/logs/app.log</code>（镜像层预置）</td>
+<td>整文件 copy-up</td>
+<td>日志输出 stdout，或挂 volume</td>
+</tr>
+<tr>
+<td><code>System.getProperty(&quot;java.io.tmpdir&quot;)</code> 默认 <code>/tmp</code></td>
+<td>写容器层</td>
+<td>挂 <code>emptyDir</code> 或 <code>--tmpfs /tmp</code></td>
+</tr>
+<tr>
+<td><code>HeapDumpOnOutOfMemoryError</code> 写工作目录</td>
+<td>大 dump 落可写层，可能撑爆磁盘</td>
+<td>指定到挂载卷</td>
+</tr>
+<tr>
+<td>JFR 录制 <code>.jfr</code> 文件</td>
+<td>同上</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>本地缓存（RocksDB &#x2F; Lucene 索引）</td>
+<td>大量随机写 + fsync</td>
+<td>必须挂 volume，且用 local SSD</td>
+</tr>
+<tr>
+<td>解压依赖到工作目录</td>
+<td>整包复制</td>
+<td>解压到 tmpfs</td>
+</tr>
+</tbody></table>
+<h3 id="6-1-一个启动自检：日志目录是不是可写层"><a href="#6-1-一个启动自检：日志目录是不是可写层" class="headerlink" title="6.1 一个启动自检：日志目录是不是可写层"></a>6.1 一个启动自检：日志目录是不是可写层</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="meta">@Slf4j</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">StorageLayoutChecker</span> <span class="keyword">implements</span> <span class="title class_">ApplicationRunner</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> Set&lt;String&gt; RISKY_FS =</span><br><span class="line">            Set.of(<span class="string">&quot;overlay&quot;</span>, <span class="string">&quot;overlay2&quot;</span>, <span class="string">&quot;fuse.fuse-overlayfs&quot;</span>, <span class="string">&quot;aufs&quot;</span>);</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">(ApplicationArguments args)</span> &#123;</span><br><span class="line">        Path[] mustBeVolume = &#123;</span><br><span class="line">                Path.of(<span class="string">&quot;/app/logs&quot;</span>),</span><br><span class="line">                Path.of(System.getProperty(<span class="string">&quot;java.io.tmpdir&quot;</span>)),</span><br><span class="line">                Path.of(<span class="string">&quot;/app/data&quot;</span>)</span><br><span class="line">        &#125;;</span><br><span class="line">        <span class="keyword">for</span> (Path p : mustBeVolume) &#123;</span><br><span class="line">            <span class="type">String</span> <span class="variable">fs</span> <span class="operator">=</span> fstypeOf(p);</span><br><span class="line">            <span class="keyword">if</span> (RISKY_FS.contains(fs)) &#123;</span><br><span class="line">                log.warn(<span class="string">&quot;路径 &#123;&#125; 位于 &#123;&#125; 文件系统（容器可写层），大文件写入会触发 copy-up 写放大&quot;</span>, p, fs);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 从 /proc/self/mountinfo 找最长匹配挂载点 */</span></span><br><span class="line">    <span class="keyword">private</span> String <span class="title function_">fstypeOf</span><span class="params">(Path path)</span> &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">target</span> <span class="operator">=</span> path.toAbsolutePath().normalize().toString();</span><br><span class="line">        <span class="type">String</span> <span class="variable">best</span> <span class="operator">=</span> <span class="literal">null</span>;</span><br><span class="line">        <span class="type">int</span> <span class="variable">bestLen</span> <span class="operator">=</span> -<span class="number">1</span>;</span><br><span class="line">        <span class="keyword">try</span> (Stream&lt;String&gt; lines = Files.lines(Path.of(<span class="string">&quot;/proc/self/mountinfo&quot;</span>))) &#123;</span><br><span class="line">            <span class="keyword">for</span> (String line : (Iterable&lt;String&gt;) lines::iterator) &#123;</span><br><span class="line">                String[] parts = line.split(<span class="string">&quot; &quot;</span>);</span><br><span class="line">                <span class="keyword">if</span> (parts.length &lt; <span class="number">5</span>) <span class="keyword">continue</span>;</span><br><span class="line">                <span class="type">String</span> <span class="variable">mountPoint</span> <span class="operator">=</span> parts[<span class="number">4</span>];</span><br><span class="line">                <span class="type">String</span> <span class="variable">fsType</span> <span class="operator">=</span> parts[parts.length - <span class="number">3</span> &gt;= <span class="number">0</span> ? parts.length - <span class="number">3</span> : <span class="number">0</span>];</span><br><span class="line">                <span class="comment">// mountinfo 中 fstype 在 &quot; - &quot; 之后</span></span><br><span class="line">                <span class="type">int</span> <span class="variable">sep</span> <span class="operator">=</span> line.indexOf(<span class="string">&quot; - &quot;</span>);</span><br><span class="line">                <span class="keyword">if</span> (sep &gt; <span class="number">0</span>) &#123;</span><br><span class="line">                    String[] post = line.substring(sep + <span class="number">3</span>).split(<span class="string">&quot; &quot;</span>);</span><br><span class="line">                    <span class="keyword">if</span> (post.length &gt; <span class="number">0</span>) fsType = post[<span class="number">0</span>];</span><br><span class="line">                &#125;</span><br><span class="line">                <span class="keyword">if</span> ((target.equals(mountPoint) || target.startsWith(mountPoint + <span class="string">&quot;/&quot;</span>))</span><br><span class="line">                        &amp;&amp; mountPoint.length() &gt; bestLen) &#123;</span><br><span class="line">                    bestLen = mountPoint.length();</span><br><span class="line">                    best = fsType;</span><br><span class="line">                &#125;</span><br><span class="line">            &#125;</span><br><span class="line">        &#125; <span class="keyword">catch</span> (IOException e) &#123;</span><br><span class="line">            log.debug(<span class="string">&quot;读取 mountinfo 失败&quot;</span>, e);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> best == <span class="literal">null</span> ? <span class="string">&quot;unknown&quot;</span> : best;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这段代码不完美（mountinfo 解析要处理转义空格），但足以在启动日志里给出明确告警。生产上更推荐直接用 <code>findmnt -T &lt;path&gt; -o FSTYPE -n</code> 的 sidecar 检查。</p>
+<h3 id="6-2-日志写入的正确姿势"><a href="#6-2-日志写入的正确姿势" class="headerlink" title="6.2 日志写入的正确姿势"></a>6.2 日志写入的正确姿势</h3><figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># logback-spring.xml：只输出到 stdout，让容器运行时接管</span></span><br><span class="line"><span class="string">&lt;appender</span> <span class="string">name=&quot;CONSOLE&quot;</span> <span class="string">class=&quot;ch.qos.logback.core.ConsoleAppender&quot;&gt;</span></span><br><span class="line">  <span class="string">&lt;encoder&gt;</span></span><br><span class="line">    <span class="string">&lt;pattern&gt;%d&#123;ISO8601&#125;</span> <span class="string">%-5level</span> [<span class="string">%thread</span>] <span class="string">%logger&#123;36&#125;</span> <span class="bullet">-</span> <span class="string">%msg%n&lt;/pattern&gt;</span></span><br><span class="line">  <span class="string">&lt;/encoder&gt;</span></span><br><span class="line"><span class="string">&lt;/appender&gt;</span></span><br><span class="line"></span><br><span class="line"><span class="string">&lt;root</span> <span class="string">level=&quot;INFO&quot;&gt;</span></span><br><span class="line">  <span class="string">&lt;appender-ref</span> <span class="string">ref=&quot;CONSOLE&quot;/&gt;</span></span><br><span class="line"><span class="string">&lt;/root&gt;</span></span><br></pre></td></tr></table></figure>
+
+<p>如果业务必须落文件（比如审计日志），挂独立 volume，并设置滚动上限：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># k8s</span></span><br><span class="line"><span class="attr">volumeMounts:</span></span><br><span class="line">  <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">logs</span></span><br><span class="line">    <span class="attr">mountPath:</span> <span class="string">/app/logs</span></span><br><span class="line"><span class="attr">volumes:</span></span><br><span class="line">  <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">logs</span></span><br><span class="line">    <span class="attr">emptyDir:</span></span><br><span class="line">      <span class="attr">sizeLimit:</span> <span class="string">5Gi</span></span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="七、fuse-overlayfs-rootless：额外一层税"><a href="#七、fuse-overlayfs-rootless：额外一层税" class="headerlink" title="七、fuse-overlayfs &#x2F; rootless：额外一层税"></a>七、fuse-overlayfs &#x2F; rootless：额外一层税</h2><p>rootless 容器（Podman rootless、Docker rootless）常退化为 <code>fuse-overlayfs</code>：文件操作要走 FUSE 用户态，每次 <code>open/write</code> 多两次上下文切换。</p>
+<p>实测差异（同一台机器，写 10 万个 4KB 小文件）：</p>
+<table>
+<thead>
+<tr>
+<th>存储驱动</th>
+<th>耗时</th>
+<th>相对开销</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>overlay2（root）</td>
+<td>18.4s</td>
+<td>1.0x</td>
+</tr>
+<tr>
+<td>fuse-overlayfs（rootless）</td>
+<td>41.2s</td>
+<td>2.2x</td>
+</tr>
+<tr>
+<td>直接写 xfs</td>
+<td>15.1s</td>
+<td>0.8x</td>
+</tr>
+</tbody></table>
+<p>所以 rootless 环境里，<strong>小文件密集写入的 Java 应用（Lucene、RocksDB、日志）性能会明显下降</strong>，能挂 volume 就挂 volume。</p>
+<hr>
+<h2 id="八、治理清单：把写放大按死在设计阶段"><a href="#八、治理清单：把写放大按死在设计阶段" class="headerlink" title="八、治理清单：把写放大按死在设计阶段"></a>八、治理清单：把写放大按死在设计阶段</h2><ol>
+<li><strong>镜像不可变</strong>：可变目录（日志、缓存、数据、临时文件）一律不放进镜像层。</li>
+<li><strong>只读根文件系统</strong>：<code>readOnlyRootFilesystem: true</code>，强制暴露「谁在偷偷写盘」。</li>
+<li><strong><code>/tmp</code> 用 tmpfs</strong>：<code>--tmpfs /tmp:size=512m</code>，避免临时文件落盘 + 顺带提速。</li>
+<li><strong>Dockerfile 避免 <code>chown -R</code></strong>：用 <code>COPY --chown</code>，只对新增文件生效。</li>
+<li><strong>合并 RUN 指令</strong>：减少层数不减少字节，但能减少层查找开销；真正省空间靠多阶段构建。</li>
+<li><strong>大文件不预置</strong>：基础镜像里别塞 JDK 源码包、历史日志、示例数据。</li>
+<li><strong>监控可写层增长</strong>：<code>docker ps -s</code> 或 kubelet 的 <code>container_fs_usage_bytes</code> 告警。</li>
+<li><strong>容量预留</strong>：<code>/var/lib/docker</code> 与业务数据盘分离，避免日志写满拖垮数据库。</li>
+</ol>
+<hr>
+<h2 id="九、踩坑实录"><a href="#九、踩坑实录" class="headerlink" title="九、踩坑实录"></a>九、踩坑实录</h2><p><strong>坑 1：容器磁盘满但节点还有空间</strong><br>节点 500G，容器报 ENOSPC。原因是 Docker 的 <code>data-root</code> 单独挂了一块 50G 盘，容器可写层写满。<code>docker info | grep &quot;Docker Root Dir&quot;</code> 一看便知。</p>
+<p><strong>坑 2：日志文件越滚越大，删了也不释放</strong><br>应用 <code>rm</code> 了日志文件但进程还持有 fd，空间不释放；在 overlayfs 上更麻烦，因为上层 whiteout 与下层原文件同时存在，<code>du</code> 和 <code>df</code> 会对不上。用 <code>lsof +L1</code> 找 deleted 文件。</p>
+<p><strong>坑 3：<code>mv</code> 目录导致启动卡 3 分钟</strong><br>启动脚本 <code>mv /data /data.bak</code>，<code>/data</code> 在镜像层有 8 万个小文件，递归 copy-up。改成挂 volume 后启动 4 秒。</p>
+<p><strong>坑 4：容器内存 2.5G 但堆只有 1G</strong><br>page cache 双份 + JVM 堆外。看 <code>memory.stat</code> 的 <code>file</code> 与 <code>anon</code> 分离，<code>file</code> 高不是泄漏。</p>
+<p><strong>坑 5：<code>fsync</code> 变慢导致 Kafka 消费延迟</strong><br>Kafka 容器把 <code>log.dirs</code> 放在可写层，副本写入触发 copy-up + 与镜像层同盘的 IO 竞争。必须挂 local volume。</p>
+<hr>
+<h2 id="十、面试追问"><a href="#十、面试追问" class="headerlink" title="十、面试追问"></a>十、面试追问</h2><p><strong>Q1：overlayfs 的 copy-up 什么时候触发？</strong><br>A：任何会修改下层文件内容或元数据的操作：<code>open</code> 写模式、<code>truncate</code>、<code>chmod</code>、<code>chown</code>、<code>setxattr</code>、<code>rename</code>。删除不复制，而是创建 whiteout。</p>
+<p><strong>Q2：为什么容器里删了文件，磁盘空间没释放？</strong><br>A：删除只是在上层建 whiteout，下层文件仍在；如果进程还持有 fd，inode 也不会释放。另外 whiteout 本身占少量空间。</p>
+<p><strong>Q3：overlayfs 的写放大怎么算？</strong><br>A：写放大 ≈（镜像层文件大小 + 业务写入量）&#x2F; 业务写入量。所以对「已存在的大文件」做小修改，放大倍数可以是几万倍。</p>
+<p><strong>Q4：为什么容器 page cache 会双份？</strong><br>A：copy-up 产生了新的 upper inode，page cache 按 inode 记账，旧 lower inode 的缓存不会立刻失效，两份都被 cgroup 计入 file 页。</p>
+<p><strong>Q5：怎么判断容器慢是存储问题？</strong><br>A：看 <code>io.pressure</code> 的 <code>full</code>、<code>io.stat</code> 的 <code>wbytes</code> 与业务写入量比值、<code>docker ps -s</code> 的可写层增长、以及 <code>bpftrace</code> 抓 <code>ovl_copy_up_one</code>。</p>
+<p><strong>Q6：为什么 rootless 容器更慢？</strong><br>A：常用 <code>fuse-overlayfs</code>，文件操作走用户态 FUSE，每次 syscall 多两次上下文切换；小文件密集场景开销可达 2 倍以上。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>overlayfs 的设计目标是「镜像分层复用 + 快速启动」，它把「写」的代价转移到了第一次修改上。这个代价在无状态服务里几乎无感，但在<strong>日志、缓存、数据库、临时文件</strong>这四类写入面前会被无限放大。</p>
+<p>工程上的解法不是调参，而是<strong>布局</strong>：让可变数据离开可写层。想清楚这一点，容器里的 ENOSPC、启动慢、内存翻倍，大半都能提前避免。</p>
+<p>下一篇换个方向，讲数据库代理层：ProxySQL &#x2F; MySQL Router 如何解决连接数爆炸，以及「连接复用」在事务和 session 变量面前为什么会变成事故。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/14/overlayfs-container-write-amplification-deep-dive/">https://jiweidong.github.io/2026/11/14/overlayfs-container-write-amplification-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/Docker/">Docker</a><a class="post-meta__tags" href="/tags/%E5%AE%B9%E5%99%A8/">容器</a><a class="post-meta__tags" href="/tags/overlayfs/">overlayfs</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/14/mysql-proxysql-router-proxy-layer-deep-dive/" title="【MySQL 中间件】数据库代理层深度解析：ProxySQL 连接复用、读写分离与 MySQL Router 选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 中间件】数据库代理层深度解析：ProxySQL 连接复用、读写分离与 MySQL Router 选型</div></div><div class="info-2"><div class="info-item-1">【MySQL 中间件】数据库代理层深度解析前言单体应用连一个 MySQL，HikariCP 设个 20 连接就够了。但当应用实例扩到 200 个、每个 20 连接，就是 4000 个到数据库的连接——MySQL 每个连接一个线程，上下文切换、内存（thread_stack + net buffer）、table_open_cache 竞争全部上来，Threads_running 一高，RT 直接塌。 常规解法是「加个代理层」，让 4000 个客户端连接复用到 400 个后端连接。但代理层不是插上就完事，它引入了三个新问题：  连接复用（multiplexing）什么时候是安全的？ 事务、session 变量、临时表、prepared statement 全都会让连接被「锁死」。 读写分离的延迟谁负责？ 代理只按规则路由，不保证主从一致。 配置改了为什么不生效？ ProxySQL 有三层配置（disk &#x2F; memory &#x2F; runtime），顺序错了就是白改。  这篇以 ProxySQL 为主线，对照 MySQL Router，把原理、配置、Java 侧协作和踩...</div></div></div></a><a class="pagination-related" href="/2026/11/14/mysql-innodb-tablespace-encryption-tde-deep-dive/" title="【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo/binlog 加密边界与密钥轮换"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo/binlog 加密边界与密钥轮换</div></div><div class="info-2"><div class="info-item-1">【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析前言很多团队做「数据加密」时，第一反应是在应用层给手机号、身份证号加个 AES 字段加密。这能解决一部分问题，但它防的是「库被人拖走之后看不懂数据」，防不住运维人员直接用 SELECT 查、也防不住备份文件被人从对象存储里拉走。 真要做数据静态加密（Data at Rest），落点通常在存储层：InnoDB 表空间加密（TDE，Transparent Data Encryption）。它最大的特点是「透明」——SQL 不用改、索引不用改、Java 代码不用改，页写入磁盘时加密、读入 buffer pool 时解密。 但它有非常多「配了以为就安全了」的坑：keyring 组件没在启动时加载、从库没跟着加密、binlog 和 redo 还是明文、备份工具没带密钥导致恢复失败、密钥轮换以为是重加密数据页。 这篇把 InnoDB TDE 从密钥体系、配置、边界、性能、轮换到 Java 侧巡检讲透。  一、威胁模型：TDE 到底防什么、不防什么先把边界说清楚，否则很容易「合规过了，安全没提升」。    场景 TDE 是否有效 ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/09/linux-pressure-stall-information-psi-deep-dive/" title="【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-09</div><div class="info-item-2">【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地</div></div><div class="info-2"><div class="info-item-1">【性能调优】PSI 压力失速信息深度解析前言：那个”CPU 只用了 35%，但 P99 抖到 800ms”的下午先说一个真实场景。线上支付服务，8 核容器，CPU 使用率稳定在 30%40%，JVM GC 日志干净（Young GC 30ms 一次，一天没有 Full GC），但每天下午三点和晚上八点，接口 P99 从 60ms 飙升到 700900ms，且抖动持续 10~20 分钟。查 JVM 什么都查不到，查应用日志只能看到”耗时变长”，查业务代码没有慢查询。 最后定位到的答案是：宿主机上另一台虚拟机的备份任务在猛写磁盘，导致这个容器的脏页回写排队，Java 线程在做任何有磁盘&#x2F;内存分配的路径上被内核 block 住了。JVM 完全不知道自己被 block 了——因为在 JVM 看来，那只是一次”有点慢的系统调用”。 这就是传统观测体系的盲区：top 告诉你 CPU 不满，vmstat 告诉你 wa 高，但”到底有多少任务被卡住了、卡了多久、卡在哪个资源上”,这些指标回答不了。Linux 4.20 引入的 PSI（Pressure Stall Information...</div></div></div></a><a class="pagination-related" href="/2026/11/05/numa-aware-jvm-performance-tuning-deep-dive/" title="【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-05</div><div class="info-item-2">【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战</div></div><div class="info-2"><div class="info-item-1">【JVM 性能】NUMA 架构与 JVM 调优深度解析前言一个很典型的线上怪象：两台机器，A 是 32 核 128G 单路，B 是 2×64 核 512G 双路。压测同一个 Spring Boot 服务，B 的 CPU 利用率上不去，P99 反而比 A 慢 30%，GC 次数还更多。 很多人第一反应是「GC 参数没调好」「线程池太小」，把 -Xmx、-XX:ParallelGCThreads、Tomcat 线程数全试了一遍，收益甚微。真实原因往往藏在 CPU 和内存的物理拓扑里——这台机器是 NUMA 架构，而 JVM 默认并不知道这件事。 这篇文章把 NUMA 的原理、JVM 在 NUMA 上的真实行为、四种落地方案、容器里的坑，以及面试会怎么问，一次讲清楚。  一、NUMA 到底是什么1.1 从 SMP 到 NUMA早期多核 server 是 SMP（Symmetric Multiprocessing）：所有 CPU 通过一条前端总线访问同一块内存，任意核访问任意内存地址的延迟都一样（UMA）。 核数一多，总线就成了瓶颈。于是有了 NUMA（Non-Uniform Memor...</div></div></div></a><a class="pagination-related" href="/2026/11/12/linux-memory-reclaim-watermark-kswapd-deep-dive/" title="【性能调优】Linux 内存回收与水位线深度解析：kswapd、direct reclaim 与容器 OOM 归因"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-12</div><div class="info-item-2">【性能调优】Linux 内存回收与水位线深度解析：kswapd、direct reclaim 与容器 OOM 归因</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux 内存回收与水位线深度解析：kswapd、direct reclaim 与容器 OOM 归因前言两个经典现场：  机器 free -m 显示 available 还有 200MB，但 Java 服务的 TP99 突然从 30ms 飙到 800ms，日志里没有任何异常。 Pod 的 memory.limit 是 4Gi，memory.current 只有 3.2Gi，容器却被 OOMKilled 了。  两个现象都与”内存还够不够”的判断逻辑有关。Linux 判断内存压力的依据不是”剩余多少”，而是相对于三条水位线（watermark）的位置；容器的判断依据也不是 memory.current，而是回收失败后的 charge 失败。 本文讲清楚 zone 水位线、kswapd 与 direct reclaim 的触发链路、cgroup v2 的回收语义，最后给出 Java 服务的调优参数与归因清单。  一、三条水位线：zone 的”红黄绿”每个 NUMA node 下的每个 zone（DMA&#x2F;DMA32&#x2F;Normal&#x2F;Movabl...</div></div></div></a><a class="pagination-related" href="/2026/11/10/linux-file-descriptor-exhaustion-java-deep-dive/" title="【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-10</div><div class="info-item-2">【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算</div></div><div class="info-2"><div class="info-item-1">【性能调优】文件描述符耗尽深度治理前言java.io.IOException: Too many open files 这个异常，几乎每个 Java 工程师都在某次深夜告警里见过。它的迷惑性在于：代码看起来没问题，连接池也配了上限，但 fd 就是一直涨。 更麻烦的是，它的表现形式千奇百怪：  接口偶发 500，重启就好，过几天再犯 accept 失败但 connect 正常（新连接进不来，老连接还在用） 日志突然不写了（logback 打不开新文件） 明明 lsof 只有 3000 个 fd，ulimit -n 是 65535，却还是报错  这篇把 fd 从内核数据结构讲到 Java 侧泄漏点，给一套能在 5 分钟内定位到具体泄漏源的排查方法论，最后给容量估算公式。  一、fd 到底是什么：三层配额先建立一个模型。一个进程能打开多少文件，受三层限制，任何一层撞墙都会报 EMFILE 或 ENFILE：    层级 限制项 查看方式 超出后果    进程级（soft） RLIMIT_NOFILE ulimit -Sn &#x2F; cat /proc/&lt;pid&gt;/lim...</div></div></div></a><a class="pagination-related" href="/2026/11/11/linux-transparent-hugepage-jvm-deep-dive/" title="【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-11</div><div class="info-item-2">【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置</div></div><div class="info-2"><div class="info-item-1">【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置前言有一个很典型的线上现象：Java 服务 CPU、GC、QPS 全部正常，但 P99.9 每隔几十秒就冒出一个 200~800ms 的尖刺；抓 GC 日志没有长停顿，抓线程栈也看不到锁竞争，iostat 只有轻微波动。最后发现是宿主机 transparent_hugepage/enabled=always，khugepaged 在后台做页合并时抢了内存管理锁。 THP（Transparent Huge Pages）是一个”看起来只有收益、实际上经常带来延迟抖动”的内核特性。它对 JVM 的影响有三个层面：TLB 命中率（性能收益）、内存分配路径（compact 与 direct reclaim）、以及容器环境下的 RSS 计量与 OOM 判定。本文把这三点拆开讲清楚，并给出一套可验证的配置与观测方法。  一、为什么需要大页：TLB 与页表走查x86-64 默认页大小 4KB，虚拟地址到物理地址的翻译靠页表，页表项缓存就是 TLB：    页大小 覆盖 8GB 堆所需页数 TLB 条目需...</div></div></div></a><a class="pagination-related" href="/2026/11/04/linux-page-cache-java-file-io-deep-dive/" title="【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-04</div><div class="info-item-2">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析前言一个很典型的现象：Java 服务写日志&#x2F;写文件，代码里 fileChannel.write() 返回成功、耗时 0.1ms，看起来磁盘快得离谱；但某天机器内存紧张，同一个写入突然变成 20ms，甚至出现大量 kswapd CPU 占用。 还有人问：FileOutputStream.write() 之后数据到底在哪？flush() 和 fsync() 有什么区别？为什么用 BufferedOutputStream 快 10 倍，但数据丢了？为什么 Kafka 号称”用页缓存所以快”，而 MySQL 却要自己管 buffer pool？ 这些问题的答案都在同一层：Linux Page Cache（页缓存）。这篇从内核机制讲到 Java API 语义，把”写文件”这件事彻底拆开。  一、Page Cache 是什么：内核的”第二层内存”1.1 一切皆页Linux 用 4KB 的页（page）管理物理内存，Page Cache 就是文件内容在内存中的副本，以 struct page 组织，用 a...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">922</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1028</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E3%80%91overlayfs-%E4%B8%8E%E5%AE%B9%E5%99%A8%E5%86%99%E6%94%BE%E5%A4%A7%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【性能调优】overlayfs 与容器写放大深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81overlay2-%E7%9A%84%E5%9B%9B%E5%B1%82%E7%BB%93%E6%9E%84"><span class="toc-number">1.2.</span> <span class="toc-text">一、overlay2 的四层结构</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81copy-up-%E7%9A%84%E5%9B%9B%E4%B8%AA%E8%A7%A6%E5%8F%91%E6%9D%A1%E4%BB%B6%EF%BC%88%E6%AF%94%E4%BD%A0%E6%83%B3%E7%9A%84%E5%A4%9A%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、copy-up 的四个触发条件（比你想的多）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%86%99%E6%94%BE%E5%A4%A7%E5%88%B0%E5%BA%95%E6%94%BE%E5%A4%A7%E5%A4%9A%E5%B0%91"><span class="toc-number">1.4.</span> <span class="toc-text">三、写放大到底放大多少</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E7%9B%AE%E5%BD%95-rename-%E7%9A%84%E9%9A%90%E8%97%8F%E6%94%BE%E5%A4%A7"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 目录 rename 的隐藏放大</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81page-cache-%E5%8F%8C%E4%BB%BD%EF%BC%9A%E5%86%85%E5%AD%98%E8%AE%B0%E8%B4%A6%E7%BF%BB%E5%80%8D%E7%9A%84%E7%9C%9F%E7%9B%B8"><span class="toc-number">1.5.</span> <span class="toc-text">四、page cache 双份：内存记账翻倍的真相</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E8%A7%82%E6%B5%8B%EF%BC%9A%E4%BA%94%E6%9D%A1%E5%91%BD%E4%BB%A4%E5%AE%9A%E4%BD%8D%E5%86%99%E6%94%BE%E5%A4%A7"><span class="toc-number">1.6.</span> <span class="toc-text">五、观测：五条命令定位写放大</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E5%AE%B9%E5%99%A8%E5%8F%AF%E5%86%99%E5%B1%82%E6%9C%89%E5%A4%9A%E5%A4%A7"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 容器可写层有多大</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E8%B0%81%E5%9C%A8%E5%86%99"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 谁在写</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-cgroup-v2-%E7%9A%84-IO-%E8%AE%B0%E8%B4%A6"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 cgroup v2 的 IO 记账</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E7%A1%AE%E8%AE%A4%E6%8C%82%E8%BD%BD%E7%B1%BB%E5%9E%8B"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 确认挂载类型</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-5-%E7%94%A8-bpftrace-%E6%8A%93-copy-up%EF%BC%88%E5%86%85%E6%A0%B8-5-x-%E6%94%AF%E6%8C%81-BTF%EF%BC%89"><span class="toc-number">1.6.5.</span> <span class="toc-text">5.5 用 bpftrace 抓 copy-up（内核 5.x + 支持 BTF）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E5%BA%94%E7%94%A8%E4%B8%BA%E4%BB%80%E4%B9%88%E7%89%B9%E5%88%AB%E5%AE%B9%E6%98%93%E8%B8%A9"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 应用为什么特别容易踩</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E4%B8%80%E4%B8%AA%E5%90%AF%E5%8A%A8%E8%87%AA%E6%A3%80%EF%BC%9A%E6%97%A5%E5%BF%97%E7%9B%AE%E5%BD%95%E6%98%AF%E4%B8%8D%E6%98%AF%E5%8F%AF%E5%86%99%E5%B1%82"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 一个启动自检：日志目录是不是可写层</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E6%97%A5%E5%BF%97%E5%86%99%E5%85%A5%E7%9A%84%E6%AD%A3%E7%A1%AE%E5%A7%BF%E5%8A%BF"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 日志写入的正确姿势</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81fuse-overlayfs-rootless%EF%BC%9A%E9%A2%9D%E5%A4%96%E4%B8%80%E5%B1%82%E7%A8%8E"><span class="toc-number">1.8.</span> <span class="toc-text">七、fuse-overlayfs &#x2F; rootless：额外一层税</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%B2%BB%E7%90%86%E6%B8%85%E5%8D%95%EF%BC%9A%E6%8A%8A%E5%86%99%E6%94%BE%E5%A4%A7%E6%8C%89%E6%AD%BB%E5%9C%A8%E8%AE%BE%E8%AE%A1%E9%98%B6%E6%AE%B5"><span class="toc-number">1.9.</span> <span class="toc-text">八、治理清单：把写放大按死在设计阶段</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E8%B8%A9%E5%9D%91%E5%AE%9E%E5%BD%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、踩坑实录</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.11.</span> <span class="toc-text">十、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.12.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/" title="【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划">【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划</a><time datetime="2026-11-14T00:50:00.000Z" title="发表于 2026-11-14 08:50:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/java-colbert-late-interaction-retrieval-deep-practice/" title="【Java AI】ColBERT 与 late interaction 检索深度实战：token 级向量、MaxSim 与 Java 侧落地">【Java AI】ColBERT 与 late interaction 检索深度实战：token 级向量、MaxSim 与 Java 侧落地</a><time datetime="2026-11-14T00:40:00.000Z" title="发表于 2026-11-14 08:40:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/mysql-proxysql-router-proxy-layer-deep-dive/" title="【MySQL 中间件】数据库代理层深度解析：ProxySQL 连接复用、读写分离与 MySQL Router 选型">【MySQL 中间件】数据库代理层深度解析：ProxySQL 连接复用、读写分离与 MySQL Router 选型</a><time datetime="2026-11-14T00:30:00.000Z" title="发表于 2026-11-14 08:30:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/overlayfs-container-write-amplification-deep-dive/" title="【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因">【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因</a><time datetime="2026-11-14T00:20:00.000Z" title="发表于 2026-11-14 08:20:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/mysql-innodb-tablespace-encryption-tde-deep-dive/" title="【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo/binlog 加密边界与密钥轮换">【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo/binlog 加密边界与密钥轮换</a><time datetime="2026-11-14T00:10:00.000Z" title="发表于 2026-11-14 08:10:00">2026-11-14</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

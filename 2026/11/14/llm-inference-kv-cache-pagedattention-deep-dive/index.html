@@ -1,0 +1,598 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【AI 体系】KV Cache 与 PagedAttention 深度解析前言很多人算「一台机器能扛多少并发」时，算法是： 12显存 80G - 模型权重 16G &#x3D; 64G 可用每个请求上下文 8k，好像能跑很多个？  然后上线发现并发到 20 就开始排队、OOM、请求被拒。 问题出在：大模型推理的显存大头不是权重，而是 KV Cache。它跟「上下文长度 × 并发数」线性相关，而这两者都是业务">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【AI 体系】KV Cache 与 PagedAttention 深度解析前言很多人算「一台机器能扛多少并发」时，算法是： 12显存 80G - 模型权重 16G &#x3D; 64G 可用每个请求上下文 8k，好像能跑很多个？  然后上线发现并发到 20 就开始排队、OOM、请求被拒。 问题出在：大模型推理的显存大头不是权重，而是 KV Cache。它跟「上下文长度 × 并发数」线性相关，而这两者都是业务">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-14T00:50:00.000Z">
+<meta property="article:modified_time" content="2026-11-14T00:04:17.534Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="AI">
+<meta property="article:tag" content="LLM">
+<meta property="article:tag" content="vLLM">
+<meta property="article:tag" content="推理优化">
+<meta property="article:tag" content="显存">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划",
+  "url": "https://jiweidong.github.io/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-14T00:50:00.000Z",
+  "dateModified": "2026-11-14T00:04:17.534Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">922</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1028</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-14T00:50:00.000Z" title="发表于 2026-11-14 08:50:00">2026-11-14</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-14T00:04:17.534Z" title="更新于 2026-11-14 08:04:17">2026-11-14</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/AI-%E5%B7%A5%E7%A8%8B/">AI 工程</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【AI-体系】KV-Cache-与-PagedAttention-深度解析"><a href="#【AI-体系】KV-Cache-与-PagedAttention-深度解析" class="headerlink" title="【AI 体系】KV Cache 与 PagedAttention 深度解析"></a>【AI 体系】KV Cache 与 PagedAttention 深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>很多人算「一台机器能扛多少并发」时，算法是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">显存 80G - 模型权重 16G = 64G 可用</span><br><span class="line">每个请求上下文 8k，好像能跑很多个？</span><br></pre></td></tr></table></figure>
+
+<p>然后上线发现并发到 20 就开始排队、OOM、请求被拒。</p>
+<p>问题出在：<strong>大模型推理的显存大头不是权重，而是 KV Cache</strong>。它跟「上下文长度 × 并发数」线性相关，而这两者都是业务侧不断往上加的参数。</p>
+<p>这篇把 KV Cache 的显存账、PagedAttention 的分页思想、prefix caching 的工程价值讲清楚，最后给一套 Java 侧可用的容量规划模型和准入控制代码。</p>
+<hr>
+<h2 id="一、为什么-decode-阶段是-memory-bound"><a href="#一、为什么-decode-阶段是-memory-bound" class="headerlink" title="一、为什么 decode 阶段是 memory-bound"></a>一、为什么 decode 阶段是 memory-bound</h2><p>Transformer 推理分两段：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>计算</th>
+<th>瓶颈</th>
+<th>指标</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Prefill</td>
+<td>一次性处理整个 prompt，矩阵乘</td>
+<td>算力（compute-bound）</td>
+<td>TTFT（首 token 延迟）</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>逐 token 生成，每步一个矩阵乘</td>
+<td><strong>显存带宽（memory-bound）</strong></td>
+<td>TPOT（每 token 延迟）</td>
+</tr>
+</tbody></table>
+<p>Decode 每一步都要把模型权重从 HBM 读一遍（8B 模型 fp16 &#x3D; 16GB），但只做一次「1×d @ d×d」的乘法——算力利用率极低。所以 decode 的速度基本由显存带宽决定：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">TPOT ≈ 模型权重字节数 / 显存带宽</span><br></pre></td></tr></table></figure>
+
+<p>A100 80G 带宽 2TB&#x2F;s，8B fp16 权重 16GB → 理论 8ms&#x2F;token。这也是为什么量化（fp8&#x2F;int4）能直接提速——权重变小，读得就快。</p>
+<p>而 <strong>KV Cache 占的是显存容量，不是带宽</strong>。它决定了「同时能装下多少个请求」，也就是并发上限。</p>
+<hr>
+<h2 id="二、KV-Cache-显存公式"><a href="#二、KV-Cache-显存公式" class="headerlink" title="二、KV Cache 显存公式"></a>二、KV Cache 显存公式</h2><p>每个 token 的 KV Cache 大小：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">bytes_per_token = 2 × n_layers × n_kv_heads × head_dim × bytes_per_elem</span><br><span class="line">                  ↑ K 和 V 各一份</span><br></pre></td></tr></table></figure>
+
+<p>以 Llama-3-8B 为例（32 层、GQA 8 个 KV 头、head_dim 128、fp16）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">2 × 32 × 8 × 128 × 2 = 131,072 B = 128 KB / token</span><br></pre></td></tr></table></figure>
+
+<p>于是：</p>
+<table>
+<thead>
+<tr>
+<th>上下文长度</th>
+<th>单请求 KV Cache</th>
+<th>32 并发</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>2k</td>
+<td>256 MB</td>
+<td>8 GB</td>
+</tr>
+<tr>
+<td>8k</td>
+<td>1 GB</td>
+<td>32 GB</td>
+</tr>
+<tr>
+<td>32k</td>
+<td>4 GB</td>
+<td>128 GB（爆）</td>
+</tr>
+<tr>
+<td>128k</td>
+<td>16 GB</td>
+<td>512 GB（想都别想）</td>
+</tr>
+</tbody></table>
+<p>对比 MHA（32 个 KV 头，不共享）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">2 × 32 × 32 × 128 × 2 = 512 KB / token   → 8k 上下文 4 GB/请求</span><br></pre></td></tr></table></figure>
+
+<p><strong>GQA&#x2F;MQA 的价值就在这里</strong>：KV 头从 32 降到 8，KV Cache 直接降到 1&#x2F;4。这也是为什么现在的开源模型几乎都用 GQA。</p>
+<h3 id="2-1-完整的显存预算表"><a href="#2-1-完整的显存预算表" class="headerlink" title="2.1 完整的显存预算表"></a>2.1 完整的显存预算表</h3><table>
+<thead>
+<tr>
+<th>组成</th>
+<th>8B 模型（A100 80G）</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>模型权重</td>
+<td>16 GB（fp16）</td>
+<td>固定</td>
+</tr>
+<tr>
+<td>激活值 &#x2F; 临时 buffer</td>
+<td>2~4 GB</td>
+<td>与 batch、序列长度相关</td>
+</tr>
+<tr>
+<td>CUDA context &#x2F; 碎片</td>
+<td>2~3 GB</td>
+<td>固定开销</td>
+</tr>
+<tr>
+<td><strong>KV Cache 可用</strong></td>
+<td><strong>~55 GB</strong></td>
+<td>剩下的才是并发空间</td>
+</tr>
+</tbody></table>
+<p>按 8k 上下文、128 KB&#x2F;token：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">55 GB / 1 GB ≈ 55 并发</span><br></pre></td></tr></table></figure>
+
+<p>这就是真实答案：<strong>80G 卡跑 8B 模型、8k 上下文，并发 50 左右</strong>，不是几百。</p>
+<hr>
+<h2 id="三、朴素-KV-Cache-的三个浪费"><a href="#三、朴素-KV-Cache-的三个浪费" class="headerlink" title="三、朴素 KV Cache 的三个浪费"></a>三、朴素 KV Cache 的三个浪费</h2><p>如果实现方式是「按 <code>max_seq_len</code> 预分配连续显存」：</p>
+<figure class="highlight python"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 伪代码：每个请求预分配 max_len 的 KV 空间</span></span><br><span class="line">kv = torch.empty(batch, <span class="number">2</span>, layers, kv_heads, max_len, head_dim)</span><br></pre></td></tr></table></figure>
+
+<p>会有三类浪费：</p>
+<table>
+<thead>
+<tr>
+<th>浪费类型</th>
+<th>成因</th>
+<th>量级</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>内部碎片</strong>（reserved &gt; used）</td>
+<td>预分配 max_len，实际只用了 200 token</td>
+<td>极大，常见 60%~80%</td>
+</tr>
+<tr>
+<td><strong>外部碎片</strong></td>
+<td>不同长度请求反复分配&#x2F;释放，留下空洞</td>
+<td>中</td>
+</tr>
+<tr>
+<td><strong>无法共享</strong></td>
+<td>相同前缀（system prompt）也不能复用</td>
+<td>中~大</td>
+</tr>
+</tbody></table>
+<p>vLLM 的论文里给的数据是：朴素方案只有 <strong>20%~40%</strong> 的 KV 显存真正存了有效 token，其余全是浪费。</p>
+<hr>
+<h2 id="四、PagedAttention：把虚拟内存思想搬到显存"><a href="#四、PagedAttention：把虚拟内存思想搬到显存" class="headerlink" title="四、PagedAttention：把虚拟内存思想搬到显存"></a>四、PagedAttention：把虚拟内存思想搬到显存</h2><p>核心思想一句话：<strong>KV Cache 不连续分配，切成固定大小的 block，用 block table 做映射。</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">逻辑序列（请求视角）:</span><br><span class="line">  block 0      block 1      block 2</span><br><span class="line">  [t0..t15]    [t16..t31]   [t32..t40]</span><br><span class="line"></span><br><span class="line">block table（每个请求一张）:</span><br><span class="line">  logical 0 → physical 7</span><br><span class="line">  logical 1 → physical 2</span><br><span class="line">  logical 2 → physical 19</span><br><span class="line"></span><br><span class="line">物理显存池:</span><br><span class="line">  [0][1][2: t16..t31][3]...[7: t0..t15]...[19: t32..t40]</span><br></pre></td></tr></table></figure>
+
+<p>好处：</p>
+<ol>
+<li><strong>内部碎片只剩最后一个 block</strong>（block&#x3D;16 token，最多浪费 15 个 token 的空间）；</li>
+<li><strong>无外部碎片</strong>：所有 block 等大，分配器就是空闲链表；</li>
+<li><strong>可共享</strong>：相同前缀的请求指向同一批物理 block，引用计数 + copy-on-write。</li>
+</ol>
+<p>vLLM 实测：显存浪费从 60%<del>80% 降到 <strong>4% 以下</strong>，吞吐提升 2</del>4 倍。</p>
+<h3 id="4-1-Copy-on-Write：并行采样和-beam-search-的救星"><a href="#4-1-Copy-on-Write：并行采样和-beam-search-的救星" class="headerlink" title="4.1 Copy-on-Write：并行采样和 beam search 的救星"></a>4.1 Copy-on-Write：并行采样和 beam search 的救星</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">请求 A: system prompt (block 0,1) + user question (block 2)</span><br><span class="line">请求 B: 同一 system prompt，不同 question → 共享 block 0,1</span><br><span class="line"></span><br><span class="line">采样出 3 个候选（n=3）:</span><br><span class="line">  三个分支共享 prompt 的 block，</span><br><span class="line">  只有新生成的 token 需要各自分配新 block</span><br></pre></td></tr></table></figure>
+
+<p>没有 CoW 时，3 个候选要复制 3 份 prompt 的 KV；有了 CoW，只多出生成部分的 block。论文里 beam search 场景节省 <strong>55%</strong> 显存。</p>
+<h3 id="4-2-调度：continuous-batching-chunked-prefill"><a href="#4-2-调度：continuous-batching-chunked-prefill" class="headerlink" title="4.2 调度：continuous batching + chunked prefill"></a>4.2 调度：continuous batching + chunked prefill</h3><p>PagedAttention 只是「存储层」，真正让吞吐起飞的是「调度层」：</p>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Continuous batching</td>
+<td>请求完成即退出 batch，新请求立刻加入，不等整批结束</td>
+</tr>
+<tr>
+<td>Chunked prefill</td>
+<td>长 prompt 切成多块，和 decode 混跑，避免长请求阻塞短请求</td>
+</tr>
+<tr>
+<td>Preemption</td>
+<td>显存不够时，抢占低优先级请求（swap 到 CPU 或直接丢弃重算）</td>
+</tr>
+</tbody></table>
+<p>一个常见现象：<strong>P99 TTFT 抖动</strong>，往往是长 prompt 的 prefill 把 decode 挤住了。开 chunked prefill，把 prefill 切小，能让 TPOT 稳定，代价是长请求 TTFT 略升。</p>
+<hr>
+<h2 id="五、Prefix-Caching：多轮对话的免费加速"><a href="#五、Prefix-Caching：多轮对话的免费加速" class="headerlink" title="五、Prefix Caching：多轮对话的免费加速"></a>五、Prefix Caching：多轮对话的免费加速</h2><p>如果两个请求的前缀完全相同（同一个 system prompt、同一段 RAG 上下文），它们的 KV 可以完全复用。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">请求 1: [system 2000 token][user Q1]</span><br><span class="line">请求 2: [system 2000 token][user Q2]</span><br><span class="line">         └── 这 2000 token 的 KV 可复用</span><br></pre></td></tr></table></figure>
+
+<p>收益：</p>
+<ul>
+<li><strong>TTFT 大幅下降</strong>：省掉 2000 token 的 prefill；</li>
+<li><strong>显存更省</strong>：共享 block。</li>
+</ul>
+<p>工程要点：</p>
+<ol>
+<li><strong>前缀必须完全一致</strong>（逐 token 相同）。差一个空格、差一个时间戳，缓存就失效。</li>
+<li><strong>静态内容放前面</strong>：system prompt、工具定义、few-shot 示例放最前，用户输入放最后。</li>
+<li><strong>路由亲和</strong>：多副本部署时，同一会话要打到同一副本才能命中缓存（一致性哈希 &#x2F; session affinity）。</li>
+<li><strong>安全隔离</strong>：缓存不能跨租户共享，否则可能通过「前缀命中时间差」推断其他租户的内容。生产上按 tenant id 做命名空间。</li>
+<li><strong>TTL 与淘汰</strong>：LRU 为主，注意长尾租户把缓存挤掉。</li>
+</ol>
+<h3 id="5-1-与云-API-的-prompt-caching-对应"><a href="#5-1-与云-API-的-prompt-caching-对应" class="headerlink" title="5.1 与云 API 的 prompt caching 对应"></a>5.1 与云 API 的 prompt caching 对应</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>自建（vLLM&#x2F;SGLang）</th>
+<th>云 API</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>命中条件</td>
+<td>前缀 token 完全一致</td>
+<td>通常有最小 token 数（如 1024）</td>
+</tr>
+<tr>
+<td>计费</td>
+<td>省算力</td>
+<td>缓存写入贵、命中读便宜</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>自己定</td>
+<td>通常 5~60 分钟</td>
+</tr>
+<tr>
+<td>控制粒度</td>
+<td>block 级</td>
+<td>请求级</td>
+</tr>
+</tbody></table>
+<p>云 API 的「缓存写入」是有成本的，所以<strong>只在同一前缀会被复用多次时才值得</strong>。一次性请求加 cache 标记反而更贵。</p>
+<hr>
+<h2 id="六、KV-Cache-量化：再省一半"><a href="#六、KV-Cache-量化：再省一半" class="headerlink" title="六、KV Cache 量化：再省一半"></a>六、KV Cache 量化：再省一半</h2><table>
+<thead>
+<tr>
+<th>精度</th>
+<th>每 token</th>
+<th>相对 fp16</th>
+<th>质量影响</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>FP16</td>
+<td>128 KB</td>
+<td>1x</td>
+<td>基线</td>
+</tr>
+<tr>
+<td>FP8</td>
+<td>64 KB</td>
+<td>0.5x</td>
+<td>很小</td>
+</tr>
+<tr>
+<td>INT8</td>
+<td>64 KB</td>
+<td>0.5x</td>
+<td>小（需 per-channel scale）</td>
+</tr>
+<tr>
+<td>INT4</td>
+<td>32 KB</td>
+<td>0.25x</td>
+<td>明显，长上下文更敏感</td>
+</tr>
+</tbody></table>
+<p>注意：<strong>KV 量化和权重量化是两件事</strong>。权重 INT4 + KV FP16 很常见；KV 也压到 INT4 时，长上下文的任务（如多跳推理）质量下降会更明显。上线前按任务类型分别评测。</p>
+<hr>
+<h2 id="七、Java-侧：容量规划与准入控制"><a href="#七、Java-侧：容量规划与准入控制" class="headerlink" title="七、Java 侧：容量规划与准入控制"></a>七、Java 侧：容量规划与准入控制</h2><p>Java 应用通常不直接跑推理（推理服务是 Python&#x2F;C++），但<strong>必须为自己的调用做容量规划</strong>，否则上游一限流，业务就是一片超时。</p>
+<h3 id="7-1-一个容量计算器"><a href="#7-1-一个容量计算器" class="headerlink" title="7.1 一个容量计算器"></a>7.1 一个容量计算器</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">ModelSpec</span><span class="params">(</span></span><br><span class="line"><span class="params">        <span class="type">int</span> layers,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> kvHeads,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> headDim,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> bytesPerElem,   // fp16=2, fp8=1</span></span><br><span class="line"><span class="params">        <span class="type">long</span> weightBytes</span></span><br><span class="line"><span class="params">)</span> &#123;</span><br><span class="line">    <span class="comment">/** 每 token KV Cache 字节数 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">long</span> <span class="title function_">kvBytesPerToken</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="number">2L</span> * layers * kvHeads * headDim * bytesPerElem;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">Capacity</span><span class="params">(</span></span><br><span class="line"><span class="params">        <span class="type">int</span> maxConcurrency,</span></span><br><span class="line"><span class="params">        <span class="type">int</span> recommendedConcurrency,</span></span><br><span class="line"><span class="params">        <span class="type">double</span> kvUtilization</span></span><br><span class="line"><span class="params">)</span> &#123;&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">KvCapacityPlanner</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/**</span></span><br><span class="line"><span class="comment">     * <span class="doctag">@param</span> gpuMemBytes   单卡显存（如 80GB）</span></span><br><span class="line"><span class="comment">     * <span class="doctag">@param</span> reservedBytes 激活值 + CUDA context + 碎片预留</span></span><br><span class="line"><span class="comment">     * <span class="doctag">@param</span> ctxTokens     业务约定的最大上下文</span></span><br><span class="line"><span class="comment">     * <span class="doctag">@param</span> safetyFactor  安全系数（建议 0.8）</span></span><br><span class="line"><span class="comment">     */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> Capacity <span class="title function_">plan</span><span class="params">(ModelSpec spec, <span class="type">long</span> gpuMemBytes, <span class="type">long</span> reservedBytes,</span></span><br><span class="line"><span class="params">                                <span class="type">int</span> ctxTokens, <span class="type">double</span> safetyFactor)</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">kvBudget</span> <span class="operator">=</span> (<span class="type">long</span>) ((gpuMemBytes - spec.weightBytes() - reservedBytes) * safetyFactor);</span><br><span class="line">        <span class="keyword">if</span> (kvBudget &lt;= <span class="number">0</span>) <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;显存不足以容纳模型&quot;</span>);</span><br><span class="line"></span><br><span class="line">        <span class="type">long</span> <span class="variable">perReq</span> <span class="operator">=</span> spec.kvBytesPerToken() * ctxTokens;</span><br><span class="line">        <span class="type">int</span> <span class="variable">max</span> <span class="operator">=</span> (<span class="type">int</span>) (kvBudget / perReq);</span><br><span class="line"></span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">Capacity</span>(</span><br><span class="line">                max,</span><br><span class="line">                Math.max(<span class="number">1</span>, (<span class="type">int</span>) (max * <span class="number">0.8</span>)),   <span class="comment">// 留 20% 余量给突发</span></span><br><span class="line">                (<span class="type">double</span>) perReq * max / kvBudget</span><br><span class="line">        );</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> &#123;</span><br><span class="line">        <span class="comment">// Llama-3-8B, 80GB, 8k 上下文</span></span><br><span class="line">        <span class="type">ModelSpec</span> <span class="variable">llama3_8b</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ModelSpec</span>(<span class="number">32</span>, <span class="number">8</span>, <span class="number">128</span>, <span class="number">2</span>, <span class="number">16L</span> &lt;&lt; <span class="number">30</span>);</span><br><span class="line">        <span class="type">Capacity</span> <span class="variable">c</span> <span class="operator">=</span> plan(llama3_8b, <span class="number">80L</span> &lt;&lt; <span class="number">30</span>, <span class="number">6L</span> &lt;&lt; <span class="number">30</span>, <span class="number">8192</span>, <span class="number">0.85</span>);</span><br><span class="line">        System.out.printf(<span class="string">&quot;max=%d, recommended=%d, util=%.2f%n&quot;</span>,</span><br><span class="line">                c.maxConcurrency(), c.recommendedConcurrency(), c.kvUtilization());</span><br><span class="line">        <span class="comment">// 输出：max=46, recommended=36, util=1.00（kvBudget 已乘安全系数）</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这段代码可以直接放进配置中心，按「模型 + 卡型 + 上下文」自动算出每个副本的并发上限，避免拍脑袋。</p>
+<h3 id="7-2-准入控制：用信号量而不是线程池"><a href="#7-2-准入控制：用信号量而不是线程池" class="headerlink" title="7.2 准入控制：用信号量而不是线程池"></a>7.2 准入控制：用信号量而不是线程池</h3><p>推理服务的瓶颈是 KV 显存，不是 Java 线程。所以限流要按「在途 token 预算」而不是「请求数」：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">LlmAdmissionController</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Semaphore slots;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">int</span> maxTokensPerRequest;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">AtomicLong</span> <span class="variable">inflightTokens</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">AtomicLong</span>();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">LlmAdmissionController</span><span class="params">(LlmCapacityProperties props)</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.slots = <span class="keyword">new</span> <span class="title class_">Semaphore</span>(props.getRecommendedConcurrency(), <span class="literal">true</span>);</span><br><span class="line">        <span class="built_in">this</span>.maxTokensPerRequest = props.getMaxContextTokens();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> &lt;T&gt; T <span class="title function_">call</span><span class="params">(<span class="type">long</span> estimatedTokens, Supplier&lt;T&gt; task)</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (estimatedTokens &gt; maxTokensPerRequest) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalArgumentException</span>(<span class="string">&quot;prompt 超出上下文预算: &quot;</span> + estimatedTokens);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">if</span> (!slots.tryAcquire()) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">RejectedExecutionException</span>(<span class="string">&quot;推理并发已满，请稍后重试&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            inflightTokens.addAndGet(estimatedTokens);</span><br><span class="line">            <span class="keyword">return</span> task.get();</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            inflightTokens.addAndGet(-estimatedTokens);</span><br><span class="line">            slots.release();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 给监控用：当前在途 token 占预算比例 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">double</span> <span class="title function_">pressure</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> (<span class="type">double</span>) inflightTokens.get() / ((<span class="type">long</span>) slots.availablePermits() + inflightTokens.get());</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>更精细的做法是按 tenant 分配配额（比如大客户 40%、普通 60%），避免一个大客户把并发吃光。</p>
+<h3 id="7-3-必须观测的五个指标"><a href="#7-3-必须观测的五个指标" class="headerlink" title="7.3 必须观测的五个指标"></a>7.3 必须观测的五个指标</h3><table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>告警阈值参考</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>TTFT</code> P95</td>
+<td>首 token 延迟</td>
+<td>&gt; 2s</td>
+</tr>
+<tr>
+<td><code>TPOT</code> P95</td>
+<td>每 token 延迟</td>
+<td>&gt; 80ms（流式体验）</td>
+</tr>
+<tr>
+<td><code>queue_depth</code></td>
+<td>排队请求数</td>
+<td>持续 &gt; 并发上限的 20%</td>
+</tr>
+<tr>
+<td><code>kv_cache_hit_rate</code></td>
+<td>prefix 命中率</td>
+<td>多轮场景 &lt; 50% 要查</td>
+</tr>
+<tr>
+<td><code>preempted_requests</code></td>
+<td>被抢占数</td>
+<td>持续 &gt; 0 说明显存不足</td>
+</tr>
+</tbody></table>
+<p>推理服务（vLLM）暴露 <code>/metrics</code>，Java 侧用 Micrometer 抓取后统一告警即可。</p>
+<hr>
+<h2 id="八、自建-vs-云-API：一张决策表"><a href="#八、自建-vs-云-API：一张决策表" class="headerlink" title="八、自建 vs 云 API：一张决策表"></a>八、自建 vs 云 API：一张决策表</h2><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>自建推理（vLLM&#x2F;SGLang）</th>
+<th>云 API</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>固定成本</td>
+<td>GPU 租金（高）</td>
+<td>0</td>
+</tr>
+<tr>
+<td>边际成本</td>
+<td>低（跑满时）</td>
+<td>高（按 token）</td>
+</tr>
+<tr>
+<td>冷启动</td>
+<td>模型加载几十秒~分钟</td>
+<td>无</td>
+</tr>
+<tr>
+<td>并发弹性</td>
+<td>受显存限制，扩副本慢</td>
+<td>秒级</td>
+</tr>
+<tr>
+<td>数据合规</td>
+<td>数据不出域</td>
+<td>需评估</td>
+</tr>
+<tr>
+<td>运维</td>
+<td>重（驱动&#x2F;版本&#x2F;调度）</td>
+<td>轻</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>高频、稳定流量、敏感数据</td>
+<td>波峰波谷、试错期、低频</td>
+</tr>
+</tbody></table>
+<p>经验分界线：<strong>日均 token 消耗 × API 单价 &gt; GPU 月租的 1.5 倍</strong>时，自建开始划算；但还要算上人力成本。</p>
+<hr>
+<h2 id="九、踩坑清单"><a href="#九、踩坑清单" class="headerlink" title="九、踩坑清单"></a>九、踩坑清单</h2><ol>
+<li><strong>按「请求数」估并发</strong> → 忽略上下文长度，实际并发只有估算的 1&#x2F;5。</li>
+<li><strong>不限制 <code>max_tokens</code></strong> → 单个请求生成 4000 token，KV 一直占着，把别人挤掉。</li>
+<li><strong>system prompt 里带时间戳</strong> → prefix cache 永远不命中。</li>
+<li><strong>多副本无会话亲和</strong> → 多轮对话每次打到不同副本，缓存全失效。</li>
+<li><strong>长 prompt 不切 chunked prefill</strong> → 一个 30k 的请求把 TPOT 拉到几百毫秒。</li>
+<li><strong>KV 量化压到 INT4 却不评测</strong> → 长上下文任务质量断崖。</li>
+<li><strong>把 swap 当万能</strong> → 抢占到 CPU 的 KV 回传要走 PCIe，延迟爆炸，不如直接重算。</li>
+<li><strong>忽略 CUDA context 和碎片</strong> → 算出来 60 并发，实际 45 就 OOM。</li>
+<li><strong>多租户共享 prefix cache</strong> → 安全隔离问题（侧信道）。</li>
+<li><strong>只看平均延迟</strong> → P99 早炸了，平均值还很好看。</li>
+</ol>
+<hr>
+<h2 id="十、面试追问"><a href="#十、面试追问" class="headerlink" title="十、面试追问"></a>十、面试追问</h2><p><strong>Q1：KV Cache 存的是什么？为什么需要它？</strong><br>A：存的是每层注意力的 Key 和 Value 向量。自回归生成时，历史 token 的 K&#x2F;V 不会变，缓存起来避免每步重算，把 decode 的复杂度从 O(n²) 降到 O(n)。</p>
+<p><strong>Q2：为什么说 decode 是 memory-bound？</strong><br>A：每生成一个 token 要把全部权重读一遍，但只做一次极小的矩阵乘，算力利用率低，速度由显存带宽决定。</p>
+<p><strong>Q3：PagedAttention 解决了什么问题？</strong><br>A：朴素预分配导致严重的内部&#x2F;外部碎片且无法共享。PagedAttention 用固定大小 block + block table 做非连续分配，浪费降到 4% 以下，并支持 CoW 共享。</p>
+<p><strong>Q4：prefix caching 在什么情况下无效？</strong><br>A：前缀不完全一致（时间戳、随机 id、动态内容在前）、多副本无亲和路由、前缀太短低于服务商最小缓存长度、缓存已被淘汰。</p>
+<p><strong>Q5：GQA 为什么能省显存？</strong><br>A：多个 query 头共享同一组 KV 头，KV 头数从 32 降到 8，KV Cache 直接降到 1&#x2F;4，同时质量损失很小。</p>
+<p><strong>Q6：显存不够时，抢占（preemption）怎么做？</strong><br>A：两种：swap（把 KV 换到 CPU 内存，恢复时换回）和 recompute（丢弃 KV，恢复时重新 prefill）。swap 受 PCIe 带宽限制，recompute 受算力限制，通常按序列长度选择。</p>
+<p><strong>Q7：怎么估算一台机器的并发？</strong><br>A：<code>(显存 - 权重 - 激活/上下文开销) × 安全系数 / (每 token KV × 最大上下文)</code>。8B 模型 80G 卡、8k 上下文大致 40~55 并发。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>KV Cache 是大模型推理里最容易被低估的成本项：它不参与计算，却决定了并发上限；它随上下文线性增长，而业务永远在要求更长的上下文。</p>
+<p>PagedAttention 的价值不只是「省显存」，更是把操作系统的虚拟内存思想引入了推理调度——有了分页，才有 continuous batching、prefix caching、CoW 共享这些上层优化。</p>
+<p>对 Java 工程师来说，不需要自己实现调度器，但<strong>必须会算这笔账</strong>：算清楚一个副本能扛多少并发、一个租户该分多少配额、什么时候该自建什么时候该用 API。这些判断，比会调 vLLM 参数更值钱。</p>
+<hr>
+<blockquote>
+<p>本日 5 篇（3 Java + 2 AI）到此结束：</p>
+<ol>
+<li>MySQL InnoDB TDE 表空间加密</li>
+<li>overlayfs 容器写放大</li>
+<li>ProxySQL &#x2F; MySQL Router 数据库代理层</li>
+<li>ColBERT late interaction 检索</li>
+<li>KV Cache 与 PagedAttention</li>
+</ol>
+</blockquote>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/">https://jiweidong.github.io/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/AI/">AI</a><a class="post-meta__tags" href="/tags/LLM/">LLM</a><a class="post-meta__tags" href="/tags/vLLM/">vLLM</a><a class="post-meta__tags" href="/tags/%E6%8E%A8%E7%90%86%E4%BC%98%E5%8C%96/">推理优化</a><a class="post-meta__tags" href="/tags/%E6%98%BE%E5%AD%98/">显存</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related full-width" href="/2026/11/14/java-colbert-late-interaction-retrieval-deep-practice/" title="【Java AI】ColBERT 与 late interaction 检索深度实战：token 级向量、MaxSim 与 Java 侧落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java AI】ColBERT 与 late interaction 检索深度实战：token 级向量、MaxSim 与 Java 侧落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】ColBERT 与 late interaction 检索深度实战前言做 RAG 做到一定深度，一定会撞上「召回质量」这堵墙。常见的三段式是： 1BM25 / 双塔向量召回 Top100  →  cross-encoder 重排 Top10  →  喂给大模型  问题是重排太贵：cross-encoder 要把 query + doc 拼起来过一遍 BERT，100 个候选就是 100 次前向，GPU 上几十毫秒，CPU 上几百毫秒。QPS 一高，重排就成了瓶颈。 late interaction（晚交互） 是第三条路：query 和 doc 分别编码成 token 级多向量，相关性用 MaxSim 算。文档向量可以离线算好，在线只做「矩阵式」相似度计算，不需要过模型。质量接近 cross-encoder，延迟接近双塔。 ColBERT 是这条路线的代表。这篇讲清它的原理、存储账、压缩手段，以及为什么 Java 生态里几乎没有现成实现——以及怎么自己写一个够用的。  一、三种检索范式的本质区别   范式 表示 打分 在线成本 离线成本 质量    双塔（bi-e...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/03/moe-quantization-inference-cost-deep-dive/" title="【AI 体系】MoE 与量化深度解析：大模型推理成本到底花在哪"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-03</div><div class="info-item-2">【AI 体系】MoE 与量化深度解析：大模型推理成本到底花在哪</div></div><div class="info-2"><div class="info-item-1">【AI 体系】MoE 与量化深度解析：推理成本到底花在哪前言2026 年做大模型应用，你会发现一个奇怪的现象：  API 价格一年降了 10 倍，但你的账单反而涨了——因为用量涨了 30 倍 同一个「70B」模型，不同厂商价格差 5 倍，质量看起来差不多 自己部署开源模型，24G 显存的卡跑不起来 32B，但厂商说他们「用 8 卡跑 671B」  这些现象背后是两件事：MoE（混合专家）改变了「参数量 ≈ 成本」的等式，量化改变了「精度 ≈ 显存」的等式。 不理解这两件事，你在做技术选型和成本核算时会一直算错。这篇文章从原理讲到工程决策，最后给一套 Java 侧的「精度档位灰度 + 质量门禁」落地代码。  一、先把成本公式写对1.1 三个不同的「参数量」这是最容易搞混的地方：    概念 含义 决定什么    总参数量（Total Params） 所有权重之和 显存占用（权重部分）   激活参数量（Active Params） 单次前向实际参与计算的参数 单 token 计算量（FLOPs）   KV Cache 推理时缓存的 K&#x2F;V 长上下文下的显存爆炸源   举例（...</div></div></div></a><a class="pagination-related" href="/2026/10/31/reasoning-models-test-time-compute-deep-dive/" title="【AI 体系】推理模型与 Test-Time Compute 深度解析：思维链扩展、思考预算与工程取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-31</div><div class="info-item-2">【AI 体系】推理模型与 Test-Time Compute 深度解析：思维链扩展、思考预算与工程取舍</div></div><div class="info-2"><div class="info-item-1">【AI 体系】推理模型与 Test-Time Compute 深度解析前言2023 年大家比的是”谁的模型参数多”，2024 年比的是”谁的上下文长”，2025 年之后战场换了一个维度：模型愿意在回答前”想”多久。 OpenAI o1&#x2F;o3、DeepSeek-R1、Gemini Thinking、Claude 的 extended thinking，本质上是同一件事的不同实现：在推理阶段投入更多计算（test-time compute），换取更强的多步推理能力。它带来了一条新的 scaling law——不增加训练成本，只增加推理成本，就能在数学、代码、规划类任务上获得数量级提升。 但对工程团队来说，这件事的落地形态和”换个更强的模型”完全不同：  它贵：思考 token 也计费，且往往比输出还多。 它慢：P99 延迟可能是普通模型的 5~20 倍。 它不可控：你无法保证它想 3 步就停，也无法完全预测它会想什么。 它不是万能：在分类、抽取、改写这类任务上，用推理模型是纯浪费。  本文讲清三件事：test-time compute 的技术谱系、什么任务值得付这个钱、Ja...</div></div></div></a><a class="pagination-related" href="/2026/10/17/java-virtual-threads-llm-io-deep-practice/" title="【Java AI】虚拟线程跑大模型 IO 深度实战：高并发 Agent 调用与阻塞式 SDK 治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-17</div><div class="info-item-2">【Java AI】虚拟线程跑大模型 IO 深度实战：高并发 Agent 调用与阻塞式 SDK 治理</div></div><div class="info-2"><div class="info-item-1">【Java AI】虚拟线程跑大模型 IO 深度实战：高并发 Agent 调用与阻塞式 SDK 治理前言AI 应用和传统 CRUD 最大的差异之一：请求的绝大部分时间都耗在外部 IO 上——调用大模型 API、向量库检索、工具（Function Calling）执行、重排。一次 LLM 调用动辄 1~30 秒，而 CPU 几乎空转。 传统「平台线程（Platform Thread）+ 线程池」模型在这种场景下非常吃亏：一个平台线程约 1MB 栈、受 OS 线程数限制，几百并发就开始排队、内存暴涨。Java 21 的虚拟线程（Virtual Threads）正是为此类「高并发阻塞 IO」场景设计的——M:N 调度，一个线程几 KB，轻松支撑十万级并发「在飞」的请求。 但虚拟线程不是银弹：synchronized 阻塞、native 调用、连接池、以及大量老旧的 LLM SDK 会把 carrier thread 钉住（pinning），让收益大打折扣。本文用 Java 技术栈把「虚拟线程跑大模型 IO」讲透，并给出可落地的治理方案。  一、为什么 LLM 场景特别适合虚拟线程LLM ...</div></div></div></a><a class="pagination-related" href="/2026/10/27/java-local-llm-ollama-vllm-deep-practice/" title="【Java AI】本地大模型部署与 Java 调用深度实战：Ollama、vLLM 与 OpenAI 兼容协议"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-27</div><div class="info-item-2">【Java AI】本地大模型部署与 Java 调用深度实战：Ollama、vLLM 与 OpenAI 兼容协议</div></div><div class="info-2"><div class="info-item-1">【Java AI】本地大模型部署与 Java 调用深度实战前言做 AI 应用开发，Java 工程师遇到的第一道现实问题是：模型跑在哪？ 走公有云 API 最省事，但企业场景里经常会撞上四种硬约束：  数据不能出内网（金融、医疗、政企）； 成本不可控（高频调用下按 token 计费比自建贵一个量级）； 需要私有微调模型（行业术语、内部代码库）； 离线&#x2F;边缘环境（工厂、车载）。  这时候就必须自建推理服务。好消息是：推理服务的对外接口已经高度标准化成 OpenAI 兼容协议，Java 侧根本不需要关心底层是 Ollama、vLLM 还是 TGI——只要对方暴露 /v1/chat/completions，Spring AI、LangChain4j、甚至裸 HttpClient 都能接。 这篇文章讲三件事：怎么选推理引擎、怎么在 Java 里接、以及生产环境里那些没人告诉你的坑。  一、推理引擎选型：Ollama vs vLLM vs LM Studio先说结论：开发调试用 Ollama，生产并发用 vLLM，个人桌面用 LM Studio。    维度 Ollama vLLM...</div></div></div></a><a class="pagination-related" href="/2026/11/07/llm-inference-batching-speculative-decoding-deep-dive/" title="【AI 体系】推理服务批调度与投机解码深度解析：吞吐、TTFT 与加速比的真实账本"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-07</div><div class="info-item-2">【AI 体系】推理服务批调度与投机解码深度解析：吞吐、TTFT 与加速比的真实账本</div></div><div class="info-2"><div class="info-item-1">【AI 体系】推理服务批调度与投机解码深度解析：吞吐、TTFT 与加速比的真实账本前言：为什么同一张卡，别人吞吐是你的 5 倍自建推理服务的第一课，通常是这样的对比：  你用 HuggingFace model.generate() 起一个 HTTP 服务，单卡 A100 跑 7B 模型，每秒 8 个请求； 隔壁用 vLLM 起同一个模型，每秒 40 个请求。  硬件一样、模型一样、精度一样。差别几乎全部来自两件事：批调度（batching &#x2F; scheduling） 和 解码优化（speculative decoding）。 很多人对这两个词的理解停留在”vLLM 快””投机解码能加速 2 倍”。但真到做容量规划、SLA 设计、成本核算的时候，你需要知道：为什么快、快多少、在什么条件下不快。这篇就从推理的物理约束讲起。 一、先理解推理的两个阶段LLM 推理分两段，特性完全相反：    阶段 计算形态 瓶颈 关键指标    Prefill（预填充） 一次处理整个 prompt，矩阵乘 算力密集 TTFT（首 token 延迟）   Decode（解码） 每步生成 1 个...</div></div></div></a><a class="pagination-related" href="/2026/11/13/java-llm-deterministic-replay-vcr-testing-deep-practice/" title="【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-13</div><div class="info-item-2">【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁</div></div><div class="info-2"><div class="info-item-1">【Java AI】大模型调用录制回放深度实战：VCR 模式、SSE 增量重放与 Prompt 变更回归门禁前言给大模型写单元测试，是所有 AI 应用团队都会撞上的墙：  输出是概率性的，assertEquals 根本没法写； 每次 CI 都真调 API，慢、贵、还依赖网络； 改了一行 prompt，不知道会影响哪些 case； 模型厂商悄悄升级了版本，线上效果变了却没人发现。  传统做法是 mock 掉 SDK，但 mock 出来的响应是「人编的」，跟真实输出分布完全不一致，测了等于没测。业界成熟的解法是 VCR（Video Cassette Recorder）模式：第一次真实调用时把「请求 + 响应」录成磁带（cassette），之后所有测试都从磁带回放。这个模式在 HTTP 客户端领域（Ruby 的 VCR、Java 的 WireMock 录制）已经用了十几年，搬到 LLM 场景需要额外解决三个问题：  流式响应（SSE）怎么录——chunk 边界本身就是被测逻辑的一部分； 请求指纹怎么算——消息数组、工具定义、参数顺序都会变； 断言怎么写——不能用全文相等，否则模型一升级全...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">922</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1028</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90AI-%E4%BD%93%E7%B3%BB%E3%80%91KV-Cache-%E4%B8%8E-PagedAttention-%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【AI 体系】KV Cache 与 PagedAttention 深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88-decode-%E9%98%B6%E6%AE%B5%E6%98%AF-memory-bound"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么 decode 阶段是 memory-bound</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81KV-Cache-%E6%98%BE%E5%AD%98%E5%85%AC%E5%BC%8F"><span class="toc-number">1.3.</span> <span class="toc-text">二、KV Cache 显存公式</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%AE%8C%E6%95%B4%E7%9A%84%E6%98%BE%E5%AD%98%E9%A2%84%E7%AE%97%E8%A1%A8"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 完整的显存预算表</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E6%9C%B4%E7%B4%A0-KV-Cache-%E7%9A%84%E4%B8%89%E4%B8%AA%E6%B5%AA%E8%B4%B9"><span class="toc-number">1.4.</span> <span class="toc-text">三、朴素 KV Cache 的三个浪费</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81PagedAttention%EF%BC%9A%E6%8A%8A%E8%99%9A%E6%8B%9F%E5%86%85%E5%AD%98%E6%80%9D%E6%83%B3%E6%90%AC%E5%88%B0%E6%98%BE%E5%AD%98"><span class="toc-number">1.5.</span> <span class="toc-text">四、PagedAttention：把虚拟内存思想搬到显存</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-Copy-on-Write%EF%BC%9A%E5%B9%B6%E8%A1%8C%E9%87%87%E6%A0%B7%E5%92%8C-beam-search-%E7%9A%84%E6%95%91%E6%98%9F"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 Copy-on-Write：并行采样和 beam search 的救星</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%B0%83%E5%BA%A6%EF%BC%9Acontinuous-batching-chunked-prefill"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 调度：continuous batching + chunked prefill</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81Prefix-Caching%EF%BC%9A%E5%A4%9A%E8%BD%AE%E5%AF%B9%E8%AF%9D%E7%9A%84%E5%85%8D%E8%B4%B9%E5%8A%A0%E9%80%9F"><span class="toc-number">1.6.</span> <span class="toc-text">五、Prefix Caching：多轮对话的免费加速</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E4%B8%8E%E4%BA%91-API-%E7%9A%84-prompt-caching-%E5%AF%B9%E5%BA%94"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 与云 API 的 prompt caching 对应</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81KV-Cache-%E9%87%8F%E5%8C%96%EF%BC%9A%E5%86%8D%E7%9C%81%E4%B8%80%E5%8D%8A"><span class="toc-number">1.7.</span> <span class="toc-text">六、KV Cache 量化：再省一半</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81Java-%E4%BE%A7%EF%BC%9A%E5%AE%B9%E9%87%8F%E8%A7%84%E5%88%92%E4%B8%8E%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6"><span class="toc-number">1.8.</span> <span class="toc-text">七、Java 侧：容量规划与准入控制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-%E4%B8%80%E4%B8%AA%E5%AE%B9%E9%87%8F%E8%AE%A1%E7%AE%97%E5%99%A8"><span class="toc-number">1.8.1.</span> <span class="toc-text">7.1 一个容量计算器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-2-%E5%87%86%E5%85%A5%E6%8E%A7%E5%88%B6%EF%BC%9A%E7%94%A8%E4%BF%A1%E5%8F%B7%E9%87%8F%E8%80%8C%E4%B8%8D%E6%98%AF%E7%BA%BF%E7%A8%8B%E6%B1%A0"><span class="toc-number">1.8.2.</span> <span class="toc-text">7.2 准入控制：用信号量而不是线程池</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-3-%E5%BF%85%E9%A1%BB%E8%A7%82%E6%B5%8B%E7%9A%84%E4%BA%94%E4%B8%AA%E6%8C%87%E6%A0%87"><span class="toc-number">1.8.3.</span> <span class="toc-text">7.3 必须观测的五个指标</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E8%87%AA%E5%BB%BA-vs-%E4%BA%91-API%EF%BC%9A%E4%B8%80%E5%BC%A0%E5%86%B3%E7%AD%96%E8%A1%A8"><span class="toc-number">1.9.</span> <span class="toc-text">八、自建 vs 云 API：一张决策表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.11.</span> <span class="toc-text">十、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.12.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/" title="【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划">【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划</a><time datetime="2026-11-14T00:50:00.000Z" title="发表于 2026-11-14 08:50:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/java-colbert-late-interaction-retrieval-deep-practice/" title="【Java AI】ColBERT 与 late interaction 检索深度实战：token 级向量、MaxSim 与 Java 侧落地">【Java AI】ColBERT 与 late interaction 检索深度实战：token 级向量、MaxSim 与 Java 侧落地</a><time datetime="2026-11-14T00:40:00.000Z" title="发表于 2026-11-14 08:40:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/mysql-proxysql-router-proxy-layer-deep-dive/" title="【MySQL 中间件】数据库代理层深度解析：ProxySQL 连接复用、读写分离与 MySQL Router 选型">【MySQL 中间件】数据库代理层深度解析：ProxySQL 连接复用、读写分离与 MySQL Router 选型</a><time datetime="2026-11-14T00:30:00.000Z" title="发表于 2026-11-14 08:30:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/overlayfs-container-write-amplification-deep-dive/" title="【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因">【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因</a><time datetime="2026-11-14T00:20:00.000Z" title="发表于 2026-11-14 08:20:00">2026-11-14</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/14/mysql-innodb-tablespace-encryption-tde-deep-dive/" title="【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo/binlog 加密边界与密钥轮换">【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo/binlog 加密边界与密钥轮换</a><time datetime="2026-11-14T00:10:00.000Z" title="发表于 2026-11-14 08:10:00">2026-11-14</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
