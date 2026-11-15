@@ -1,0 +1,439 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析前言先看一个线上真实场景： 一个 Spring Boot 服务，接口 P99 从 40ms 涨到 380ms。GC 日志干净（单次 8ms），CPU 使用率 62%（没打满），线程池队列不深，下游依赖 RT 正常。top 看每个线程都在 R 状态，没死锁没 BLOCKED。 最后定位到的原因是：这台机器上同时跑了一个数据导出任">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag&#x2F;vslice">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析前言先看一个线上真实场景： 一个 Spring Boot 服务，接口 P99 从 40ms 涨到 380ms。GC 日志干净（单次 8ms），CPU 使用率 62%（没打满），线程池队列不深，下游依赖 RT 正常。top 看每个线程都在 R 状态，没死锁没 BLOCKED。 最后定位到的原因是：这台机器上同时跑了一个数据导出任">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-15T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-11-15T00:01:57.190Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="EEVDF">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="性能调优">
+<meta property="article:tag" content="调度器">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice",
+  "url": "https://jiweidong.github.io/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-15T00:10:00.000Z",
+  "dateModified": "2026-11-15T00:01:57.190Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">927</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1033</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-15T00:10:00.000Z" title="发表于 2026-11-15 08:10:00">2026-11-15</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-15T00:01:57.190Z" title="更新于 2026-11-15 08:01:57">2026-11-15</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【性能调优】Linux-EEVDF-调度器与-Java-线程延迟深度解析"><a href="#【性能调优】Linux-EEVDF-调度器与-Java-线程延迟深度解析" class="headerlink" title="【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析"></a>【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>先看一个线上真实场景：</p>
+<p>一个 Spring Boot 服务，接口 P99 从 40ms 涨到 380ms。GC 日志干净（单次 8ms），CPU 使用率 62%（没打满），线程池队列不深，下游依赖 RT 正常。<code>top</code> 看每个线程都在 R 状态，没死锁没 BLOCKED。</p>
+<p>最后定位到的原因是：<strong>这台机器上同时跑了一个数据导出任务，两者共享同一 cgroup，EEVDF&#x2F;CFS 把可运行线程按权重公平分配 CPU 时间片，业务线程每次被唤醒后，要等「别人用完属于它的那一段」才能拿到 CPU。</strong></p>
+<p>也就是说，Java 侧的线程池、GC、异步编排都做对了，但<strong>真正决定你的请求什么时候被 CPU 执行的是内核调度器</strong>，而这一层几乎没有人写进 Java 的性能排查清单。</p>
+<p>这篇把 CFS → EEVDF 的演进讲清楚，然后把「内核调度语义」翻译成 Java 工程师能用的东西：哪些 JVM 参数是假的、哪些指标能观测、混部时怎么隔离。</p>
+<h2 id="一、先回顾-CFS：Java-工程师最该知道的三件事"><a href="#一、先回顾-CFS：Java-工程师最该知道的三件事" class="headerlink" title="一、先回顾 CFS：Java 工程师最该知道的三件事"></a>一、先回顾 CFS：Java 工程师最该知道的三件事</h2><p>CFS（Completely Fair Scheduler，2.6.23 起）的核心只有一个变量：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">vruntime += 实际运行时间 × (NICE_0_LOAD / 该任务权重)</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li>权重由 nice 值决定（nice 0 → 权重 1024，nice -20 → 88761，nice 19 → 15，近似 1.25 倍等比）。</li>
+<li>调度实体挂在红黑树上，<strong>每次选 vruntime 最小的那个</strong>运行。</li>
+<li>时间片不是固定的，而是由 <code>sched_latency</code>（默认 6ms~24ms 自适应）除以「可运行任务数」得到，再受 <code>sched_min_granularity</code>（默认 0.75ms）兜底。</li>
+</ul>
+<p>对 Java 工程师来说，需要记住的三个推论：</p>
+<p><strong>推论 1：<code>Thread.setPriority()</code> 在 Linux 上基本是装饰品。</strong><br>JVM 在 Linux 上把 Java 优先级映射到 pthread 的调度策略时，默认策略是 <code>SCHED_OTHER</code>（即 CFS&#x2F;EEVDF），而 <code>SCHED_OTHER</code> <strong>不看</strong> <code>sched_priority</code>（它只对 <code>SCHED_FIFO/SCHED_RR</code> 有效）。所以 <code>new Thread(...).setPriority(MAX_PRIORITY)</code> 在 Linux 上不会让线程多拿 CPU。真正能改的是 nice 值，但 JDK 没有公开 API（只能通过 JNI 调 <code>setpriority(2)</code>，且需要权限）。</p>
+<p><strong>推论 2：线程数远超核数时，公平 &#x3D; 谁都在等。</strong><br>8 核机器上开 200 个可运行线程，每个线程的 vruntime 增长都很慢，但每次被调度到只跑 0.75ms 就被换下。上下文切换本身（<del>1</del>3μs）加上 cache 污染，会让每个线程的实际吞吐断崖下跌。这就是「线程池不是越大越好」在内核层的解释。</p>
+<p><strong>推论 3：<code>availableProcessors()</code> 只看 cpuset，不看 quota。</strong><br>容器里 <code>--cpus=2</code> 但没有 <code>--cpuset-cpus</code> 时，<code>Runtime.getRuntime().availableProcessors()</code> 仍然返回宿主机核数（除非开了 <code>-XX:ActiveProcessorCount</code> 或新版 JDK 的容器感知）。线程池、ForkJoinPool 并行度、GC 线程数全部会按宿主机核数算，然后被 cgroup quota 硬掐。</p>
+<h2 id="二、CFS-到底哪里不够：延迟敏感任务没有表达渠道"><a href="#二、CFS-到底哪里不够：延迟敏感任务没有表达渠道" class="headerlink" title="二、CFS 到底哪里不够：延迟敏感任务没有表达渠道"></a>二、CFS 到底哪里不够：延迟敏感任务没有表达渠道</h2><p>CFS 的唯一目标是「公平」。它有一个补救机制叫<strong>唤醒抢占</strong>：一个新唤醒的任务如果 vruntime 比当前任务小 <code>wakeup_granularity</code>，就可以抢占。</p>
+<p>问题在于：</p>
+<ol>
+<li><code>wakeup_granularity</code> 是从 <code>sched_latency</code> 推出来的，而 <code>sched_latency</code> 随可运行任务数<strong>变大</strong>（有上限），于是任务越多，抢占越难。</li>
+<li>公平调度<strong>不区分「我需要多久内被调度」</strong>。一个跑 50ms 的批处理任务和一个只需要 0.2ms 就能返回的 RPC 线程，权重相同时待遇一样。</li>
+<li>结果：<strong>平均延迟很好，尾延迟很差</strong>。CFS 时代所有「CPU 密集 + 延迟敏感混部」的团队都在调 <code>sched_wakeup_granularity_ns</code>、<code>sched_min_granularity_ns</code>，本质上是在打补丁。</li>
+</ol>
+<p>这就是 EEVDF（Earliest Eligible Virtual Deadline First）进入主线的动机。</p>
+<h2 id="三、EEVDF：把「公平」换成「公平-截止时间」"><a href="#三、EEVDF：把「公平」换成「公平-截止时间」" class="headerlink" title="三、EEVDF：把「公平」换成「公平 + 截止时间」"></a>三、EEVDF：把「公平」换成「公平 + 截止时间」</h2><p>EEVDF 的理论来自 1995 年的一篇论文，Linux 6.6 起成为 CFS 的替代实现（内核里代码路径仍然叫 <code>fair.c</code>，但算法换了）。它引入两个关键概念：</p>
+<p><strong>1. lag（滞后）&#x3D; 应得服务时间 − 实际获得服务时间</strong></p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">lag_i = (虚拟时间 - vruntime_i) × 权重_i</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>lag &gt; 0</code>：这个任务「被欠了」，应该优先补给它。</li>
+<li><code>lag &lt; 0</code>：这个任务「超支了」，得等别人追上。</li>
+<li><strong>只有 lag ≥ 0 的任务才是 eligible（有资格）</strong>。这保证了不会出现「某个任务靠低权重长期霸占 CPU」的不公平。</li>
+</ul>
+<p><strong>2. virtual deadline（虚拟截止时间）&#x3D; eligible 时间 + 请求的片长折算</strong></p>
+<p>每个任务有一个「片长请求」<code>slice</code>，EEVDF 在任务变为 eligible 的时刻加上它的片长，得到一个虚拟截止时间：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">virtual_deadline_i = eligible_time_i + slice_i / 权重_i</span><br></pre></td></tr></table></figure>
+
+<p>调度决策变成：<strong>在 eligible 集合里，选 virtual deadline 最小的那个</strong>。</p>
+<p>这两步的语义非常关键：</p>
+<ul>
+<li><strong>lag 保证公平</strong>（谁被欠得多谁先有资格）；</li>
+<li><strong>virtual deadline 保证延迟</strong>（短片长的任务截止时间天然更早，先跑）。</li>
+</ul>
+<p>所以 EEVDF 给了延迟敏感任务一个<strong>正式的、非特权的表达渠道</strong>：把 <code>slice</code> 调小，截止时间就提前，就能更快被调度，同时因为它仍然要满足 lag ≥ 0，不会饿死别人。</p>
+<h3 id="3-1-参数对照"><a href="#3-1-参数对照" class="headerlink" title="3.1 参数对照"></a>3.1 参数对照</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>CFS</th>
+<th>EEVDF</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>选择依据</td>
+<td>vruntime 最小</td>
+<td>eligible 集合中 virtual deadline 最小</td>
+</tr>
+<tr>
+<td>时间片</td>
+<td><code>sched_latency / nr_running</code>，受 <code>sched_min_granularity</code> 兜底</td>
+<td>每个任务自带 <code>slice</code>，由 <code>sched_base_slice</code>（默认 3ms）派生</td>
+</tr>
+<tr>
+<td>延迟敏感</td>
+<td>只能靠 <code>wakeup_granularity</code> 抢占</td>
+<td>调小 <code>slice</code> 提前截止时间</td>
+</tr>
+<tr>
+<td>主要可调项</td>
+<td><code>sched_latency_ns</code>、<code>sched_min_granularity_ns</code>、<code>sched_wakeup_granularity_ns</code></td>
+<td><code>sched_base_slice_ns</code>（<code>/sys/kernel/debug/sched/base_slice_ns</code>）、<code>/proc/sys/kernel/sched_*</code> 大幅缩减</td>
+</tr>
+<tr>
+<td>用户侧接口</td>
+<td>nice</td>
+<td><strong>nice + <code>sched_setattr(2)</code> 的 <code>SCHED_FLAG_UTIL_CLAMP</code> &#x2F; slice 请求</strong></td>
+</tr>
+</tbody></table>
+<p>这里有一个现实检查：<strong>内核暴露给用户态的 slice 调节接口非常有限</strong>。<code>sched_setattr(2)</code> 里的 <code>sched_runtime</code> 字段在 EEVDF 下可以被解释为 slice 请求，但不是所有发行版都开放，glibc 也没有包装。<strong>在 Java 里你几乎不可能直接改 slice。</strong> 所以对应用层来说，EEVDF 的实际收益是「内核默认行为更合理了」，而不是「我能精细调它」。</p>
+<p>那 Java 工程师能做什么？往下看。</p>
+<h2 id="四、把调度语义翻译成-Java-侧的动作"><a href="#四、把调度语义翻译成-Java-侧的动作" class="headerlink" title="四、把调度语义翻译成 Java 侧的动作"></a>四、把调度语义翻译成 Java 侧的动作</h2><h3 id="4-1-cgroup-v2-的-cpu-weight-和-cpu-max-语义完全不同"><a href="#4-1-cgroup-v2-的-cpu-weight-和-cpu-max-语义完全不同" class="headerlink" title="4.1 cgroup v2 的 cpu.weight 和 cpu.max 语义完全不同"></a>4.1 cgroup v2 的 <code>cpu.weight</code> 和 <code>cpu.max</code> 语义完全不同</h3><p>这是最容易搞错的一点：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>语义</th>
+<th>生效条件</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>cpu.weight</code>（1~10000，默认 100）</td>
+<td>竞争时的<strong>比例分配</strong></td>
+<td>只在同层级 cgroup 之间有 CPU 竞争时生效</td>
+<td>不限制上限。独占机器时用到 100% 也没人管</td>
+</tr>
+<tr>
+<td><code>cpu.max</code>（如 <code>200000 100000</code> &#x3D; 2 核）</td>
+<td><strong>带宽上限</strong></td>
+<td>每个 100ms 周期结算一次</td>
+<td>用超了就被 throttle 到下个周期，<strong>产生周期性抖动</strong></td>
+</tr>
+</tbody></table>
+<p><code>cpu.max</code> 的抖动是 Java 服务 P99 的经典杀手：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">周期 100ms，配额 50ms</span><br><span class="line">业务线程在周期前 50ms 用完全部配额</span><br><span class="line">剩余 50ms 内所有可运行线程被 throttle（R 状态但不被调度）</span><br><span class="line">下一个周期开始，积压的线程一起冲上来，cache 全冷</span><br></pre></td></tr></table></figure>
+
+<p>现象就是：CPU 使用率看起来只有 50%，但 P99 周期性尖刺。观测点是 <code>cpu.stat</code>：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">$ cat /sys/fs/cgroup/myapp/cpu.stat</span><br><span class="line">usage_usec 48123456</span><br><span class="line">nr_periods 1200</span><br><span class="line">nr_throttled 87</span><br><span class="line">throttled_usec 4350000</span><br></pre></td></tr></table></figure>
+
+<p><code>nr_throttled / nr_periods</code> 超过 5% 就值得动手了。</p>
+<h3 id="4-2-GC-线程和业务线程权重相同，这是默认宿命"><a href="#4-2-GC-线程和业务线程权重相同，这是默认宿命" class="headerlink" title="4.2 GC 线程和业务线程权重相同，这是默认宿命"></a>4.2 GC 线程和业务线程权重相同，这是默认宿命</h3><p>JVM 的 GC 线程、编译线程、业务线程在同一个 cgroup 里，权重一样。G1 的并发标记线程会吃掉不少 CPU，而这些 CPU 是从业务线程嘴里抢的。</p>
+<p>EEVDF 下有一个「帮忙」：GC 线程是长期可运行的，它们的 lag 会逐渐变负（因为它们一直在超支），业务线程（频繁睡眠、唤醒）lag 保持 ≥ 0，因此在 eligible 集合里更容易抢到 virtual deadline 优先权。<strong>这是 EEVDF 相比 CFS 对 Java 服务的一个隐性改善</strong>：交互型负载（线程频繁阻塞&#x2F;唤醒）比批处理型负载（线程长期可运行）更容易拿到 CPU。</p>
+<p>但要主动利用它，还得做两件事：</p>
+<ol>
+<li><strong>把 CPU 密集的旁路任务（导出、重建索引、离线计算）拆到独立 cgroup</strong>，给低 <code>cpu.weight</code>，并且加 <code>cpu.max</code> 硬顶。</li>
+<li><strong>不要用 <code>-XX:ParallelGCThreads</code> 拉满</strong>。容器里默认按 cpuset 算，如果 cpuset 是宿主机全核而 quota 只有 2 核，GC 线程数会严重超配。</li>
+</ol>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 容器感知自检：启动时打印，别等出事才查</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">CpuBudgetPrinter</span> &#123;</span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">main</span><span class="params">(String[] args)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        System.out.println(<span class="string">&quot;availableProcessors = &quot;</span> + Runtime.getRuntime().availableProcessors());</span><br><span class="line">        System.out.println(<span class="string">&quot;cpu.max   = &quot;</span> + readOrNull(<span class="string">&quot;/sys/fs/cgroup/cpu.max&quot;</span>));</span><br><span class="line">        System.out.println(<span class="string">&quot;cpu.weight= &quot;</span> + readOrNull(<span class="string">&quot;/sys/fs/cgroup/cpu.weight&quot;</span>));</span><br><span class="line">        System.out.println(<span class="string">&quot;cpuset    = &quot;</span> + readOrNull(<span class="string">&quot;/sys/fs/cgroup/cpuset.cpus.effective&quot;</span>));</span><br><span class="line">        System.out.println(<span class="string">&quot;cpu.stat  = &quot;</span> + readOrNull(<span class="string">&quot;/sys/fs/cgroup/cpu.stat&quot;</span>));</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> String <span class="title function_">readOrNull</span><span class="params">(String path)</span> &#123;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">return</span> Files.readString(Path.of(path)).trim().replace(<span class="string">&#x27;\n&#x27;</span>, <span class="string">&#x27; &#x27;</span>);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">            <span class="keyword">return</span> <span class="literal">null</span>; <span class="comment">// cgroup v1 或非容器环境</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-虚拟线程的-carrier-数与调度叠加"><a href="#4-3-虚拟线程的-carrier-数与调度叠加" class="headerlink" title="4.3 虚拟线程的 carrier 数与调度叠加"></a>4.3 虚拟线程的 carrier 数与调度叠加</h3><p>虚拟线程的 carrier 线程数默认等于 <code>availableProcessors()</code>。在 EEVDF 下，carrier 线程是<strong>长期可运行</strong>的（它们跑 ForkJoinPool 的工作队列），而阻塞的虚拟线程不占 carrier。</p>
+<p>这里有一个容易忽视的叠加效应：</p>
+<ul>
+<li>如果 carrier 数 &lt; 真实可用 CPU（比如 quota 2 核但 <code>availableProcessors()</code> 返回 32），虚拟线程的并行度会被高估，实际执行时被 throttle；</li>
+<li>如果 carrier 数 &gt; 真实可用 CPU，上下文切换变多，cache 命中率下降，但 EEVDF 的 lag 机制会让频繁 yield 的 carrier 更容易被调度，抖动比 CFS 时代小一些。</li>
+</ul>
+<p>结论：<strong>显式设置 <code>-Djdk.virtualThreadScheduler.parallelism=N</code>，N 取 cgroup 有效核数</strong>，别让它猜。</p>
+<h2 id="五、观测：三个层次，按成本从低到高"><a href="#五、观测：三个层次，按成本从低到高" class="headerlink" title="五、观测：三个层次，按成本从低到高"></a>五、观测：三个层次，按成本从低到高</h2><p><strong>第一层：cgroup 与进程级（零成本，先看这个）</strong></p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>位置</th>
+<th>判读</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>throttled_usec</code></td>
+<td><code>/sys/fs/cgroup/&lt;path&gt;/cpu.stat</code></td>
+<td>周期 throttling，P99 周期尖刺</td>
+</tr>
+<tr>
+<td><code>cpu.pressure</code></td>
+<td><code>/sys/fs/cgroup/&lt;path&gt;/cpu.pressure</code></td>
+<td><code>some avg10</code> 反映「有任务等 CPU」的比例</td>
+</tr>
+<tr>
+<td><code>nr_running</code></td>
+<td><code>/proc/&lt;pid&gt;/schedstat</code> 第 1 列</td>
+<td>超过核数 2 倍说明排队严重</td>
+</tr>
+<tr>
+<td><code>se.statistics.wait_sum</code></td>
+<td><code>/proc/&lt;pid&gt;/sched</code>（需 root）</td>
+<td>累计等 CPU 时间，<strong>最直接的证据</strong></td>
+</tr>
+</tbody></table>
+<p><code>schedstat</code> 三列语义（很多文章写错）：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">$ cat /proc/self/schedstat</span><br><span class="line">1234567890 45678901 12345</span><br><span class="line"># 第1列：在 CPU 上运行的纳秒数</span><br><span class="line"># 第2列：在运行队列里等待的纳秒数   ← 关键</span><br><span class="line"># 第3列：被调度到的次数（slice 数）</span><br></pre></td></tr></table></figure>
+
+<p><strong>第二层：Java 内部（能区分「等 CPU」和「等锁」）</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 用 ThreadMXBean 的 CPU 时间 + 墙钟时间对比，定位线程到底在等什么</span></span><br><span class="line"><span class="type">ThreadMXBean</span> <span class="variable">mx</span> <span class="operator">=</span> ManagementFactory.getThreadMXBean();</span><br><span class="line"><span class="keyword">if</span> (mx.isThreadCpuTimeSupported() &amp;&amp; !mx.isThreadCpuTimeEnabled()) &#123;</span><br><span class="line">    mx.setThreadCpuTimeEnabled(<span class="literal">true</span>);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="type">long</span> <span class="variable">wallStart</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line"><span class="type">long</span> <span class="variable">cpuStart</span>  <span class="operator">=</span> mx.getCurrentThreadCpuTime();</span><br><span class="line"></span><br><span class="line">doWork();</span><br><span class="line"></span><br><span class="line"><span class="type">long</span> <span class="variable">wall</span> <span class="operator">=</span> System.nanoTime() - wallStart;</span><br><span class="line"><span class="type">long</span> <span class="variable">cpu</span>  <span class="operator">=</span> mx.getCurrentThreadCpuTime() - cpuStart;</span><br><span class="line"><span class="comment">// cpu/wall ≈ 1  → 一直在跑（CPU 密集 或 自旋）</span></span><br><span class="line"><span class="comment">// cpu/wall ≈ 0.1 → 大部分时间不在 CPU 上：等锁 / 等 IO / 被 throttle</span></span><br><span class="line">System.out.printf(<span class="string">&quot;wall=%.2fms cpu=%.2fms ratio=%.2f%n&quot;</span>,</span><br><span class="line">        wall / <span class="number">1e6</span>, cpu / <span class="number">1e6</span>, (<span class="type">double</span>) cpu / wall);</span><br></pre></td></tr></table></figure>
+
+<p>这个比值是排查的第一步分流器：<strong>ratio 低但线程状态是 RUNNABLE，就是被 throttle 或等 CPU</strong>（Java 的 RUNNABLE 包含「在运行队列里排队」，这是 JDK 的语义，别被误导）。</p>
+<p><strong>第三层：内核级（需要 root &#x2F; debugfs）</strong></p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 每个任务的调度延迟分布</span></span><br><span class="line">perf <span class="built_in">sched</span> latency -p &lt;pid&gt;</span><br><span class="line"></span><br><span class="line"><span class="comment"># 调度器内部状态（EEVDF 下能看到 slice / deadline 相关字段）</span></span><br><span class="line"><span class="built_in">cat</span> /proc/sched_debug | <span class="built_in">head</span> -50</span><br><span class="line"></span><br><span class="line"><span class="comment"># 动态追踪：谁在抢 CPU</span></span><br><span class="line">bpftrace -e <span class="string">&#x27;tracepoint:sched:sched_switch /pid == 12345/ &#123;</span></span><br><span class="line"><span class="string">  @wait[comm] = hist(nsecs - @start[tid]);</span></span><br><span class="line"><span class="string">&#125;&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="六、混部治理：一张决策表"><a href="#六、混部治理：一张决策表" class="headerlink" title="六、混部治理：一张决策表"></a>六、混部治理：一张决策表</h2><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>症状</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>周期 throttling</td>
+<td><code>nr_throttled</code> 高，P99 呈方波</td>
+<td>提高 <code>cpu.max</code> 或降低峰值并发；把批任务移到别的 cgroup</td>
+</tr>
+<tr>
+<td>长期 CPU 排队</td>
+<td><code>cpu.pressure some</code> &gt; 20%</td>
+<td>减少线程池大小 &#x2F; 拆服务 &#x2F; 加核</td>
+</tr>
+<tr>
+<td>批任务抢业务 CPU</td>
+<td>业务 P99 与批任务启动时间强相关</td>
+<td>批任务独立 cgroup，<code>cpu.weight=10</code>，<code>cpu.max</code> 硬顶</td>
+</tr>
+<tr>
+<td>GC 抢占</td>
+<td>GC 时间正常但 STW 变长</td>
+<td>限制 <code>ParallelGCThreads</code>，或把 GC 与批任务错峰</td>
+</tr>
+<tr>
+<td>容器核数识别错误</td>
+<td>线程池远大于 quota</td>
+<td><code>-XX:ActiveProcessorCount=N</code> + 虚拟线程 parallelism</td>
+</tr>
+<tr>
+<td>尾延迟抖动但 CPU 空闲</td>
+<td><code>wait_sum</code> 高、<code>nr_running</code> 高</td>
+<td>检查是否有 CPU 密集线程在自旋（<code>cpu/wall≈1</code>）</td>
+</tr>
+</tbody></table>
+<h2 id="七、面试常见追问"><a href="#七、面试常见追问" class="headerlink" title="七、面试常见追问"></a>七、面试常见追问</h2><p><strong>Q1：CFS 的 vruntime 是怎么算的？为什么要除以权重？</strong><br>vruntime 是虚拟运行时间，等于实际运行时间按权重折算。权重越大（nice 越小），同样的实际时间折算出的 vruntime 增长越慢，因此在红黑树上越靠左，被调度得越频繁——这就是「高优先级拿更多 CPU」的实现方式。除以权重保证了不同优先级的任务在<strong>虚拟时间轴</strong>上是公平的。</p>
+<p><strong>Q2：EEVDF 相比 CFS 解决了什么问题？</strong><br>CFS 只表达公平，不表达延迟需求，唤醒抢占靠 <code>wakeup_granularity</code> 打补丁。EEVDF 引入 lag 保证公平（只有 lag ≥ 0 才 eligible），引入 virtual deadline 表达延迟（slice 越短截止越早）。两者结合，可以在不牺牲公平的前提下让延迟敏感任务更快被调度。</p>
+<p><strong>Q3：<code>Thread.setPriority</code> 为什么在 Linux 上无效？</strong><br>因为 Linux 的默认调度策略 <code>SCHED_OTHER</code> 不使用 <code>sched_priority</code> 字段，只使用 nice 值决定权重。JVM 不会把 Java 优先级翻译成 nice（历史上 <code>-XX:+UseThreadPriorities</code> 在 Linux 上也是空操作）。想要真实优先级只能用 <code>SCHED_FIFO/SCHED_RR</code>（需要 <code>CAP_SYS_NICE</code>，且会饿死其他线程，生产禁用）。</p>
+<p><strong>Q4：容器里 <code>availableProcessors()</code> 为什么不准？</strong><br>它读的是 cpuset（<code>sched_getaffinity</code>），不是 cgroup CPU quota。<code>--cpus=2</code> 只设置 quota 不设置 cpuset，所以 JVM 看到的是宿主机全部核。JDK 10+ 有一部分容器感知（<code>UseContainerSupport</code>），但主要作用于<strong>内存</strong>；CPU 侧仍需 <code>-XX:ActiveProcessorCount</code> 显式指定。</p>
+<h2 id="八、落地踩坑清单"><a href="#八、落地踩坑清单" class="headerlink" title="八、落地踩坑清单"></a>八、落地踩坑清单</h2><ol>
+<li><strong>别迷信「CPU 没打满就没问题」</strong>。调度延迟发生在「有 CPU 空闲但你的线程没被选中」的时候，利用率指标看不出来。</li>
+<li><strong><code>nr_throttled</code> 要作为 SLO 指标上报</strong>，和 P99 放同一个看板。</li>
+<li><strong>不要把 <code>cpu.weight</code> 当成限流</strong>。它只在竞争时按比例分配，独占时无限。</li>
+<li><strong>批任务的 <code>cpu.max</code> 要留出余量</strong>，否则批任务自己也会被 throttle 得极慢，反而拉长总时长。</li>
+<li><strong>EEVDF 不是银弹</strong>。它改善的是「同权重下的尾延迟」，如果你的问题是 quota 打满或者锁竞争，换调度器没用。</li>
+<li><strong>升级内核要重新压测</strong>。6.6 之后 EEVDF 的参数默认值还在调整，同样的负载在不同内核上 P99 可能差 30%。</li>
+</ol>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><ul>
+<li>CFS 用 vruntime 表达公平，用唤醒抢占勉强表达延迟；EEVDF 用 <strong>lag 表达公平、virtual deadline 表达延迟</strong>，把两件事拆开了。</li>
+<li>对 Java 工程师来说，最要紧的不是调 EEVDF 参数（内核没给你接口），而是<strong>认清三件事</strong>：Java 线程优先级是假的、<code>availableProcessors()</code> 可能骗你、<code>cpu.max</code> 会制造周期性抖动。</li>
+<li>可观测的三件套：<code>cpu.stat</code>（throttle）、<code>cpu.pressure</code>（排队）、<code>/proc/&lt;pid&gt;/schedstat</code> 第 2 列（累计等 CPU 时间）。</li>
+<li>混部治理的正确姿势是<strong>分层 cgroup + 权重 + 硬顶</strong>，而不是在应用层调线程池参数祈祷。</li>
+</ul>
+<p>下一篇我会把「文件系统层的持久化语义」拆开讲——<code>fsync</code> 之后数据到底在哪、ext4 和 XFS 的差别为什么会让你的 WAL 性能差一倍。那是另一层同样被 Java 工程师忽视的内核语义。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/">https://jiweidong.github.io/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/%E8%B0%83%E5%BA%A6%E5%99%A8/">调度器</a><a class="post-meta__tags" href="/tags/EEVDF/">EEVDF</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/15/nginx-auth-request-subrequest-deep-practice/" title="【Nginx 实战】auth_request 与子请求深度解析：内部鉴权网关的子请求生命周期与生产治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Nginx 实战】auth_request 与子请求深度解析：内部鉴权网关的子请求生命周期与生产治理</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】auth_request 与子请求深度解析前言微服务里做统一鉴权，有三种常见落点：  每个服务自己引 Spring Security（重复实现、配置漂移、升级地狱）； 网关层（Spring Cloud Gateway &#x2F; APISIX）统一校验（要引入 Java&#x2F;Nginx 之外的组件）； 在 Nginx 层做 auth_request 子请求鉴权（零额外组件，接入成本最低）。  第三条路用的人很多，但真正讲清楚的人很少。大多数配置文章止步于「复制这段配置就能用」，于是生产里出现这些问题：  POST 请求鉴权永远失败（因为子请求默认不带 body）； 上游 auth 服务返回 503，用户看到 500（错误码语义被吞）； 每次请求多一次 RTT，QPS 高了之后 auth 服务先崩； 想把 auth 返回的 X-User-Id 透传给业务，发现拿不到； 大文件上传时鉴权接口超时，但业务接口并不慢。  这篇从 subrequest 的生命周期讲起，把 auth_request 的语义边界、错误码映射、性能模型和五个典型坑全部拆开。 一、su...</div></div></div></a><a class="pagination-related" href="/2026/11/14/llm-inference-kv-cache-pagedattention-deep-dive/" title="【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【AI 体系】KV Cache 与 PagedAttention 深度解析：显存账、分页调度与并发容量规划</div></div><div class="info-2"><div class="info-item-1">【AI 体系】KV Cache 与 PagedAttention 深度解析前言很多人算「一台机器能扛多少并发」时，算法是： 12显存 80G - 模型权重 16G = 64G 可用每个请求上下文 8k，好像能跑很多个？  然后上线发现并发到 20 就开始排队、OOM、请求被拒。 问题出在：大模型推理的显存大头不是权重，而是 KV Cache。它跟「上下文长度 × 并发数」线性相关，而这两者都是业务侧不断往上加的参数。 这篇把 KV Cache 的显存账、PagedAttention 的分页思想、prefix caching 的工程价值讲清楚，最后给一套 Java 侧可用的容量规划模型和准入控制代码。  一、为什么 decode 阶段是 memory-boundTransformer 推理分两段：    阶段 计算 瓶颈 指标    Prefill 一次性处理整个 prompt，矩阵乘 算力（compute-bound） TTFT（首 token 延迟）   Decode 逐 token 生成，每步一个矩阵乘 显存带宽（memory-bound） TPOT（每 token 延迟） ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/04/linux-page-cache-java-file-io-deep-dive/" title="【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-04</div><div class="info-item-2">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析前言一个很典型的现象：Java 服务写日志&#x2F;写文件，代码里 fileChannel.write() 返回成功、耗时 0.1ms，看起来磁盘快得离谱；但某天机器内存紧张，同一个写入突然变成 20ms，甚至出现大量 kswapd CPU 占用。 还有人问：FileOutputStream.write() 之后数据到底在哪？flush() 和 fsync() 有什么区别？为什么用 BufferedOutputStream 快 10 倍，但数据丢了？为什么 Kafka 号称”用页缓存所以快”，而 MySQL 却要自己管 buffer pool？ 这些问题的答案都在同一层：Linux Page Cache（页缓存）。这篇从内核机制讲到 Java API 语义，把”写文件”这件事彻底拆开。  一、Page Cache 是什么：内核的”第二层内存”1.1 一切皆页Linux 用 4KB 的页（page）管理物理内存，Page Cache 就是文件内容在内存中的副本，以 struct page 组织，用 a...</div></div></div></a><a class="pagination-related" href="/2026/11/15/ext4-xfs-fsync-java-durability-deep-dive/" title="【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-15</div><div class="info-item-2">【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义</div></div><div class="info-2"><div class="info-item-1">【性能调优】ext4 与 XFS 文件系统深度解析前言Java 里写「持久化」看起来只有两行： 12fileChannel.write(buf);fileChannel.force(true);  但只要你在生产里认真对待过数据安全，就会撞上两个方向相反的问题：  方向一（丢数据）：force(true) 明明调了，断电后最后几条记录还是没了；或者文件在，但目录项不见了，重启后文件「消失」。 方向二（慢）：为了安全，每条记录都 force()，结果吞吐只有 800 条&#x2F;秒；改成每 100 条刷一次，吞吐上去了，但断电丢 100 条。  这两个问题的答案都不在 Java 里，而在文件系统层：ext4 的延迟分配、journal 的三种模式、fsync 到底触发了什么、XFS 的 extent 与预分配、以及「元数据」和「数据」是两条独立的持久化路径。  说明：脏页回写的三个水位线（dirty_ratio、dirty_background_ratio、dirty_expire_centisecs）以及 write/flush/force/close 四层语义已经在《Linu...</div></div></div></a><a class="pagination-related" href="/2026/11/05/numa-aware-jvm-performance-tuning-deep-dive/" title="【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-05</div><div class="info-item-2">【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战</div></div><div class="info-2"><div class="info-item-1">【JVM 性能】NUMA 架构与 JVM 调优深度解析前言一个很典型的线上怪象：两台机器，A 是 32 核 128G 单路，B 是 2×64 核 512G 双路。压测同一个 Spring Boot 服务，B 的 CPU 利用率上不去，P99 反而比 A 慢 30%，GC 次数还更多。 很多人第一反应是「GC 参数没调好」「线程池太小」，把 -Xmx、-XX:ParallelGCThreads、Tomcat 线程数全试了一遍，收益甚微。真实原因往往藏在 CPU 和内存的物理拓扑里——这台机器是 NUMA 架构，而 JVM 默认并不知道这件事。 这篇文章把 NUMA 的原理、JVM 在 NUMA 上的真实行为、四种落地方案、容器里的坑，以及面试会怎么问，一次讲清楚。  一、NUMA 到底是什么1.1 从 SMP 到 NUMA早期多核 server 是 SMP（Symmetric Multiprocessing）：所有 CPU 通过一条前端总线访问同一块内存，任意核访问任意内存地址的延迟都一样（UMA）。 核数一多，总线就成了瓶颈。于是有了 NUMA（Non-Uniform Memor...</div></div></div></a><a class="pagination-related" href="/2026/11/11/linux-transparent-hugepage-jvm-deep-dive/" title="【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-11</div><div class="info-item-2">【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置</div></div><div class="info-2"><div class="info-item-1">【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置前言有一个很典型的线上现象：Java 服务 CPU、GC、QPS 全部正常，但 P99.9 每隔几十秒就冒出一个 200~800ms 的尖刺；抓 GC 日志没有长停顿，抓线程栈也看不到锁竞争，iostat 只有轻微波动。最后发现是宿主机 transparent_hugepage/enabled=always，khugepaged 在后台做页合并时抢了内存管理锁。 THP（Transparent Huge Pages）是一个”看起来只有收益、实际上经常带来延迟抖动”的内核特性。它对 JVM 的影响有三个层面：TLB 命中率（性能收益）、内存分配路径（compact 与 direct reclaim）、以及容器环境下的 RSS 计量与 OOM 判定。本文把这三点拆开讲清楚，并给出一套可验证的配置与观测方法。  一、为什么需要大页：TLB 与页表走查x86-64 默认页大小 4KB，虚拟地址到物理地址的翻译靠页表，页表项缓存就是 TLB：    页大小 覆盖 8GB 堆所需页数 TLB 条目需...</div></div></div></a><a class="pagination-related" href="/2026/11/10/linux-file-descriptor-exhaustion-java-deep-dive/" title="【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-10</div><div class="info-item-2">【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算</div></div><div class="info-2"><div class="info-item-1">【性能调优】文件描述符耗尽深度治理前言java.io.IOException: Too many open files 这个异常，几乎每个 Java 工程师都在某次深夜告警里见过。它的迷惑性在于：代码看起来没问题，连接池也配了上限，但 fd 就是一直涨。 更麻烦的是，它的表现形式千奇百怪：  接口偶发 500，重启就好，过几天再犯 accept 失败但 connect 正常（新连接进不来，老连接还在用） 日志突然不写了（logback 打不开新文件） 明明 lsof 只有 3000 个 fd，ulimit -n 是 65535，却还是报错  这篇把 fd 从内核数据结构讲到 Java 侧泄漏点，给一套能在 5 分钟内定位到具体泄漏源的排查方法论，最后给容量估算公式。  一、fd 到底是什么：三层配额先建立一个模型。一个进程能打开多少文件，受三层限制，任何一层撞墙都会报 EMFILE 或 ENFILE：    层级 限制项 查看方式 超出后果    进程级（soft） RLIMIT_NOFILE ulimit -Sn &#x2F; cat /proc/&lt;pid&gt;/lim...</div></div></div></a><a class="pagination-related" href="/2026/11/09/linux-pressure-stall-information-psi-deep-dive/" title="【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-09</div><div class="info-item-2">【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地</div></div><div class="info-2"><div class="info-item-1">【性能调优】PSI 压力失速信息深度解析前言：那个”CPU 只用了 35%，但 P99 抖到 800ms”的下午先说一个真实场景。线上支付服务，8 核容器，CPU 使用率稳定在 30%40%，JVM GC 日志干净（Young GC 30ms 一次，一天没有 Full GC），但每天下午三点和晚上八点，接口 P99 从 60ms 飙升到 700900ms，且抖动持续 10~20 分钟。查 JVM 什么都查不到，查应用日志只能看到”耗时变长”，查业务代码没有慢查询。 最后定位到的答案是：宿主机上另一台虚拟机的备份任务在猛写磁盘，导致这个容器的脏页回写排队，Java 线程在做任何有磁盘&#x2F;内存分配的路径上被内核 block 住了。JVM 完全不知道自己被 block 了——因为在 JVM 看来，那只是一次”有点慢的系统调用”。 这就是传统观测体系的盲区：top 告诉你 CPU 不满，vmstat 告诉你 wa 高，但”到底有多少任务被卡住了、卡了多久、卡在哪个资源上”,这些指标回答不了。Linux 4.20 引入的 PSI（Pressure Stall Information...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">927</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1033</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E3%80%91Linux-EEVDF-%E8%B0%83%E5%BA%A6%E5%99%A8%E4%B8%8E-Java-%E7%BA%BF%E7%A8%8B%E5%BB%B6%E8%BF%9F%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E5%9B%9E%E9%A1%BE-CFS%EF%BC%9AJava-%E5%B7%A5%E7%A8%8B%E5%B8%88%E6%9C%80%E8%AF%A5%E7%9F%A5%E9%81%93%E7%9A%84%E4%B8%89%E4%BB%B6%E4%BA%8B"><span class="toc-number">1.2.</span> <span class="toc-text">一、先回顾 CFS：Java 工程师最该知道的三件事</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81CFS-%E5%88%B0%E5%BA%95%E5%93%AA%E9%87%8C%E4%B8%8D%E5%A4%9F%EF%BC%9A%E5%BB%B6%E8%BF%9F%E6%95%8F%E6%84%9F%E4%BB%BB%E5%8A%A1%E6%B2%A1%E6%9C%89%E8%A1%A8%E8%BE%BE%E6%B8%A0%E9%81%93"><span class="toc-number">1.3.</span> <span class="toc-text">二、CFS 到底哪里不够：延迟敏感任务没有表达渠道</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81EEVDF%EF%BC%9A%E6%8A%8A%E3%80%8C%E5%85%AC%E5%B9%B3%E3%80%8D%E6%8D%A2%E6%88%90%E3%80%8C%E5%85%AC%E5%B9%B3-%E6%88%AA%E6%AD%A2%E6%97%B6%E9%97%B4%E3%80%8D"><span class="toc-number">1.4.</span> <span class="toc-text">三、EEVDF：把「公平」换成「公平 + 截止时间」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%8F%82%E6%95%B0%E5%AF%B9%E7%85%A7"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 参数对照</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%8A%8A%E8%B0%83%E5%BA%A6%E8%AF%AD%E4%B9%89%E7%BF%BB%E8%AF%91%E6%88%90-Java-%E4%BE%A7%E7%9A%84%E5%8A%A8%E4%BD%9C"><span class="toc-number">1.5.</span> <span class="toc-text">四、把调度语义翻译成 Java 侧的动作</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-cgroup-v2-%E7%9A%84-cpu-weight-%E5%92%8C-cpu-max-%E8%AF%AD%E4%B9%89%E5%AE%8C%E5%85%A8%E4%B8%8D%E5%90%8C"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 cgroup v2 的 cpu.weight 和 cpu.max 语义完全不同</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-GC-%E7%BA%BF%E7%A8%8B%E5%92%8C%E4%B8%9A%E5%8A%A1%E7%BA%BF%E7%A8%8B%E6%9D%83%E9%87%8D%E7%9B%B8%E5%90%8C%EF%BC%8C%E8%BF%99%E6%98%AF%E9%BB%98%E8%AE%A4%E5%AE%BF%E5%91%BD"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 GC 线程和业务线程权重相同，这是默认宿命</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E8%99%9A%E6%8B%9F%E7%BA%BF%E7%A8%8B%E7%9A%84-carrier-%E6%95%B0%E4%B8%8E%E8%B0%83%E5%BA%A6%E5%8F%A0%E5%8A%A0"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 虚拟线程的 carrier 数与调度叠加</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E8%A7%82%E6%B5%8B%EF%BC%9A%E4%B8%89%E4%B8%AA%E5%B1%82%E6%AC%A1%EF%BC%8C%E6%8C%89%E6%88%90%E6%9C%AC%E4%BB%8E%E4%BD%8E%E5%88%B0%E9%AB%98"><span class="toc-number">1.6.</span> <span class="toc-text">五、观测：三个层次，按成本从低到高</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%B7%B7%E9%83%A8%E6%B2%BB%E7%90%86%EF%BC%9A%E4%B8%80%E5%BC%A0%E5%86%B3%E7%AD%96%E8%A1%A8"><span class="toc-number">1.7.</span> <span class="toc-text">六、混部治理：一张决策表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E5%B8%B8%E8%A7%81%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试常见追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E8%90%BD%E5%9C%B0%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.9.</span> <span class="toc-text">八、落地踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/15/java-engineer-ai-fundamentals-learning-map/" title="【AI 转型】Java 工程师补 AI 理论基础的学习地图：60 天，只学「够用」的那 20%">【AI 转型】Java 工程师补 AI 理论基础的学习地图：60 天，只学「够用」的那 20%</a><time datetime="2026-11-15T00:50:00.000Z" title="发表于 2026-11-15 08:50:00">2026-11-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/15/java-vector-store-bulk-upsert-index-tuning-deep-practice/" title="【Java AI】向量库批量写入与索引构建调优深度实战：ES bulk、Qdrant、Milvus 与 pgvector 的 Java 落地">【Java AI】向量库批量写入与索引构建调优深度实战：ES bulk、Qdrant、Milvus 与 pgvector 的 Java 落地</a><time datetime="2026-11-15T00:40:00.000Z" title="发表于 2026-11-15 08:40:00">2026-11-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/15/ext4-xfs-fsync-java-durability-deep-dive/" title="【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义">【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义</a><time datetime="2026-11-15T00:30:00.000Z" title="发表于 2026-11-15 08:30:00">2026-11-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/15/nginx-auth-request-subrequest-deep-practice/" title="【Nginx 实战】auth_request 与子请求深度解析：内部鉴权网关的子请求生命周期与生产治理">【Nginx 实战】auth_request 与子请求深度解析：内部鉴权网关的子请求生命周期与生产治理</a><time datetime="2026-11-15T00:20:00.000Z" title="发表于 2026-11-15 08:20:00">2026-11-15</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/" title="【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice">【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag/vslice</a><time datetime="2026-11-15T00:10:00.000Z" title="发表于 2026-11-15 08:10:00">2026-11-15</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
