@@ -1,0 +1,423 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析一、前言Java 应用「写日志慢」「刷盘抖动」「数据库 fsync 延迟高」，很多人第一反应是换 SSD、加 IOPS。但一块 NVMe 在 fio 里能跑 50 万 IOPS，业务侧 fsync 的 P99 却是 80ms —— 差距往往不在硬件，而在块层的排队方式。 从 FileChannel.force() 返回到数据真正落">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析一、前言Java 应用「写日志慢」「刷盘抖动」「数据库 fsync 延迟高」，很多人第一反应是换 SSD、加 IOPS。但一块 NVMe 在 fio 里能跑 50 万 IOPS，业务侧 fsync 的 P99 却是 80ms —— 差距往往不在硬件，而在块层的排队方式。 从 FileChannel.force() 返回到数据真正落">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-16T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-11-16T00:02:08.624Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="IO 调度">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="blk-mq">
+<meta property="article:tag" content="fsync">
+<meta property="article:tag" content="性能调优">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟",
+  "url": "https://jiweidong.github.io/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-16T00:20:00.000Z",
+  "dateModified": "2026-11-16T00:02:08.624Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">932</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1047</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-16T00:20:00.000Z" title="发表于 2026-11-16 08:20:00">2026-11-16</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-16T00:02:08.624Z" title="更新于 2026-11-16 08:02:08">2026-11-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【性能调优】Linux-块层-blk-mq-与-IO-调度器深度解析"><a href="#【性能调优】Linux-块层-blk-mq-与-IO-调度器深度解析" class="headerlink" title="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析"></a>【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析</h1><h2 id="一、前言"><a href="#一、前言" class="headerlink" title="一、前言"></a>一、前言</h2><p>Java 应用「写日志慢」「刷盘抖动」「数据库 fsync 延迟高」，很多人第一反应是换 SSD、加 IOPS。但一块 NVMe 在 <code>fio</code> 里能跑 50 万 IOPS，业务侧 <code>fsync</code> 的 P99 却是 80ms —— 差距往往不在硬件，而在<strong>块层的排队方式</strong>。</p>
+<p>从 <code>FileChannel.force()</code> 返回到数据真正落到介质，中间要穿过：page cache → 文件系统 → 块层 blk-mq → 设备队列 → 控制器缓存 → 介质。blk-mq 是 Linux 4.x 之后的重写，把「每 CPU 一个软件队列 + 多硬件队列」变成了默认模型；IO 调度器（<code>none</code>&#x2F;<code>mq-deadline</code>&#x2F;<code>kyber</code>&#x2F;<code>bfq</code>）则决定了请求怎么合并、排序、限流。</p>
+<p>本文把这层拆开，讲清楚三件事：<strong>请求怎么排队、调度器怎么选、Java 侧怎么量</strong>。</p>
+<span id="more"></span>
+
+<h2 id="二、IO-路径全景"><a href="#二、IO-路径全景" class="headerlink" title="二、IO 路径全景"></a>二、IO 路径全景</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">write(2)</span><br><span class="line">  └─ VFS → page cache（脏页）</span><br><span class="line">       └─ writeback 内核线程 / fsync 主动回写</span><br><span class="line">            └─ 文件系统：ext4/XFS 分配 extent、生成 bio</span><br><span class="line">                 └─ 块层 blk-mq</span><br><span class="line">                      ├─ 软件队列（per-CPU）</span><br><span class="line">                      ├─ IO 调度器（合并/排序/限流）</span><br><span class="line">                      └─ 硬件队列 hctx → 设备驱动</span><br><span class="line">                           └─ NVMe 队列对 / SCSI 队列</span><br><span class="line">                                └─ 设备缓存 → 介质</span><br></pre></td></tr></table></figure>
+
+<p>两个关键事实：</p>
+<ol>
+<li><strong>普通 <code>write()</code> 不落盘</strong>，只写 page cache，返回即成功。真正的 IO 发生在 writeback 或 <code>fsync</code>；</li>
+<li><strong><code>fsync</code> 也不是「一次 IO」</strong>，它要等文件数据 + 元数据（extent、inode 时间、journal 提交）全部持久化，物理上是多次 IO + 一次 FLUSH 命令。</li>
+</ol>
+<h2 id="三、blk-mq-的队列模型"><a href="#三、blk-mq-的队列模型" class="headerlink" title="三、blk-mq 的队列模型"></a>三、blk-mq 的队列模型</h2><h3 id="3-1-三代演进"><a href="#3-1-三代演进" class="headerlink" title="3.1 三代演进"></a>3.1 三代演进</h3><table>
+<thead>
+<tr>
+<th>代际</th>
+<th>模型</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>旧 block 层</td>
+<td>全局 <code>request_queue</code> + 单锁</td>
+<td>多核下锁竞争，NUMA 远程访问</td>
+</tr>
+<tr>
+<td>blk-mq（3.13+）</td>
+<td>per-CPU 软件队列 + 多硬件队列</td>
+<td>需要设备支持多队列</td>
+</tr>
+<tr>
+<td>blk-mq + io_uring（5.1+）</td>
+<td>用户态提交&#x2F;完成环，绕过部分 syscall</td>
+<td>生态与权限限制</td>
+</tr>
+</tbody></table>
+<h3 id="3-2-软件队列与硬件队列"><a href="#3-2-软件队列与硬件队列" class="headerlink" title="3.2 软件队列与硬件队列"></a>3.2 软件队列与硬件队列</h3><ul>
+<li><strong>软件队列（<code>ctx</code>）</strong>：每个 CPU 一个，应用提交 bio 时先落到本地队列，避免跨核竞争；</li>
+<li><strong>硬件队列（<code>hctx</code>）</strong>：与设备队列一一映射。NVMe 通常支持 64~128 个队列对，SATA 通常只有 1 个；</li>
+<li><strong>映射关系</strong>：CPU → 软件队列 → 硬件队列。队列数不匹配时会出现多对一，成为瓶颈。</li>
+</ul>
+<p>查看：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">ls</span> /sys/block/nvme0n1/mq/</span><br><span class="line"><span class="comment"># 0 1 2 ... 63        ← 64 个 hctx</span></span><br><span class="line"></span><br><span class="line"><span class="built_in">cat</span> /sys/block/nvme0n1/queue/nr_requests      <span class="comment"># 每个 hctx 的请求数上限，默认 1023</span></span><br><span class="line"><span class="built_in">cat</span> /sys/block/nvme0n1/queue/scheduler        <span class="comment"># [none] mq-deadline kyber bfq</span></span><br><span class="line"><span class="built_in">cat</span> /sys/block/nvme0n1/queue/nr_hw_queues</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-3-tag-与队列深度"><a href="#3-3-tag-与队列深度" class="headerlink" title="3.3 tag 与队列深度"></a>3.3 tag 与队列深度</h3><p>blk-mq 用 <strong>tag</strong> 标识 in-flight 请求，tag 数量就是队列深度。NVMe 的队列深度可以到 1024，SATA 的 NCQ 只有 32。</p>
+<p>队列深度决定了<strong>能同时压给设备多少个请求</strong>。按 Little 定律：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">并发请求数 = 吞吐(IOPS) × 单请求延迟</span><br></pre></td></tr></table></figure>
+
+<p>一块 100μs 延迟、50 万 IOPS 的 NVMe，需要 50 个并发请求才能打满。如果应用是「一次 <code>fsync</code> 等一个」，并发度只有 1，IOPS 上限就是 1&#x2F;100μs &#x3D; 1 万。这就是「硬件很强、业务很慢」的数学原因。</p>
+<h2 id="四、四种-IO-调度器"><a href="#四、四种-IO-调度器" class="headerlink" title="四、四种 IO 调度器"></a>四、四种 IO 调度器</h2><h3 id="4-1-对比"><a href="#4-1-对比" class="headerlink" title="4.1 对比"></a>4.1 对比</h3><table>
+<thead>
+<tr>
+<th>调度器</th>
+<th>排序&#x2F;合并</th>
+<th>fairness</th>
+<th>延迟控制</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>none</code></td>
+<td>仅简单合并</td>
+<td>无</td>
+<td>无</td>
+<td>NVMe &#x2F; 低延迟 SSD &#x2F; 多队列设备</td>
+</tr>
+<tr>
+<td><code>mq-deadline</code></td>
+<td>按截止时间排序，读优先</td>
+<td>弱</td>
+<td>读 500ms、写 5s 截止</td>
+<td>SATA SSD、HDD、通用</td>
+</tr>
+<tr>
+<td><code>kyber</code></td>
+<td>按读&#x2F;写&#x2F;discard 三类限流</td>
+<td>无</td>
+<td>令牌桶控制延迟目标</td>
+<td>低延迟 SSD、可预测负载</td>
+</tr>
+<tr>
+<td><code>bfq</code></td>
+<td>按 cgroup&#x2F;进程公平排队</td>
+<td>强</td>
+<td>预算控制</td>
+<td>桌面、SATA、混合负载</td>
+</tr>
+</tbody></table>
+<h3 id="4-2-none"><a href="#4-2-none" class="headerlink" title="4.2 none"></a>4.2 none</h3><p><code>none</code> 不是「什么都不做」，它仍做相邻请求合并（merge），只是不做重排。对 NVMe 来说，设备内部有完整的调度能力（多队列、内部并行），内核再排序反而增加延迟。</p>
+<p><strong>判断标准</strong>：设备是 NVMe 或多队列 SSD，且队列深度 &gt; 32，用 <code>none</code>。数据库（MySQL&#x2F;PostgreSQL）在这类盘上通常也建议 <code>none</code>。</p>
+<h3 id="4-3-mq-deadline"><a href="#4-3-mq-deadline" class="headerlink" title="4.3 mq-deadline"></a>4.3 mq-deadline</h3><p>为每个请求设截止时间，读请求优先：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">cat</span> /sys/block/sda/queue/iosched/read_expire     <span class="comment"># 500 (ms)</span></span><br><span class="line"><span class="built_in">cat</span> /sys/block/sda/queue/iosched/write_expire    <span class="comment"># 5000</span></span><br><span class="line"><span class="built_in">cat</span> /sys/block/sda/queue/iosched/fifo_batch      <span class="comment"># 16</span></span><br><span class="line"><span class="built_in">cat</span> /sys/block/sda/queue/iosched/writes_starved  <span class="comment"># 2</span></span><br></pre></td></tr></table></figure>
+
+<p>参数含义：</p>
+<ul>
+<li><code>fifo_batch</code>：每批处理多少个同方向请求再切换方向。调大提高吞吐、增加读延迟；调小相反；</li>
+<li><code>writes_starved</code>：读请求可以「饿死」写请求多少轮。默认 2 表示读优先但不完全饿死写。</li>
+</ul>
+<p>HDD 上必须用它，因为机械盘需要减少寻道；SATA SSD 上也可用，收益有限。</p>
+<h3 id="4-4-kyber"><a href="#4-4-kyber" class="headerlink" title="4.4 kyber"></a>4.4 kyber</h3><p>kyber 的思路很直接：给读、写、discard 三类请求各一个令牌桶，按目标延迟反推令牌数。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">cat</span> /sys/block/nvme0n1/queue/iosched/read_lat_nsec      <span class="comment"># 2000000 (2ms)</span></span><br><span class="line"><span class="built_in">cat</span> /sys/block/nvme0n1/queue/iosched/write_lat_nsec     <span class="comment"># 10000000 (10ms)</span></span><br></pre></td></tr></table></figure>
+
+<p>当某类请求的延迟超过目标，就暂停分发该类请求，把设备让给其他类。适合「读写混跑、要求读延迟可控」的场景。缺点是参数需要按设备实测调，默认值在高端 NVMe 上偏保守。</p>
+<h3 id="4-5-bfq"><a href="#4-5-bfq" class="headerlink" title="4.5 bfq"></a>4.5 bfq</h3><p>bfq 是唯一提供<strong>进程&#x2F;cgroup 级公平</strong>的调度器。它会为每个队列维护预算（budget），按权重分配带宽。</p>
+<p>适合：桌面环境（防止 <code>dd</code> 卡死桌面）、多租户但没用 cgroup io 控制的场景。不适合：高 IOPS 的数据库，因为它的排队与预算计算本身有 CPU 开销。</p>
+<h3 id="4-6-怎么选"><a href="#4-6-怎么选" class="headerlink" title="4.6 怎么选"></a>4.6 怎么选</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">NVMe / 多队列 SSD</span><br><span class="line">├─ 数据库 / 低延迟       → none</span><br><span class="line">├─ 混合读写、要延迟可控   → kyber</span><br><span class="line">└─ 多租户、要公平         → bfq（或 none + cgroup io.max）</span><br><span class="line"></span><br><span class="line">SATA SSD</span><br><span class="line">├─ 通用                  → mq-deadline</span><br><span class="line">└─ 桌面/公平              → bfq</span><br><span class="line"></span><br><span class="line">HDD</span><br><span class="line">└─ mq-deadline（唯一正确选择）</span><br></pre></td></tr></table></figure>
+
+<p>临时切换：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">echo</span> mq-deadline &gt; /sys/block/sda/queue/scheduler</span><br><span class="line"><span class="comment"># 持久化用 udev 规则或 tuned profile</span></span><br></pre></td></tr></table></figure>
+
+<h2 id="五、被误读的-iostat"><a href="#五、被误读的-iostat" class="headerlink" title="五、被误读的 iostat"></a>五、被误读的 iostat</h2><h3 id="5-1-util-不是「磁盘使用率」"><a href="#5-1-util-不是「磁盘使用率」" class="headerlink" title="5.1 %util 不是「磁盘使用率」"></a>5.1 %util 不是「磁盘使用率」</h3><p><code>iostat -x</code> 的 <code>%util</code> 计算方式是「设备有 IO 在途的时间占比」。对支持并行的 NVMe，同一时刻可以有几十个请求在途，<code>%util</code> 很容易显示 100%，但设备远未饱和。</p>
+<p><strong>NVMe 上 <code>%util</code> 基本没有参考价值</strong>，要看：</p>
+<ul>
+<li><code>r/s</code>、<code>w/s</code>：实际 IOPS；</li>
+<li><code>rMB/s</code>、<code>wMB/s</code>：带宽；</li>
+<li><code>await</code>：平均延迟（含排队）；</li>
+<li><code>aqu-sz</code>：平均队列长度；</li>
+<li><code>rareq-sz</code>、<code>wareq-sz</code>：平均请求大小。</li>
+</ul>
+<h3 id="5-2-await-的构成"><a href="#5-2-await-的构成" class="headerlink" title="5.2 await 的构成"></a>5.2 await 的构成</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">await = 队列等待时间 + 设备处理时间</span><br></pre></td></tr></table></figure>
+
+<p><code>await</code> 高但 <code>%util</code> 低，说明请求在<strong>排队</strong>（队列深度不够、调度器限流、cgroup <code>io.max</code> 卡住）；<code>await</code> 高且 <code>%util</code> 高，才是设备真饱和。</p>
+<h3 id="5-3-用-bpftrace-看真实延迟分布"><a href="#5-3-用-bpftrace-看真实延迟分布" class="headerlink" title="5.3 用 bpftrace 看真实延迟分布"></a>5.3 用 bpftrace 看真实延迟分布</h3><p>平均值会骗人，要看直方图：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">bpftrace -e <span class="string">&#x27;</span></span><br><span class="line"><span class="string">kprobe:blk_account_io_done &#123;</span></span><br><span class="line"><span class="string">  @us[tid] = hist((nsecs - @start[arg0]) / 1000);</span></span><br><span class="line"><span class="string">&#125;</span></span><br><span class="line"><span class="string">kprobe:blk_account_io_start &#123; @start[arg0] = nsecs; &#125;</span></span><br><span class="line"><span class="string">&#x27;</span></span><br></pre></td></tr></table></figure>
+
+<p>或者用 <code>biolatency</code>（bcc）：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">biolatency -m 10      <span class="comment"># 按毫秒桶输出直方图</span></span><br></pre></td></tr></table></figure>
+
+<p>典型双峰分布：左边 100μs 是缓存命中&#x2F;正常 IO，右边 10ms+ 的小峰是<strong>日志提交或 writeback 抖动</strong>。只有直方图能看出这种结构。</p>
+<h2 id="六、WBT：写回限流"><a href="#六、WBT：写回限流" class="headerlink" title="六、WBT：写回限流"></a>六、WBT：写回限流</h2><p>Linux 4.10 引入 Writeback Throttling（WBT），防止「脏页写太猛把读延迟拖死」。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="built_in">cat</span> /sys/block/nvme0n1/queue/wbt_lat_usec    <span class="comment"># 默认 75000 (75ms)</span></span><br></pre></td></tr></table></figure>
+
+<p>原理：跟踪每个 in-flight 写请求的完成延迟，如果超过 <code>wbt_lat_usec</code>，就限制新的写请求进入。它不是限带宽，而是<strong>限并发</strong>。</p>
+<p>对延迟敏感的读服务，可以把 <code>wbt_lat_usec</code> 调低（如 20000）；对纯写吞吐场景，可以调高或关闭（<code>0</code>）。</p>
+<h2 id="七、Java-侧的落盘延迟"><a href="#七、Java-侧的落盘延迟" class="headerlink" title="七、Java 侧的落盘延迟"></a>七、Java 侧的落盘延迟</h2><h3 id="7-1-fsync-的实际代价"><a href="#7-1-fsync-的实际代价" class="headerlink" title="7.1 fsync 的实际代价"></a>7.1 fsync 的实际代价</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">FsyncLatencyProbe</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">Histogram</span> <span class="variable">histogram</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Histogram</span>(</span><br><span class="line">        <span class="keyword">new</span> <span class="title class_">LogarithmicBucketBoundaries</span>(<span class="number">1</span>, <span class="number">2</span>, <span class="number">5</span>, <span class="number">10</span>, <span class="number">20</span>, <span class="number">50</span>, <span class="number">100</span>, <span class="number">200</span>, <span class="number">500</span>, <span class="number">1000</span>, <span class="number">2000</span>, <span class="number">5000</span>));</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">appendAndSync</span><span class="params">(Path path, <span class="type">byte</span>[] payload)</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">        <span class="keyword">try</span> (<span class="type">FileChannel</span> <span class="variable">ch</span> <span class="operator">=</span> FileChannel.open(path,</span><br><span class="line">                StandardOpenOption.CREATE, StandardOpenOption.WRITE,</span><br><span class="line">                StandardOpenOption.APPEND)) &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">            ch.write(ByteBuffer.wrap(payload));</span><br><span class="line">            ch.force(<span class="literal">false</span>);            <span class="comment">// false = 只刷数据，不刷元数据</span></span><br><span class="line">            histogram.record((System.nanoTime() - start) / <span class="number">1_000_000</span>);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>force(false)</code> 与 <code>force(true)</code> 的区别：</p>
+<table>
+<thead>
+<tr>
+<th>调用</th>
+<th>刷数据</th>
+<th>刷元数据（文件大小&#x2F;时间）</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>force(false)</code></td>
+<td>是</td>
+<td>否</td>
+<td>固定大小文件、预分配、覆盖写</td>
+</tr>
+<tr>
+<td><code>force(true)</code></td>
+<td>是</td>
+<td>是</td>
+<td>追加写、需要持久化文件长度</td>
+</tr>
+</tbody></table>
+<p><strong>追加写场景必须 <code>force(true)</code></strong>。很多「重启后最后几条日志丢了」的 bug，就是因为用了 <code>force(false)</code>：数据块落了盘，但 inode 里的 <code>size</code> 还是旧值，重启后文件被截断。</p>
+<h3 id="7-2-组提交：用并发换-IOPS"><a href="#7-2-组提交：用并发换-IOPS" class="headerlink" title="7.2 组提交：用并发换 IOPS"></a>7.2 组提交：用并发换 IOPS</h3><p>单线程 <code>fsync</code> 的 IOPS 上限是 <code>1/延迟</code>。要打满设备，必须让多个写请求同时在途 —— 这就是组提交：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">GroupCommitWriter</span> <span class="keyword">implements</span> <span class="title class_">AutoCloseable</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> FileChannel channel;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> BlockingQueue&lt;CompletableFuture&lt;Void&gt;&gt; pending =</span><br><span class="line">            <span class="keyword">new</span> <span class="title class_">LinkedBlockingQueue</span>&lt;&gt;();</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Thread flusher;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">GroupCommitWriter</span><span class="params">(Path path)</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">        <span class="built_in">this</span>.channel = FileChannel.open(path,</span><br><span class="line">                StandardOpenOption.CREATE, StandardOpenOption.WRITE,</span><br><span class="line">                StandardOpenOption.APPEND);</span><br><span class="line">        <span class="built_in">this</span>.flusher = Thread.ofPlatform().name(<span class="string">&quot;group-commit&quot;</span>).daemon().start(<span class="built_in">this</span>::loop);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> CompletableFuture&lt;Void&gt; <span class="title function_">write</span><span class="params">(<span class="type">byte</span>[] data)</span> &#123;</span><br><span class="line">        CompletableFuture&lt;Void&gt; f = <span class="keyword">new</span> <span class="title class_">CompletableFuture</span>&lt;&gt;();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            channel.write(ByteBuffer.wrap(data));   <span class="comment">// 先写 page cache</span></span><br><span class="line">            pending.add(f);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (IOException e) &#123;</span><br><span class="line">            f.completeExceptionally(e);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> f;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">void</span> <span class="title function_">loop</span><span class="params">()</span> &#123;</span><br><span class="line">        List&lt;CompletableFuture&lt;Void&gt;&gt; batch = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;(<span class="number">256</span>);</span><br><span class="line">        <span class="keyword">while</span> (!Thread.currentThread().isInterrupted()) &#123;</span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                batch.add(pending.take());</span><br><span class="line">                pending.drainTo(batch, <span class="number">255</span>);       <span class="comment">// 攒一批</span></span><br><span class="line">                channel.force(<span class="literal">true</span>);               <span class="comment">// 一次 fsync 覆盖一批</span></span><br><span class="line">                batch.forEach(f -&gt; f.complete(<span class="literal">null</span>));</span><br><span class="line">            &#125; <span class="keyword">catch</span> (InterruptedException e) &#123;</span><br><span class="line">                Thread.currentThread().interrupt();</span><br><span class="line">            &#125; <span class="keyword">catch</span> (IOException e) &#123;</span><br><span class="line">                batch.forEach(f -&gt; f.completeExceptionally(e));</span><br><span class="line">            &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">                batch.clear();</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">close</span><span class="params">()</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">        flusher.interrupt();</span><br><span class="line">        channel.force(<span class="literal">true</span>);</span><br><span class="line">        channel.close();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这就是 Kafka、RocketMQ、MySQL 组提交的简化版。收益：100 个并发写、单次 <code>fsync</code> 5ms，串行是 200 IOPS，组提交后接近 2 万 IOPS 等效吞吐。</p>
+<h3 id="7-3-Java-能不能用-O-DIRECT"><a href="#7-3-Java-能不能用-O-DIRECT" class="headerlink" title="7.3 Java 能不能用 O_DIRECT"></a>7.3 Java 能不能用 O_DIRECT</h3><p>Java 标准库<strong>没有</strong> <code>O_DIRECT</code> 开关。三条路：</p>
+<ol>
+<li><strong>JNI&#x2F;JNA 调 <code>open(2)</code></strong>，再用 <code>FileChannel</code> 包装 fd。要求 buffer 地址与长度按逻辑块大小（512&#x2F;4096）对齐；</li>
+<li><strong>Java 21+ FFM API</strong>（<code>java.lang.foreign</code>）直接调 <code>open</code>&#x2F;<code>pread</code>，用 <code>Arena.allocate(size, 4096)</code> 保证对齐；</li>
+<li><strong>Netty 的 <code>IoUring</code>&#x2F;native transport</strong> 或第三方库（如 <code>jnr</code>）。</li>
+</ol>
+<p>FFM 示例（片段）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">try</span> (<span class="type">Arena</span> <span class="variable">arena</span> <span class="operator">=</span> Arena.ofConfined()) &#123;</span><br><span class="line">    <span class="type">MemorySegment</span> <span class="variable">buf</span> <span class="operator">=</span> arena.allocate(<span class="number">4096</span>, <span class="number">4096</span>);   <span class="comment">// 4K 对齐</span></span><br><span class="line">    <span class="type">int</span> <span class="variable">fd</span> <span class="operator">=</span> (<span class="type">int</span>) open.invokeExact(pathAddress, O_RDWR | O_DIRECT);</span><br><span class="line">    <span class="type">long</span> <span class="variable">n</span> <span class="operator">=</span> (<span class="type">long</span>) pread.invokeExact(fd, buf, <span class="number">4096</span>, <span class="number">0L</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>坑：</p>
+<ul>
+<li><code>DirectByteBuffer</code> 的地址由 JVM 分配，默认只保证 8 字节对齐，<strong>不能直接用于 O_DIRECT</strong>；</li>
+<li>O_DIRECT 绕过 page cache，读会变慢（没有预读），写小片段会放大 IO；</li>
+<li>容器里 seccomp 可能拦 <code>openat</code> 的 <code>O_DIRECT</code> 标志（少见，但云上遇到过）。</li>
+</ul>
+<p>结论：<strong>除非你在写存储引擎，否则不要碰 O_DIRECT</strong>。用「page cache + 组提交 + 合理预读」就够了。</p>
+<h3 id="7-4-观测-Java-写延迟"><a href="#7-4-观测-Java-写延迟" class="headerlink" title="7.4 观测 Java 写延迟"></a>7.4 观测 Java 写延迟</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Micrometer + Prometheus，按操作类型分桶</span></span><br><span class="line">Timer.builder(<span class="string">&quot;app.disk.fsync&quot;</span>)</span><br><span class="line">     .tag(<span class="string">&quot;file&quot;</span>, <span class="string">&quot;wal&quot;</span>)</span><br><span class="line">     .publishPercentileHistogram()</span><br><span class="line">     .serviceLevelObjectives(Duration.ofMillis(<span class="number">1</span>), Duration.ofMillis(<span class="number">5</span>),</span><br><span class="line">                             Duration.ofMillis(<span class="number">20</span>), Duration.ofMillis(<span class="number">100</span>))</span><br><span class="line">     .register(registry)</span><br><span class="line">     .record(() -&gt; channel.force(<span class="literal">true</span>));</span><br></pre></td></tr></table></figure>
+
+<p>再配合节点侧的 <code>biolatency</code>，就能把「应用慢」定位到「排队慢」还是「介质慢」。</p>
+<h2 id="八、实战：一次-P99-抖动归因"><a href="#八、实战：一次-P99-抖动归因" class="headerlink" title="八、实战：一次 P99 抖动归因"></a>八、实战：一次 P99 抖动归因</h2><p>现象：订单服务 P99 从 30ms 涨到 300ms，CPU 正常，GC 正常，磁盘 <code>%util</code> 60%。</p>
+<p>排查过程：</p>
+<ol>
+<li><code>iostat -x 1</code> 看 <code>await</code> 从 0.5ms 涨到 40ms，<code>aqu-sz</code> 从 2 涨到 30 → 请求在排队；</li>
+<li><code>biolatency</code> 直方图出现 50ms 的峰 → 不是介质慢，是排队；</li>
+<li><code>cat /sys/block/nvme0n1/queue/scheduler</code> 显示 <code>bfq</code> → 有人按「桌面优化」教程改了调度器；</li>
+<li>切回 <code>none</code>，<code>await</code> 回到 0.8ms，P99 回到 35ms。</li>
+</ol>
+<p>根因：bfq 的公平排队在高并发小 IO 下引入了额外调度延迟，而这块 NVMe 根本不需要内核排序。</p>
+<p>教训：<strong>调度器不是越「智能」越好</strong>。多队列设备上，内核越少干预越好。</p>
+<h2 id="九、面试高频追问"><a href="#九、面试高频追问" class="headerlink" title="九、面试高频追问"></a>九、面试高频追问</h2><p><strong>Q1：blk-mq 解决了什么问题？</strong><br>旧块层是全局单队列单锁，多核高并发下锁竞争严重、NUMA 远程访问多。blk-mq 改成 per-CPU 软件队列 + 多硬件队列，每个 CPU 本地提交，减少竞争，并能充分利用 NVMe 的多队列能力。</p>
+<p><strong>Q2：NVMe 为什么推荐 <code>none</code>？</strong><br>NVMe 设备内部有多队列和并行调度能力，内核再做排序&#x2F;合并会增加延迟。<code>none</code> 只做相邻合并，把调度权交给设备。</p>
+<p><strong>Q3：<code>%util</code> 100% 说明磁盘满了吗？</strong><br>不一定。<code>%util</code> 只表示「有 IO 在途的时间占比」，支持并行的设备可以同时处理多个请求。要看 IOPS、带宽、<code>await</code>、<code>aqu-sz</code> 综合判断。</p>
+<p><strong>Q4：<code>fsync</code> 为什么比 <code>write</code> 慢几个数量级？</strong><br><code>write</code> 只写 page cache 就返回；<code>fsync</code> 要等数据块、文件元数据、日志提交全部持久化，中间可能涉及多次 IO 与一次设备 FLUSH，还要等设备缓存落盘。</p>
+<p><strong>Q5：组提交为什么能提升吞吐？</strong><br>把多个等待持久化的请求合并成一次 <code>fsync</code>，用一次设备往返覆盖多个事务，把「延迟 × 并发」的乘积用起来，等效吞吐提升一个数量级。</p>
+<p><strong>Q6：<code>force(false)</code> 什么时候安全？</strong><br>文件大小固定、已预分配、只覆盖已有区间时安全。追加写、需要持久化文件长度时必须 <code>force(true)</code>，否则崩溃后文件可能被截断。</p>
+<h2 id="十、小结"><a href="#十、小结" class="headerlink" title="十、小结"></a>十、小结</h2><ol>
+<li>blk-mq 的核心是「per-CPU 软件队列 + 多硬件队列 + tag 队列深度」，理解它才能理解 IOPS 上限。</li>
+<li>调度器选型看设备：NVMe 用 <code>none</code>，SATA 用 <code>mq-deadline</code>，要公平用 <code>bfq</code>，要延迟可控用 <code>kyber</code>。</li>
+<li><code>%util</code> 在 NVMe 上会骗人，看 <code>await</code>、<code>aqu-sz</code> 和直方图。</li>
+<li>WBT 用并发限流保护读延迟，参数是 <code>wbt_lat_usec</code>。</li>
+<li>Java 侧提升落盘吞吐的正道是<strong>组提交</strong>，不是换更贵的盘。</li>
+<li>追加写场景 <code>force(true)</code> 不能省；O_DIRECT 除非写存储引擎，否则别碰。</li>
+</ol>
+<p>块层是「应用」与「硬件」之间最容易被忽略的一层。把它搞明白，很多所谓的「磁盘性能问题」其实只是排队问题。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/">https://jiweidong.github.io/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/blk-mq/">blk-mq</a><a class="post-meta__tags" href="/tags/IO-%E8%B0%83%E5%BA%A6/">IO 调度</a><a class="post-meta__tags" href="/tags/fsync/">fsync</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/16/java-llm-model-cascade-distillation-cost-deep-practice/" title="【Java AI】模型级联与蒸馏降本深度实战：置信度路由、验证器与 Spring AI 落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】模型级联与蒸馏降本深度实战：置信度路由、验证器与 Spring AI 落地</div></div><div class="info-2"><div class="info-item-1">【Java AI】模型级联与蒸馏降本深度实战一、前言大模型应用上线三个月，账单往往比预期高一个数量级。原因通常不是单价，而是所有请求都走了最贵的模型：分类、抽取、改写、闲聊、复杂推理，全部打给旗舰模型。 真正的降本不是「换个便宜的模型」，而是让每个请求走它配得上的模型。这需要三件事：  级联（Cascade）：小模型先答，答不好再升级； 验证器（Verifier）：判断「答得好不好」，而不是靠感觉； 蒸馏（Distillation）：把旗舰模型的能力固化到小模型，减少升级比例。  本文用 Java + Spring AI 实现一套可落地的级联与蒸馏体系，给出成本公式、验证器设计、数据飞轮与踩坑清单。   二、成本结构：先算清账2.1 单次请求成本1cost = input_tokens × price_in + output_tokens × price_out  以某旗舰模型与轻量模型为例（数字仅作量级示意）：    模型档位 输入价（&#x2F;1M） 输出价（&#x2F;1M） 相对成本 典型延迟    旗舰 $3.00 $15.00 1.0 2~8s   中档 $0.50...</div></div></div></a><a class="pagination-related" href="/2026/11/16/mysql-relay-log-parallel-replay-deep-dive/" title="【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】中继日志与并行回放深度解析一、前言主从延迟是 Java 后端最熟悉的故障之一：下单成功、立刻查订单查不到；缓存刚删、从库又读回旧值。大多数人第一反应是「加 replica_parallel_workers」，但调完发现延迟没降，甚至更严重——因为没搞清并行回放的边界在哪。 replica_parallel_workers=8 不等于 8 倍吞吐。能不能并行，取决于主库写 binlog 时有没有把「事务之间的依赖关系」标出来；从库只是按标记执行。而 relay log 的落盘、coordinator 的分发、worker 的提交顺序，又各自有独立的瓶颈。 本文按「主库怎么标 → 从库怎么落 → coordinator 怎么分 → worker 怎么放」这条链路拆开讲，最后给出延迟归因方法与 Java 侧治理代码。   二、复制链路全景123456主库  ├─ 事务提交 → binlog（含 last_committed / sequence_number）  └─ dump thread ──网络──▶ 从库                           ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/13/cgroup-v2-io-throttling-java-deep-dive/" title="【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-13</div><div class="info-item-2">【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理</div></div><div class="info-2"><div class="info-item-1">【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理前言一个很典型的线上现象：某个 Java 服务部署到 K8s 之后，CPU 用了 limit 的 40%，堆内存稳定，GC 也正常，但接口 P99 从 80ms 涨到 900ms。查 iostat -x 发现磁盘 %util 接近 100%，aqu-sz 排队深度飙到几十。最后一查，同节点上另一个服务的日志疯狂刷盘，把本地盘的 IOPS 吃干净了。 CPU 有 cpu.max，内存有 memory.max，磁盘却没有天然的隔离——这是很多团队容器化踩得最深的一个坑。cgroup v1 时代的 blkio 控制器只做「权重」，v2 把 IO 控制重做成 io 控制器，提供了 io.max（硬上限）、io.latency（延迟保障）、io.weight（权重）、io.stat（用量统计）、io.pressure（压力失速）五件套，但默认一个都不生效，而且有几个反直觉的语义陷阱。 这篇文章按「原理 → 参数语义 → Java 落地 → 排查手册 → 面试追问」的顺序，...</div></div></div></a><a class="pagination-related" href="/2026/11/11/linux-transparent-hugepage-jvm-deep-dive/" title="【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-11</div><div class="info-item-2">【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置</div></div><div class="info-2"><div class="info-item-1">【性能调优】透明大页（THP）与 JVM 深度解析：延迟尖刺、khugepaged 与容器配置前言有一个很典型的线上现象：Java 服务 CPU、GC、QPS 全部正常，但 P99.9 每隔几十秒就冒出一个 200~800ms 的尖刺；抓 GC 日志没有长停顿，抓线程栈也看不到锁竞争，iostat 只有轻微波动。最后发现是宿主机 transparent_hugepage/enabled=always，khugepaged 在后台做页合并时抢了内存管理锁。 THP（Transparent Huge Pages）是一个”看起来只有收益、实际上经常带来延迟抖动”的内核特性。它对 JVM 的影响有三个层面：TLB 命中率（性能收益）、内存分配路径（compact 与 direct reclaim）、以及容器环境下的 RSS 计量与 OOM 判定。本文把这三点拆开讲清楚，并给出一套可验证的配置与观测方法。  一、为什么需要大页：TLB 与页表走查x86-64 默认页大小 4KB，虚拟地址到物理地址的翻译靠页表，页表项缓存就是 TLB：    页大小 覆盖 8GB 堆所需页数 TLB 条目需...</div></div></div></a><a class="pagination-related" href="/2026/11/15/linux-eevdf-scheduler-java-thread-latency-deep-dive/" title="【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag&#x2F;vslice"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-15</div><div class="info-item-2">【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析：从 CFS 的 vruntime 到 lag&#x2F;vslice</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux EEVDF 调度器与 Java 线程延迟深度解析前言先看一个线上真实场景： 一个 Spring Boot 服务，接口 P99 从 40ms 涨到 380ms。GC 日志干净（单次 8ms），CPU 使用率 62%（没打满），线程池队列不深，下游依赖 RT 正常。top 看每个线程都在 R 状态，没死锁没 BLOCKED。 最后定位到的原因是：这台机器上同时跑了一个数据导出任务，两者共享同一 cgroup，EEVDF&#x2F;CFS 把可运行线程按权重公平分配 CPU 时间片，业务线程每次被唤醒后，要等「别人用完属于它的那一段」才能拿到 CPU。 也就是说，Java 侧的线程池、GC、异步编排都做对了，但真正决定你的请求什么时候被 CPU 执行的是内核调度器，而这一层几乎没有人写进 Java 的性能排查清单。 这篇把 CFS → EEVDF 的演进讲清楚，然后把「内核调度语义」翻译成 Java 工程师能用的东西：哪些 JVM 参数是假的、哪些指标能观测、混部时怎么隔离。 一、先回顾 CFS：Java 工程师最该知道的三件事CFS（Completely Fa...</div></div></div></a><a class="pagination-related" href="/2026/11/15/ext4-xfs-fsync-java-durability-deep-dive/" title="【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-15</div><div class="info-item-2">【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义</div></div><div class="info-2"><div class="info-item-1">【性能调优】ext4 与 XFS 文件系统深度解析前言Java 里写「持久化」看起来只有两行： 12fileChannel.write(buf);fileChannel.force(true);  但只要你在生产里认真对待过数据安全，就会撞上两个方向相反的问题：  方向一（丢数据）：force(true) 明明调了，断电后最后几条记录还是没了；或者文件在，但目录项不见了，重启后文件「消失」。 方向二（慢）：为了安全，每条记录都 force()，结果吞吐只有 800 条&#x2F;秒；改成每 100 条刷一次，吞吐上去了，但断电丢 100 条。  这两个问题的答案都不在 Java 里，而在文件系统层：ext4 的延迟分配、journal 的三种模式、fsync 到底触发了什么、XFS 的 extent 与预分配、以及「元数据」和「数据」是两条独立的持久化路径。  说明：脏页回写的三个水位线（dirty_ratio、dirty_background_ratio、dirty_expire_centisecs）以及 write/flush/force/close 四层语义已经在《Linu...</div></div></div></a><a class="pagination-related" href="/2026/11/09/linux-pressure-stall-information-psi-deep-dive/" title="【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-09</div><div class="info-item-2">【性能调优】PSI 压力失速信息深度解析：内存、IO、CPU 争抢的量化归因与 Java 应用落地</div></div><div class="info-2"><div class="info-item-1">【性能调优】PSI 压力失速信息深度解析前言：那个”CPU 只用了 35%，但 P99 抖到 800ms”的下午先说一个真实场景。线上支付服务，8 核容器，CPU 使用率稳定在 30%40%，JVM GC 日志干净（Young GC 30ms 一次，一天没有 Full GC），但每天下午三点和晚上八点，接口 P99 从 60ms 飙升到 700900ms，且抖动持续 10~20 分钟。查 JVM 什么都查不到，查应用日志只能看到”耗时变长”，查业务代码没有慢查询。 最后定位到的答案是：宿主机上另一台虚拟机的备份任务在猛写磁盘，导致这个容器的脏页回写排队，Java 线程在做任何有磁盘&#x2F;内存分配的路径上被内核 block 住了。JVM 完全不知道自己被 block 了——因为在 JVM 看来，那只是一次”有点慢的系统调用”。 这就是传统观测体系的盲区：top 告诉你 CPU 不满，vmstat 告诉你 wa 高，但”到底有多少任务被卡住了、卡了多久、卡在哪个资源上”,这些指标回答不了。Linux 4.20 引入的 PSI（Pressure Stall Information...</div></div></div></a><a class="pagination-related" href="/2026/11/05/numa-aware-jvm-performance-tuning-deep-dive/" title="【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-05</div><div class="info-item-2">【JVM 性能】NUMA 架构与 JVM 调优深度解析：跨节点访存、UseNUMA 与容器绑定实战</div></div><div class="info-2"><div class="info-item-1">【JVM 性能】NUMA 架构与 JVM 调优深度解析前言一个很典型的线上怪象：两台机器，A 是 32 核 128G 单路，B 是 2×64 核 512G 双路。压测同一个 Spring Boot 服务，B 的 CPU 利用率上不去，P99 反而比 A 慢 30%，GC 次数还更多。 很多人第一反应是「GC 参数没调好」「线程池太小」，把 -Xmx、-XX:ParallelGCThreads、Tomcat 线程数全试了一遍，收益甚微。真实原因往往藏在 CPU 和内存的物理拓扑里——这台机器是 NUMA 架构，而 JVM 默认并不知道这件事。 这篇文章把 NUMA 的原理、JVM 在 NUMA 上的真实行为、四种落地方案、容器里的坑，以及面试会怎么问，一次讲清楚。  一、NUMA 到底是什么1.1 从 SMP 到 NUMA早期多核 server 是 SMP（Symmetric Multiprocessing）：所有 CPU 通过一条前端总线访问同一块内存，任意核访问任意内存地址的延迟都一样（UMA）。 核数一多，总线就成了瓶颈。于是有了 NUMA（Non-Uniform Memor...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">932</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1047</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E3%80%91Linux-%E5%9D%97%E5%B1%82-blk-mq-%E4%B8%8E-IO-%E8%B0%83%E5%BA%A6%E5%99%A8%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">一、前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81IO-%E8%B7%AF%E5%BE%84%E5%85%A8%E6%99%AF"><span class="toc-number">1.2.</span> <span class="toc-text">二、IO 路径全景</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81blk-mq-%E7%9A%84%E9%98%9F%E5%88%97%E6%A8%A1%E5%9E%8B"><span class="toc-number">1.3.</span> <span class="toc-text">三、blk-mq 的队列模型</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%89%E4%BB%A3%E6%BC%94%E8%BF%9B"><span class="toc-number">1.3.1.</span> <span class="toc-text">3.1 三代演进</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E8%BD%AF%E4%BB%B6%E9%98%9F%E5%88%97%E4%B8%8E%E7%A1%AC%E4%BB%B6%E9%98%9F%E5%88%97"><span class="toc-number">1.3.2.</span> <span class="toc-text">3.2 软件队列与硬件队列</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-tag-%E4%B8%8E%E9%98%9F%E5%88%97%E6%B7%B1%E5%BA%A6"><span class="toc-number">1.3.3.</span> <span class="toc-text">3.3 tag 与队列深度</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%9B%9B%E7%A7%8D-IO-%E8%B0%83%E5%BA%A6%E5%99%A8"><span class="toc-number">1.4.</span> <span class="toc-text">四、四种 IO 调度器</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%AF%B9%E6%AF%94"><span class="toc-number">1.4.1.</span> <span class="toc-text">4.1 对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-none"><span class="toc-number">1.4.2.</span> <span class="toc-text">4.2 none</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-mq-deadline"><span class="toc-number">1.4.3.</span> <span class="toc-text">4.3 mq-deadline</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-4-kyber"><span class="toc-number">1.4.4.</span> <span class="toc-text">4.4 kyber</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-5-bfq"><span class="toc-number">1.4.5.</span> <span class="toc-text">4.5 bfq</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-6-%E6%80%8E%E4%B9%88%E9%80%89"><span class="toc-number">1.4.6.</span> <span class="toc-text">4.6 怎么选</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E8%A2%AB%E8%AF%AF%E8%AF%BB%E7%9A%84-iostat"><span class="toc-number">1.5.</span> <span class="toc-text">五、被误读的 iostat</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-util-%E4%B8%8D%E6%98%AF%E3%80%8C%E7%A3%81%E7%9B%98%E4%BD%BF%E7%94%A8%E7%8E%87%E3%80%8D"><span class="toc-number">1.5.1.</span> <span class="toc-text">5.1 %util 不是「磁盘使用率」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-await-%E7%9A%84%E6%9E%84%E6%88%90"><span class="toc-number">1.5.2.</span> <span class="toc-text">5.2 await 的构成</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%94%A8-bpftrace-%E7%9C%8B%E7%9C%9F%E5%AE%9E%E5%BB%B6%E8%BF%9F%E5%88%86%E5%B8%83"><span class="toc-number">1.5.3.</span> <span class="toc-text">5.3 用 bpftrace 看真实延迟分布</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81WBT%EF%BC%9A%E5%86%99%E5%9B%9E%E9%99%90%E6%B5%81"><span class="toc-number">1.6.</span> <span class="toc-text">六、WBT：写回限流</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81Java-%E4%BE%A7%E7%9A%84%E8%90%BD%E7%9B%98%E5%BB%B6%E8%BF%9F"><span class="toc-number">1.7.</span> <span class="toc-text">七、Java 侧的落盘延迟</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-fsync-%E7%9A%84%E5%AE%9E%E9%99%85%E4%BB%A3%E4%BB%B7"><span class="toc-number">1.7.1.</span> <span class="toc-text">7.1 fsync 的实际代价</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-2-%E7%BB%84%E6%8F%90%E4%BA%A4%EF%BC%9A%E7%94%A8%E5%B9%B6%E5%8F%91%E6%8D%A2-IOPS"><span class="toc-number">1.7.2.</span> <span class="toc-text">7.2 组提交：用并发换 IOPS</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-3-Java-%E8%83%BD%E4%B8%8D%E8%83%BD%E7%94%A8-O-DIRECT"><span class="toc-number">1.7.3.</span> <span class="toc-text">7.3 Java 能不能用 O_DIRECT</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-4-%E8%A7%82%E6%B5%8B-Java-%E5%86%99%E5%BB%B6%E8%BF%9F"><span class="toc-number">1.7.4.</span> <span class="toc-text">7.4 观测 Java 写延迟</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E5%AE%9E%E6%88%98%EF%BC%9A%E4%B8%80%E6%AC%A1-P99-%E6%8A%96%E5%8A%A8%E5%BD%92%E5%9B%A0"><span class="toc-number">1.8.</span> <span class="toc-text">八、实战：一次 P99 抖动归因</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">九、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E5%B0%8F%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">十、小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/llm-model-snapshot-release-governance-deep-dive/" title="【AI 工程化】模型快照与发布治理深度解析：版本锁定、影子流量与金标集门禁">【AI 工程化】模型快照与发布治理深度解析：版本锁定、影子流量与金标集门禁</a><time datetime="2026-11-16T00:40:00.000Z" title="发表于 2026-11-16 08:40:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/java-llm-model-cascade-distillation-cost-deep-practice/" title="【Java AI】模型级联与蒸馏降本深度实战：置信度路由、验证器与 Spring AI 落地">【Java AI】模型级联与蒸馏降本深度实战：置信度路由、验证器与 Spring AI 落地</a><time datetime="2026-11-16T00:30:00.000Z" title="发表于 2026-11-16 08:30:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/" title="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟</a><time datetime="2026-11-16T00:20:00.000Z" title="发表于 2026-11-16 08:20:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/mysql-relay-log-parallel-replay-deep-dive/" title="【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理">【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理</a><time datetime="2026-11-16T00:10:00.000Z" title="发表于 2026-11-16 08:10:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/" title="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界</a><time datetime="2026-11-16T00:00:00.000Z" title="发表于 2026-11-16 08:00:00">2026-11-16</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

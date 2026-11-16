@@ -1,0 +1,441 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析一、前言把 Java 应用搬进 Kubernetes 之后，很多团队都遇到过这样的怪事：容器退出码 137，但翻遍应用日志找不到 OutOfMemoryError；明明堆只用了 60%，Pod 却被反复驱逐；调大了 -Xmx，重启反而更频繁。 根因是：容器里的内存死亡路径不止一条。JVM 堆 OOM、cgroup OOM Ki">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析一、前言把 Java 应用搬进 Kubernetes 之后，很多团队都遇到过这样的怪事：容器退出码 137，但翻遍应用日志找不到 OutOfMemoryError；明明堆只用了 60%，Pod 却被反复驱逐；调大了 -Xmx，重启反而更频繁。 根因是：容器里的内存死亡路径不止一条。JVM 堆 OOM、cgroup OOM Ki">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-16T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-16T00:01:08.944Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="JVM">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="OOM">
+<meta property="article:tag" content="云原生">
+<meta property="article:tag" content="内存治理">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界",
+  "url": "https://jiweidong.github.io/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-16T00:00:00.000Z",
+  "dateModified": "2026-11-16T00:01:08.944Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">932</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1047</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-16T00:00:00.000Z" title="发表于 2026-11-16 08:00:00">2026-11-16</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-16T00:01:08.944Z" title="更新于 2026-11-16 08:01:08">2026-11-16</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【云原生】Kubernetes-Pod-驱逐与-JVM-内存治理深度解析"><a href="#【云原生】Kubernetes-Pod-驱逐与-JVM-内存治理深度解析" class="headerlink" title="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析"></a>【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析</h1><h2 id="一、前言"><a href="#一、前言" class="headerlink" title="一、前言"></a>一、前言</h2><p>把 Java 应用搬进 Kubernetes 之后，很多团队都遇到过这样的怪事：容器退出码 137，但翻遍应用日志<strong>找不到 <code>OutOfMemoryError</code></strong>；明明堆只用了 60%，Pod 却被反复驱逐；调大了 <code>-Xmx</code>，重启反而更频繁。</p>
+<p>根因是：容器里的内存死亡路径<strong>不止一条</strong>。JVM 堆 OOM、cgroup OOM Kill、kubelet 驱逐、节点内核 OOM Killer，四条路径的触发者、判断依据、退出表现都不一样。只盯着 <code>-Xmx</code> 调参，等于在四条并行的高速公路上只修了一条。</p>
+<p>本文按「谁在什么条件下杀进程」这条主线，把 Pod 驱逐与 JVM 内存治理拆开讲清楚，并给出可直接落地的配置模板与 Java 侧代码。</p>
+<span id="more"></span>
+
+<h2 id="二、四条内存死亡路径"><a href="#二、四条内存死亡路径" class="headerlink" title="二、四条内存死亡路径"></a>二、四条内存死亡路径</h2><h3 id="2-1-全景对比"><a href="#2-1-全景对比" class="headerlink" title="2.1 全景对比"></a>2.1 全景对比</h3><table>
+<thead>
+<tr>
+<th>路径</th>
+<th>触发者</th>
+<th>判断依据</th>
+<th>进程信号</th>
+<th>K8s 侧表现</th>
+<th>应用日志</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>JVM 堆 OOM</td>
+<td>JVM 自身</td>
+<td>堆&#x2F;元空间&#x2F;直接内存超限</td>
+<td>抛 <code>OutOfMemoryError</code></td>
+<td>可能仍 Running，随后崩溃</td>
+<td>有明确异常栈</td>
+</tr>
+<tr>
+<td>cgroup OOM Kill</td>
+<td>内核 memcg</td>
+<td><code>memory.max</code> 用尽且回收失败</td>
+<td>SIGKILL（137）</td>
+<td><code>OOMKilled</code>，重启计数 +1</td>
+<td>通常无</td>
+</tr>
+<tr>
+<td>kubelet 驱逐</td>
+<td>kubelet</td>
+<td>节点资源低于 eviction 阈值</td>
+<td>SIGTERM→宽限→SIGKILL</td>
+<td><code>Evicted</code>，Pod 重建（可能换节点）</td>
+<td>可能只有 shutdown 日志</td>
+</tr>
+<tr>
+<td>节点 OOM Killer</td>
+<td>内核全局</td>
+<td>节点内存耗尽</td>
+<td>SIGKILL（137）</td>
+<td>可能无状态，节点 NotReady</td>
+<td>无</td>
+</tr>
+</tbody></table>
+<p>关键点：<strong>137 &#x3D; 128 + 9，只能说明「被 SIGKILL」，不能区分是谁杀的</strong>。区分靠 <code>kubectl describe pod</code> 的 <code>Reason</code>&#x2F;<code>Exit Code</code>&#x2F;<code>Last State</code>，以及节点上的 <code>dmesg</code>。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">kubectl get pod app-0 -o jsonpath=<span class="string">&#x27;&#123;.status.containerStatuses[0].lastState.terminated&#125;&#x27;</span></span><br><span class="line"><span class="comment"># reason: OOMKilled   → cgroup 内存超限</span></span><br><span class="line"><span class="comment"># reason: Error, exitCode: 137 → 需要再看 describe 的 Reason: Evicted</span></span><br><span class="line"></span><br><span class="line">kubectl describe pod app-0 | grep -A3 -E <span class="string">&#x27;Reason|Events&#x27;</span></span><br><span class="line"><span class="comment"># Reason: Evicted / The node was low on resource: memory.</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="2-2-为什么「堆没满也会被杀」"><a href="#2-2-为什么「堆没满也会被杀」" class="headerlink" title="2.2 为什么「堆没满也会被杀」"></a>2.2 为什么「堆没满也会被杀」</h3><p>JVM 的常驻内存远不止堆：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">RSS ≈ Heap + Metaspace + Code Cache + Direct ByteBuffer + Thread Stack</span><br><span class="line">      + GC 辅助结构（卡表/标记位图/RSet）+ JNI/glibc malloc arena + mmap 文件页</span><br></pre></td></tr></table></figure>
+
+<p>一个 <code>-Xmx2g</code> 的 Spring Boot 服务，实测 RSS 常见 2.6<del>3.2GB：堆 2g、Metaspace 150</del>250MB、Code Cache 100~240MB、Direct 128MB、200 个线程 × 1MB 栈、G1 的 RSet 与卡表、再加 glibc 每线程 arena（默认上限 8 × 核数，容器里 32 核就是 256 个 arena，碎片化非常明显）。如果 <code>limits.memory</code> 设成 2Gi，堆还没满，容器先被 memcg 杀掉。</p>
+<h2 id="三、kubelet-驱逐机制"><a href="#三、kubelet-驱逐机制" class="headerlink" title="三、kubelet 驱逐机制"></a>三、kubelet 驱逐机制</h2><h3 id="3-1-驱逐信号与阈值"><a href="#3-1-驱逐信号与阈值" class="headerlink" title="3.1 驱逐信号与阈值"></a>3.1 驱逐信号与阈值</h3><p>kubelet 周期性采集四类信号：</p>
+<table>
+<thead>
+<tr>
+<th>信号</th>
+<th>默认硬阈值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory.available</code></td>
+<td><code>&lt; 100Mi</code></td>
+<td>节点可分配内存</td>
+</tr>
+<tr>
+<td><code>nodefs.available</code></td>
+<td><code>&lt; 10%</code></td>
+<td>节点根盘（镜像、日志、emptyDir）</td>
+</tr>
+<tr>
+<td><code>imagefs.available</code></td>
+<td><code>&lt; 15%</code></td>
+<td>镜像&#x2F;容器可写层所在文件系统</td>
+</tr>
+<tr>
+<td><code>pid.available</code></td>
+<td><code>&lt; 10%</code></td>
+<td>可用 PID</td>
+</tr>
+</tbody></table>
+<p>注意 <code>memory.available</code> 是<strong>节点级</strong>的，不是 Pod 级。也就是说：隔壁一个没有 limit 的 Pod 打爆节点，你的 Guaranteed Pod 也可能被驱逐（虽然排序靠后）。</p>
+<p>软驱逐需要配合宽限期，写法是 <code>memory.available&lt;500Mi,nodefs.available&lt;10%,nodefs.inodesFree&lt;5%</code> 这类组合：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># kubelet 配置片段</span></span><br><span class="line"><span class="attr">evictionHard:</span></span><br><span class="line">  <span class="attr">memory.available:</span> <span class="string">&quot;300Mi&quot;</span></span><br><span class="line">  <span class="attr">nodefs.available:</span> <span class="string">&quot;10%&quot;</span></span><br><span class="line">  <span class="attr">imagefs.available:</span> <span class="string">&quot;15%&quot;</span></span><br><span class="line"><span class="attr">evictionSoft:</span></span><br><span class="line">  <span class="attr">memory.available:</span> <span class="string">&quot;800Mi&quot;</span></span><br><span class="line"><span class="attr">evictionSoftGracePeriod:</span></span><br><span class="line">  <span class="attr">memory.available:</span> <span class="string">&quot;1m30s&quot;</span></span><br><span class="line"><span class="attr">evictionPressureTransitionPeriod:</span> <span class="string">&quot;30s&quot;</span></span><br></pre></td></tr></table></figure>
+
+<p>工程经验：<code>evictionHard.memory.available</code> 不要低于 200Mi。留太少，内核在 kubelet 反应过来之前就会触发全局 OOM；留太多，又浪费节点容量。</p>
+<h3 id="3-2-QoS-与驱逐排序"><a href="#3-2-QoS-与驱逐排序" class="headerlink" title="3.2 QoS 与驱逐排序"></a>3.2 QoS 与驱逐排序</h3><table>
+<thead>
+<tr>
+<th>QoS</th>
+<th>条件</th>
+<th>OOM score adj</th>
+<th>驱逐优先级</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Guaranteed</td>
+<td>所有容器 CPU&#x2F;内存 requests &#x3D;&#x3D; limits</td>
+<td>-997</td>
+<td>最后</td>
+</tr>
+<tr>
+<td>Burstable</td>
+<td>至少一个容器设了 request&#x2F;limit，但不满足 Guaranteed</td>
+<td>2~999（按 request 占节点比例）</td>
+<td>中间</td>
+</tr>
+<tr>
+<td>BestEffort</td>
+<td>所有容器都没设 request&#x2F;limit</td>
+<td>1000</td>
+<td>最先</td>
+</tr>
+</tbody></table>
+<p>驱逐排序不是单纯按 QoS，而是分三轮：</p>
+<ol>
+<li>先驱逐 <strong>BestEffort &#x2F; Burstable 且用量超过 request</strong> 的 Pod，按「用量超出 request 的绝对值 + Priority」排序；</li>
+<li>再驱逐 <strong>Burstable 且用量未超 request</strong>；</li>
+<li>最后才动 Guaranteed。</li>
+</ol>
+<p>所以「request 设小、limit 设大」是最危险的组合：平时跑得欢，节点一紧张就是第一批被清退的对象。</p>
+<h3 id="3-3-PriorityClass-与-PDB-的边界"><a href="#3-3-PriorityClass-与-PDB-的边界" class="headerlink" title="3.3 PriorityClass 与 PDB 的边界"></a>3.3 PriorityClass 与 PDB 的边界</h3><p><code>priorityClassName</code> 影响的是<strong>调度抢占</strong>和驱逐排序权重，不是免死金牌。PDB（PodDisruptionBudget）只约束<strong>自愿中断</strong>（drain、升级），kubelet 因资源压力驱逐时<strong>不受 PDB 保护</strong>。这一点在故障复盘里经常被误解。</p>
+<h2 id="四、cgroup-v2：memory-high-与-memory-max"><a href="#四、cgroup-v2：memory-high-与-memory-max" class="headerlink" title="四、cgroup v2：memory.high 与 memory.max"></a>四、cgroup v2：memory.high 与 memory.max</h2><h3 id="4-1-三个水位"><a href="#4-1-三个水位" class="headerlink" title="4.1 三个水位"></a>4.1 三个水位</h3><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>行为</th>
+<th>是否杀进程</th>
+<th>JVM 是否感知</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>memory.low</code></td>
+<td>尽力保护，回收时优先跳过</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>memory.high</code></td>
+<td>超过就<strong>限流</strong>（直接回收 + throttle），分配变慢</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>memory.max</code></td>
+<td>超过且回收失败 → memcg OOM Kill</td>
+<td>是</td>
+<td>否</td>
+</tr>
+</tbody></table>
+<p><code>memory.high</code> 是最容易被忽略的一档：它不杀进程，但会让应用<strong>变慢</strong>。表现是 GC 时间没涨、CPU 不高，但 P99 抖动、日志写入卡顿、<code>malloc</code> 变慢。因为进程每次缺页都要先做直接回收，回收不动就被 throttle 睡眠。</p>
+<p>Java 侧完全看不到这个信号：<code>MemoryMXBean</code> 只报堆，<code>OperatingSystemMXBean.getCommittedVirtualMemorySize()</code> 也不等于 cgroup 用量。要观测只能读 cgroup 文件：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 读取容器内存状态（cgroup v2）</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">record</span> <span class="title class_">CgroupMemory</span><span class="params">(<span class="type">long</span> current, <span class="type">long</span> max, <span class="type">long</span> high, <span class="type">long</span> eventsHigh)</span> &#123;&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">static</span> CgroupMemory <span class="title function_">read</span><span class="params">()</span> <span class="keyword">throws</span> IOException &#123;</span><br><span class="line">    <span class="type">Path</span> <span class="variable">base</span> <span class="operator">=</span> Path.of(<span class="string">&quot;/sys/fs/cgroup&quot;</span>);</span><br><span class="line">    <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">CgroupMemory</span>(</span><br><span class="line">        readLong(base.resolve(<span class="string">&quot;memory.current&quot;</span>)),</span><br><span class="line">        readLong(base.resolve(<span class="string">&quot;memory.max&quot;</span>)),   <span class="comment">// &quot;max&quot; 表示无限制</span></span><br><span class="line">        readLong(base.resolve(<span class="string">&quot;memory.high&quot;</span>)),</span><br><span class="line">        readLong(base.resolve(<span class="string">&quot;memory.events&quot;</span>)).stream()... <span class="comment">// 见下</span></span><br><span class="line">    );</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>memory.events</code> 里几个计数器很有价值：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">low 0</span><br><span class="line">high 1273          # 触发 memory.high 限流的次数</span><br><span class="line">max 12             # 触达 memory.max 的次数（危险）</span><br><span class="line">oom 3              # memcg OOM 次数</span><br><span class="line">oom_kill 3</span><br></pre></td></tr></table></figure>
+
+<p>把 <code>high</code>&#x2F;<code>max</code>&#x2F;<code>oom_kill</code> 三个计数打到监控里，比看 RSS 曲线更早发现「内存墙」。</p>
+<h3 id="4-2-JVM-怎么读容器-limit"><a href="#4-2-JVM-怎么读容器-limit" class="headerlink" title="4.2 JVM 怎么读容器 limit"></a>4.2 JVM 怎么读容器 limit</h3><p><code>-XX:+UseContainerSupport</code>（JDK 10+ 默认开启）让 JVM 从 cgroup 读取 <code>memory.max</code> 作为 <code>MaxMemory</code>。注意：</p>
+<ul>
+<li>JVM <strong>只看 <code>memory.max</code>，不看 <code>memory.high</code></strong>；</li>
+<li>如果 <code>memory.max</code> 是 <code>max</code>（无限制），JVM 回退到<strong>节点物理内存</strong>，容器里就会算出巨大的堆 —— 这是「容器里默认堆过大」的经典原因；</li>
+<li><code>-XX:MaxRAMPercentage=75</code> 的基数是 <code>memory.max</code>，不是 request。</li>
+</ul>
+<p>推荐配比：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">resources:</span></span><br><span class="line">  <span class="attr">requests:</span></span><br><span class="line">    <span class="attr">memory:</span> <span class="string">&quot;2Gi&quot;</span></span><br><span class="line">    <span class="attr">cpu:</span> <span class="string">&quot;1000m&quot;</span></span><br><span class="line">  <span class="attr">limits:</span></span><br><span class="line">    <span class="attr">memory:</span> <span class="string">&quot;2Gi&quot;</span>     <span class="comment"># 与 request 相等，拿到 Guaranteed</span></span><br><span class="line">    <span class="attr">cpu:</span> <span class="string">&quot;2000m&quot;</span></span><br><span class="line"><span class="attr">env:</span></span><br><span class="line">  <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">JAVA_TOOL_OPTIONS</span></span><br><span class="line">    <span class="attr">value:</span> <span class="string">&gt;-</span></span><br><span class="line"><span class="string">      -XX:MaxRAMPercentage=70</span></span><br><span class="line"><span class="string">      -XX:InitialRAMPercentage=40</span></span><br><span class="line"><span class="string">      -XX:MaxMetaspaceSize=256m</span></span><br><span class="line"><span class="string">      -XX:MaxDirectMemorySize=256m</span></span><br><span class="line"><span class="string">      -XX:ReservedCodeCacheSize=128m</span></span><br><span class="line"><span class="string">      -XX:+ExitOnOutOfMemoryError</span></span><br><span class="line"><span class="string">      -XX:+HeapDumpOnOutOfMemoryError</span></span><br><span class="line"><span class="string">      -XX:HeapDumpPath=/dump</span></span><br><span class="line"><span class="string">      -Xlog:gc*:file=/log/gc.log:time,uptime:filecount=5,filesize=20m</span></span><br></pre></td></tr></table></figure>
+
+<p>70% 而不是 75%：给 Metaspace、Code Cache、线程栈、Direct、GC 结构留 30%。对于高并发 Netty 服务（大量 Direct ByteBuffer + 堆外池），建议降到 60~65%。</p>
+<h2 id="五、真实故障：堆转储把节点盘打满"><a href="#五、真实故障：堆转储把节点盘打满" class="headerlink" title="五、真实故障：堆转储把节点盘打满"></a>五、真实故障：堆转储把节点盘打满</h2><p>一个很典型的连环故障：</p>
+<ol>
+<li>应用发生堆 OOM，<code>HeapDumpOnOutOfMemoryError</code> 把 2GB 的 <code>java_pid1.hprof</code> 写到 <code>emptyDir</code>；</li>
+<li><code>emptyDir</code> 默认落在节点根盘，节点 <code>nodefs.available</code> 跌破 10%；</li>
+<li>kubelet 触发 <code>nodefs</code> 驱逐，把<strong>同节点上其他 Pod</strong>（包括没出问题的服务）全部 Evicted；</li>
+<li>雪崩。</li>
+</ol>
+<p>治理要点：</p>
+<ul>
+<li>堆转储目录挂<strong>独立 PVC</strong>，或者给 <code>emptyDir</code> 设 <code>sizeLimit</code>（超限会驱逐该 Pod，但不会拖垮节点）；</li>
+<li>只在排障窗口开 <code>HeapDumpOnOutOfMemoryError</code>，日常用 <code>-XX:+ExitOnOutOfMemoryError</code> 快速失败 + 重启；</li>
+<li>日志同样要限大小，<code>-Xlog</code> 的 <code>filecount/filesize</code> 必须写；</li>
+<li>给 <code>nodefs</code> 单独划盘，把镜像层与业务日志分离（<code>imagefs</code> 与 <code>nodefs</code> 分开时驱逐信号才准确）。</li>
+</ul>
+<h2 id="六、Java-侧的可观测与自保"><a href="#六、Java-侧的可观测与自保" class="headerlink" title="六、Java 侧的可观测与自保"></a>六、Java 侧的可观测与自保</h2><h3 id="6-1-内存预算自检"><a href="#6-1-内存预算自检" class="headerlink" title="6.1 内存预算自检"></a>6.1 内存预算自检</h3><p>启动时算一遍预算，超了就<strong>拒绝启动</strong>，比运行期随机被杀好得多：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">MemoryBudgetChecker</span> <span class="keyword">implements</span> <span class="title class_">ApplicationRunner</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">MB</span> <span class="operator">=</span> <span class="number">1024</span> * <span class="number">1024</span>;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">(ApplicationArguments args)</span> &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">max</span> <span class="operator">=</span> Runtime.getRuntime().maxMemory();</span><br><span class="line">        <span class="type">long</span> <span class="variable">cgroupMax</span> <span class="operator">=</span> CgroupSupport.memoryMaxBytes();   <span class="comment">// -1 表示无限制</span></span><br><span class="line">        <span class="type">long</span> <span class="variable">nonHeapBudget</span> <span class="operator">=</span> <span class="number">256</span> * MB   <span class="comment">// Metaspace</span></span><br><span class="line">                           + <span class="number">128</span> * MB   <span class="comment">// Code Cache</span></span><br><span class="line">                           + <span class="number">256</span> * MB   <span class="comment">// Direct</span></span><br><span class="line">                           + <span class="number">64L</span> * MB * <span class="number">200</span>; <span class="comment">// 200 线程栈（粗算）</span></span><br><span class="line">        <span class="type">long</span> <span class="variable">expected</span> <span class="operator">=</span> max + nonHeapBudget;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (cgroupMax &gt; <span class="number">0</span> &amp;&amp; expected &gt; cgroupMax * <span class="number">0.95</span>) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(String.format(</span><br><span class="line">                <span class="string">&quot;内存预算超限: heap=%dMB nonHeap≈%dMB total≈%dMB limit=%dMB&quot;</span>,</span><br><span class="line">                max / MB, nonHeapBudget / MB, expected / MB, cgroupMax / MB));</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>配合 Micrometer 暴露 cgroup 指标（Spring Boot 3 已自动绑定 <code>process.memory.usage</code> 等）：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">Gauge.builder(<span class="string">&quot;app.cgroup.memory.high.events&quot;</span>, () -&gt; readEvent(<span class="string">&quot;high&quot;</span>))</span><br><span class="line">     .register(meterRegistry);</span><br><span class="line">Gauge.builder(<span class="string">&quot;app.cgroup.memory.oom.kills&quot;</span>, () -&gt; readEvent(<span class="string">&quot;oom_kill&quot;</span>))</span><br><span class="line">     .register(meterRegistry);</span><br></pre></td></tr></table></figure>
+
+<p>告警规则建议：<code>oom_kill</code> 增量 &gt; 0 立即 P1；<code>high</code> 计数 5 分钟内持续增长 → 预警（说明已经在被限流，只是还没死）。</p>
+<h3 id="6-2-优雅停机"><a href="#6-2-优雅停机" class="headerlink" title="6.2 优雅停机"></a>6.2 优雅停机</h3><p>被驱逐时 kubelet 发 SIGTERM，宽限期默认 30s。Java 侧要保证：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">lifecycle:</span></span><br><span class="line">  <span class="attr">preStop:</span></span><br><span class="line">    <span class="attr">exec:</span></span><br><span class="line">      <span class="attr">command:</span> [<span class="string">&quot;sh&quot;</span>, <span class="string">&quot;-c&quot;</span>, <span class="string">&quot;sleep 5&quot;</span>]   <span class="comment"># 等 Endpoints 摘除传播</span></span><br><span class="line"><span class="attr">terminationGracePeriodSeconds:</span> <span class="number">40</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// Spring Boot 3：开启优雅停机</span></span><br><span class="line"><span class="comment">// server.shutdown=graceful</span></span><br><span class="line"><span class="comment">// spring.lifecycle.timeout-per-shutdown-phase=25s</span></span><br></pre></td></tr></table></figure>
+
+<p><code>preStop sleep 5</code> 不是玄学：Endpoints&#x2F;iptables 规则传播有延迟，直接关进程会有几秒的 502。</p>
+<h3 id="6-3-探针不要互相打架"><a href="#6-3-探针不要互相打架" class="headerlink" title="6.3 探针不要互相打架"></a>6.3 探针不要互相打架</h3><ul>
+<li><code>startupProbe</code>：给慢启动兜底（Spring Boot 冷启动 30~60s），失败阈值 <code>failureThreshold: 30</code>、<code>periodSeconds: 5</code>；</li>
+<li><code>livenessProbe</code>：只判断「进程是否死锁」，<strong>不要查数据库&#x2F;下游</strong>。下游抖动会导致全量重启，把小故障放大成血崩；</li>
+<li><code>readinessProbe</code>：可以查关键依赖，失败只摘流量不重启。</li>
+</ul>
+<p>一个常见的错误配置是 liveness 的 <code>timeoutSeconds: 1</code>：GC 停顿超过 1s 就被判死，Pod 反复重启，看起来像「内存问题」，其实是探针问题。</p>
+<h2 id="七、排障决策树"><a href="#七、排障决策树" class="headerlink" title="七、排障决策树"></a>七、排障决策树</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">容器 137 退出</span><br><span class="line">├─ describe 里 Reason=Evicted</span><br><span class="line">│   ├─ 信号 memory.available → 节点内存压力（看谁在吃内存，检查无 limit 的 Pod）</span><br><span class="line">│   ├─ 信号 nodefs.available → 日志/堆转储/镜像堆积（du -sh /var/lib/docker /var/log）</span><br><span class="line">│   └─ 信号 pid.available  → 线程/进程泄漏</span><br><span class="line">├─ describe 里 Reason=OOMKilled</span><br><span class="line">│   ├─ 堆接近 Xmx → 真实内存泄漏或流量上涨（开 heap dump）</span><br><span class="line">│   └─ 堆远低于 Xmx → 堆外（Direct/Metaspace/线程栈/glibc arena），看 NMT</span><br><span class="line">└─ 无 Reason，节点 NotReady</span><br><span class="line">    └─ 内核全局 OOM（dmesg -T | grep -i &#x27;killed process&#x27;）</span><br></pre></td></tr></table></figure>
+
+<p>堆外排查用 NMT：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">-XX:NativeMemoryTracking=summary</span><br><span class="line">jcmd 1 VM.native_memory summary scale=MB</span><br></pre></td></tr></table></figure>
+
+<p>重点看 <code>Other</code>（malloc arena&#x2F;JNI）与 <code>Thread</code>（栈）两项，通常就是「堆没满但 RSS 高」的答案。</p>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：requests 和 limits 到底怎么设？</strong><br>CPU 的 request 决定调度与 <code>cpu.weight</code>，limit 决定 <code>cpu.max</code> 配额（会被 throttle）；内存的 request 影响驱逐排序与 OOM score，limit 是硬墙。生产建议：内存 request &#x3D;&#x3D; limit（Guaranteed），CPU request 按 P50 设、limit 按 P99 或干脆不设（避免 throttle），靠 HPA 扩容。</p>
+<p><strong>Q2：为什么 <code>-Xmx</code> 等于 limit 一定会被杀？</strong><br>因为堆只是 RSS 的一部分。JVM 还有 Metaspace、Code Cache、Direct、线程栈、GC 结构，以及 glibc 的 arena 碎片。堆顶到 limit 时，堆外还没算，memcg 先 OOM。</p>
+<p><strong>Q3：<code>memory.high</code> 和 <code>memory.max</code> 区别？</strong><br><code>high</code> 是软限，超了限流不杀；<code>max</code> 是硬限，超了杀。JVM 只读 <code>max</code>。设了 <code>high</code> 之后出现「无 OOM 但变慢」，要查 <code>memory.events</code> 的 <code>high</code> 计数。</p>
+<p><strong>Q4：Kubernetes 的 QoS 能保证不被驱逐吗？</strong><br>不能。Guaranteed 只是排序最后、OOM score 最低。节点真没内存时一样会被驱逐，只是优先牺牲别人。</p>
+<p><strong>Q5：怎么区分 cgroup OOM 和节点 OOM？</strong><br>cgroup OOM 会在 <code>kubectl describe</code> 里显示 <code>OOMKilled</code> 且容器重启计数增加；节点 OOM 是内核杀的，Pod 状态可能不变，需要 <code>dmesg</code> 里找 <code>Out of memory: Killed process</code>，同时看节点是否 NotReady。</p>
+<h2 id="九、小结"><a href="#九、小结" class="headerlink" title="九、小结"></a>九、小结</h2><ol>
+<li>137 不是结论，只是起点；先看 <code>Reason</code> 再定位是四条路径里的哪一条。</li>
+<li>JVM 只认 <code>memory.max</code>，不认 <code>memory.high</code>，更不认 request；堆外必须显式预留。</li>
+<li><code>MaxRAMPercentage</code> 建议 60~70%，高 Direct 场景更低；<code>-Xmx</code> 直接等于 limit 是自找 OOMKilled。</li>
+<li>堆转储、日志、emptyDir 都可能触发 <code>nodefs</code> 驱逐，必须限容量、分盘。</li>
+<li>liveness 不要查下游，startup 要给足冷启动时间。</li>
+<li>把 <code>memory.events</code> 的 <code>high</code>&#x2F;<code>max</code>&#x2F;<code>oom_kill</code> 打进监控，比看 RSS 曲线更早发现问题。</li>
+</ol>
+<p>容器化不是把 <code>-Xmx</code> 改小就完事，它要求你把「JVM 内存模型」和「cgroup 内存模型」两张账合起来算。算清了，驱逐和 OOM 就从玄学变成可解释的事件。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/">https://jiweidong.github.io/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/JVM/">JVM</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a><a class="post-meta__tags" href="/tags/OOM/">OOM</a><a class="post-meta__tags" href="/tags/%E5%86%85%E5%AD%98%E6%B2%BB%E7%90%86/">内存治理</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/16/mysql-relay-log-parallel-replay-deep-dive/" title="【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】中继日志与并行回放深度解析一、前言主从延迟是 Java 后端最熟悉的故障之一：下单成功、立刻查订单查不到；缓存刚删、从库又读回旧值。大多数人第一反应是「加 replica_parallel_workers」，但调完发现延迟没降，甚至更严重——因为没搞清并行回放的边界在哪。 replica_parallel_workers=8 不等于 8 倍吞吐。能不能并行，取决于主库写 binlog 时有没有把「事务之间的依赖关系」标出来；从库只是按标记执行。而 relay log 的落盘、coordinator 的分发、worker 的提交顺序，又各自有独立的瓶颈。 本文按「主库怎么标 → 从库怎么落 → coordinator 怎么分 → worker 怎么放」这条链路拆开讲，最后给出延迟归因方法与 Java 侧治理代码。   二、复制链路全景123456主库  ├─ 事务提交 → binlog（含 last_committed / sequence_number）  └─ dump thread ──网络──▶ 从库                           ...</div></div></div></a><a class="pagination-related" href="/2026/11/15/java-engineer-ai-fundamentals-learning-map/" title="【AI 转型】Java 工程师补 AI 理论基础的学习地图：60 天，只学「够用」的那 20%"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【AI 转型】Java 工程师补 AI 理论基础的学习地图：60 天，只学「够用」的那 20%</div></div><div class="info-2"><div class="info-item-1">【AI 转型】Java 工程师补 AI 理论基础的学习地图前言写转型系列到现在，评论区问得最多的一类问题是：  「你写的那些 Spring AI、LangChain4j、RAG 我都能照着做，但面试官一问『Transformer 里注意力是怎么算的』『LoRA 为什么能省显存』我就卡住了。要不要先去补数学？补到什么程度？」  这个问题有两种典型错误答案。 错误答案一：不用补，会调框架就行。短期能找到活干，但天花板极低。模型选型、参数调优、成本核算、效果归因，这些「值钱的事」全部需要理论直觉。而且一旦模型升级、框架换代，纯 API 知识归零。 错误答案二：从头学机器学习。买《统计学习方法》+ 吴恩达 + 3Blue1Brown，从线性回归推到反向传播，两个月后放弃。原因是没有目标函数：你不知道学到哪一步算够，也不知道学的这部分在工程里对应什么。 这篇给第三种答案：只学「够用」的 20%，并且用 Java 工程师擅长的方式学——写代码验证，而不是推公式。 一、先定义「够用」：三个可检验的能力转型做 AI 应用开发（不是算法岗），理论只需要支撑三件事：    能力 具体表现 对应的理论...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/01/jvm-container-cpu-limit-thread-sizing-deep-dive/" title="【JVM 云原生】容器 CPU Limit 与 JVM 并行度适配深度解析：ActiveProcessorCount、GC 线程与线程池 sizing"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-01</div><div class="info-item-2">【JVM 云原生】容器 CPU Limit 与 JVM 并行度适配深度解析：ActiveProcessorCount、GC 线程与线程池 sizing</div></div><div class="info-2"><div class="info-item-1">【JVM 云原生】容器 CPU Limit 与 JVM 并行度适配深度解析前言先说一个我亲历的事故。 一个 Spring Boot 服务迁到 K8s，Pod 配置 limits.cpu: 2。上线后 P99 从 80ms 涨到 900ms，CPU 使用率却只有 35%——监控上看”资源很闲”，业务上”响应很慢”。 排查了两天才定位：JVM 认为这台机器有 64 个核。 于是：  G1 开了 41 个 ParallelGCThreads（8 + (64-8)×5/8 = 43，受堆大小微调） ForkJoinPool.commonPool 并行度 &#x3D; 63 Netty EventLoop &#x3D; 128 个线程 虚拟线程的 carrier pool 并行度 &#x3D; 64 各种 Executors.newFixedThreadPool(availableProcessors) 全部按 64 起步  64 个线程抢 2 个核的 quota，每次 cgroup 周期（100ms）配额在 20ms 内就被打光，剩下 80ms 全部被 throttle（限流挂起）。表现...</div></div></div></a><a class="pagination-related" href="/2026/06/17/jvm-production-tuning-practice/" title="JVM 生产环境性能调优实战：案例、工具与参数精讲"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-17</div><div class="info-item-2">JVM 生产环境性能调优实战：案例、工具与参数精讲</div></div><div class="info-2"><div class="info-item-1">JVM 生产环境性能调优实战：案例、工具与参数精讲一、JVM 调优的本质JVM 调优的核心目标不是”把 GC 延迟降到 0”——这是不可能的。真正的目标是在可用资源范围内，找到 GC 频率、GC 停顿时间和吞吐量之间的最优平衡。 1.1 调优三角12345678910111213      吞吐量      ▲     /|\    / | \   /  |  \  /   |   \ /    |    \────────────► 低延迟      \       \        \         ▼       内存占用  三种指标互斥：不能既要吞吐高、又要延迟低、还要内存省。    场景 优先级排序 调优方向    在线交易系统 延迟 &gt; 吞吐 &gt; 内存 G1 &#x2F; ZGC，减少 STW   批处理系统 吞吐 &gt; 内存 &gt; 延迟 Parallel GC，拉大堆内存   流式计算 吞吐 &gt; 延迟 &gt; 内存 G1 &#x2F; Parallel，调优新生代   微服务（边缘） 内存 &gt; 延迟 &gt; 吞吐 减小堆内存，Z...</div></div></div></a><a class="pagination-related" href="/2026/09/11/jvm-container-cgroup-memory-deep-dive/" title="【JVM 云原生】JVM 容器化深度解析：cgroup 内存限制、UseContainerSupport 与 K8s OOMKilled 排查"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-11</div><div class="info-item-2">【JVM 云原生】JVM 容器化深度解析：cgroup 内存限制、UseContainerSupport 与 K8s OOMKilled 排查</div></div><div class="info-2"><div class="info-item-1">【JVM 云原生】JVM 容器化深度解析：cgroup 内存限制、UseContainerSupport 与 K8s OOMKilled 排查面试官：Pod limit 是 2Gi，堆只用了 1G，为什么容器还是被 OOMKilled？这是容器化 Java 应用最经典的线上事故。我们先把结论摆出来：  容器的 OOMKilled 是 Linux 内核 cgroup 层面的 OOM Killer 干的，不是 JVM 的 OutOfMemoryError。它看的是进程组的 RSS 总量（堆 + 非堆 + 栈 + 直接内存 + 代码缓存 + JVM 自身），而不仅仅是堆。  而事故的第一根因往往是：JVM 根本没意识到自己跑在容器里，默认按”宿主机物理内存的 1&#x2F;4”来设置 -Xmx。 本文从 cgroup 原理讲到 Java 版本演进，再到 K8s 排查手法。 一、根因：JVM 眼中的”内存”是谁的内存JDK 8 早期（8u131 之前），JVM 通过 sysconf(_SC_PHYS_PAGES) 这类系统调用拿”物理内存”，容器里这返回的是宿主机的内存。 于是经典事故现...</div></div></div></a><a class="pagination-related" href="/2026/07/28/spring-cloud-kubernetes-deep-practice/" title="【云原生实战】Spring Cloud Kubernetes 微服务在 K8s 中的部署与服务治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-28</div><div class="info-item-2">【云原生实战】Spring Cloud Kubernetes 微服务在 K8s 中的部署与服务治理</div></div><div class="info-2"><div class="info-item-1">【云原生实战】Spring Cloud Kubernetes 微服务在 K8s 中的部署与服务治理一、为什么需要 Spring Cloud Kubernetes？Spring Cloud 在传统微服务架构中提供了服务发现（Eureka&#x2F;Nacos）、配置管理（Config Server）、负载均衡（Ribbon&#x2F;LoadBalancer）等能力。当微服务迁移到 Kubernetes 后，很多基础设施能力 K8s 已经内置：    能力 传统 Spring Cloud Kubernetes 原生 Spring Cloud K8s    服务发现 Eureka &#x2F; Nacos Service + DNS @K8sServiceDiscovery   配置管理 Config Server ConfigMap &#x2F; Secret @ConfigMapPropertySource   负载均衡 Ribbon Service (RoundRobin) 内置 K8s Service   健康检查 Actuator &#x2F; &#x2F;health L...</div></div></div></a><a class="pagination-related" href="/2026/07/27/java-thread-class-source-deep-dive/" title="【并发编程】Java Thread 源码深度解析：线程状态机、生命周期与操作系统线程映射"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-27</div><div class="info-item-2">【并发编程】Java Thread 源码深度解析：线程状态机、生命周期与操作系统线程映射</div></div><div class="info-2"><div class="info-item-1">【并发编程】Java Thread 源码深度解析：线程状态机、生命周期与操作系统线程映射前言提起 Java 多线程，每个人都能说出继承 Thread 或实现 Runnable。但 Thread 类的底层源码是怎样的？Java 线程和操作系统线程是什么关系？start() 和 run() 底层到底做了什么？ 这些问题是 Java 面试中最高频的”基础深挖”类题目——看似基础，想答得深入却需要真正理解源码。 本文从 Thread 源码出发，深入分析线程的创建、启动、状态切换、生命周期以及底层实现。  一、Thread 类的整体架构12345678910111213141516171819202122232425262728293031// java.lang.Thread (JDK 21 源码概览)public class Thread implements Runnable &#123;    // 线程名    private volatile String name;        // 线程优先级（1-10，默认5）    private int priority;     ...</div></div></div></a><a class="pagination-related" href="/2026/10/30/jvm-leyden-aot-cache-deep-dive/" title="【JVM 前沿】Project Leyden AOT 缓存深度实战：JEP 483&#x2F;514&#x2F;515 与 Java 启动加速"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-30</div><div class="info-item-2">【JVM 前沿】Project Leyden AOT 缓存深度实战：JEP 483&#x2F;514&#x2F;515 与 Java 启动加速</div></div><div class="info-2"><div class="info-item-1">【JVM 前沿】Project Leyden AOT 缓存深度实战：JEP 483&#x2F;514&#x2F;515 与 Java 启动加速前言Java 服务启动慢，是个老生常谈但一直没根治的问题。一个中等规模的 Spring Boot 应用，从 java -jar 到端口可服务，30 秒起步；如果挂了上千个 Bean、扫描了大量注解，60 秒也不稀奇。在 Kubernetes 上这直接变成”扩容慢、滚动发布久、HPA 反应迟钝”。 过去我们有三板斧：CDS&#x2F;AppCDS（类加载加速）、分层编译调优（缩短 C1→C2 预热）、GraalVM Native Image（彻底 AOT 编译）。前两个效果有限（20~30%），第三个效果拔群但兼容性代价大（反射、动态代理、JIT 峰值性能下降）。 Project Leyden 走的是第四条路：不改变 JVM 执行模型，只把”上次启动时学到的东西”存下来，下次直接用。JDK 24 交付了 JEP 483（AOT 类加载与链接），JDK 25 又加了 JEP 514（命令行易用性）、JEP 515（AOT 方法剖析）、JEP 5...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">932</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1047</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E4%BA%91%E5%8E%9F%E7%94%9F%E3%80%91Kubernetes-Pod-%E9%A9%B1%E9%80%90%E4%B8%8E-JVM-%E5%86%85%E5%AD%98%E6%B2%BB%E7%90%86%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">一、前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%9B%9B%E6%9D%A1%E5%86%85%E5%AD%98%E6%AD%BB%E4%BA%A1%E8%B7%AF%E5%BE%84"><span class="toc-number">1.2.</span> <span class="toc-text">二、四条内存死亡路径</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E5%85%A8%E6%99%AF%E5%AF%B9%E6%AF%94"><span class="toc-number">1.2.1.</span> <span class="toc-text">2.1 全景对比</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E4%B8%BA%E4%BB%80%E4%B9%88%E3%80%8C%E5%A0%86%E6%B2%A1%E6%BB%A1%E4%B9%9F%E4%BC%9A%E8%A2%AB%E6%9D%80%E3%80%8D"><span class="toc-number">1.2.2.</span> <span class="toc-text">2.2 为什么「堆没满也会被杀」</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81kubelet-%E9%A9%B1%E9%80%90%E6%9C%BA%E5%88%B6"><span class="toc-number">1.3.</span> <span class="toc-text">三、kubelet 驱逐机制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E9%A9%B1%E9%80%90%E4%BF%A1%E5%8F%B7%E4%B8%8E%E9%98%88%E5%80%BC"><span class="toc-number">1.3.1.</span> <span class="toc-text">3.1 驱逐信号与阈值</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-QoS-%E4%B8%8E%E9%A9%B1%E9%80%90%E6%8E%92%E5%BA%8F"><span class="toc-number">1.3.2.</span> <span class="toc-text">3.2 QoS 与驱逐排序</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-PriorityClass-%E4%B8%8E-PDB-%E7%9A%84%E8%BE%B9%E7%95%8C"><span class="toc-number">1.3.3.</span> <span class="toc-text">3.3 PriorityClass 与 PDB 的边界</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81cgroup-v2%EF%BC%9Amemory-high-%E4%B8%8E-memory-max"><span class="toc-number">1.4.</span> <span class="toc-text">四、cgroup v2：memory.high 与 memory.max</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%B8%89%E4%B8%AA%E6%B0%B4%E4%BD%8D"><span class="toc-number">1.4.1.</span> <span class="toc-text">4.1 三个水位</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-JVM-%E6%80%8E%E4%B9%88%E8%AF%BB%E5%AE%B9%E5%99%A8-limit"><span class="toc-number">1.4.2.</span> <span class="toc-text">4.2 JVM 怎么读容器 limit</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E7%9C%9F%E5%AE%9E%E6%95%85%E9%9A%9C%EF%BC%9A%E5%A0%86%E8%BD%AC%E5%82%A8%E6%8A%8A%E8%8A%82%E7%82%B9%E7%9B%98%E6%89%93%E6%BB%A1"><span class="toc-number">1.5.</span> <span class="toc-text">五、真实故障：堆转储把节点盘打满</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E4%BE%A7%E7%9A%84%E5%8F%AF%E8%A7%82%E6%B5%8B%E4%B8%8E%E8%87%AA%E4%BF%9D"><span class="toc-number">1.6.</span> <span class="toc-text">六、Java 侧的可观测与自保</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E5%86%85%E5%AD%98%E9%A2%84%E7%AE%97%E8%87%AA%E6%A3%80"><span class="toc-number">1.6.1.</span> <span class="toc-text">6.1 内存预算自检</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E4%BC%98%E9%9B%85%E5%81%9C%E6%9C%BA"><span class="toc-number">1.6.2.</span> <span class="toc-text">6.2 优雅停机</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E6%8E%A2%E9%92%88%E4%B8%8D%E8%A6%81%E4%BA%92%E7%9B%B8%E6%89%93%E6%9E%B6"><span class="toc-number">1.6.3.</span> <span class="toc-text">6.3 探针不要互相打架</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%8E%92%E9%9A%9C%E5%86%B3%E7%AD%96%E6%A0%91"><span class="toc-number">1.7.</span> <span class="toc-text">七、排障决策树</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E5%B0%8F%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">九、小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/llm-model-snapshot-release-governance-deep-dive/" title="【AI 工程化】模型快照与发布治理深度解析：版本锁定、影子流量与金标集门禁">【AI 工程化】模型快照与发布治理深度解析：版本锁定、影子流量与金标集门禁</a><time datetime="2026-11-16T00:40:00.000Z" title="发表于 2026-11-16 08:40:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/java-llm-model-cascade-distillation-cost-deep-practice/" title="【Java AI】模型级联与蒸馏降本深度实战：置信度路由、验证器与 Spring AI 落地">【Java AI】模型级联与蒸馏降本深度实战：置信度路由、验证器与 Spring AI 落地</a><time datetime="2026-11-16T00:30:00.000Z" title="发表于 2026-11-16 08:30:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/" title="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟</a><time datetime="2026-11-16T00:20:00.000Z" title="发表于 2026-11-16 08:20:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/mysql-relay-log-parallel-replay-deep-dive/" title="【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理">【MySQL 底层】中继日志与并行回放深度解析：MTS、WRITESET 与复制延迟治理</a><time datetime="2026-11-16T00:10:00.000Z" title="发表于 2026-11-16 08:10:00">2026-11-16</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/" title="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界</a><time datetime="2026-11-16T00:00:00.000Z" title="发表于 2026-11-16 08:00:00">2026-11-16</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
