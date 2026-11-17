@@ -1,0 +1,431 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因前言一个真实工单：  一条按时间范围查订单的 SQL，EXPLAIN 显示 type&#x3D;range、rows&#x3D;1、Extra&#x3D;Using index condition，看起来完美。但接口 P99 3.2s，慢日志里这条 SQL 每次扫描行数 80 万。  问题不在索引，也不在 SQL 写法，而在优化器估错了行数：它以为只有 1">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/17/mysql-explain-analyze-plan-deviation-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因前言一个真实工单：  一条按时间范围查订单的 SQL，EXPLAIN 显示 type&#x3D;range、rows&#x3D;1、Extra&#x3D;Using index condition，看起来完美。但接口 P99 3.2s，慢日志里这条 SQL 每次扫描行数 80 万。  问题不在索引，也不在 SQL 写法，而在优化器估错了行数：它以为只有 1">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-17T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-11-17T00:02:14.084Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="性能优化">
+<meta property="article:tag" content="执行计划">
+<meta property="article:tag" content="索引">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相",
+  "url": "https://jiweidong.github.io/2026/11/17/mysql-explain-analyze-plan-deviation-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-17T00:10:00.000Z",
+  "dateModified": "2026-11-17T00:02:14.084Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/17/mysql-explain-analyze-plan-deviation-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">937</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1049</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-17T00:10:00.000Z" title="发表于 2026-11-17 08:10:00">2026-11-17</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-17T00:02:14.084Z" title="更新于 2026-11-17 08:02:14">2026-11-17</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/MySQL/">MySQL</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-优化】EXPLAIN-ANALYZE-与执行计划偏差归因"><a href="#【MySQL-优化】EXPLAIN-ANALYZE-与执行计划偏差归因" class="headerlink" title="【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因"></a>【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>一个真实工单：</p>
+<blockquote>
+<p>一条按时间范围查订单的 SQL，<code>EXPLAIN</code> 显示 <code>type=range</code>、<code>rows=1</code>、<code>Extra=Using index condition</code>，看起来完美。但接口 P99 3.2s，慢日志里这条 SQL 每次扫描行数 80 万。</p>
+</blockquote>
+<p>问题不在索引，也不在 SQL 写法，而在<strong>优化器估错了行数</strong>：它以为只有 1 行，实际有 80 万行，于是选了一个”对 1 行最优、对 80 万行灾难”的执行计划。</p>
+<p><code>EXPLAIN</code> 给你的永远是<strong>估算值</strong>；<code>EXPLAIN ANALYZE</code> 给你的才是<strong>实测值</strong>。把两者放在一起看，偏差出现在哪个节点，问题就出在哪里。</p>
+<p>本文讲三件事：怎么读 <code>EXPLAIN ANALYZE</code>、估算为什么会错、以及怎么把”让计划稳定”工程化。</p>
+<hr>
+<h2 id="一、EXPLAIN-的三种形态"><a href="#一、EXPLAIN-的三种形态" class="headerlink" title="一、EXPLAIN 的三种形态"></a>一、EXPLAIN 的三种形态</h2><table>
+<thead>
+<tr>
+<th>形态</th>
+<th>命令</th>
+<th>是否执行 SQL</th>
+<th>输出内容</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>传统格式</td>
+<td><code>EXPLAIN SELECT ...</code></td>
+<td>否</td>
+<td>表、type、key、rows（估算）、Extra</td>
+<td>日常快速看索引</td>
+</tr>
+<tr>
+<td>树形格式</td>
+<td><code>EXPLAIN FORMAT=TREE SELECT ...</code></td>
+<td>否</td>
+<td>迭代器树 + 估算成本</td>
+<td>看 join 顺序与成本</td>
+</tr>
+<tr>
+<td>实测格式</td>
+<td><code>EXPLAIN ANALYZE SELECT ...</code></td>
+<td><strong>是</strong></td>
+<td>每个节点的估算 vs 实测</td>
+<td>定位偏差根因</td>
+</tr>
+</tbody></table>
+<p><code>EXPLAIN ANALYZE</code> 从 MySQL 8.0.18 开始提供，输出长这样：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">-&gt; Nested loop inner join  (cost=2481.55 rows=1) (actual time=0.097..3120.441 rows=803214 loops=1)</span><br><span class="line">    -&gt; Filter: (o.status = 3)  (cost=1200.10 rows=1) (actual time=0.061..2841.772 rows=803214 loops=1)</span><br><span class="line">        -&gt; Index range scan on o using idx_create_time  (cost=1200.10 rows=1) (actual time=0.052..2201.339 rows=803214 loops=1)</span><br><span class="line">    -&gt; Single-row index lookup on u using PRIMARY (id=o.user_id)  (cost=0.25 rows=1) (actual time=0.003..0.003 rows=1 loops=803214)</span><br></pre></td></tr></table></figure>
+
+<h3 id="1-1-字段怎么读"><a href="#1-1-字段怎么读" class="headerlink" title="1.1 字段怎么读"></a>1.1 字段怎么读</h3><ul>
+<li><code>cost</code>：优化器<strong>估算</strong>的成本（单位是”随机读页”的抽象值），只用于比较，不是毫秒；</li>
+<li><code>rows</code>：优化器<strong>估算</strong>的行数（在 <code>actual</code> 前面）或<strong>实测</strong>的平均每轮行数（在 <code>actual</code> 后面）；</li>
+<li><code>actual time=A..B</code>：该节点第一行返回时间..最后一行返回时间（毫秒）；</li>
+<li><code>loops=N</code>：该节点被执行了多少次。</li>
+</ul>
+<h3 id="1-2-最容易读错的两件事"><a href="#1-2-最容易读错的两件事" class="headerlink" title="1.2 最容易读错的两件事"></a>1.2 最容易读错的两件事</h3><p><strong>第一，<code>actual rows</code> 是”每轮平均值”，要乘 <code>loops</code>：</strong></p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-&gt; Single-row index lookup ... (actual time=0.003..0.003 rows=1 loops=803214)</span><br></pre></td></tr></table></figure>
+
+<p>这个节点总执行行数 &#x3D; <code>1 × 803214 = 803214</code>，总耗时约 <code>0.003 × 803214 ≈ 2409ms</code>。只看 <code>rows=1</code> 会以为它很轻。</p>
+<p><strong>第二，<code>actual time</code> 是”包含子节点”的累计时间</strong>（在树形输出里父节点的 A..B 覆盖子节点）。所以定位瓶颈要看”<strong>自身耗时 &#x3D; 本节点 B - 子节点 B</strong>“，或者直接找”rows 偏差最大的那个节点”。</p>
+<hr>
+<h2 id="二、执行计划是怎么被选出来的"><a href="#二、执行计划是怎么被选出来的" class="headerlink" title="二、执行计划是怎么被选出来的"></a>二、执行计划是怎么被选出来的</h2><p>优化器做三件事：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">1. 枚举访问路径：全表扫描 / 各索引的 range、ref、eq_ref / index merge</span><br><span class="line">2. 估算每个路径的行数：依赖统计信息（索引基数、直方图、采样）</span><br><span class="line">3. 用成本模型比较：server_cost（CPU）+ engine_cost（IO），选总成本最低的</span><br></pre></td></tr></table></figure>
+
+<p>关键认知：<strong>优化器不追求”正确”，只追求”按它以为的代价最小”</strong>。所以当输入（统计信息）错了，输出（计划）必然错，而且错得自洽——<code>EXPLAIN</code> 看起来毫无破绽。</p>
+<p>成本常数：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> mysql.server_cost;</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> mysql.engine_cost;</span><br></pre></td></tr></table></figure>
+
+<p>在 SSD 上，默认的 <code>io_block_read_cost=1.0</code> 可能严重高估随机 IO 代价，导致优化器过度偏好”小索引范围扫描”，这也是很多”看起来很怪”的计划的来源之一。修改成本常数是<strong>全局影响</strong>，生产上务必谨慎评估。</p>
+<hr>
+<h2 id="三、六类偏差根因"><a href="#三、六类偏差根因" class="headerlink" title="三、六类偏差根因"></a>三、六类偏差根因</h2><h3 id="3-1-数据倾斜"><a href="#3-1-数据倾斜" class="headerlink" title="3.1 数据倾斜"></a>3.1 数据倾斜</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- status: 1 占 99.2%，3 占 0.3%</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> status <span class="operator">=</span> <span class="number">3</span> <span class="keyword">AND</span> create_time <span class="operator">&gt;</span> <span class="string">&#x27;2026-11-01&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>优化器按”平均选择性”估算 <code>status=3</code> 命中 0.3%，但如果你把 <code>status</code> 放在联合索引第一列，它可能认为”这个条件过滤性很好”，实际却要扫大量数据。<strong>倾斜字段 + 联合索引顺序错误</strong>是最常见的组合。</p>
+<h3 id="3-2-多列相关性"><a href="#3-2-多列相关性" class="headerlink" title="3.2 多列相关性"></a>3.2 多列相关性</h3><p>优化器假设列与列<strong>独立</strong>：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> users <span class="keyword">WHERE</span> province <span class="operator">=</span> <span class="string">&#x27;浙江&#x27;</span> <span class="keyword">AND</span> city <span class="operator">=</span> <span class="string">&#x27;杭州&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>它会算 <code>P(浙江) × P(杭州)</code>，但杭州必然在浙江，实际选择率远高于估算值 → 低估行数 → 选错 join 顺序。</p>
+<h3 id="3-3-表达式与函数"><a href="#3-3-表达式与函数" class="headerlink" title="3.3 表达式与函数"></a>3.3 表达式与函数</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 索引失效 + 估算失真</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> <span class="type">DATE</span>(create_time) <span class="operator">=</span> <span class="string">&#x27;2026-11-17&#x27;</span>;</span><br><span class="line"><span class="comment">-- 应改为</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> create_time <span class="operator">&gt;=</span> <span class="string">&#x27;2026-11-17&#x27;</span> <span class="keyword">AND</span> create_time <span class="operator">&lt;</span> <span class="string">&#x27;2026-11-18&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>函数作用于列时，优化器无法使用索引统计，只能退回默认选择率（常见 10% 或更粗的猜测）。</p>
+<h3 id="3-4-前缀索引与模糊匹配"><a href="#3-4-前缀索引与模糊匹配" class="headerlink" title="3.4 前缀索引与模糊匹配"></a>3.4 前缀索引与模糊匹配</h3><p><code>LIKE &#39;%keyword%&#39;</code> 无法用 B+ 树定位，优化器对这类条件的选择率估计非常粗，容易低估或高估。</p>
+<h3 id="3-5-统计信息过期或采样偏差"><a href="#3-5-统计信息过期或采样偏差" class="headerlink" title="3.5 统计信息过期或采样偏差"></a>3.5 统计信息过期或采样偏差</h3><p>InnoDB 默认 <code>innodb_stats_persistent=ON</code>，每张表采样 <code>innodb_stats_persistent_sample_pages=20</code> 个页。对于十亿行的大表，20 个页的样本很容易错过倾斜数据。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 看统计信息</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> mysql.innodb_table_stats <span class="keyword">WHERE</span> table_name <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span>;</span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> mysql.innodb_index_stats <span class="keyword">WHERE</span> table_name <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span>;</span><br><span class="line"><span class="keyword">SHOW</span> INDEX <span class="keyword">FROM</span> orders;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-6-隐式转换与字符集不一致"><a href="#3-6-隐式转换与字符集不一致" class="headerlink" title="3.6 隐式转换与字符集不一致"></a>3.6 隐式转换与字符集不一致</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- user_id 是 varchar，传了数字 → 全表转换，索引失效</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> users <span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">123456</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这类问题在 <code>EXPLAIN</code> 里会表现为 <code>type=ALL</code> 或 <code>key=NULL</code>，相对好发现；但如果发生在 join 的驱动条件上，就会变成”估算 1 行实际百万行”。</p>
+<hr>
+<h2 id="四、五步归因流程"><a href="#四、五步归因流程" class="headerlink" title="四、五步归因流程"></a>四、五步归因流程</h2><h3 id="第一步：从-digest-找到”最贵的-SQL”"><a href="#第一步：从-digest-找到”最贵的-SQL”" class="headerlink" title="第一步：从 digest 找到”最贵的 SQL”"></a>第一步：从 digest 找到”最贵的 SQL”</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> DIGEST_TEXT,</span><br><span class="line">       COUNT_STAR,</span><br><span class="line">       ROUND(SUM_TIMER_WAIT <span class="operator">/</span> <span class="number">1e12</span>, <span class="number">2</span>) <span class="keyword">AS</span> total_sec,</span><br><span class="line">       ROUND(AVG_TIMER_WAIT <span class="operator">/</span> <span class="number">1e9</span>, <span class="number">2</span>)  <span class="keyword">AS</span> avg_ms,</span><br><span class="line">       SUM_ROWS_EXAMINED,</span><br><span class="line">       SUM_ROWS_SENT</span><br><span class="line"><span class="keyword">FROM</span> performance_schema.events_statements_summary_by_digest</span><br><span class="line"><span class="keyword">ORDER</span> <span class="keyword">BY</span> SUM_TIMER_WAIT <span class="keyword">DESC</span></span><br><span class="line">LIMIT <span class="number">20</span>;</span><br></pre></td></tr></table></figure>
+
+<p>重点看 <code>SUM_ROWS_EXAMINED / SUM_ROWS_SENT</code> 的比值。比值 &gt; 100 基本可以确定”扫了很多但没用到”。</p>
+<h3 id="第二步：看估算"><a href="#第二步：看估算" class="headerlink" title="第二步：看估算"></a>第二步：看估算</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN FORMAT<span class="operator">=</span>TREE <span class="keyword">SELECT</span> ...;</span><br></pre></td></tr></table></figure>
+
+<p>先看 join 顺序是否符合直觉：驱动表应该是<strong>过滤后结果集最小</strong>的那张。</p>
+<h3 id="第三步：看实测，找第一个偏差节点"><a href="#第三步：看实测，找第一个偏差节点" class="headerlink" title="第三步：看实测，找第一个偏差节点"></a>第三步：看实测，找第一个偏差节点</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">EXPLAIN ANALYZE <span class="keyword">SELECT</span> ...;</span><br></pre></td></tr></table></figure>
+
+<p>判断标准：</p>
+<ul>
+<li><code>actual rows × loops</code> 与估算 <code>rows</code> 相差 <strong>10 倍以上</strong> → 该节点统计信息有问题；</li>
+<li>父节点的 <code>actual rows</code> 远大于子节点 → 说明过滤条件没生效（函数、隐式转换、类型不匹配）；</li>
+<li>某个节点 <code>actual time</code> 自身占比 &gt; 50% → 瓶颈在这里。</li>
+</ul>
+<h3 id="第四步：验证统计信息"><a href="#第四步：验证统计信息" class="headerlink" title="第四步：验证统计信息"></a>第四步：验证统计信息</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 采样更充分（大表慎用，会加锁/耗 IO）</span></span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">UPDATE</span> HISTOGRAM <span class="keyword">ON</span> status, province <span class="keyword">WITH</span> <span class="number">1024</span> BUCKETS;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 看直方图</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> information_schema.COLUMN_STATISTICS</span><br><span class="line"><span class="keyword">WHERE</span> TABLE_NAME <span class="operator">=</span> <span class="string">&#x27;orders&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>直方图对<strong>倾斜字段的等值&#x2F;范围查询</strong>最有效；对高基数列（如 id）意义不大。</p>
+<h3 id="第五步：必要时看-optimizer-trace"><a href="#第五步：必要时看-optimizer-trace" class="headerlink" title="第五步：必要时看 optimizer trace"></a>第五步：必要时看 optimizer trace</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SET</span> optimizer_trace <span class="operator">=</span> <span class="string">&#x27;enabled=on&#x27;</span>;</span><br><span class="line"><span class="keyword">SELECT</span> ...;</span><br><span class="line"><span class="keyword">SELECT</span> TRACE <span class="keyword">FROM</span> information_schema.OPTIMIZER_TRACE;</span><br><span class="line"><span class="keyword">SET</span> optimizer_trace <span class="operator">=</span> <span class="string">&#x27;enabled=off&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>Trace 输出很大（几百 KB 到几 MB），只在”实在想不通为什么选这个索引”时用，且<strong>不要在生产高频 SQL 上长期开启</strong>。</p>
+<hr>
+<h2 id="五、三个典型案例"><a href="#五、三个典型案例" class="headerlink" title="五、三个典型案例"></a>五、三个典型案例</h2><h3 id="案例一：范围估算-1-行，实际-80-万"><a href="#案例一：范围估算-1-行，实际-80-万" class="headerlink" title="案例一：范围估算 1 行，实际 80 万"></a>案例一：范围估算 1 行，实际 80 万</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders</span><br><span class="line"><span class="keyword">WHERE</span> create_time <span class="operator">&gt;=</span> <span class="string">&#x27;2026-11-01&#x27;</span> <span class="keyword">AND</span> create_time <span class="operator">&lt;</span> <span class="string">&#x27;2026-12-01&#x27;</span></span><br><span class="line">  <span class="keyword">AND</span> status <span class="operator">=</span> <span class="number">3</span>;</span><br></pre></td></tr></table></figure>
+
+<p><code>EXPLAIN</code> 显示 <code>rows=1</code>，因为统计信息里这个时间段的基数被严重低估（订单表按天分区写入，统计信息停在月初）。</p>
+<p><strong>修复</strong>：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">ANALYZE <span class="keyword">TABLE</span> orders <span class="keyword">UPDATE</span> HISTOGRAM <span class="keyword">ON</span> status <span class="keyword">WITH</span> <span class="number">256</span> BUCKETS;</span><br><span class="line"><span class="comment">-- 或调整索引顺序：让高选择性的 status 参与索引</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> orders <span class="keyword">ADD</span> INDEX idx_status_time (status, create_time);</span><br></pre></td></tr></table></figure>
+
+<p>修复后 <code>actual rows</code> 与估算接近，计划从”扫 80 万行再过滤”变成”扫 2.4 万行”。</p>
+<h3 id="案例二：join-顺序反了"><a href="#案例二：join-顺序反了" class="headerlink" title="案例二：join 顺序反了"></a>案例二：join 顺序反了</h3><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">-&gt; Nested loop inner join (actual rows=1 loops=1)</span><br><span class="line">    -&gt; Table scan on small_table (actual rows=200000 loops=1)   ← 驱动表选错</span><br><span class="line">    -&gt; Index lookup on big_table (actual rows=1 loops=200000)</span><br></pre></td></tr></table></figure>
+
+<p>优化器以为 <code>small_table</code> 只有 10 行，实际 20 万行，于是把它当驱动表，导致 20 万次回表。</p>
+<p><strong>验证</strong>：用 <code>STRAIGHT_JOIN</code> 强制顺序，如果变快，说明就是估算问题。</p>
+<p><strong>修复</strong>：更新统计信息 &#x2F; 加直方图 &#x2F; 必要时用 <code>/*+ JOIN_ORDER(...) */</code> 固定，但要写注释说明原因。</p>
+<h3 id="案例三：ORDER-BY-LIMIT-选错索引"><a href="#案例三：ORDER-BY-LIMIT-选错索引" class="headerlink" title="案例三：ORDER BY LIMIT 选错索引"></a>案例三：ORDER BY LIMIT 选错索引</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SELECT</span> <span class="operator">*</span> <span class="keyword">FROM</span> orders <span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">123</span> <span class="keyword">ORDER</span> <span class="keyword">BY</span> create_time <span class="keyword">DESC</span> LIMIT <span class="number">20</span>;</span><br></pre></td></tr></table></figure>
+
+<p>优化器可能选 <code>idx_create_time</code>（以为能直接取前 20 行），实际要扫描大量行再过滤 <code>user_id</code>。</p>
+<p><strong>修复</strong>：建 <code>(user_id, create_time)</code> 联合索引，让”过滤 + 排序”在同一个索引里完成。</p>
+<hr>
+<h2 id="六、修复手段对比"><a href="#六、修复手段对比" class="headerlink" title="六、修复手段对比"></a>六、修复手段对比</h2><table>
+<thead>
+<tr>
+<th>手段</th>
+<th>适用场景</th>
+<th>生效速度</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ANALYZE TABLE</code></td>
+<td>统计信息过期</td>
+<td>快</td>
+<td>大表采样耗 IO；会短暂影响计划</td>
+</tr>
+<tr>
+<td>直方图</td>
+<td>倾斜字段的等值&#x2F;范围查询</td>
+<td>快</td>
+<td>只对部分谓词有效；需维护</td>
+</tr>
+<tr>
+<td>调整索引</td>
+<td>索引顺序&#x2F;覆盖不匹配</td>
+<td>需 DDL</td>
+<td>8.0 可用 ONLINE DDL，仍有负载</td>
+</tr>
+<tr>
+<td>改写 SQL</td>
+<td>函数、隐式转换、OR</td>
+<td>快</td>
+<td>需回归测试</td>
+</tr>
+<tr>
+<td>Optimizer Hint</td>
+<td>临时止血</td>
+<td>快</td>
+<td>硬编码计划，版本升级可能失效</td>
+</tr>
+<tr>
+<td><code>STRAIGHT_JOIN</code></td>
+<td>join 顺序错误</td>
+<td>快</td>
+<td>强耦合表顺序，维护成本高</td>
+</tr>
+<tr>
+<td>拆查询&#x2F;汇总表</td>
+<td>复杂聚合、报表</td>
+<td>慢</td>
+<td>增加数据一致性成本</td>
+</tr>
+</tbody></table>
+<p><strong>原则</strong>：能用”统计信息 + 索引”解决的，不要用 hint；hint 是止痛药，不是治疗方案。每条 hint 都必须配注释和到期复查时间。</p>
+<hr>
+<h2 id="七、Java-侧工程化：把-EXPLAIN-ANALYZE-变成巡检"><a href="#七、Java-侧工程化：把-EXPLAIN-ANALYZE-变成巡检" class="headerlink" title="七、Java 侧工程化：把 EXPLAIN ANALYZE 变成巡检"></a>七、Java 侧工程化：把 EXPLAIN ANALYZE 变成巡检</h2><h3 id="7-1-MyBatis-慢-SQL-拦截器"><a href="#7-1-MyBatis-慢-SQL-拦截器" class="headerlink" title="7.1 MyBatis 慢 SQL 拦截器"></a>7.1 MyBatis 慢 SQL 拦截器</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Intercepts(&#123;</span></span><br><span class="line"><span class="meta">    @Signature(type = Executor.class, method = &quot;query&quot;,</span></span><br><span class="line"><span class="meta">        args = &#123;MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class&#125;)</span></span><br><span class="line"><span class="meta">&#125;)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SlowSqlInterceptor</span> <span class="keyword">implements</span> <span class="title class_">Interceptor</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Logger</span> <span class="variable">log</span> <span class="operator">=</span> LoggerFactory.getLogger(SlowSqlInterceptor.class);</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">long</span> <span class="variable">THRESHOLD_MS</span> <span class="operator">=</span> <span class="number">500</span>;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> Object <span class="title function_">intercept</span><span class="params">(Invocation invocation)</span> <span class="keyword">throws</span> Throwable &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">return</span> invocation.proceed();</span><br><span class="line">        &#125; <span class="keyword">finally</span> &#123;</span><br><span class="line">            <span class="type">long</span> <span class="variable">costMs</span> <span class="operator">=</span> (System.nanoTime() - start) / <span class="number">1_000_000</span>;</span><br><span class="line">            <span class="keyword">if</span> (costMs &gt; THRESHOLD_MS) &#123;</span><br><span class="line">                <span class="type">MappedStatement</span> <span class="variable">ms</span> <span class="operator">=</span> (MappedStatement) invocation.getArgs()[<span class="number">0</span>];</span><br><span class="line">                log.warn(<span class="string">&quot;slow sql id=&#123;&#125; cost=&#123;&#125;ms params=&#123;&#125;&quot;</span>,</span><br><span class="line">                        ms.getId(), costMs, safeParams(invocation.getArgs()[<span class="number">1</span>]));</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> String <span class="title function_">safeParams</span><span class="params">(Object param)</span> &#123;</span><br><span class="line">        <span class="comment">// 生产上必须脱敏：手机号、身份证、地址</span></span><br><span class="line">        <span class="keyword">return</span> String.valueOf(param).replaceAll(<span class="string">&quot;1\\d&#123;10&#125;&quot;</span>, <span class="string">&quot;1**********&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="7-2-定时巡检（只读、限流、采样）"><a href="#7-2-定时巡检（只读、限流、采样）" class="headerlink" title="7.2 定时巡检（只读、限流、采样）"></a>7.2 定时巡检（只读、限流、采样）</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">PlanHealthChecker</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> JdbcTemplate jdbcTemplate;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> MeterRegistry registry;</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 每 10 分钟抽查一条最贵的 digest，最多 1 条，避免给数据库添负担</span></span><br><span class="line">    <span class="meta">@Scheduled(fixedDelay = 600_000)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">checkTopDigest</span><span class="params">()</span> &#123;</span><br><span class="line">        List&lt;String&gt; digests = jdbcTemplate.queryForList(<span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">            SELECT DIGEST_TEXT FROM performance_schema.events_statements_summary_by_digest</span></span><br><span class="line"><span class="string">            WHERE SCHEMA_NAME = DATABASE() AND DIGEST_TEXT LIKE &#x27;SELECT%&#x27;</span></span><br><span class="line"><span class="string">            ORDER BY SUM_TIMER_WAIT DESC LIMIT 5</span></span><br><span class="line"><span class="string">            &quot;&quot;&quot;</span>, String.class);</span><br><span class="line"></span><br><span class="line">        <span class="keyword">for</span> (String digest : digests) &#123;</span><br><span class="line">            <span class="keyword">try</span> &#123;</span><br><span class="line">                <span class="type">String</span> <span class="variable">plan</span> <span class="operator">=</span> jdbcTemplate.queryForObject(<span class="string">&quot;EXPLAIN ANALYZE &quot;</span> + digest, String.class);</span><br><span class="line">                <span class="keyword">if</span> (plan != <span class="literal">null</span> &amp;&amp; plan.contains(<span class="string">&quot;rows=&quot;</span>)) &#123;</span><br><span class="line">                    registry.counter(<span class="string">&quot;mysql.plan.checked&quot;</span>).increment();</span><br><span class="line">                &#125;</span><br><span class="line">            &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">                <span class="comment">// digest 里的 ? 占位符不能直接执行，这里仅作示意：</span></span><br><span class="line">                <span class="comment">// 生产实现应基于 SQL 模板 + 采样参数，且限制在只读从库</span></span><br><span class="line">                registry.counter(<span class="string">&quot;mysql.plan.check.failed&quot;</span>).increment();</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>这段代码有两个必须说明的工程约束：</p>
+<ol>
+<li><strong><code>DIGEST_TEXT</code> 里的 <code>?</code> 不能直接执行</strong>，需要配套”参数采样表”（从慢日志里取真实参数）；</li>
+<li>必须跑在<strong>只读从库</strong>，且并发限制为 1，否则巡检本身会成为故障源。</li>
+</ol>
+<h3 id="7-3-CI-里做计划回归"><a href="#7-3-CI-里做计划回归" class="headerlink" title="7.3 CI 里做计划回归"></a>7.3 CI 里做计划回归</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Test</span></span><br><span class="line"><span class="keyword">void</span> <span class="title function_">orderQueryShouldNotFullScan</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">String</span> <span class="variable">plan</span> <span class="operator">=</span> jdbcTemplate.queryForObject(</span><br><span class="line">        <span class="string">&quot;EXPLAIN SELECT * FROM orders WHERE user_id = ? ORDER BY create_time DESC LIMIT 20&quot;</span>,</span><br><span class="line">        String.class, <span class="number">1L</span>);</span><br><span class="line"></span><br><span class="line">    assertThat(plan).doesNotContain(<span class="string">&quot;type: ALL&quot;</span>);</span><br><span class="line">    assertThat(plan).containsIgnoringCase(<span class="string">&quot;idx_user_time&quot;</span>);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>在测试库上用<strong>接近生产的数据分布</strong>（至少百万行 + 倾斜数据）跑这类断言，可以拦住”某次加索引&#x2F;改 SQL 导致计划退化”的回归。</p>
+<hr>
+<h2 id="八、踩坑清单"><a href="#八、踩坑清单" class="headerlink" title="八、踩坑清单"></a>八、踩坑清单</h2><ol>
+<li><strong><code>EXPLAIN ANALYZE</code> 会真实执行 SQL</strong>。<code>UPDATE/DELETE</code> 千万别直接跑；对 <code>SELECT</code> 也要注意它可能扫全表，生产上先加 <code>LIMIT</code> 或放到从库。</li>
+<li><strong><code>LIMIT</code> 不一定能提前终止</strong>。某些执行路径下 <code>EXPLAIN ANALYZE</code> 仍会算完整个结果集，别以为加了 <code>LIMIT 10</code> 就没开销。</li>
+<li><strong><code>ANALYZE TABLE</code> 会让计划短暂抖动</strong>。刚分析完的几分钟内，缓存中的执行计划可能被重建，高峰期慎用。</li>
+<li><strong>直方图不是万能的</strong>。它只影响”选择率估算”，不改变索引可用性；对 <code>LIKE &#39;%x%&#39;</code> 依然无能为力。</li>
+<li><strong>主从统计信息不一致</strong>。从库的 <code>innodb_stats_persistent</code> 采样可能落后，导致”主库快、从库慢”。读写分离场景要单独验证从库计划。</li>
+<li><strong>优化器 hint 的版本兼容性</strong>。MySQL 8.0 的 hint 语法与 5.7 不同，升级大版本时务必回归所有 hint。</li>
+</ol>
+<hr>
+<h2 id="九、面试追问"><a href="#九、面试追问" class="headerlink" title="九、面试追问"></a>九、面试追问</h2><p><strong>Q1：<code>EXPLAIN</code> 的 <code>rows</code> 和 <code>filtered</code> 是什么关系？</strong></p>
+<p><code>rows</code> 是该访问路径预估需要读取的行数，<code>filtered</code> 是这些行中满足剩余条件的百分比。两者相乘 ≈ 传给下一节点的行数。join 时优化器就是用这个乘积估算中间结果集大小。</p>
+<p><strong>Q2：为什么 MySQL 会选错索引？</strong></p>
+<p>本质是”成本估算错误”，来源有三类：统计信息不准（采样、过期）、成本模型失真（IO 代价常数与实际存储不匹配）、选择率假设错误（列独立、无直方图）。解决顺序是”先修数据统计，再改索引，最后才用 hint”。</p>
+<p><strong>Q3：怎么判断一个执行计划”稳定”？</strong></p>
+<p>看三点：<code>EXPLAIN</code> 的 <code>key</code> 在数据量增长后是否漂移；<code>actual rows</code> 与估算是否长期保持同一量级；是否有 <code>Using filesort</code>&#x2F;<code>Using temporary</code> 随数据增长而出现。工程上用 CI 断言 + 慢日志回归来保障。</p>
+<p><strong>Q4：索引下推（ICP）在 EXPLAIN 里怎么看？</strong></p>
+<p><code>Extra</code> 列出现 <code>Using index condition</code>。它表示 WHERE 中部分条件下推到存储引擎层过滤，减少回表次数。<code>EXPLAIN ANALYZE</code> 里可以看到 <code>Index range scan</code> 节点的 <code>actual rows</code> 明显小于扫描的索引条目数。</p>
+<p><strong>Q5：为什么 <code>EXPLAIN ANALYZE</code> 显示的时间加起来和总耗时对不上？</strong></p>
+<p>因为 <code>actual time</code> 是累计值且各节点有重叠（父节点包含子节点），同时不包括客户端网络传输、结果集序列化、以及 SQL 解析&#x2F;优化阶段的时间。它衡量的是<strong>执行器内部耗时</strong>，不是端到端 RT。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p><code>EXPLAIN</code> 是”优化器以为的世界”，<code>EXPLAIN ANALYZE</code> 是”真实发生的事”。两者的差距，就是性能问题的藏身之处。</p>
+<p>一套可复用的方法论：</p>
+<ol>
+<li>用 <code>performance_schema</code> 找最贵的 digest；</li>
+<li>用 <code>EXPLAIN FORMAT=TREE</code> 看估算与 join 顺序；</li>
+<li>用 <code>EXPLAIN ANALYZE</code> 找第一个 rows 偏差 &gt; 10 倍的节点；</li>
+<li>用统计信息&#x2F;直方图&#x2F;索引修复根因；</li>
+<li>用 CI 断言 + 慢 SQL 巡检防回归。</li>
+</ol>
+<p>把这五步固化成团队流程，比记住一百条”索引优化技巧”更有用。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/17/mysql-explain-analyze-plan-deviation-deep-dive/">https://jiweidong.github.io/2026/11/17/mysql-explain-analyze-plan-deviation-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E7%B4%A2%E5%BC%95/">索引</a><a class="post-meta__tags" href="/tags/%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92/">执行计划</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/17/redis-lettuce-client-timeout-topology-deep-practice/" title="【Redis 实战】Lettuce 客户端连接治理深度实战：命令超时、拓扑刷新与共享连接的真实边界"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 实战】Lettuce 客户端连接治理深度实战：命令超时、拓扑刷新与共享连接的真实边界</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Lettuce 客户端连接治理深度实战前言线上一个很典型的事故序列：  Redis 集群扩容，运维加了一个分片； 应用侧开始零星报 io.lettuce.core.RedisCommandTimeoutException: Command timed out after 3 second(s)； 偶发的超时把 Tomcat 线程池占满，接口雪崩； 重启应用后恢复，一周后再次发生。  事后复盘发现三处配置问题叠加：命令超时 3s 但没有重试策略、集群拓扑刷新依赖默认值（30 分钟）、shareNativeConnection=true 下用 BLPOP 做延迟队列把唯一的共享连接占住了。 很多团队对 Redis 的认知停留在”加个 @Cacheable 就行”，但客户端才是 Redis 故障的第一现场。本文把 Lettuce 的连接模型、四类超时、拓扑刷新、池化取舍和观测手段讲清楚。  说明：jedis-vs-lettuce-redis-client-comparison 那篇讲的是两个客户端的源码与选型对比，本文不重复；本文只讲已经在用 Lettuce 的前提...</div></div></div></a><a class="pagination-related" href="/2026/11/17/linux-conntrack-nat-exhaustion-deep-dive/" title="【性能调优】nf_conntrack 表满与 NAT 深度解析：为什么连接会「莫名超时」而服务端毫无日志"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【性能调优】nf_conntrack 表满与 NAT 深度解析：为什么连接会「莫名超时」而服务端毫无日志</div></div><div class="info-2"><div class="info-item-1">【性能调优】nf_conntrack 表满与 NAT 深度解析前言先说一个几乎每个 Java 后端都会遇到的现场：  客户端侧偶发 ConnectException: Connection timed out，概率 0.1%~1%，集中在高峰期； 服务端 QPS 曲线平稳，CPU、GC、线程池、连接数全部正常，业务日志一条报错都没有； ping 正常、telnet 偶尔失败、重试一次又能通； 运维说「网络没问题」，开发说「代码没问题」，最后靠重启某个节点”恢复”。  如果你在宿主机（或节点）上 dmesg -T | grep conntrack，大概率能看到这一行： 1nf_conntrack: table full, dropping packet  这就是本文要讲的主角：Linux 连接跟踪表（conntrack）耗尽。它不产生 RST、不进应用日志、不打满 CPU，只安静地把包丢掉，把故障伪装成”网络抖动”。 本文从内核表结构讲到 K8s Service 的 DNAT、从超时参数讲到 Java 侧连接池治理，最后给出可以直接抄的排查与治理模板。  一、conntrack 到...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/21/mysql-invisible-index-governance-deep-practice/" title="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战前言「索引加得越多，查询越快」——这是我在面试里最常听到、也最想纠正的一句话。 索引不是免费的。每一个二级索引在写入路径上都要付出代价：  INSERT：每多一个索引，就多一次 B+ 树定位插入，多一份 redo&#x2F;undo； UPDATE：只要被索引的列发生变化，就要删除旧记录 + 插入新记录（delete-mark + insert），而不是原地更新； DELETE：所有索引都要打删除标记； 优化器：候选索引越多，range 评估的组合越多，执行计划越容易走偏； 存储：一个千万级表的二级索引，随随便便几十 GB。  一个跑了三五年的业务库，SHOW INDEX 出来十几二十个索引是常态，其中至少三分之一是历史遗留：早期为了某个报表加的、某次慢查询临时加的、开发觉得「加了总没坏处」加的。问题是——你敢直接 DROP INDEX 吗？ 不敢。因为线上没人能保证这个索引真的没人用。白天不敢动，晚上动了出问题没人背。于是索引越堆越多，写入越来越慢，形成死循环。 MySQL 8.0 给的答案叫 不可见...</div></div></div></a><a class="pagination-related" href="/2026/07/01/mysql-index-failure-scenarios-guide/" title="【MySQL优化】索引失效场景全总结与优化实战：从 EXPLAIN 到 SQL 优化"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-01</div><div class="info-item-2">【MySQL优化】索引失效场景全总结与优化实战：从 EXPLAIN 到 SQL 优化</div></div><div class="info-2"><div class="info-item-1">【MySQL优化】索引失效场景全总结与优化实战：从 EXPLAIN 到 SQL 优化前言在工作中，我们经常会遇到这样的问题：明明建了索引，SQL 查询却依然慢如蜗牛。很大可能性是——索引失效了。 索引失效是 MySQL 性能优化中最常见的坑。本文将总结 12 种常见的索引失效场景，并为每种场景提供 SQL 示例和 EXPLAIN 分析，帮你彻底掌握索引优化的精髓。  一、准备工作先建一张示例表： 12345678910111213CREATE TABLE `employee` (  `id` INT PRIMARY KEY AUTO_INCREMENT,  `name` VARCHAR(50) NOT NULL,  `phone` VARCHAR(20) DEFAULT NULL,  `age` INT DEFAULT NULL,  `status` TINYINT DEFAULT NULL,  `department` VARCHAR(50) DEFAULT NULL,  `create_time` DATETIME DEFAULT NULL,  KEY `idx_name` ...</div></div></div></a><a class="pagination-related" href="/2026/06/13/mysql-index-transaction/" title="MySQL 索引与事务详解（面试跳槽篇）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-13</div><div class="info-item-2">MySQL 索引与事务详解（面试跳槽篇）</div></div><div class="info-2"><div class="info-item-1">MySQL 索引与事务详解（面试跳槽篇） 本文涵盖了 MySQL 面试中最高频的索引、事务、锁、日志、主从架构等核心知识点，结合大量 SQL 示例和原理图解，帮你从容应对面试。   一、索引1.1 索引数据结构选型MySQL InnoDB 选择 B+Tree 作为索引的底层数据结构。为什么不是其他结构？    数据结构 特点 为什么不选    二叉查找树 每个节点最多两个子节点 极端情况下退化为链表，树高太大   红黑树 自平衡二叉树 数据量大时树高依然很高（百万数据树高约 20）   B-Tree 多路平衡查找树，每个节点存数据 查询不稳定，范围查询需中序遍历   B+Tree 非叶子节点只存索引，叶子节点存数据且双向链表连接 ✅ 查询稳定、范围查询高效、磁盘 I&#x2F;O 少   B+Tree 的核心优势：  查询稳定：所有数据都在叶子节点，查询任何数据都走相同 I&#x2F;O 次数 范围查询高效：叶子节点用双向链表连接，直接遍历即可 磁盘 I&#x2F;O 少：非叶子节点只存索引（不存数据），能容纳更多 key，树高更矮 排序友好：叶子节点天然有序  1.2 B+Tr...</div></div></div></a><a class="pagination-related" href="/2026/06/11/mysql-index-optimization/" title="MySQL 索引原理与优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-11</div><div class="info-item-2">MySQL 索引原理与优化实战</div></div><div class="info-2"><div class="info-item-1">前言索引是数据库性能调优中最基础也最核心的手段。一条 SQL 走不走索引、走什么索引，执行时间可能相差几个数量级。本文从底层存储结构讲起，结合实际案例，带你彻底掌握 MySQL 索引优化。  一、索引的底层数据结构1.1 为什么选择 B+ 树？MySQL InnoDB 存储引擎使用 B+ 树作为索引结构。对比其他数据结构：    数据结构 磁盘 I&#x2F;O 范围查询 有序性 适用场景    哈希表 O(1) ❌ 不支持 ❌ 等值查询   二叉树 O(log n) ✅ ✅ 内存中   B 树 O(log n) ❌ 较差 ✅ 磁盘存储   B+ 树 O(log n) ✅ 优秀 ✅ 磁盘存储（最优）   1.2 B+ 树的核心特征1234567            [50]          ↙     ↘     [20, 30]    [70, 90]   ↙   ↓   ↘    ↓    ↓    ↘[10,15][25][35] [60] [80] [95,100]  ↑  ↑   ↑   ↑   ↑    ↑     ↑  └─── 数据页链表 ──────────...</div></div></div></a><a class="pagination-related" href="/2026/08/15/mysql-back-to-table-covering-index-deep-dive/" title="【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-15</div><div class="info-item-2">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】回表与覆盖索引深度解析：从 InnoDB 索引结构到 SQL 优化实战面试官：什么是回表？什么是覆盖索引？为什么 select * 和 select 指定字段性能差这么多？“回表”和”覆盖索引”是 MySQL 索引面试中最核心的两个概念，也是 SQL 优化的基本功。很多同学知道”要建联合索引、不要 select *”，但说不清背后的原理——为什么覆盖索引能避免回表？为什么联合索引能覆盖更多查询？ 本文从 InnoDB 索引结构出发，把回表、覆盖索引、索引下推（ICP）的关系一次讲透，最后给出可直接落地的优化 checklist。 一、先从 InnoDB 索引结构说起1.1 聚簇索引（Clustered Index）InnoDB 的表本身就是一棵 B+ 树，主键索引就是聚簇索引：  叶子节点直接存放整行数据（包括所有字段）； 每张表只有一个聚簇索引（通常是主键，没有主键就用第一个非空唯一索引，再没有就隐藏的 rowid）； 数据行按照主键顺序物理排列（逻辑顺序）。  123456789聚簇索引 B+ 树（主键 id）┌─────────┐│  根节点   │  ...</div></div></div></a><a class="pagination-related" href="/2026/10/04/mysql-optimizer-hint-deep-dive/" title="【MySQL 优化】优化器提示（Optimizer Hint）深度解析：从 INDEX HINT 到执行计划干预与 Optimizer Trace"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-04</div><div class="info-item-2">【MySQL 优化】优化器提示（Optimizer Hint）深度解析：从 INDEX HINT 到执行计划干预与 Optimizer Trace</div></div><div class="info-2"><div class="info-item-1">【MySQL 优化】优化器提示（Optimizer Hint）深度解析：从 INDEX HINT 到执行计划干预与 Optimizer Trace面试官：如果 MySQL 选错了索引，你会怎么办？一个很常见的生产场景：某条 SQL 明明有更优的索引，但优化器就是不走，导致慢查询。 很多人第一反应是 FORCE INDEX。但 FORCE INDEX 只是最粗粒度的一种手段，而且它无法解决 join 顺序、子查询策略、半连接策略等问题。真正系统的答案是：优化器 Hint（Optimizer Hints）。 这一篇把 MySQL 的 Hint 体系讲透：分类、语法、常用 Hint、失效原因，以及如何用 Optimizer Trace 定位优化器为什么”想错了”。  一、为什么要干预优化器MySQL 优化器是基于成本（Cost-Based）的。成本估算依赖统计信息，而统计信息天然有误差：    误差来源 说明    采样估算 InnoDB 默认采样 20 个页估算基数，数据倾斜时严重失真   直方图缺失 未建直方图时，范围条件的选择性靠猜   关联假设 优化器假设列之间独立，多列条件会...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">937</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1049</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E4%BC%98%E5%8C%96%E3%80%91EXPLAIN-ANALYZE-%E4%B8%8E%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92%E5%81%8F%E5%B7%AE%E5%BD%92%E5%9B%A0"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81EXPLAIN-%E7%9A%84%E4%B8%89%E7%A7%8D%E5%BD%A2%E6%80%81"><span class="toc-number">1.2.</span> <span class="toc-text">一、EXPLAIN 的三种形态</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E5%AD%97%E6%AE%B5%E6%80%8E%E4%B9%88%E8%AF%BB"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 字段怎么读</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E6%9C%80%E5%AE%B9%E6%98%93%E8%AF%BB%E9%94%99%E7%9A%84%E4%B8%A4%E4%BB%B6%E4%BA%8B"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 最容易读错的两件事</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E6%89%A7%E8%A1%8C%E8%AE%A1%E5%88%92%E6%98%AF%E6%80%8E%E4%B9%88%E8%A2%AB%E9%80%89%E5%87%BA%E6%9D%A5%E7%9A%84"><span class="toc-number">1.3.</span> <span class="toc-text">二、执行计划是怎么被选出来的</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%85%AD%E7%B1%BB%E5%81%8F%E5%B7%AE%E6%A0%B9%E5%9B%A0"><span class="toc-number">1.4.</span> <span class="toc-text">三、六类偏差根因</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E6%95%B0%E6%8D%AE%E5%80%BE%E6%96%9C"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 数据倾斜</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%A4%9A%E5%88%97%E7%9B%B8%E5%85%B3%E6%80%A7"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 多列相关性</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E8%A1%A8%E8%BE%BE%E5%BC%8F%E4%B8%8E%E5%87%BD%E6%95%B0"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 表达式与函数</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%89%8D%E7%BC%80%E7%B4%A2%E5%BC%95%E4%B8%8E%E6%A8%A1%E7%B3%8A%E5%8C%B9%E9%85%8D"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 前缀索引与模糊匹配</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-5-%E7%BB%9F%E8%AE%A1%E4%BF%A1%E6%81%AF%E8%BF%87%E6%9C%9F%E6%88%96%E9%87%87%E6%A0%B7%E5%81%8F%E5%B7%AE"><span class="toc-number">1.4.5.</span> <span class="toc-text">3.5 统计信息过期或采样偏差</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-6-%E9%9A%90%E5%BC%8F%E8%BD%AC%E6%8D%A2%E4%B8%8E%E5%AD%97%E7%AC%A6%E9%9B%86%E4%B8%8D%E4%B8%80%E8%87%B4"><span class="toc-number">1.4.6.</span> <span class="toc-text">3.6 隐式转换与字符集不一致</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E4%BA%94%E6%AD%A5%E5%BD%92%E5%9B%A0%E6%B5%81%E7%A8%8B"><span class="toc-number">1.5.</span> <span class="toc-text">四、五步归因流程</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%80%E6%AD%A5%EF%BC%9A%E4%BB%8E-digest-%E6%89%BE%E5%88%B0%E2%80%9D%E6%9C%80%E8%B4%B5%E7%9A%84-SQL%E2%80%9D"><span class="toc-number">1.5.1.</span> <span class="toc-text">第一步：从 digest 找到”最贵的 SQL”</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%BA%8C%E6%AD%A5%EF%BC%9A%E7%9C%8B%E4%BC%B0%E7%AE%97"><span class="toc-number">1.5.2.</span> <span class="toc-text">第二步：看估算</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%B8%89%E6%AD%A5%EF%BC%9A%E7%9C%8B%E5%AE%9E%E6%B5%8B%EF%BC%8C%E6%89%BE%E7%AC%AC%E4%B8%80%E4%B8%AA%E5%81%8F%E5%B7%AE%E8%8A%82%E7%82%B9"><span class="toc-number">1.5.3.</span> <span class="toc-text">第三步：看实测，找第一个偏差节点</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E5%9B%9B%E6%AD%A5%EF%BC%9A%E9%AA%8C%E8%AF%81%E7%BB%9F%E8%AE%A1%E4%BF%A1%E6%81%AF"><span class="toc-number">1.5.4.</span> <span class="toc-text">第四步：验证统计信息</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E7%AC%AC%E4%BA%94%E6%AD%A5%EF%BC%9A%E5%BF%85%E8%A6%81%E6%97%B6%E7%9C%8B-optimizer-trace"><span class="toc-number">1.5.5.</span> <span class="toc-text">第五步：必要时看 optimizer trace</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%B8%89%E4%B8%AA%E5%85%B8%E5%9E%8B%E6%A1%88%E4%BE%8B"><span class="toc-number">1.6.</span> <span class="toc-text">五、三个典型案例</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A1%88%E4%BE%8B%E4%B8%80%EF%BC%9A%E8%8C%83%E5%9B%B4%E4%BC%B0%E7%AE%97-1-%E8%A1%8C%EF%BC%8C%E5%AE%9E%E9%99%85-80-%E4%B8%87"><span class="toc-number">1.6.1.</span> <span class="toc-text">案例一：范围估算 1 行，实际 80 万</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A1%88%E4%BE%8B%E4%BA%8C%EF%BC%9Ajoin-%E9%A1%BA%E5%BA%8F%E5%8F%8D%E4%BA%86"><span class="toc-number">1.6.2.</span> <span class="toc-text">案例二：join 顺序反了</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E6%A1%88%E4%BE%8B%E4%B8%89%EF%BC%9AORDER-BY-LIMIT-%E9%80%89%E9%94%99%E7%B4%A2%E5%BC%95"><span class="toc-number">1.6.3.</span> <span class="toc-text">案例三：ORDER BY LIMIT 选错索引</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%BF%AE%E5%A4%8D%E6%89%8B%E6%AE%B5%E5%AF%B9%E6%AF%94"><span class="toc-number">1.7.</span> <span class="toc-text">六、修复手段对比</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81Java-%E4%BE%A7%E5%B7%A5%E7%A8%8B%E5%8C%96%EF%BC%9A%E6%8A%8A-EXPLAIN-ANALYZE-%E5%8F%98%E6%88%90%E5%B7%A1%E6%A3%80"><span class="toc-number">1.8.</span> <span class="toc-text">七、Java 侧工程化：把 EXPLAIN ANALYZE 变成巡检</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#7-1-MyBatis-%E6%85%A2-SQL-%E6%8B%A6%E6%88%AA%E5%99%A8"><span class="toc-number">1.8.1.</span> <span class="toc-text">7.1 MyBatis 慢 SQL 拦截器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-2-%E5%AE%9A%E6%97%B6%E5%B7%A1%E6%A3%80%EF%BC%88%E5%8F%AA%E8%AF%BB%E3%80%81%E9%99%90%E6%B5%81%E3%80%81%E9%87%87%E6%A0%B7%EF%BC%89"><span class="toc-number">1.8.2.</span> <span class="toc-text">7.2 定时巡检（只读、限流、采样）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#7-3-CI-%E9%87%8C%E5%81%9A%E8%AE%A1%E5%88%92%E5%9B%9E%E5%BD%92"><span class="toc-number">1.8.3.</span> <span class="toc-text">7.3 CI 里做计划回归</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.9.</span> <span class="toc-text">八、踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.11.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/17/ai-customer-service-system-design/" title="【系统设计】AI 客服系统架构设计：意图识别、RAG 知识库、人机协同与质检闭环">【系统设计】AI 客服系统架构设计：意图识别、RAG 知识库、人机协同与质检闭环</a><time datetime="2026-11-17T00:40:00.000Z" title="发表于 2026-11-17 08:40:00">2026-11-17</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/17/java-mcp-tool-marketplace-governance-deep-practice/" title="【Java AI】MCP 工具市场治理深度实战：准入、评级、灰度与下线的全生命周期">【Java AI】MCP 工具市场治理深度实战：准入、评级、灰度与下线的全生命周期</a><time datetime="2026-11-17T00:30:00.000Z" title="发表于 2026-11-17 08:30:00">2026-11-17</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/17/redis-lettuce-client-timeout-topology-deep-practice/" title="【Redis 实战】Lettuce 客户端连接治理深度实战：命令超时、拓扑刷新与共享连接的真实边界">【Redis 实战】Lettuce 客户端连接治理深度实战：命令超时、拓扑刷新与共享连接的真实边界</a><time datetime="2026-11-17T00:20:00.000Z" title="发表于 2026-11-17 08:20:00">2026-11-17</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/17/mysql-explain-analyze-plan-deviation-deep-dive/" title="【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相">【MySQL 优化】EXPLAIN ANALYZE 与执行计划偏差归因：估算 1 行、实际 80 万行的真相</a><time datetime="2026-11-17T00:10:00.000Z" title="发表于 2026-11-17 08:10:00">2026-11-17</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/17/linux-conntrack-nat-exhaustion-deep-dive/" title="【性能调优】nf_conntrack 表满与 NAT 深度解析：为什么连接会「莫名超时」而服务端毫无日志">【性能调优】nf_conntrack 表满与 NAT 深度解析：为什么连接会「莫名超时」而服务端毫无日志</a><time datetime="2026-11-17T00:00:00.000Z" title="发表于 2026-11-17 08:00:00">2026-11-17</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
