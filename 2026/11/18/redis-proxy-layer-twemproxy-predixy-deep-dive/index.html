@@ -1,0 +1,493 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Redis 中间件】Redis 代理层深度解析前言大部分团队用 Redis 的方式是「客户端直连 + 客户端分片（Jedis Cluster &#x2F; Lettuce 拓扑感知）」。这套方案在中小规模下工作得很好，但只要出现下面任意一种情况，代理层就会被重新拿出来讨论：  客户端语言栈太多（Java、Go、Python、PHP），每种都要实现一遍分片与故障转移逻辑； 需要做多租户隔离、按业务">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/18/redis-proxy-layer-twemproxy-predixy-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Redis 中间件】Redis 代理层深度解析前言大部分团队用 Redis 的方式是「客户端直连 + 客户端分片（Jedis Cluster &#x2F; Lettuce 拓扑感知）」。这套方案在中小规模下工作得很好，但只要出现下面任意一种情况，代理层就会被重新拿出来讨论：  客户端语言栈太多（Java、Go、Python、PHP），每种都要实现一遍分片与故障转移逻辑； 需要做多租户隔离、按业务">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-18T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-18T00:02:07.192Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Redis">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="代理层">
+<meta property="article:tag" content="架构设计">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱",
+  "url": "https://jiweidong.github.io/2026/11/18/redis-proxy-layer-twemproxy-predixy-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-18T00:00:00.000Z",
+  "dateModified": "2026-11-18T00:02:07.192Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/18/redis-proxy-layer-twemproxy-predixy-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">942</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1055</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-18T00:00:00.000Z" title="发表于 2026-11-18 08:00:00">2026-11-18</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-18T00:02:07.192Z" title="更新于 2026-11-18 08:02:07">2026-11-18</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Redis-中间件】Redis-代理层深度解析"><a href="#【Redis-中间件】Redis-代理层深度解析" class="headerlink" title="【Redis 中间件】Redis 代理层深度解析"></a>【Redis 中间件】Redis 代理层深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>大部分团队用 Redis 的方式是「客户端直连 + 客户端分片（Jedis Cluster &#x2F; Lettuce 拓扑感知）」。这套方案在中小规模下工作得很好，但只要出现下面任意一种情况，代理层就会被重新拿出来讨论：</p>
+<ul>
+<li>客户端语言栈太多（Java、Go、Python、PHP），每种都要实现一遍分片与故障转移逻辑；</li>
+<li>需要做<strong>多租户隔离</strong>、按业务限流、按命令审计，但不想改业务代码；</li>
+<li>历史包袱是单机&#x2F;主从 Redis，想平滑迁到集群，但业务方短期内不能改连接方式；</li>
+<li>需要统一的慢查询、命中率、后端连接数观测，而不是在 200 个 Pod 里各看各的。</li>
+</ul>
+<p>代理层不是银弹，它把「分片逻辑」从客户端搬到了中间，代价是多一跳网络、多一个故障点、以及一堆<strong>语义边界</strong>（跨槽命令、事务、阻塞命令、Pub&#x2F;Sub）必须提前想清楚。这篇文章把 Twemproxy、Predixy、Envoy Redis Proxy 三条主流路线拆开讲，重点放在<strong>协议语义陷阱</strong>和 <strong>Java 客户端接入姿势</strong>上。</p>
+<hr>
+<h2 id="一、代理层到底解决了什么"><a href="#一、代理层到底解决了什么" class="headerlink" title="一、代理层到底解决了什么"></a>一、代理层到底解决了什么</h2><p>先明确代理层的职责边界。一个合格的 Redis 代理通常承担五件事：</p>
+<table>
+<thead>
+<tr>
+<th>职责</th>
+<th>说明</th>
+<th>不做会怎样</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>分片路由</td>
+<td>按 key 计算槽位&#x2F;哈希，转发到后端节点</td>
+<td>每个客户端都要维护拓扑，语言栈重复实现</td>
+</tr>
+<tr>
+<td>连接复用</td>
+<td>客户端 1000 连接 → 后端每节点 10 连接</td>
+<td>后端 <code>maxclients</code> 被打爆，内存与 FD 双高</td>
+</tr>
+<tr>
+<td>协议归一</td>
+<td>单机&#x2F;主从&#x2F;集群对客户端呈现为单一入口</td>
+<td>迁移期间业务要改配置甚至改代码</td>
+</tr>
+<tr>
+<td>读写分离</td>
+<td>读命令路由到副本，写命令路由到主</td>
+<td>副本闲置，主库压力集中</td>
+</tr>
+<tr>
+<td>治理</td>
+<td>限流、熔断、审计、慢命令拦截、指标</td>
+<td>出问题只能靠客户端侧零散日志</td>
+</tr>
+</tbody></table>
+<p>注意这里没有「提升性能」。<strong>代理层几乎总是增加延迟</strong>，它的价值是可运维性与一致性，不是吞吐。任何声称「加代理更快」的方案，通常是因为原来客户端连接管理太烂。</p>
+<h3 id="一跳代理的延迟成本"><a href="#一跳代理的延迟成本" class="headerlink" title="一跳代理的延迟成本"></a>一跳代理的延迟成本</h3><p>同机房内，一次 <code>GET</code> 的耗时大致是：</p>
+<table>
+<thead>
+<tr>
+<th>链路</th>
+<th>p50</th>
+<th>p99</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>客户端直连 Redis（同 AZ）</td>
+<td>0.15 ms</td>
+<td>0.5 ms</td>
+</tr>
+<tr>
+<td>经 Twemproxy（单线程）</td>
+<td>0.25 ms</td>
+<td>1.2 ms</td>
+</tr>
+<tr>
+<td>经 Predixy（多线程）</td>
+<td>0.22 ms</td>
+<td>0.9 ms</td>
+</tr>
+<tr>
+<td>经 Envoy（sidecar 同节点）</td>
+<td>0.30 ms</td>
+<td>1.5 ms</td>
+</tr>
+</tbody></table>
+<p>绝对值都不大，但要注意<strong>尾延迟放大</strong>：代理是多租户共享的，一个大 key 的 <code>HGETALL</code> 或者一个 <code>KEYS</code> 就能把同实例上所有人的 p99 拉起来。所以代理层必须配<strong>单请求大小限制</strong>和<strong>慢命令熔断</strong>，否则它会把局部故障放大成全局故障。</p>
+<hr>
+<h2 id="二、三条技术路线对比"><a href="#二、三条技术路线对比" class="headerlink" title="二、三条技术路线对比"></a>二、三条技术路线对比</h2><h3 id="2-1-Twemproxy（nutcracker）"><a href="#2-1-Twemproxy（nutcracker）" class="headerlink" title="2.1 Twemproxy（nutcracker）"></a>2.1 Twemproxy（nutcracker）</h3><p>Twitter 开源的老牌代理，C 实现，<strong>单线程 event loop</strong>。</p>
+<ul>
+<li>分片：ketama 一致性哈希（自带，不认 Redis Cluster 槽位）</li>
+<li>后端：支持多个 Redis 实例列表，<strong>不支持 Redis Cluster 协议</strong></li>
+<li>命令：支持大部分单 key 命令，多 key 命令（<code>MGET</code>&#x2F;<code>MSET</code>&#x2F;<code>DEL</code> 多参数）会<strong>按节点拆分再聚合</strong></li>
+<li>不支持：事务、Lua、<code>SUBSCRIBE</code>、<code>SELECT</code> 切库、<code>SCAN</code>（游标语义会错）</li>
+<li>扩容：<strong>不能在线扩</strong>。加节点会导致大量 key 重新映射，必须做双写迁移或停机</li>
+<li>状态：Twitter 已归档，社区基本停止维护</li>
+</ul>
+<p>Twemproxy 的定位很清楚：<strong>它是 2012 年的方案</strong>。今天新项目不应该再选它，但存量系统里非常多，排查问题时必须知道它的语义边界。</p>
+<h3 id="2-2-Predixy"><a href="#2-2-Predixy" class="headerlink" title="2.2 Predixy"></a>2.2 Predixy</h3><p>C++ 实现，<strong>多线程</strong>，是目前「自建 Redis 代理」里最实用的一个。</p>
+<ul>
+<li>后端模式：Standalone &#x2F; Sentinel &#x2F; <strong>Redis Cluster</strong> 三种都支持</li>
+<li>分片：支持 <code>hash</code>（ketama 一致性哈希）、<code>slot</code>（Redis Cluster 16384 槽）、<code>modula</code></li>
+<li>读写分离：<code>ReadStrategy</code> 可配 master &#x2F; slave &#x2F; 低延迟优先</li>
+<li>支持 pipeline、<code>MULTI/EXEC</code>（同节点内）、<code>SCAN</code>（按节点轮询）、Pub&#x2F;Sub</li>
+<li>自带 <code>INFO</code>、<code>LATENCY</code> 统计，可按后端节点看 QPS 与延迟分位</li>
+<li>多线程模型：<code>WorkerThreads</code> 配置，通常设为 CPU 核数</li>
+</ul>
+<p>Predixy 的关键价值：<strong>它能在集群模式下把 <code>MOVED/ASK</code> 藏起来</strong>，客户端看到的是一个「永远不会重定向」的单点 Redis。</p>
+<h3 id="2-3-Envoy-Redis-Proxy"><a href="#2-3-Envoy-Redis-Proxy" class="headerlink" title="2.3 Envoy Redis Proxy"></a>2.3 Envoy Redis Proxy</h3><p>Envoy 的 <code>redis_proxy</code> filter，L7 协议解析 + 集群发现。</p>
+<ul>
+<li>优势：和 Service Mesh 天然集成，mTLS、限流、熔断、可观测全都复用 Envoy 那套</li>
+<li>劣势：<strong>命令支持是白名单制</strong>，多 key 命令默认要求同槽（<code>enable_redirection</code>、<code>enable_multi_key_commands</code>），事务、阻塞命令支持有限</li>
+<li>适合：已经在 Istio&#x2F;Envoy 体系内，需要统一的 mesh 治理，而不是把它当 Redis 分片中间件</li>
+</ul>
+<h3 id="2-4-选型对照表"><a href="#2-4-选型对照表" class="headerlink" title="2.4 选型对照表"></a>2.4 选型对照表</h3><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Twemproxy</th>
+<th>Predixy</th>
+<th>Envoy Redis Proxy</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>多线程</td>
+<td>❌ 单线程</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>Redis Cluster 后端</td>
+<td>❌</td>
+<td>✅</td>
+<td>✅（需配置 cluster 类型）</td>
+</tr>
+<tr>
+<td>一致性哈希</td>
+<td>✅ ketama</td>
+<td>✅</td>
+<td>❌（依赖上游 cluster）</td>
+</tr>
+<tr>
+<td>读写分离</td>
+<td>❌</td>
+<td>✅</td>
+<td>✅（read policy）</td>
+</tr>
+<tr>
+<td>事务</td>
+<td>❌</td>
+<td>同节点可用</td>
+<td>受限</td>
+</tr>
+<tr>
+<td>阻塞命令</td>
+<td>❌</td>
+<td>✅（需专用连接）</td>
+<td>受限</td>
+</tr>
+<tr>
+<td>在线扩容</td>
+<td>❌</td>
+<td>集群模式 ✅</td>
+<td>集群模式 ✅</td>
+</tr>
+<tr>
+<td>可观测</td>
+<td>基础</td>
+<td>较全（分节点延迟）</td>
+<td>最全（mesh 生态）</td>
+</tr>
+<tr>
+<td>维护状态</td>
+<td>归档</td>
+<td>活跃度一般</td>
+<td>活跃</td>
+</tr>
+</tbody></table>
+<p><strong>结论</strong>：新项目要代理，优先「客户端直连 Cluster」；确实需要代理，选 Predixy（自建）或 Envoy（已有 mesh）。Twemproxy 只作为存量维护。</p>
+<hr>
+<h2 id="三、分片语义：代理层最容易踩的坑"><a href="#三、分片语义：代理层最容易踩的坑" class="headerlink" title="三、分片语义：代理层最容易踩的坑"></a>三、分片语义：代理层最容易踩的坑</h2><h3 id="3-1-跨槽多-key-命令"><a href="#3-1-跨槽多-key-命令" class="headerlink" title="3.1 跨槽多 key 命令"></a>3.1 跨槽多 key 命令</h3><p><code>MGET k1 k2 k3</code> 在代理层会被拆成 N 个请求，再按原顺序聚合。这带来两个后果：</p>
+<ol>
+<li><strong>延迟取最大值</strong>：3 个 key 落在 3 个节点，耗时 ≈ max(t1,t2,t3) + 代理调度开销；</li>
+<li><strong>部分失败语义</strong>：某个节点超时，聚合器返回什么？Predixy 默认会返回错误，业务侧看到的是「整个 MGET 失败」，但实际有些 key 已经读到了。</li>
+</ol>
+<p>更危险的是<strong>写命令</strong>：<code>MSET k1 v1 k2 v2</code> 拆成两个 <code>SET</code>，如果第二个失败，第一个已经生效 —— <strong>没有原子性</strong>。业务如果依赖 MSET 的原子性做「批量状态更新」，迁到代理后会静默出错。</p>
+<p>规避方式：用 hash tag 把相关 key 固定到同一槽。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"># 同一用户的数据固定到同槽</span><br><span class="line">user:&#123;1001&#125;:profile</span><br><span class="line">user:&#123;1001&#125;:settings</span><br><span class="line">user:&#123;1001&#125;:quota</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-2-事务与-Lua"><a href="#3-2-事务与-Lua" class="headerlink" title="3.2 事务与 Lua"></a>3.2 事务与 Lua</h3><p><code>MULTI/EXEC</code> 在代理层只有「所有 key 同节点」才可能被正确转发。Predixy 会检查并在跨节点时直接报错，这是好事（快速失败）；Twemproxy 直接不支持，客户端行为取决于驱动实现。</p>
+<p>Lua 脚本的问题更隐蔽：脚本里如果访问了多个 key，代理无法静态分析出 key 集合，只能按 <code>KEYS[1]</code> 猜，猜错就会<strong>在错误的节点执行脚本</strong>，然后拿到 <code>nil</code> 或者报错。</p>
+<p><strong>生产规则：走代理的 Lua 脚本，必须把所有 key 作为前 N 个参数显式传入，并且保证同槽。</strong></p>
+<h3 id="3-3-SCAN-的游标语义"><a href="#3-3-SCAN-的游标语义" class="headerlink" title="3.3 SCAN 的游标语义"></a>3.3 SCAN 的游标语义</h3><p>这是分布式 Redis 的经典陷阱。单机 <code>SCAN 0 COUNT 100</code> 返回的游标是「位反转的桶索引」，代理如果要遍历所有后端节点，必须自己维护「当前在第几个节点 + 该节点的游标」。</p>
+<p>Twemproxy 不支持 <code>SCAN</code>，Predixy 支持但语义是「按节点顺序遍历」。如果你的代码用 <code>SCAN</code> 做「全量 key 清理」，在代理后面可能：</p>
+<ul>
+<li>重复返回同一个 key（不同节点游标重叠时不会，但节点扩容后会）</li>
+<li>漏 key（遍历过程中发生 rehash）</li>
+<li>遍历时间极长</li>
+</ul>
+<p><strong>正确做法</strong>：全量遍历用「业务侧维护 key 索引」或者 <code>SCAN</code> 配合「按前缀分片 + 并发扫」，不要假设游标全局唯一。</p>
+<h3 id="3-4-阻塞命令与-Pub-Sub"><a href="#3-4-阻塞命令与-Pub-Sub" class="headerlink" title="3.4 阻塞命令与 Pub&#x2F;Sub"></a>3.4 阻塞命令与 Pub&#x2F;Sub</h3><p><code>BLPOP</code>、<code>SUBSCRIBE</code>、<code>XREAD BLOCK</code> 这类命令会<strong>长期占住连接</strong>。代理如果是「多路复用」模型（一个后端连接服务多个客户端请求），一条阻塞命令就会把整条连接堵死。</p>
+<p>Predixy 的处理是：阻塞命令走<strong>独占连接</strong>（<code>GenerateBlockingConnection</code>），代价是连接数上升。所以配置 <code>BLPOP</code> 超时时间很关键——<code>timeout=0</code> 会让连接永久占用，代理连接池很快耗尽。</p>
+<h3 id="3-5-数据库编号"><a href="#3-5-数据库编号" class="headerlink" title="3.5 数据库编号"></a>3.5 数据库编号</h3><p>集群模式只有 db0。代理如果后端是 Cluster，<code>SELECT 1</code> 会失败。很多老代码在初始化时无脑 <code>SELECT 0</code>，迁到代理后会报 <code>ERR SELECT is not allowed in cluster mode</code>。这属于「迁移期必查项」。</p>
+<hr>
+<h2 id="四、Java-客户端接入姿势"><a href="#四、Java-客户端接入姿势" class="headerlink" title="四、Java 客户端接入姿势"></a>四、Java 客户端接入姿势</h2><h3 id="4-1-连代理时，必须关掉「客户端集群模式」"><a href="#4-1-连代理时，必须关掉「客户端集群模式」" class="headerlink" title="4.1 连代理时，必须关掉「客户端集群模式」"></a>4.1 连代理时，必须关掉「客户端集群模式」</h3><p>最常见的错误：业务代码原本连 Cluster，改成代理地址后仍然用 <code>RedisClusterClient</code>，于是客户端自己做拓扑发现（拿到的是代理地址，发现不了），然后不断重试、拓扑刷新，日志刷满 <code>Cannot retrieve initial cluster partitions</code>。</p>
+<p><strong>Lettuce 正确写法（连代理 &#x3D; 连单机）</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">import</span> io.lettuce.core.ClientOptions;</span><br><span class="line"><span class="keyword">import</span> io.lettuce.core.RedisClient;</span><br><span class="line"><span class="keyword">import</span> io.lettuce.core.RedisURI;</span><br><span class="line"><span class="keyword">import</span> io.lettuce.core.api.StatefulRedisConnection;</span><br><span class="line"><span class="keyword">import</span> io.lettuce.core.codec.StringCodec;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ProxyLettuceFactory</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> StatefulRedisConnection&lt;String, String&gt; <span class="title function_">create</span><span class="params">(String proxyHost, <span class="type">int</span> port)</span> &#123;</span><br><span class="line">        <span class="type">RedisURI</span> <span class="variable">uri</span> <span class="operator">=</span> RedisURI.builder()</span><br><span class="line">                .withHost(proxyHost)</span><br><span class="line">                .withPort(port)</span><br><span class="line">                <span class="comment">// 代理不认 db，但部分代理支持 0；显式写 0 避免 driver 默认值差异</span></span><br><span class="line">                .withDatabase(<span class="number">0</span>)</span><br><span class="line">                .withTimeout(Duration.ofMillis(<span class="number">800</span>))          <span class="comment">// 命令超时</span></span><br><span class="line">                .build();</span><br><span class="line"></span><br><span class="line">        <span class="type">RedisClient</span> <span class="variable">client</span> <span class="operator">=</span> RedisClient.create(uri);</span><br><span class="line"></span><br><span class="line">        client.setOptions(ClientOptions.builder()</span><br><span class="line">                <span class="comment">// 代理不会发 MOVED/ASK（Predixy 已消化），因此不需要拓扑刷新</span></span><br><span class="line">                .autoReconnect(<span class="literal">true</span>)</span><br><span class="line">                .disconnectedBehavior(ClientOptions.DisconnectedBehavior.REJECT_COMMANDS)</span><br><span class="line">                <span class="comment">// 关键：不要开启 cluster 支持</span></span><br><span class="line">                .build());</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 连接级保活，防止中间 LB/NAT 静默断链</span></span><br><span class="line">        client.setOptions(ClientOptions.builder()</span><br><span class="line">                .pingBeforeActivateConnection(<span class="literal">true</span>)</span><br><span class="line">                .build());</span><br><span class="line"></span><br><span class="line">        <span class="keyword">return</span> client.connect(StringCodec.UTF8);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>三个要点：</p>
+<ol>
+<li><strong>不要用 <code>RedisClusterClient</code></strong>，用 <code>RedisClient</code>；</li>
+<li><code>pingBeforeActivateConnection(true)</code> 能在拿到「已被 LB 断掉的僵尸连接」时立刻发现；</li>
+<li>超时要<strong>短于</strong>上游 LB 的空闲超时，否则连接被中间设备回收后第一次请求必然失败。</li>
+</ol>
+<h3 id="4-2-连接池容量怎么算"><a href="#4-2-连接池容量怎么算" class="headerlink" title="4.2 连接池容量怎么算"></a>4.2 连接池容量怎么算</h3><p>代理层的连接池和直连不一样：代理本身会复用后端连接，所以<strong>客户端连接数不需要按后端节点数放大</strong>。</p>
+<p>用 Little 定律估算：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">所需连接数 ≈ QPS × 平均持有时长(s) × 安全系数(1.5~2)</span><br></pre></td></tr></table></figure>
+
+<p>例：单实例 2000 QPS，平均命令耗时 0.5ms（含网络），则并发占用 ≈ 2000 × 0.0005 &#x3D; 1 条，安全系数 2 → 2 条。实际工程里因为存在慢命令、pipeline、事务，通常配 8~16 条即可。</p>
+<p><strong>不要配 200 条</strong>。连接数过多会让代理的 event loop 出现调度抖动，反而拉高 p99。</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># Spring Boot 配置示例（Lettuce 连接池需要 commons-pool2）</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">data:</span></span><br><span class="line">    <span class="attr">redis:</span></span><br><span class="line">      <span class="attr">host:</span> <span class="string">redis-proxy.internal</span></span><br><span class="line">      <span class="attr">port:</span> <span class="number">7617</span></span><br><span class="line">      <span class="attr">timeout:</span> <span class="string">800ms</span></span><br><span class="line">      <span class="attr">lettuce:</span></span><br><span class="line">        <span class="attr">pool:</span></span><br><span class="line">          <span class="attr">max-active:</span> <span class="number">16</span></span><br><span class="line">          <span class="attr">max-idle:</span> <span class="number">16</span></span><br><span class="line">          <span class="attr">min-idle:</span> <span class="number">4</span></span><br><span class="line">          <span class="attr">max-wait:</span> <span class="string">200ms</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-故障转移时客户端该做什么"><a href="#4-3-故障转移时客户端该做什么" class="headerlink" title="4.3 故障转移时客户端该做什么"></a>4.3 故障转移时客户端该做什么</h3><p>代理的高可用有两种形态：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>客户端感知</th>
+<th>注意事项</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>代理自身多实例 + LB（推荐）</td>
+<td>无感，LB 摘除故障实例</td>
+<td>LB 健康检查要发真实 <code>PING</code>，不要只查 TCP 端口</td>
+</tr>
+<tr>
+<td>单代理 + VIP 漂移</td>
+<td>连接被重置，需重连</td>
+<td>重连风暴会打垮新代理，必须加退避</td>
+</tr>
+</tbody></table>
+<p>Java 侧重连退避建议：指数退避 + 抖动，上限 5s；同时用<strong>熔断器</strong>（Resilience4j）在下游持续失败时快速失败，避免线程池被拖死。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">RetryConfig</span> <span class="variable">retry</span> <span class="operator">=</span> RetryConfig.custom()</span><br><span class="line">        .maxAttempts(<span class="number">3</span>)</span><br><span class="line">        .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(</span><br><span class="line">                Duration.ofMillis(<span class="number">100</span>), <span class="number">2.0</span>, <span class="number">0.3</span>, Duration.ofSeconds(<span class="number">2</span>)))</span><br><span class="line">        .retryExceptions(RedisConnectionException.class, RedisCommandTimeoutException.class)</span><br><span class="line">        .build();</span><br></pre></td></tr></table></figure>
+
+<p><strong>注意</strong>：<code>RedisCommandTimeoutException</code> 重试有风险——命令可能已经在服务端执行成功，只是响应丢了。所以只对<strong>幂等命令</strong>重试，写命令要么不重试，要么业务侧用幂等 token 兜底。</p>
+<hr>
+<h2 id="五、代理层配置实战（Predixy）"><a href="#五、代理层配置实战（Predixy）" class="headerlink" title="五、代理层配置实战（Predixy）"></a>五、代理层配置实战（Predixy）</h2><p>一份可直接用的最小配置：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line">## predixy.conf</span><br><span class="line">Bind 0.0.0.0:7617</span><br><span class="line">WorkerThreads 4</span><br><span class="line">ClientTimeout 300</span><br><span class="line">Log ./predixy.log</span><br><span class="line"></span><br><span class="line">## 后端为 Redis Cluster</span><br><span class="line">ClusterServerPool &#123;</span><br><span class="line">    MasterReadPriority 60</span><br><span class="line">    StaticSlaveReadPriority 50</span><br><span class="line">    DynamicSlaveReadPriority 50</span><br><span class="line">    RefreshInterval 1</span><br><span class="line">    ServerTimeout 1000</span><br><span class="line">    ServerFailureLimit 10</span><br><span class="line">    ServerRetryTimeout 1</span><br><span class="line">    KeepAlive 120</span><br><span class="line">    Servers &#123;</span><br><span class="line">        + 10.0.0.11:6379</span><br><span class="line">        + 10.0.0.12:6379</span><br><span class="line">        + 10.0.0.13:6379</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>参数解释：</p>
+<ul>
+<li><code>MasterReadPriority 60</code> + <code>SlaveReadPriority 50</code>：读写分离，主 60% 读、从 50%（按权重归一）。如果不做读写分离，把三者设成相同值即可。</li>
+<li><code>ServerFailureLimit 10</code> + <code>ServerRetryTimeout 1</code>：连续 10 次失败标记节点不可用，1 秒后重试。<strong>这两个值太小会导致抖动</strong>（网络毛刺就把节点摘了），太大则故障恢复慢。生产建议 <code>10/1</code>~&#96;20&#x2F;3&#96;。</li>
+<li><code>RefreshInterval 1</code>：集群拓扑刷新间隔。集群在 reshard 期间会频繁变化，1s 是合理值。</li>
+<li><code>ClientTimeout 300</code>：客户端空闲超时，要<strong>小于</strong>上游 LB 的空闲超时。</li>
+</ul>
+<p><strong>限流</strong>：Predixy 支持 <code>Authority</code> 做 ACL 与限流，但能力有限。真正需要按租户限流，建议在代理前面挂 Envoy，或者业务侧用 Sentinel&#x2F;Resilience4j 做客户端限流（成本更低）。</p>
+<hr>
+<h2 id="六、观测与故障排查"><a href="#六、观测与故障排查" class="headerlink" title="六、观测与故障排查"></a>六、观测与故障排查</h2><p>代理层出问题时，现象往往是「客户端超时，但 Redis 服务端毫无异常」。排查顺序建议：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">1. 代理自身指标：QPS、p50/p99、后端连接数、错误码分布</span><br><span class="line">2. 代理 → 后端：每个节点的延迟分位（Predixy INFO 可直接看）</span><br><span class="line">3. 后端 → 代理：slowlog、connected_clients、rejected_connections</span><br><span class="line">4. 客户端 → 代理：TCP 重传、conntrack 表项、LB 5xx</span><br></pre></td></tr></table></figure>
+
+<p>三个高频故障模式：</p>
+<h3 id="6-1-「客户端超时但服务端-QPS-为-0」"><a href="#6-1-「客户端超时但服务端-QPS-为-0」" class="headerlink" title="6.1 「客户端超时但服务端 QPS 为 0」"></a>6.1 「客户端超时但服务端 QPS 为 0」</h3><p>典型原因：<strong>代理到后端的连接被中间设备（NAT&#x2F;SLB）静默回收</strong>，代理以为连接可用，发出去的命令永远等不到响应。Predixy 的 <code>KeepAlive 120</code> 就是干这个的——每 120 秒发一次 <code>PING</code> 保活。</p>
+<p>如果代理不支持 keepalive，就在后端开 <code>tcp-keepalive</code>，并确认 <code>net.ipv4.tcp_keepalive_time</code> 小于 NAT 空闲超时（云上 NAT 常见 300s，容器环境可能只有 60s）。</p>
+<h3 id="6-2-「p99-突然翻倍，QPS-没变」"><a href="#6-2-「p99-突然翻倍，QPS-没变」" class="headerlink" title="6.2 「p99 突然翻倍，QPS 没变」"></a>6.2 「p99 突然翻倍，QPS 没变」</h3><p>先看是不是<strong>大 key</strong>。代理是共享的，一个 <code>HGETALL</code> 返回 10MB，会阻塞 event loop（Twemproxy 单线程下尤其致命）。排查：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 找大 key（离线执行，别在高峰期扫）</span></span><br><span class="line">redis-cli --bigkeys</span><br><span class="line"><span class="comment"># 或在代理侧拦截：限制单请求返回字节数</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-「扩容后大量-MISS」"><a href="#6-3-「扩容后大量-MISS」" class="headerlink" title="6.3 「扩容后大量 MISS」"></a>6.3 「扩容后大量 MISS」</h3><p>如果做了代理层分片（ketama），加节点会导致部分 key 重新映射。缓存命中率会掉一段时间，然后因为回源把数据库打挂。</p>
+<p><strong>正确姿势</strong>：扩容前先做「双写 + 双读比对」，或者用 Redis Cluster 的槽迁移（<code>CLUSTER SETSLOT IMPORTING/MIGRATING</code> + <code>MIGRATE</code>），槽迁移是逐槽原子切换，不会出现大面积 MISS。</p>
+<hr>
+<h2 id="七、面试追问"><a href="#七、面试追问" class="headerlink" title="七、面试追问"></a>七、面试追问</h2><p><strong>Q1：为什么 Redis Cluster 官方不提供代理？</strong></p>
+<p>官方认为分片逻辑应该下沉到客户端（smart client），代理会成为单点与性能瓶颈。但官方也确实提供过 <code>redis-cluster-proxy</code>（实验性），说明在「多语言、客户端能力弱」的场景下代理有真实需求。本质是<strong>复杂度放在哪一端</strong>的权衡。</p>
+<p><strong>Q2：代理层如何保证 <code>MOVED</code> 重定向对客户端透明？</strong></p>
+<p>代理自己订阅&#x2F;轮询集群拓扑（<code>CLUSTER SLOTS</code>&#x2F;<code>CLUSTER SHARDS</code>），收到 <code>MOVED</code> 时更新本地槽表并重试一次；收到 <code>ASK</code> 时对本次请求加 <code>ASKING</code> 后转发到目标节点，<strong>不更新槽表</strong>。区别在于 <code>MOVED</code> 是永久迁移，<code>ASK</code> 是迁移中间态。</p>
+<p><strong>Q3：为什么 <code>MGET</code> 在代理后面会变慢？</strong></p>
+<p>拆成 N 个单 key 请求并发发出，耗时 ≈ 最慢的那个 + 聚合开销；同时代理的并发度受 event loop &#x2F; worker 数限制，批量大了会排队。如果业务确实需要批量，用 hash tag 把 key 收敛到同槽，代理就能一次转发。</p>
+<p><strong>Q4：客户端分片和代理分片能同时用吗？</strong></p>
+<p>不能，这是典型的<strong>双重分片反模式</strong>。客户端按自己的哈希把 key 分到「代理 A&#x2F;B」，代理再按槽位分到后端节点，两套映射不一致会导致 key 落到错误节点。表现是「写入成功但读不到」。迁移期必须确保只有一层在做路由。</p>
+<p><strong>Q5：代理层怎么做灰度迁移？</strong></p>
+<p>常见做法是「双读单写」：写主链路（新集群），读同时读新旧并比对差异（异步，不阻塞业务），差异率低于阈值后切读、再切写。代理层可以在这一层做「按 key 哈希百分比」的流量切分，但要注意<strong>同一 key 的读写必须落在同一侧</strong>，否则会出现写新读旧的不一致。</p>
+<hr>
+<h2 id="八、小结"><a href="#八、小结" class="headerlink" title="八、小结"></a>八、小结</h2><ul>
+<li>代理层的价值是<strong>集中治理与多语言一致性</strong>，不是性能。默认方案仍然是客户端直连 Cluster。</li>
+<li>选型上，Twemproxy 已归档只做存量维护；自建优先 Predixy；已在 Mesh 体系内优先 Envoy。</li>
+<li>真正的事故都来自<strong>语义边界</strong>：跨槽多 key、事务、Lua、SCAN、阻塞命令、<code>SELECT</code>。</li>
+<li>Java 侧接入代理的核心是「把代理当单机」：关掉集群拓扑发现、配短超时、开连接保活、连接池按 Little 定律算而不是拍脑袋。</li>
+<li>观测三件套：代理分节点延迟、后端连接数、错误码分布。缺一个就会在故障时抓瞎。</li>
+</ul>
+<p>代理层是典型的「平时感觉不到，出事就是全局」的组件。上线前把那几条语义边界写成测试用例（跨槽 MGET、同槽事务、Lua 多 key、BLPOP 超时），比事后排查省一百倍时间。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/18/redis-proxy-layer-twemproxy-predixy-deep-dive/">https://jiweidong.github.io/2026/11/18/redis-proxy-layer-twemproxy-predixy-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/%E6%9E%B6%E6%9E%84%E8%AE%BE%E8%AE%A1/">架构设计</a><a class="post-meta__tags" href="/tags/Redis/">Redis</a><a class="post-meta__tags" href="/tags/%E4%BB%A3%E7%90%86%E5%B1%82/">代理层</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/18/kubernetes-cni-veth-nftables-packet-path-deep-dive/" title="【云原生网络】容器网络包路径深度解析：veth、网桥、VXLAN 与 nftables 的每一跳"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【云原生网络】容器网络包路径深度解析：veth、网桥、VXLAN 与 nftables 的每一跳</div></div><div class="info-2"><div class="info-item-1">【云原生网络】容器网络包路径深度解析前言线上最让人抓狂的故障类型之一，是「服务端没日志、客户端超时」。在 Kubernetes 里，这类问题十有八九发生在包路径上：veth 丢包、conntrack 表满、MTU 黑洞、NetworkPolicy 静默 DROP、Service DNAT 后回程不对称。 这些问题有两个共同特点：  应用层完全无感 —— Java 侧只看到 SocketTimeoutException 或者 gRPC DEADLINE_EXCEEDED； kubectl logs 什么都看不到 —— 因为包根本没到进程。  要定位它们，必须能在脑子里画出「一个包从 Pod A 的 socket 到 Pod B 的 socket 经过哪些设备、哪些表、哪些 hook」。这篇文章就把这条路径拆到每一跳，并给出可直接执行的排查命令。  一、先看清「一个 Pod 的网络长什么样」创建 Pod 时，CRI 调用 CNI 插件，典型动作是： 123456# CNI 插件大致做的三件事ip link add veth0 type veth peer name veth1ip l...</div></div></div></a><a class="pagination-related" href="/2026/11/17/ai-customer-service-system-design/" title="【系统设计】AI 客服系统架构设计：意图识别、RAG 知识库、人机协同与质检闭环"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【系统设计】AI 客服系统架构设计：意图识别、RAG 知识库、人机协同与质检闭环</div></div><div class="info-2"><div class="info-item-1">【系统设计】AI 客服系统架构设计前言AI 客服是过去两年落地最密集的场景，也是最容易”Demo 惊艳、上线翻车”的场景。 Demo 阶段：接一个大模型，把 FAQ 塞进 prompt，问什么答什么，客户很满意。上线三个月：答错政策导致赔付、A 客户看到 B 客户的订单、活动规则更新了但机器人还在说旧规则、用户骂了两句机器人还在机械回复”请问还有什么可以帮您”。 问题不在模型，而在系统。客服是一个”高准确率要求 + 强业务耦合 + 有法律后果”的场景，它需要的不是”会聊天的模型”，而是一套包含意图路由、知识检索、工具调用、人机协同、输出治理和评测闭环的工程体系。 本文给出一套可落地的架构设计，重点讲清楚每个模块的边界、失败模式和 Java 侧的实现要点。  一、需求与约束1.1 功能域   域 典型问题 处理方式    售前咨询 产品参数、价格、优惠 RAG 知识库   订单&#x2F;物流 我的订单到哪了 工具调用（业务 API）   售后 退款、换货、投诉 工作流 + 人工审批   政策解释 保修、发票、会员规则 RAG + 版本化   闲聊&#x2F;情绪 抱怨、辱骂 情绪...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/16/delay-queue-solutions-deep-dive/" title="延迟队列深度解析：五种实现方案对比与订单超时关闭实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-16</div><div class="info-item-2">延迟队列深度解析：五种实现方案对比与订单超时关闭实战</div></div><div class="info-2"><div class="info-item-1">延迟队列深度解析：五种实现方案对比与订单超时关闭实战面试官：说说你们是怎么实现订单超时自动关闭的？这是高并发场景下的经典问题。用户下单后 30 分钟未支付，订单要自动关闭、库存要释放。实现”延迟任务”的方案五花八门，面试官想听的不是某一个方案，而是你对方案选型的思考：为什么不用定时任务轮询？为什么用 Redis ZSet？为什么生产环境最终选了 RocketMQ？ 本文系统梳理 5 种主流延迟队列实现方案，从原理到代码，从优缺点到选型建议，一文讲透。 一、什么是延迟队列？普通队列：生产者放入消息，消费者立即消费。延迟队列：消息进入队列后，等待指定时间才被消费者消费。 核心能力：“到点了才执行”。 典型业务场景：    场景 延迟时间 到期动作    订单超时未支付 30 分钟 关闭订单、释放库存   用户下单未评价 7 天 发送提醒   定时发布文章 自定义 自动上架   支付成功通知 5 秒 通知下游   分布式锁续期 30 秒 续期&#x2F;释放   失败重试 递增 重新投递   二、方案一：数据库轮询（最朴素，先被否定）用定时任务（XXL-Job &#x2F; Quart...</div></div></div></a><a class="pagination-related" href="/2026/08/20/jedis-vs-lettuce-redis-client-comparison/" title="【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-20</div><div class="info-item-2">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战</div></div><div class="info-2"><div class="info-item-1">【Redis 客户端】Jedis vs Lettuce 深度对比：线程安全、连接池、源码与选型实战面试官：你们项目里用的是 Jedis 还是 Lettuce？为什么？这是 Spring Boot 项目里最常被问到的问题之一。Spring Boot 2.x 默认集成 Lettuce，Spring Boot 1.x 默认 Jedis；Spring Data Redis 把两者都做了封装，很多人只是跟着默认走，却说不清两者的本质区别。 本文从线程模型、连接管理、源码实现、性能表现四个维度，把 Jedis 和 Lettuce 彻底讲透，最后给出生产环境选型建议。 一、先看本质：一个线程安全，一个线程不安全这是两者最核心、最根本的区别，其余所有差异几乎都由它衍生出来。 1.1 Jedis：非线程安全，必须配连接池Jedis 实例内部持有 Socket 连接，直接复用同一个 Jedis 实例执行并发命令，会出现响应错乱、数据交叉污染的问题。看源码： 1234567// Jedis 底层本质是对 redis.clients.jedis.Connection 的封装public class Co...</div></div></div></a><a class="pagination-related" href="/2026/08/06/redis-transaction-deep-dive/" title="【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 事务深度解析：MULTI&#x2F;EXEC&#x2F;WATCH 原理与 Lua 脚本对比面试官：Redis 的事务和 MySQL 的事务有什么区别？Redis 事务能回滚吗？Redis 事务是面试中高频且容易答错的考点。很多人的第一反应是「Redis 事务就是一组命令的批量执行」，但面试官往往会在后面连续追问：「它能回滚吗？」「有隔离性吗？」「WATCH 是什么？」「为什么不建议用事务而用 Lua？」 这篇文章把 Redis 事务从命令到原理、从对比到实战彻底讲透。  一、Redis 事务的核心命令Redis 事务通过四个命令实现：MULTI、EXEC、DISCARD、WATCH。    命令 作用    MULTI 开启事务，标记事务开始   EXEC 执行事务队列中的所有命令   DISCARD 取消事务，清空命令队列   WATCH 监视一个或多个 key，事务执行前若被修改则事务被打断   基本用法123456789127.0.0.1:6379&gt; MULTIOK127.0.0.1:6379&gt; SET account:1001...</div></div></div></a><a class="pagination-related" href="/2026/10/18/redis-functions-server-side-scripting-deep-practice/" title="【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-18</div><div class="info-item-2">【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis Functions 深度实战：服务端函数、Lua 脚本治理与原子性边界前言EVAL 大概是 Redis 里被滥用最多的命令之一。限流、扣库存、分布式锁续期、幂等校验，全都往里塞一段 Lua。短期很爽，长期很痛：  脚本字符串散落在几十个 Java 类里，改一行要发版； 没有版本概念，线上到底跑的是哪一版脚本说不清； SCRIPT FLUSH 之后所有 EVALSHA 报 NOSCRIPT，流量一冲就雪崩； 没有统一的权限边界，谁都能 EVAL 一段死循环把实例拖垮； 集群模式下 key 跨 slot 直接报 CROSSSLOT。  Redis 7.0 引入的 Functions（服务端函数） 就是来收拾这个烂摊子的：脚本变成「库（library）」，有名字、有版本、持久化、可复制、可管理，客户端只负责 FCALL 调用。 这篇文章讲清楚三件事：Functions 的模型与生命周期、Java 侧怎么落地、原子性与集群边界在哪。最后给一份「Lua → Functions」的迁移清单和面试追问。  一、从 EVAL 到 FCALL：模型变化1.1 EVA...</div></div></div></a><a class="pagination-related" href="/2026/09/02/redis-big-key-hot-key-deep-dive/" title="【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-02</div><div class="info-item-2">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis 大 Key 与热 Key 问题深度解析：从危害识别、监控定位到完整治理方案面试官：线上 Redis 突然变慢、CPU 飙升、甚至发生阻塞，你会怎么排查？很多同学第一反应是”看慢日志、看 bigkeys”，但真正能系统讲清楚大 Key 和热 Key 的完整治理链路的人不多。今天我们从原理到实战，一次性把这两个”Redis 头号杀手”讲透。  一、什么是大 Key？什么是热 Key？1.1 大 Key（Big Key）大 Key 不是指某个 Key 的字符串值很长，而是指单个 Key 占用内存过大或元素数量过多。业界一般没有绝对标准，常用的判断线是：    类型 判定标准（参考） 举例    String value 超过 10KB 一个 JSON 序列化的大对象、一张 Base64 图片   Hash &#x2F; Set &#x2F; ZSet &#x2F; List 元素数量超过 5000 个，或总大小超过 10MB 一个存了几万条用户行为的 Hash   单个 value 过大 超过 1MB 就要警惕 缓存整张报表数据   1.2 热 Key（...</div></div></div></a><a class="pagination-related" href="/2026/10/26/redis-stack-search-json-deep-practice/" title="【Redis 实战】Redis Stack 深度实战：RediSearch 全文检索、RedisJSON 与混合查询"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-26</div><div class="info-item-2">【Redis 实战】Redis Stack 深度实战：RediSearch 全文检索、RedisJSON 与混合查询</div></div><div class="info-2"><div class="info-item-1">【Redis 实战】Redis Stack 深度实战：RediSearch 全文检索、RedisJSON 与混合查询前言一个真实的排查现场：商品列表页要求「关键词搜索 + 类目筛选 + 价格区间 + 按销量排序 + 分页」，团队最初用 KEYS prefix:* 加 Java 内存过滤，QPS 一上 200 就打满 CPU；后来换成 ES，又背上了集群运维、数据同步、双写一致性的包袱。 这类「数据量中等、查询维度多、要求毫秒级」的场景，Redis Stack 往往是个被低估的选项：数据本来就在 Redis 里，加个索引就能做全文检索、标签过滤、数值范围、地理位置，甚至向量相似度检索。 这篇文章把 RedisJSON、RediSearch、混合查询、向量检索和 Java 落地一次讲透，最后给出生产踩坑清单和面试追问。 一、Redis Stack 到底是什么Redis Stack 不是「另一个数据库」，而是 Redis + 一组官方模块的打包发行版：    模块 作用 典型场景    RedisJSON 原生 JSON 文档类型，支持 JSONPath 读写子字段 商品详情、用户画像...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">942</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1055</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Redis-%E4%B8%AD%E9%97%B4%E4%BB%B6%E3%80%91Redis-%E4%BB%A3%E7%90%86%E5%B1%82%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【Redis 中间件】Redis 代理层深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%BB%A3%E7%90%86%E5%B1%82%E5%88%B0%E5%BA%95%E8%A7%A3%E5%86%B3%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、代理层到底解决了什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E4%B8%80%E8%B7%B3%E4%BB%A3%E7%90%86%E7%9A%84%E5%BB%B6%E8%BF%9F%E6%88%90%E6%9C%AC"><span class="toc-number">1.2.1.</span> <span class="toc-text">一跳代理的延迟成本</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%B8%89%E6%9D%A1%E6%8A%80%E6%9C%AF%E8%B7%AF%E7%BA%BF%E5%AF%B9%E6%AF%94"><span class="toc-number">1.3.</span> <span class="toc-text">二、三条技术路线对比</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-Twemproxy%EF%BC%88nutcracker%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 Twemproxy（nutcracker）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-Predixy"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 Predixy</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-Envoy-Redis-Proxy"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 Envoy Redis Proxy</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E9%80%89%E5%9E%8B%E5%AF%B9%E7%85%A7%E8%A1%A8"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 选型对照表</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%88%86%E7%89%87%E8%AF%AD%E4%B9%89%EF%BC%9A%E4%BB%A3%E7%90%86%E5%B1%82%E6%9C%80%E5%AE%B9%E6%98%93%E8%B8%A9%E7%9A%84%E5%9D%91"><span class="toc-number">1.4.</span> <span class="toc-text">三、分片语义：代理层最容易踩的坑</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E8%B7%A8%E6%A7%BD%E5%A4%9A-key-%E5%91%BD%E4%BB%A4"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 跨槽多 key 命令</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E4%BA%8B%E5%8A%A1%E4%B8%8E-Lua"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 事务与 Lua</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-SCAN-%E7%9A%84%E6%B8%B8%E6%A0%87%E8%AF%AD%E4%B9%89"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 SCAN 的游标语义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E9%98%BB%E5%A1%9E%E5%91%BD%E4%BB%A4%E4%B8%8E-Pub-Sub"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 阻塞命令与 Pub&#x2F;Sub</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-5-%E6%95%B0%E6%8D%AE%E5%BA%93%E7%BC%96%E5%8F%B7"><span class="toc-number">1.4.5.</span> <span class="toc-text">3.5 数据库编号</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81Java-%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%8E%A5%E5%85%A5%E5%A7%BF%E5%8A%BF"><span class="toc-number">1.5.</span> <span class="toc-text">四、Java 客户端接入姿势</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E8%BF%9E%E4%BB%A3%E7%90%86%E6%97%B6%EF%BC%8C%E5%BF%85%E9%A1%BB%E5%85%B3%E6%8E%89%E3%80%8C%E5%AE%A2%E6%88%B7%E7%AB%AF%E9%9B%86%E7%BE%A4%E6%A8%A1%E5%BC%8F%E3%80%8D"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 连代理时，必须关掉「客户端集群模式」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%BF%9E%E6%8E%A5%E6%B1%A0%E5%AE%B9%E9%87%8F%E6%80%8E%E4%B9%88%E7%AE%97"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 连接池容量怎么算</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E6%95%85%E9%9A%9C%E8%BD%AC%E7%A7%BB%E6%97%B6%E5%AE%A2%E6%88%B7%E7%AB%AF%E8%AF%A5%E5%81%9A%E4%BB%80%E4%B9%88"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 故障转移时客户端该做什么</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E4%BB%A3%E7%90%86%E5%B1%82%E9%85%8D%E7%BD%AE%E5%AE%9E%E6%88%98%EF%BC%88Predixy%EF%BC%89"><span class="toc-number">1.6.</span> <span class="toc-text">五、代理层配置实战（Predixy）</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E8%A7%82%E6%B5%8B%E4%B8%8E%E6%95%85%E9%9A%9C%E6%8E%92%E6%9F%A5"><span class="toc-number">1.7.</span> <span class="toc-text">六、观测与故障排查</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E3%80%8C%E5%AE%A2%E6%88%B7%E7%AB%AF%E8%B6%85%E6%97%B6%E4%BD%86%E6%9C%8D%E5%8A%A1%E7%AB%AF-QPS-%E4%B8%BA-0%E3%80%8D"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 「客户端超时但服务端 QPS 为 0」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E3%80%8Cp99-%E7%AA%81%E7%84%B6%E7%BF%BB%E5%80%8D%EF%BC%8CQPS-%E6%B2%A1%E5%8F%98%E3%80%8D"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 「p99 突然翻倍，QPS 没变」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E3%80%8C%E6%89%A9%E5%AE%B9%E5%90%8E%E5%A4%A7%E9%87%8F-MISS%E3%80%8D"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 「扩容后大量 MISS」</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E5%B0%8F%E7%BB%93"><span class="toc-number">1.9.</span> <span class="toc-text">八、小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/18/deep-research-agent-system-design/" title="【系统设计】Deep Research 智能体架构设计：规划、并行检索、证据管理与引用校验">【系统设计】Deep Research 智能体架构设计：规划、并行检索、证据管理与引用校验</a><time datetime="2026-11-18T00:40:00.000Z" title="发表于 2026-11-18 08:40:00">2026-11-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/18/java-agent-tool-retrieval-rag-deep-practice/" title="【Java AI】Agent 工具检索深度实战：RAG over Tools、动态工具集与 Spring AI/LangChain4j 落地">【Java AI】Agent 工具检索深度实战：RAG over Tools、动态工具集与 Spring AI/LangChain4j 落地</a><time datetime="2026-11-18T00:30:00.000Z" title="发表于 2026-11-18 08:30:00">2026-11-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/18/grpc-http2-flow-control-keepalive-deep-practice/" title="【Java 网络】gRPC 流控、Keepalive 与长连接治理深度实战：WINDOW_UPDATE、GOAWAY 与生产参数">【Java 网络】gRPC 流控、Keepalive 与长连接治理深度实战：WINDOW_UPDATE、GOAWAY 与生产参数</a><time datetime="2026-11-18T00:20:00.000Z" title="发表于 2026-11-18 08:20:00">2026-11-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/18/kubernetes-cni-veth-nftables-packet-path-deep-dive/" title="【云原生网络】容器网络包路径深度解析：veth、网桥、VXLAN 与 nftables 的每一跳">【云原生网络】容器网络包路径深度解析：veth、网桥、VXLAN 与 nftables 的每一跳</a><time datetime="2026-11-18T00:10:00.000Z" title="发表于 2026-11-18 08:10:00">2026-11-18</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/18/redis-proxy-layer-twemproxy-predixy-deep-dive/" title="【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱">【Redis 中间件】Redis 代理层深度解析：Twemproxy、Predixy 与 Envoy 的选型、分片与生产陷阱</a><time datetime="2026-11-18T00:00:00.000Z" title="发表于 2026-11-18 08:00:00">2026-11-18</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
