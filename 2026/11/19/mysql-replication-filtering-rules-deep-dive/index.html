@@ -1,0 +1,467 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 底层】MySQL 复制过滤规则深度解析前言先看一个真实事故。 某业务做库表拆分，DBA 在从库上加了这么一行： 1replicate-do-db &#x3D; order  意图很明确：这个从库只同步 order 库，别把整个实例几百个库都拉过来。 三个月后做主从切换，新主库上 order 库少了 11 万行数据。排查发现：业务代码里有一段「跨库写入」——连接默认库是 order，但 SQL">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/19/mysql-replication-filtering-rules-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 底层】MySQL 复制过滤规则深度解析前言先看一个真实事故。 某业务做库表拆分，DBA 在从库上加了这么一行： 1replicate-do-db &#x3D; order  意图很明确：这个从库只同步 order 库，别把整个实例几百个库都拉过来。 三个月后做主从切换，新主库上 order 库少了 11 万行数据。排查发现：业务代码里有一段「跨库写入」——连接默认库是 order，但 SQL">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-19T00:20:00.000Z">
+<meta property="article:modified_time" content="2026-11-19T00:05:50.859Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="GTID">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="主从复制">
+<meta property="article:tag" content="数据库">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案",
+  "url": "https://jiweidong.github.io/2026/11/19/mysql-replication-filtering-rules-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-19T00:20:00.000Z",
+  "dateModified": "2026-11-19T00:05:50.859Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/19/mysql-replication-filtering-rules-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">947</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1055</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-19T00:20:00.000Z" title="发表于 2026-11-19 08:20:00">2026-11-19</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-19T00:05:50.859Z" title="更新于 2026-11-19 08:05:50">2026-11-19</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-底层】MySQL-复制过滤规则深度解析"><a href="#【MySQL-底层】MySQL-复制过滤规则深度解析" class="headerlink" title="【MySQL 底层】MySQL 复制过滤规则深度解析"></a>【MySQL 底层】MySQL 复制过滤规则深度解析</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>先看一个真实事故。</p>
+<p>某业务做库表拆分，DBA 在从库上加了这么一行：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">replicate-do-db</span> = order</span><br></pre></td></tr></table></figure>
+
+<p>意图很明确：这个从库只同步 <code>order</code> 库，别把整个实例几百个库都拉过来。</p>
+<p>三个月后做主从切换，新主库上 <code>order</code> 库少了 11 万行数据。排查发现：业务代码里有一段「跨库写入」——连接默认库是 <code>order</code>，但 SQL 写的是 <code>UPDATE user.points SET ...</code>。在 <code>replicate-do-db=order</code> 的规则下，这条语句被<strong>静默过滤</strong>了。</p>
+<p>没有报错，没有延迟，<code>Seconds_Behind_Master</code> 一直是 0，GTID 集合完全一致。<strong>唯一不对劲的地方，是数据对不上。</strong></p>
+<p>这就是复制过滤最危险的特征：它不制造故障，它制造的是<strong>沉默的数据分叉</strong>。本文把过滤规则的作用域、格式依赖、GTID 交互和正确用法讲清楚。</p>
+<hr>
+<h2 id="一、过滤发生在哪一侧：这是第一个分水岭"><a href="#一、过滤发生在哪一侧：这是第一个分水岭" class="headerlink" title="一、过滤发生在哪一侧：这是第一个分水岭"></a>一、过滤发生在哪一侧：这是第一个分水岭</h2><p>MySQL 的复制过滤分两类，语义完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>配置位置</th>
+<th>参数</th>
+<th>作用点</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>源库（master）</td>
+<td><code>binlog-do-db</code> &#x2F; <code>binlog-ignore-db</code></td>
+<td>写 binlog 时</td>
+<td><strong>binlog 本身不完整</strong></td>
+</tr>
+<tr>
+<td>从库（replica）</td>
+<td><code>replicate-do-db</code> &#x2F; <code>replicate-ignore-db</code> &#x2F; <code>replicate-wild-do-table</code> …</td>
+<td>应用 relay log 时</td>
+<td>binlog 完整，但从库数据不全</td>
+</tr>
+</tbody></table>
+<h3 id="1-1-源库过滤几乎总是错的"><a href="#1-1-源库过滤几乎总是错的" class="headerlink" title="1.1 源库过滤几乎总是错的"></a>1.1 源库过滤几乎总是错的</h3><p><code>binlog-do-db</code> 会让不匹配的事务<strong>根本不进入 binlog</strong>。这意味着：</p>
+<ul>
+<li>基于 binlog 的 <strong>PITR（按时间点恢复）</strong> 无法恢复到一致状态；</li>
+<li><strong>CDC</strong>（Canal &#x2F; Debezium &#x2F; Maxwell）拿不到完整变更；</li>
+<li>新增从库、Clone、逻辑备份都可能缺数据；</li>
+<li>最要命的是：这个「缺失」在源库上完全看不出来，只有当你需要 binlog 的那一天才会爆炸。</li>
+</ul>
+<p>所以业界共识很明确：<strong>不要在源库做过滤</strong>。要拆分就拆实例，要部分同步就用 CDC 或逻辑导出。</p>
+<h3 id="1-2-从库过滤：能用，但必须理解语义"><a href="#1-2-从库过滤：能用，但必须理解语义" class="headerlink" title="1.2 从库过滤：能用，但必须理解语义"></a>1.2 从库过滤：能用，但必须理解语义</h3><p>从库过滤至少保证 binlog 完整，代价是从库数据不全。它适合的场景很窄：</p>
+<ul>
+<li>一个从库专门给某个业务做只读查询；</li>
+<li>临时数据迁移过渡期；</li>
+<li>明确的「单库从库」且业务保证不跨库写。</li>
+</ul>
+<p>即便如此，也要用对参数。</p>
+<hr>
+<h2 id="二、replicate-do-db-到底匹配什么"><a href="#二、replicate-do-db-到底匹配什么" class="headerlink" title="二、replicate-do-db 到底匹配什么"></a>二、<code>replicate-do-db</code> 到底匹配什么</h2><p>这是全文最重要的一节。</p>
+<h3 id="2-1-语句格式-vs-行格式，行为不同"><a href="#2-1-语句格式-vs-行格式，行为不同" class="headerlink" title="2.1 语句格式 vs 行格式，行为不同"></a>2.1 语句格式 vs 行格式，行为不同</h3><p>MySQL 文档里有一句很容易被略过的话：</p>
+<blockquote>
+<p>使用语句格式复制时，<code>replicate-do-db</code> 基于<strong>默认数据库</strong>（<code>USE</code> 的库）判断；使用行格式复制时，基于<strong>表实际所在的数据库</strong>判断。</p>
+</blockquote>
+<p>看这个例子：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">USE <span class="keyword">order</span>;</span><br><span class="line"><span class="keyword">UPDATE</span> user.points <span class="keyword">SET</span> points <span class="operator">=</span> points <span class="operator">+</span> <span class="number">10</span> <span class="keyword">WHERE</span> user_id <span class="operator">=</span> <span class="number">1001</span>;</span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>binlog 格式</th>
+<th>规则 <code>replicate-do-db=order</code></th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>STATEMENT</td>
+<td>默认库是 <code>order</code> → 匹配</td>
+<td>语句被复制 ✅</td>
+</tr>
+<tr>
+<td>ROW</td>
+<td>表在 <code>user</code> 库 → 不匹配</td>
+<td>变更被过滤 ❌</td>
+</tr>
+</tbody></table>
+<p>同一行配置，换个 <code>binlog_format</code>，结果完全相反。如果生产是 ROW、测试是 STATEMENT，你会得到「测试环境一切正常，上线后数据静默丢失」的经典剧本。</p>
+<h3 id="2-2-更隐蔽的反向案例：源库-binlog-do-db"><a href="#2-2-更隐蔽的反向案例：源库-binlog-do-db" class="headerlink" title="2.2 更隐蔽的反向案例：源库 binlog-do-db"></a>2.2 更隐蔽的反向案例：源库 <code>binlog-do-db</code></h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">USE <span class="keyword">order</span>;</span><br><span class="line"><span class="keyword">INSERT INTO</span> user.points_log(user_id, delta) <span class="keyword">VALUES</span> (<span class="number">1001</span>, <span class="number">10</span>);</span><br></pre></td></tr></table></figure>
+
+<p>配置 <code>binlog-do-db=order</code>：</p>
+<ul>
+<li>默认库是 <code>order</code> → <strong>这条语句被写入 binlog</strong>；</li>
+<li>但它写的是 <code>user</code> 库的表；</li>
+<li>从库如果没有 <code>user.points_log</code> 或结构不同 → <code>1146 Table doesn&#39;t exist</code>，复制直接停。</li>
+</ul>
+<p>于是源库过滤既能「漏」，也能「多」，取决于语句的默认库和实际表的错配。这类问题在存储过程、触发器、事件调度里尤其常见，因为它们的默认库继承关系更难判断。</p>
+<h3 id="2-3-表级规则才是可预测的"><a href="#2-3-表级规则才是可预测的" class="headerlink" title="2.3 表级规则才是可预测的"></a>2.3 表级规则才是可预测的</h3><figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">replicate-wild-do-table</span> = order.%</span><br></pre></td></tr></table></figure>
+
+<p>表级规则按<strong>实际表名</strong>匹配，不受 <code>USE</code> 影响，也不受语句跨库影响。通配符：</p>
+<ul>
+<li><code>%</code> 匹配任意多个字符；</li>
+<li><code>_</code> 匹配单个字符；</li>
+<li>需要转义时用 <code>\%</code>。</li>
+</ul>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 只同步 order 库，但排除日志表</span></span><br><span class="line"><span class="attr">replicate-wild-do-table</span> = order.%</span><br><span class="line"><span class="attr">replicate-wild-ignore-table</span> = order.%_log</span><br></pre></td></tr></table></figure>
+
+<p>注意：<strong><code>replicate-wild-ignore-table</code> 的优先级高于 do 规则</strong>，ignore 命中就丢弃。</p>
+<hr>
+<h2 id="三、规则的匹配顺序：混用是事故之源"><a href="#三、规则的匹配顺序：混用是事故之源" class="headerlink" title="三、规则的匹配顺序：混用是事故之源"></a>三、规则的匹配顺序：混用是事故之源</h2><p>MySQL 的过滤规则不是「所有规则取交集」，而是有明确的判定顺序：</p>
+<ol>
+<li>先判断<strong>库级</strong>规则（<code>replicate-do-db</code> &#x2F; <code>replicate-ignore-db</code>）；</li>
+<li>再判断<strong>表级</strong>规则（<code>replicate-do-table</code> &#x2F; <code>replicate-wild-do-table</code> 等）；</li>
+<li>命中即决定，不再往下走。</li>
+</ol>
+<p>这意味着：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">replicate-do-db</span> = order</span><br><span class="line"><span class="attr">replicate-wild-do-table</span> = user.points_log</span><br></pre></td></tr></table></figure>
+
+<p>你以为「order 库 + user.points_log 表」都会同步，实际上库级规则先命中&#x2F;拦截，表级规则可能根本没机会生效。<strong>库级与表级混用，行为很难在脑子里推演。</strong></p>
+<p>工程建议只有一条：<strong>只用 <code>replicate-wild-do-table</code> &#x2F; <code>replicate-wild-ignore-table</code>，不要用 <code>*-do-db</code>。</strong></p>
+<hr>
+<h2 id="四、GTID-模式下的「假一致」"><a href="#四、GTID-模式下的「假一致」" class="headerlink" title="四、GTID 模式下的「假一致」"></a>四、GTID 模式下的「假一致」</h2><p>这是复制过滤最反直觉的部分。</p>
+<h3 id="4-1-从库过滤：GTID-齐全，数据缺失"><a href="#4-1-从库过滤：GTID-齐全，数据缺失" class="headerlink" title="4.1 从库过滤：GTID 齐全，数据缺失"></a>4.1 从库过滤：GTID 齐全，数据缺失</h3><p>在 GTID 模式下，从库收到一个事务后：</p>
+<ol>
+<li>事务写入 relay log；</li>
+<li>事务的 GTID 被记入 <code>gtid_executed</code>；</li>
+<li>应用阶段被过滤规则跳过，<strong>数据不变</strong>。</li>
+</ol>
+<p>于是：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 源库</span></span><br><span class="line"><span class="keyword">SELECT</span> @<span class="variable">@GLOBAL</span>.gtid_executed;</span><br><span class="line"><span class="comment">-- 3f9a...:1-982341</span></span><br><span class="line"></span><br><span class="line"><span class="comment">-- 从库</span></span><br><span class="line"><span class="keyword">SELECT</span> @<span class="variable">@GLOBAL</span>.gtid_executed;</span><br><span class="line"><span class="comment">-- 3f9a...:1-982341   ← 一模一样</span></span><br></pre></td></tr></table></figure>
+
+<p><code>gtid_executed</code> 相同、<code>Seconds_Behind_Source=0</code>、<code>Replicate_Wild_Do_Table</code> 也符合预期——所有监控都是绿的，<strong>但数据就是不一样</strong>。</p>
+<p>更麻烦的是后续操作：</p>
+<ul>
+<li>用这个从库再做一次级联复制，下游会继承同样的缺口；</li>
+<li>用 <code>mysqldump --set-gtid-purged=ON</code> 备份恢复，GTID 会「跳过」那些从未应用的变更；</li>
+<li>主从切换后，新主库直接缺数据，而且找不到任何错误日志。</li>
+</ul>
+<h3 id="4-2-源库过滤：GTID-本身缺失"><a href="#4-2-源库过滤：GTID-本身缺失" class="headerlink" title="4.2 源库过滤：GTID 本身缺失"></a>4.2 源库过滤：GTID 本身缺失</h3><p>源库 <code>binlog-do-db</code> 更彻底：事务不写 binlog，GTID 也不产生。<code>gtid_executed</code> 是自洽的，但它描述的是一个<strong>比真实数据更小的历史</strong>。任何依赖 binlog 的系统（CDC、审计、恢复）都会静默偏差。</p>
+<h3 id="4-3-如何发现"><a href="#4-3-如何发现" class="headerlink" title="4.3 如何发现"></a>4.3 如何发现</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 源库与从库分别执行，比较差集（需在从库执行，参数为源库集合）</span></span><br><span class="line"><span class="keyword">SELECT</span> GTID_SUBTRACT(@<span class="variable">@GLOBAL</span>.gtid_executed, <span class="string">&#x27;3f9a...:1-982341&#x27;</span>);</span><br></pre></td></tr></table></figure>
+
+<p>但注意：<strong>这个方法只能发现「少事务」，发现不了「事务在但数据被过滤」</strong>。从库过滤恰恰是后者。</p>
+<p>真正可靠的对账手段是数据层校验：</p>
+<ul>
+<li><code>pt-table-checksum</code> 分块校验（注意它会走复制，过滤表要显式排除）；</li>
+<li>业务侧行数&#x2F;金额&#x2F;最大 ID 的周期对账；</li>
+<li>双写期做逐条 diff。</li>
+</ul>
+<hr>
+<h2 id="五、动态修改与多源复制"><a href="#五、动态修改与多源复制" class="headerlink" title="五、动态修改与多源复制"></a>五、动态修改与多源复制</h2><h3 id="5-1-CHANGE-REPLICATION-FILTER"><a href="#5-1-CHANGE-REPLICATION-FILTER" class="headerlink" title="5.1 CHANGE REPLICATION FILTER"></a>5.1 <code>CHANGE REPLICATION FILTER</code></h3><p>MySQL 5.7+ 支持在线修改，不必重启：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">CHANGE REPLICATION <span class="keyword">FILTER</span></span><br><span class="line">  REPLICATE_WILD_DO_TABLE <span class="operator">=</span> (<span class="string">&#x27;order.%&#x27;</span>),</span><br><span class="line">  REPLICATE_WILD_IGNORE_TABLE <span class="operator">=</span> (<span class="string">&#x27;order.%_log&#x27;</span>);</span><br></pre></td></tr></table></figure>
+
+<p>多源复制必须指定通道，否则会改到所有通道：</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">CHANGE REPLICATION <span class="keyword">FILTER</span></span><br><span class="line">  REPLICATE_WILD_DO_TABLE <span class="operator">=</span> (<span class="string">&#x27;order.%&#x27;</span>)</span><br><span class="line">  <span class="keyword">FOR</span> CHANNEL <span class="string">&#x27;ch_order&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>这是一个高频事故：多源环境下漏写 <code>FOR CHANNEL</code>，把另外几个通道的规则一起覆盖了。</p>
+<h3 id="5-2-查看当前规则"><a href="#5-2-查看当前规则" class="headerlink" title="5.2 查看当前规则"></a>5.2 查看当前规则</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">SHOW</span> REPLICA STATUS\G</span><br></pre></td></tr></table></figure>
+
+<p>关注这些字段：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">Replicate_Do_DB:</span><br><span class="line">Replicate_Ignore_DB:</span><br><span class="line">Replicate_Do_Table:</span><br><span class="line">Replicate_Ignore_Table:</span><br><span class="line">Replicate_Wild_Do_Table: order.%</span><br><span class="line">Replicate_Wild_Ignore_Table: order.%_log</span><br></pre></td></tr></table></figure>
+
+<p>多源复制用 <code>SHOW REPLICA STATUS FOR CHANNEL &#39;ch_order&#39;</code>。</p>
+<hr>
+<h2 id="六、过滤与高可用组件的冲突"><a href="#六、过滤与高可用组件的冲突" class="headerlink" title="六、过滤与高可用组件的冲突"></a>六、过滤与高可用组件的冲突</h2><table>
+<thead>
+<tr>
+<th>组件</th>
+<th>是否兼容过滤</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>异步&#x2F;半同步复制</td>
+<td>兼容</td>
+<td>但数据可能不一致</td>
+</tr>
+<tr>
+<td>MGR（组复制）</td>
+<td><strong>不支持</strong></td>
+<td>成员必须数据完全一致，过滤会导致成员分叉</td>
+</tr>
+<tr>
+<td>Clone 插件</td>
+<td>不适用</td>
+<td>整实例物理拷贝，绕过过滤</td>
+</tr>
+<tr>
+<td>Orchestrator &#x2F; MHA</td>
+<td>需注意</td>
+<td>切换后新主可能缺数据，拓扑修复会放大问题</td>
+</tr>
+<tr>
+<td>Canal &#x2F; Debezium</td>
+<td>不适用</td>
+<td>它们读源库 binlog，源库过滤会让 CDC 缺事件</td>
+</tr>
+<tr>
+<td>逻辑备份 <code>mysqldump</code></td>
+<td>不适用</td>
+<td>导出的是从库现有数据，缺口被固化</td>
+</tr>
+</tbody></table>
+<p>特别说 MGR：组复制要求所有成员应用相同的事务集，复制过滤在组复制通道上不被支持。<strong>只要用了 MGR，就别想用过滤做库表裁剪</strong>，只能在业务层拆库或拆实例。</p>
+<hr>
+<h2 id="七、正确做法：四条路线"><a href="#七、正确做法：四条路线" class="headerlink" title="七、正确做法：四条路线"></a>七、正确做法：四条路线</h2><h3 id="路线-1：拆实例（首选）"><a href="#路线-1：拆实例（首选）" class="headerlink" title="路线 1：拆实例（首选）"></a>路线 1：拆实例（首选）</h3><p>需要独立同步的业务，直接独立实例 + 独立复制链路。成本是机器，收益是语义清晰：没有过滤，就没有隐性缺口。</p>
+<h3 id="路线-2：CDC-做逻辑订阅"><a href="#路线-2：CDC-做逻辑订阅" class="headerlink" title="路线 2：CDC 做逻辑订阅"></a>路线 2：CDC 做逻辑订阅</h3><p>源库保持完整 binlog（<code>binlog_format=ROW</code>、<code>binlog_row_image=FULL</code>），用 Canal&#x2F;Debezium 按库表订阅，写到目标库或消息队列。</p>
+<p>优点：</p>
+<ul>
+<li>源库 binlog 完整，PITR 不受影响；</li>
+<li>过滤逻辑在 CDC 侧，可观测、可重放；</li>
+<li>支持字段级裁剪、脱敏、路由。</li>
+</ul>
+<h3 id="路线-3：必须过滤时，只用表级规则"><a href="#路线-3：必须过滤时，只用表级规则" class="headerlink" title="路线 3：必须过滤时，只用表级规则"></a>路线 3：必须过滤时，只用表级规则</h3><figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">replicate-wild-do-table</span> = order.%</span><br><span class="line"><span class="attr">replicate-wild-ignore-table</span> = order.%_log</span><br></pre></td></tr></table></figure>
+
+<p>并且：</p>
+<ul>
+<li>强制 <code>binlog_format=ROW</code>；</li>
+<li>应用层禁止跨库写（用 ArchUnit&#x2F;代码扫描卡住 <code>db1.t</code> 这种写法）；</li>
+<li>上线前用真实 SQL 回放验证过滤结果。</li>
+</ul>
+<h3 id="路线-4：逻辑导出-增量补齐"><a href="#路线-4：逻辑导出-增量补齐" class="headerlink" title="路线 4：逻辑导出 + 增量补齐"></a>路线 4：逻辑导出 + 增量补齐</h3><p>初始化用 <code>mysqldump --databases order</code> 或 <code>mysqlpump</code>，增量用 CDC。适合迁移期，不适合长期架构。</p>
+<hr>
+<h2 id="八、Java-侧：把「过滤配置」纳入启动自检"><a href="#八、Java-侧：把「过滤配置」纳入启动自检" class="headerlink" title="八、Java 侧：把「过滤配置」纳入启动自检"></a>八、Java 侧：把「过滤配置」纳入启动自检</h2><p>复制过滤的问题在于「配置错了不会报错」。那就让它报错。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ReplicationFilterGuard</span> <span class="keyword">implements</span> <span class="title class_">ApplicationRunner</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> JdbcTemplate jdbc;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">(ApplicationArguments args)</span> &#123;</span><br><span class="line">        List&lt;Map&lt;String, Object&gt;&gt; rows = jdbc.queryForList(<span class="string">&quot;SHOW REPLICA STATUS&quot;</span>);</span><br><span class="line">        <span class="keyword">if</span> (rows.isEmpty()) &#123;</span><br><span class="line">            <span class="keyword">return</span>; <span class="comment">// 不是从库</span></span><br><span class="line">        &#125;</span><br><span class="line">        Map&lt;String, Object&gt; status = rows.get(<span class="number">0</span>);</span><br><span class="line"></span><br><span class="line">        List&lt;String&gt; problems = <span class="keyword">new</span> <span class="title class_">ArrayList</span>&lt;&gt;();</span><br><span class="line">        <span class="keyword">for</span> (String col : List.of(<span class="string">&quot;Replicate_Do_DB&quot;</span>, <span class="string">&quot;Replicate_Ignore_DB&quot;</span>,</span><br><span class="line">                                  <span class="string">&quot;Replicate_Do_Table&quot;</span>, <span class="string">&quot;Replicate_Ignore_Table&quot;</span>)) &#123;</span><br><span class="line">            <span class="type">Object</span> <span class="variable">v</span> <span class="operator">=</span> status.get(col);</span><br><span class="line">            <span class="keyword">if</span> (v != <span class="literal">null</span> &amp;&amp; !v.toString().isBlank()) &#123;</span><br><span class="line">                problems.add(col + <span class="string">&quot;=&quot;</span> + v);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="type">Object</span> <span class="variable">wildDo</span> <span class="operator">=</span> status.get(<span class="string">&quot;Replicate_Wild_Do_Table&quot;</span>);</span><br><span class="line">        <span class="keyword">if</span> (wildDo != <span class="literal">null</span> &amp;&amp; !wildDo.toString().isBlank()) &#123;</span><br><span class="line">            log.warn(<span class="string">&quot;从库启用了表级复制过滤: &#123;&#125;&quot;</span>, wildDo);</span><br><span class="line">        &#125;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (!problems.isEmpty()) &#123;</span><br><span class="line">            <span class="comment">// 库级过滤：直接告警，要求改用表级规则</span></span><br><span class="line">            log.error(<span class="string">&quot;检测到库级复制过滤，存在跨库写入被静默丢弃的风险: &#123;&#125;&quot;</span>, problems);</span><br><span class="line">            meterRegistry.counter(<span class="string">&quot;mysql.replication.filter.risky&quot;</span>).increment();</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>再配合一个数据对账任务：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 每天凌晨对核心表做行数与金额校验</span></span><br><span class="line"><span class="type">long</span> <span class="variable">sourceCount</span> <span class="operator">=</span> sourceJdbc.queryForObject(<span class="string">&quot;SELECT COUNT(*) FROM order.orders&quot;</span>, Long.class);</span><br><span class="line"><span class="type">long</span> <span class="variable">replicaCount</span> <span class="operator">=</span> replicaJdbc.queryForObject(<span class="string">&quot;SELECT COUNT(*) FROM order.orders&quot;</span>, Long.class);</span><br><span class="line"><span class="keyword">if</span> (Math.abs(sourceCount - replicaCount) &gt; threshold) &#123;</span><br><span class="line">    alert(<span class="string">&quot;order.orders 主从行数偏差: source=%d replica=%d&quot;</span>.formatted(sourceCount, replicaCount));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>行数对账有局限（删除+插入可能抵消），但对「整段事务被过滤」这类事故非常敏感，成本也低。</p>
+<hr>
+<h2 id="九、切换演练清单"><a href="#九、切换演练清单" class="headerlink" title="九、切换演练清单"></a>九、切换演练清单</h2><p>主从切换会把「从库缺数据」直接变成「生产缺数据」。演练时逐项确认：</p>
+<ol>
+<li><code>SHOW REPLICA STATUS</code> 的 <code>Replicate_*</code> 字段是否符合预期；</li>
+<li>源库与从库核心表行数、金额、最大 ID 是否一致；</li>
+<li><code>pt-table-checksum</code> 是否通过（过滤表要单独处理）；</li>
+<li><code>gtid_executed</code> 是否一致（一致不代表数据一致，只代表事务集一致）；</li>
+<li>切换后 CDC 是否能从新主继续消费；</li>
+<li>备份恢复演练是否覆盖被过滤的表。</li>
+</ol>
+<hr>
+<h2 id="十、面试追问"><a href="#十、面试追问" class="headerlink" title="十、面试追问"></a>十、面试追问</h2><p><strong>Q1：<code>replicate-do-db</code> 在 ROW 和 STATEMENT 下行为一样吗？</strong></p>
+<p>不一样。STATEMENT 按默认库（<code>USE</code> 的库）判断，ROW 按表实际所在库判断。跨库语句在两种格式下可能得到完全相反的结果。</p>
+<p><strong>Q2：为什么说源库 <code>binlog-do-db</code> 很危险？</strong></p>
+<p>它让不匹配的事务根本不进 binlog，破坏 PITR、CDC、克隆和增量恢复，而且源库本身看不出任何异常。</p>
+<p><strong>Q3：从库过滤后，GTID 集合会不一致吗？</strong></p>
+<p>通常一致。被过滤的事务仍写入 relay log 并把 GTID 记入 <code>gtid_executed</code>，只是不应用数据。所以「GTID 一致」不能证明「数据一致」。</p>
+<p><strong>Q4：MGR 能用复制过滤吗？</strong></p>
+<p>不能。组复制要求成员数据完全一致，过滤会导致成员分叉，官方不支持在组复制通道上使用复制过滤。</p>
+<p><strong>Q5：那正确的库表裁剪方案是什么？</strong></p>
+<p>优先级：拆实例 &gt; CDC 逻辑订阅 &gt; 表级 <code>replicate-wild-do-table</code>（强制 ROW + 禁止跨库写）。源库过滤不在选项里。</p>
+<hr>
+<h2 id="十一、总结"><a href="#十一、总结" class="headerlink" title="十一、总结"></a>十一、总结</h2><p>复制过滤的坑，本质是三个「不对称」：</p>
+<ol>
+<li><strong>格式不对称</strong>：同一条规则在 STATEMENT &#x2F; ROW 下语义不同；</li>
+<li><strong>层级不对称</strong>：库级规则先于表级规则，混用时行为难推演；</li>
+<li><strong>观测不对称</strong>：GTID 一致、延迟为 0、监控全绿，但数据已经少了。</li>
+</ol>
+<p>所以结论很硬：</p>
+<ul>
+<li>源库永不过滤；</li>
+<li>从库只用表级规则；</li>
+<li>跨库写必须从代码层禁掉；</li>
+<li>把过滤配置和数据对账纳入启动自检与日常巡检。</li>
+</ul>
+<p>数据复制这件事，最贵的从来不是带宽，而是<strong>你以为同步了</strong>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/19/mysql-replication-filtering-rules-deep-dive/">https://jiweidong.github.io/2026/11/19/mysql-replication-filtering-rules-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a><a class="post-meta__tags" href="/tags/%E4%B8%BB%E4%BB%8E%E5%A4%8D%E5%88%B6/">主从复制</a><a class="post-meta__tags" href="/tags/GTID/">GTID</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/19/java-realtime-voice-agent-vad-streaming-deep-practice/" title="【Java AI】实时语音 Agent 深度实战：VAD 断句、流式 ASR、双工打断与端到端延迟预算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】实时语音 Agent 深度实战：VAD 断句、流式 ASR、双工打断与端到端延迟预算</div></div><div class="info-2"><div class="info-item-1">【Java AI】实时语音 Agent 深度实战前言做语音助手，最容易低估的一句话是：「ASR 和 TTS 我都调通了，怎么体验还是像个对讲机？」 因为能转写 ≠ 能对话。真人对话的核心不是识别准确率，而是三件事：  什么时候该听（端点检测，不能用户喘口气就抢话）； 什么时候该说（首包要快，但不能把半句话念出去）； 什么时候该停（用户一开口，立刻闭嘴）。  这三件事没有一件是 ASR&#x2F;TTS 厂商 API 帮你解决的，全部要在编排层实现。本文用 Java（Spring WebFlux + 虚拟线程）搭一条完整的实时语音链路，把 VAD、流式 ASR、LLM、流式 TTS、双工打断和延迟预算逐段拆开。  一、链路拆解与延迟预算一条最小的实时语音链路： 1234567891011麦克风采集(20ms/帧)   ↓VAD 帧级判定 ──→ 状态机（静音/说话/拖尾）   ↓ 端点确认流式 ASR（partial → final）   ↓ final 文本LLM（流式 token）   ↓ 按句切分流式 TTS（首包 → 音频块）   ↓播放队列（jitter buffer） ...</div></div></div></a><a class="pagination-related" href="/2026/11/19/elasticsearch-search-profiler-slow-log-deep-practice/" title="【ES 底层】Elasticsearch Profile API 与慢查询日志深度实战：把「查询慢」拆到每个 Lucene 方法"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【ES 底层】Elasticsearch Profile API 与慢查询日志深度实战：把「查询慢」拆到每个 Lucene 方法</div></div><div class="info-2"><div class="info-item-1">【ES 底层】Elasticsearch Profile API 与慢查询日志深度实战前言线上一个商品搜索接口 P99 从 80ms 涨到 600ms。你打开 Kibana，看到 took 是 580，于是开始猜：  是不是分片太多？ 是不是 wildcard 太慢？ 是不是该加缓存？  猜错三次之后，你开始怀疑人生。问题在于：took 只是一个总数，它不告诉你钱花在哪儿了。 Elasticsearch 其实给了两把手术刀：  Profile API：把一次查询在每个分片上的执行树展开，精确到 next_doc、advance、build_scorer 这些 Lucene 方法级的纳秒耗时； 慢查询日志（slow log）：在生产环境低成本采样，回答「哪些查询慢、慢在 query 还是 fetch」。  这两者配合，才能把「查询慢」从一句抱怨变成一张可执行的账单。本文按「耗时口径 → Profile 用法 → breakdown 读法 → 慢日志 → 常见形态 → Java 落地」讲完。  一、先对齐口径：took 到底统计了什么一次 _search 的耗时至少有四个层次：   ...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/08/06/mysql-table-design-best-practice/" title="【MySQL 实战】MySQL 表设计最佳实践：字段类型选型、范式与反范式、索引设计规范"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-06</div><div class="info-item-2">【MySQL 实战】MySQL 表设计最佳实践：字段类型选型、范式与反范式、索引设计规范</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】MySQL 表设计最佳实践：字段类型选型、范式与反范式、索引设计规范面试官：你做过数据库表设计吗？说一下你的设计规范？「表设计」是后端开发的基本功，也是面试中最容易暴露水平的环节——很多人上来就聊索引优化，但一问字段类型为什么选 varchar(255)、为什么用 bigint 不用 int，就答不上来了。 表设计做得好，后续的查询优化、扩展、迁移都顺；设计得烂，上线就是灾难。本文从字段类型选型 → 范式与反范式 → 索引设计 → 命名规范 → 实战案例五层，系统梳理 MySQL 表设计的最佳实践。  一、字段类型选型：这是表设计的第一关1. 整数类型怎么选？   类型 字节数 取值范围（有符号） 适用场景    TINYINT 1 -128 ~ 127 状态码、开关（0&#x2F;1）、枚举小值   SMALLINT 2 -32768 ~ 32767 较小数值、端口号   MEDIUMINT 3 -838万 ~ 838万 中量数值   INT 4 -21亿 ~ 21亿 常规数值   BIGINT 8 ±922亿亿 主键 ID、雪花 ID、订单号   最佳实践...</div></div></div></a><a class="pagination-related" href="/2026/10/09/mysql-innodb-dirty-page-flush-checkpoint-deep-dive/" title="【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-09</div><div class="info-item-2">【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 脏页刷盘与 Checkpoint 深度解析：LSN、模糊检查点与 Adaptive Flushing面试官：你说 redo log 保证崩溃恢复，那 redo log 是不是可以无限写？不会。如果 redo log 能无限写下去，那崩溃恢复时要重放的日志量就是无止境的，恢复时间不可控。 面试官接着问：那当 redo log 写满的时候会发生什么？脏页是怎么被刷盘的？为什么有时候会突然出现”数据库抖动”，所有更新都卡住？ 答案就落在两个词上：Checkpoint（检查点） 和 脏页刷盘（Flushing）。这篇文章把 LSN、Checkpoint、Adaptive Flushing、刷脏线程、Doublewrite 的关系一次讲清楚。 一、先建立坐标系：LSN 是一切的基础InnoDB 里所有关于”进度”的话题都围绕 LSN（Log Sequence Number），它是一个全局单调递增的 uint64，单位是字节。  每产生一条 redo 记录，log_sys-&gt;lsn 就往前推进 len 字节。 redo 文件是环形的（innodb_lo...</div></div></div></a><a class="pagination-related" href="/2026/09/09/mysql-gtid-parallel-replication-deep-dive/" title="【MySQL 高可用】MySQL GTID 复制深度解析：从位点同步痛点、GTID 生命周期到并行复制与主从切换实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-09</div><div class="info-item-2">【MySQL 高可用】MySQL GTID 复制深度解析：从位点同步痛点、GTID 生命周期到并行复制与主从切换实战</div></div><div class="info-2"><div class="info-item-1">【MySQL 高可用】MySQL GTID 复制深度解析：从位点同步痛点、GTID 生命周期到并行复制与主从切换实战面试官：你们主从复制用的位点（file+pos）还是 GTID？说说 GTID 解决了什么问题？很多同学的 MySQL 主从还停留在”看 SHOW MASTER STATUS 拿 File 和 Position，然后 CHANGE MASTER TO 手动指定”的阶段。这套位点复制在单主一从的玩具环境没问题，一旦涉及主从切换、级联复制、故障恢复，就会暴露出大量手工操作的痛点。而 GTID（Global Transaction Identifier，全局事务标识符） 正是 MySQL 5.6 引入、5.7 成熟、8.0 默认的复制革命。 本文从复制协议的底层痛点讲起，一路深入到 GTID 生命周期、自动定位、并行复制（MTS）与主从切换，面试够用，实战也够用。 一、位点复制到底痛在哪？传统复制中，从库通过 CHANGE MASTER TO MASTER_LOG_FILE=&#39;mysql-bin.000021&#39;, MASTER_LOG_POS=154; 告...</div></div></div></a><a class="pagination-related" href="/2026/07/12/java-flyway-database-migration-practice/" title="【工程实战】Flyway 数据库版本迁移：从入门到团队协作最佳实践"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-12</div><div class="info-item-2">【工程实战】Flyway 数据库版本迁移：从入门到团队协作最佳实践</div></div><div class="info-2"><div class="info-item-1">【工程实战】Flyway 数据库版本迁移：从入门到团队协作最佳实践一、为什么需要数据库版本管理？在团队协作中，数据库结构变更（DDL）经常出现以下问题：    问题 场景 后果    字段不一致 开发A加了字段，开发B不知道 部署报错   迁移顺序混乱 多人同时修改数据库结构 线上迁移失败   回滚困难 上线后发现 SQL 写错了 手动回滚不可追溯   环境差异 开发&#x2F;测试&#x2F;生产库结构不同 测试通过，上线挂掉   Flyway 的解决方案：像 Git 管理代码一样管理数据库变更，每个 SQL 脚本有版本号，按顺序执行，记录执行历史。 二、Flyway 核心原理2.1 工作流程12345678910┌─────────────┐     ┌──────────────────┐     ┌──────────────┐│  读取迁移   │ ──► │  检查 flyway_    │ ──► │  执行未运行  ││  脚本列表   │     │  schema_history  │     │  的迁移脚本  │└─────────────┘     └─...</div></div></div></a><a class="pagination-related" href="/2026/11/10/mysql-javascript-stored-program-deep-dive/" title="【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-10</div><div class="info-item-2">【MySQL 9】JavaScript 存储程序深度解析：GraalVM 运行时、能力边界与 Java 侧落地取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 9】JavaScript 存储程序深度解析前言MySQL 9.0 干了一件在 MySQL 历史上挺反常识的事：把 JavaScript 引擎塞进了数据库服务器进程里。你可以在 CREATE FUNCTION &#x2F; CREATE PROCEDURE 里直接写 ECMAScript，用 GraalVM 执行，而不是写那段让所有人都不想维护的 SQL&#x2F;PSM 存储过程。 这个特性的定位很明确——干掉”为了几十行数据加工逻辑专门建一个中间服务”的尴尬。但它同时也带来了一堆必须想清楚的边界问题：能不能读文件？能不能发 HTTP？出错怎么排查？性能到底比 SQL 过程快还是慢？什么时候该用它，什么时候该老老实实回 Java 应用层写？ 这篇我们把这套机制从运行时、语法、能力边界、性能、生产治理到 Java 侧落地完整过一遍。注意：JavaScript 存储程序是 MySQL 企业版特性，社区版用不了，这一点在做技术选型时是第一道门槛。  一、为什么 MySQL 要引入 JavaScript先看一张”同一件事四种写法”的对比，这是理解这个特性价值的最快方式。 需...</div></div></div></a><a class="pagination-related" href="/2026/06/19/mysql-8-new-features/" title="MySQL 8.0 新特性深度详解：从实战出发"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-06-19</div><div class="info-item-2">MySQL 8.0 新特性深度详解：从实战出发</div></div><div class="info-2"><div class="info-item-1">MySQL 8.0 自 2018 年正式发布以来，经历了多个小版本的迭代，已经成为企业级生产环境的主流选择。相比 MySQL 5.7，8.0 在性能、安全、SQL 功能、JSON 支持、InnoDB 存储引擎等方面都有质的飞跃。本文将从实战角度深度剖析 MySQL 8.0 的核心新特性，提供详尽的代码示例。   一、窗口函数（Window Functions）窗口函数是 MySQL 8.0 最重磅的 SQL 增强之一。在 5.7 及之前版本中，实现排名、累计求和、移动平均等分析型查询往往需要借助用户变量或子查询，写法复杂且性能差。8.0 引入的窗口函数让这类查询变得简洁优雅。 1.1 ROW_NUMBER、RANK、DENSE_RANK这三个函数用于行号分配和排名，是最常用的窗口函数。它们的区别在于对并列值的处理方式： 123456789101112131415161718-- 准备示例数据CREATE TABLE sales (    id INT AUTO_INCREMENT PRIMARY KEY,    employee VARCHAR(50),    departmen...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">947</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1055</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">250</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%BA%95%E5%B1%82%E3%80%91MySQL-%E5%A4%8D%E5%88%B6%E8%BF%87%E6%BB%A4%E8%A7%84%E5%88%99%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 底层】MySQL 复制过滤规则深度解析</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E8%BF%87%E6%BB%A4%E5%8F%91%E7%94%9F%E5%9C%A8%E5%93%AA%E4%B8%80%E4%BE%A7%EF%BC%9A%E8%BF%99%E6%98%AF%E7%AC%AC%E4%B8%80%E4%B8%AA%E5%88%86%E6%B0%B4%E5%B2%AD"><span class="toc-number">1.2.</span> <span class="toc-text">一、过滤发生在哪一侧：这是第一个分水岭</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E6%BA%90%E5%BA%93%E8%BF%87%E6%BB%A4%E5%87%A0%E4%B9%8E%E6%80%BB%E6%98%AF%E9%94%99%E7%9A%84"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 源库过滤几乎总是错的</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E4%BB%8E%E5%BA%93%E8%BF%87%E6%BB%A4%EF%BC%9A%E8%83%BD%E7%94%A8%EF%BC%8C%E4%BD%86%E5%BF%85%E9%A1%BB%E7%90%86%E8%A7%A3%E8%AF%AD%E4%B9%89"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 从库过滤：能用，但必须理解语义</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81replicate-do-db-%E5%88%B0%E5%BA%95%E5%8C%B9%E9%85%8D%E4%BB%80%E4%B9%88"><span class="toc-number">1.3.</span> <span class="toc-text">二、replicate-do-db 到底匹配什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E8%AF%AD%E5%8F%A5%E6%A0%BC%E5%BC%8F-vs-%E8%A1%8C%E6%A0%BC%E5%BC%8F%EF%BC%8C%E8%A1%8C%E4%B8%BA%E4%B8%8D%E5%90%8C"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 语句格式 vs 行格式，行为不同</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E6%9B%B4%E9%9A%90%E8%94%BD%E7%9A%84%E5%8F%8D%E5%90%91%E6%A1%88%E4%BE%8B%EF%BC%9A%E6%BA%90%E5%BA%93-binlog-do-db"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 更隐蔽的反向案例：源库 binlog-do-db</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E8%A1%A8%E7%BA%A7%E8%A7%84%E5%88%99%E6%89%8D%E6%98%AF%E5%8F%AF%E9%A2%84%E6%B5%8B%E7%9A%84"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 表级规则才是可预测的</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E8%A7%84%E5%88%99%E7%9A%84%E5%8C%B9%E9%85%8D%E9%A1%BA%E5%BA%8F%EF%BC%9A%E6%B7%B7%E7%94%A8%E6%98%AF%E4%BA%8B%E6%95%85%E4%B9%8B%E6%BA%90"><span class="toc-number">1.4.</span> <span class="toc-text">三、规则的匹配顺序：混用是事故之源</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81GTID-%E6%A8%A1%E5%BC%8F%E4%B8%8B%E7%9A%84%E3%80%8C%E5%81%87%E4%B8%80%E8%87%B4%E3%80%8D"><span class="toc-number">1.5.</span> <span class="toc-text">四、GTID 模式下的「假一致」</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E4%BB%8E%E5%BA%93%E8%BF%87%E6%BB%A4%EF%BC%9AGTID-%E9%BD%90%E5%85%A8%EF%BC%8C%E6%95%B0%E6%8D%AE%E7%BC%BA%E5%A4%B1"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 从库过滤：GTID 齐全，数据缺失</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E6%BA%90%E5%BA%93%E8%BF%87%E6%BB%A4%EF%BC%9AGTID-%E6%9C%AC%E8%BA%AB%E7%BC%BA%E5%A4%B1"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 源库过滤：GTID 本身缺失</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%A6%82%E4%BD%95%E5%8F%91%E7%8E%B0"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 如何发现</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%8A%A8%E6%80%81%E4%BF%AE%E6%94%B9%E4%B8%8E%E5%A4%9A%E6%BA%90%E5%A4%8D%E5%88%B6"><span class="toc-number">1.6.</span> <span class="toc-text">五、动态修改与多源复制</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-CHANGE-REPLICATION-FILTER"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 CHANGE REPLICATION FILTER</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E6%9F%A5%E7%9C%8B%E5%BD%93%E5%89%8D%E8%A7%84%E5%88%99"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 查看当前规则</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E8%BF%87%E6%BB%A4%E4%B8%8E%E9%AB%98%E5%8F%AF%E7%94%A8%E7%BB%84%E4%BB%B6%E7%9A%84%E5%86%B2%E7%AA%81"><span class="toc-number">1.7.</span> <span class="toc-text">六、过滤与高可用组件的冲突</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%AD%A3%E7%A1%AE%E5%81%9A%E6%B3%95%EF%BC%9A%E5%9B%9B%E6%9D%A1%E8%B7%AF%E7%BA%BF"><span class="toc-number">1.8.</span> <span class="toc-text">七、正确做法：四条路线</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%B7%AF%E7%BA%BF-1%EF%BC%9A%E6%8B%86%E5%AE%9E%E4%BE%8B%EF%BC%88%E9%A6%96%E9%80%89%EF%BC%89"><span class="toc-number">1.8.1.</span> <span class="toc-text">路线 1：拆实例（首选）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%B7%AF%E7%BA%BF-2%EF%BC%9ACDC-%E5%81%9A%E9%80%BB%E8%BE%91%E8%AE%A2%E9%98%85"><span class="toc-number">1.8.2.</span> <span class="toc-text">路线 2：CDC 做逻辑订阅</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%B7%AF%E7%BA%BF-3%EF%BC%9A%E5%BF%85%E9%A1%BB%E8%BF%87%E6%BB%A4%E6%97%B6%EF%BC%8C%E5%8F%AA%E7%94%A8%E8%A1%A8%E7%BA%A7%E8%A7%84%E5%88%99"><span class="toc-number">1.8.3.</span> <span class="toc-text">路线 3：必须过滤时，只用表级规则</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#%E8%B7%AF%E7%BA%BF-4%EF%BC%9A%E9%80%BB%E8%BE%91%E5%AF%BC%E5%87%BA-%E5%A2%9E%E9%87%8F%E8%A1%A5%E9%BD%90"><span class="toc-number">1.8.4.</span> <span class="toc-text">路线 4：逻辑导出 + 增量补齐</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81Java-%E4%BE%A7%EF%BC%9A%E6%8A%8A%E3%80%8C%E8%BF%87%E6%BB%A4%E9%85%8D%E7%BD%AE%E3%80%8D%E7%BA%B3%E5%85%A5%E5%90%AF%E5%8A%A8%E8%87%AA%E6%A3%80"><span class="toc-number">1.9.</span> <span class="toc-text">八、Java 侧：把「过滤配置」纳入启动自检</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E5%88%87%E6%8D%A2%E6%BC%94%E7%BB%83%E6%B8%85%E5%8D%95"><span class="toc-number">1.10.</span> <span class="toc-text">九、切换演练清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.11.</span> <span class="toc-text">十、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E4%B8%80%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.12.</span> <span class="toc-text">十一、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/19/enterprise-ai-copilot-platform-system-design/" title="【系统设计】企业 AI Copilot 平台架构设计：多租户、工具注册、权限下推与成本分摊">【系统设计】企业 AI Copilot 平台架构设计：多租户、工具注册、权限下推与成本分摊</a><time datetime="2026-11-19T00:40:00.000Z" title="发表于 2026-11-19 08:40:00">2026-11-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/19/java-realtime-voice-agent-vad-streaming-deep-practice/" title="【Java AI】实时语音 Agent 深度实战：VAD 断句、流式 ASR、双工打断与端到端延迟预算">【Java AI】实时语音 Agent 深度实战：VAD 断句、流式 ASR、双工打断与端到端延迟预算</a><time datetime="2026-11-19T00:30:00.000Z" title="发表于 2026-11-19 08:30:00">2026-11-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/19/mysql-replication-filtering-rules-deep-dive/" title="【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案">【MySQL 底层】复制过滤规则深度解析：replicate-do-db 的跨库陷阱、GTID 空洞与替代方案</a><time datetime="2026-11-19T00:20:00.000Z" title="发表于 2026-11-19 08:20:00">2026-11-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/19/elasticsearch-search-profiler-slow-log-deep-practice/" title="【ES 底层】Elasticsearch Profile API 与慢查询日志深度实战：把「查询慢」拆到每个 Lucene 方法">【ES 底层】Elasticsearch Profile API 与慢查询日志深度实战：把「查询慢」拆到每个 Lucene 方法</a><time datetime="2026-11-19T00:10:00.000Z" title="发表于 2026-11-19 08:10:00">2026-11-19</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/19/nginx-grpc-proxy-http2-deep-practice/" title="【Nginx 实战】Nginx 代理 gRPC 深度实战：grpc_pass、HTTP/2 端到端与流式长连接治理">【Nginx 实战】Nginx 代理 gRPC 深度实战：grpc_pass、HTTP/2 端到端与流式长连接治理</a><time datetime="2026-11-19T00:00:00.000Z" title="发表于 2026-11-19 08:00:00">2026-11-19</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
