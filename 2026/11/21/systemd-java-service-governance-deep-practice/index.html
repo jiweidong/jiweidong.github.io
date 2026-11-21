@@ -1,0 +1,483 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【运维实战】systemd 与 Java 服务治理前言一个 Java 服务上线，多数团队的做法是 nohup java -jar app.jar &amp;，或者写个 start.sh 里套 nohup，之后再补一个 kill -9 $PID 的 stop.sh。这套东西在单机上能跑三年，但一旦碰上这几种情况就会露馅：  机器重启后服务没起来（没人记得加 rc.local）。 进程 OOM 被内核">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/21/systemd-java-service-governance-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【运维实战】systemd 与 Java 服务治理前言一个 Java 服务上线，多数团队的做法是 nohup java -jar app.jar &amp;，或者写个 start.sh 里套 nohup，之后再补一个 kill -9 $PID 的 stop.sh。这套东西在单机上能跑三年，但一旦碰上这几种情况就会露馅：  机器重启后服务没起来（没人记得加 rc.local）。 进程 OOM 被内核">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-21T00:10:00.000Z">
+<meta property="article:modified_time" content="2026-11-21T00:03:03.603Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="systemd">
+<meta property="article:tag" content="生产实践">
+<meta property="article:tag" content="运维">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机",
+  "url": "https://jiweidong.github.io/2026/11/21/systemd-java-service-governance-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-21T00:10:00.000Z",
+  "dateModified": "2026-11-21T00:03:03.603Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/21/systemd-java-service-governance-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">957</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1060</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">251</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-21T00:10:00.000Z" title="发表于 2026-11-21 08:10:00">2026-11-21</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-21T00:03:03.603Z" title="更新于 2026-11-21 08:03:03">2026-11-21</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E7%94%9F%E4%BA%A7%E8%BF%90%E7%BB%B4/">生产运维</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【运维实战】systemd-与-Java-服务治理"><a href="#【运维实战】systemd-与-Java-服务治理" class="headerlink" title="【运维实战】systemd 与 Java 服务治理"></a>【运维实战】systemd 与 Java 服务治理</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>一个 Java 服务上线，多数团队的做法是 <code>nohup java -jar app.jar &amp;</code>，或者写个 <code>start.sh</code> 里套 <code>nohup</code>，之后再补一个 <code>kill -9 $PID</code> 的 <code>stop.sh</code>。这套东西在单机上能跑三年，但一旦碰上这几种情况就会露馅：</p>
+<ul>
+<li>机器重启后服务没起来（没人记得加 <code>rc.local</code>）。</li>
+<li>进程 OOM 被内核杀了，没人知道，直到用户投诉。</li>
+<li>服务假死（线程全卡住但进程还在），负载均衡还在往上打流量。</li>
+<li>运维 <code>kill</code> 了一下，正在处理的事务被硬切，产生脏数据。</li>
+<li>日志把磁盘写满，整个节点上的服务一起挂。</li>
+</ul>
+<p>systemd 不是”启动脚本管理器”，它是<strong>进程生命周期的唯一权威</strong>：它管启动顺序、管重启策略、管资源上限、管日志、管优雅退出、还管”这个进程还活着吗”。这篇文章讲清楚 Java 服务该怎么和它配合，以及那些配置项背后的真实语义。</p>
+<h2 id="一、先选对-Type：simple-exec-notify-forking"><a href="#一、先选对-Type：simple-exec-notify-forking" class="headerlink" title="一、先选对 Type：simple &#x2F; exec &#x2F; notify &#x2F; forking"></a>一、先选对 Type：simple &#x2F; exec &#x2F; notify &#x2F; forking</h2><table>
+<thead>
+<tr>
+<th>Type</th>
+<th>systemd 认为”启动完成”的时机</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>simple</code></td>
+<td><code>fork()</code> 之后立刻认为启动成功</td>
+<td>最简单，但启动失败也被当成功</td>
+</tr>
+<tr>
+<td><code>exec</code></td>
+<td><code>execve()</code> 成功之后</td>
+<td>比 <code>simple</code> 稍好，能捕获”二进制不存在”</td>
+</tr>
+<tr>
+<td><code>notify</code></td>
+<td>进程主动发 <code>READY=1</code></td>
+<td><strong>Java 服务推荐</strong>，Spring 容器就绪才算启动完成</td>
+</tr>
+<tr>
+<td><code>forking</code></td>
+<td>父进程退出、子进程接管</td>
+<td>传统守护进程，Java 基本不用</td>
+</tr>
+<tr>
+<td><code>oneshot</code></td>
+<td>进程退出且 exit&#x3D;0</td>
+<td>初始化任务、迁移脚本</td>
+</tr>
+</tbody></table>
+<p>很多人用 <code>Type=simple</code>，然后抱怨”服务启动失败 systemd 也不重启”。原因很直接：<code>simple</code> 下 systemd 在 fork 完就认为成功了，之后的 <code>ClassNotFoundException</code>、端口占用、配置缺失，全都被当成”运行中崩溃”——如果 <code>Restart=on-failure</code> 配了还好，没配就静默躺平。</p>
+<p><code>Type=notify</code> 才是正解：进程真正 ready 之后才发信号，启动阶段的失败会被算作启动失败，能触发 <code>StartLimitBurst</code> 的熔断逻辑。</p>
+<h3 id="1-1-Java-怎么发-READY-1"><a href="#1-1-Java-怎么发-READY-1" class="headerlink" title="1.1 Java 怎么发 READY=1"></a>1.1 Java 怎么发 <code>READY=1</code></h3><p>systemd 的协议极其简单：往 <code>$NOTIFY_SOCKET</code> 指向的 <strong>Unix datagram socket</strong> 发一行文本，比如 <code>READY=1\n</code>。</p>
+<p>Java 没有标准库支持（<code>java.net</code> 不支持 Unix domain socket），所以只有两条路：</p>
+<p><strong>路线一：调 <code>systemd-notify</code> 二进制（零依赖）</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">final</span> <span class="keyword">class</span> <span class="title class_">SystemdNotify</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">String</span> <span class="variable">SOCKET</span> <span class="operator">=</span> System.getenv(<span class="string">&quot;NOTIFY_SOCKET&quot;</span>);</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="type">boolean</span> <span class="title function_">available</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> SOCKET != <span class="literal">null</span> &amp;&amp; !SOCKET.isEmpty();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 发送任意状态字符串，例如 &quot;READY=1&quot;、&quot;WATCHDOG=1&quot;、&quot;STATUS=Serving&quot; */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">static</span> <span class="keyword">void</span> <span class="title function_">notify</span><span class="params">(String state)</span> &#123;</span><br><span class="line">        <span class="keyword">if</span> (!available()) <span class="keyword">return</span>;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">new</span> <span class="title class_">ProcessBuilder</span>(<span class="string">&quot;systemd-notify&quot;</span>, state)</span><br><span class="line">                    .redirectErrorStream(<span class="literal">true</span>)</span><br><span class="line">                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)</span><br><span class="line">                    .start()</span><br><span class="line">                    .waitFor(<span class="number">2</span>, TimeUnit.SECONDS);</span><br><span class="line">        &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">            <span class="comment">// 通知失败不能影响主流程，只记录</span></span><br><span class="line">            log.warn(<span class="string">&quot;sd_notify failed: &#123;&#125;&quot;</span>, e.toString());</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>关键点：<strong><code>systemd-notify</code> 是从另一个 PID 发出的</strong>，systemd 默认只接受主进程的通知（<code>NotifyAccess=main</code>），所以 unit 里必须写：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">NotifyAccess</span>=all</span><br></pre></td></tr></table></figure>
+
+<p>否则你会看到 systemd 一直等到 <code>TimeoutStartSec</code> 然后判定启动失败，而应用日志里一切正常 —— 这个坑非常经典。</p>
+<p><strong>路线二：用 JNA &#x2F; junixsocket 直接写 socket</strong></p>
+<p>零 fork 开销，适合看门狗（15 秒一次，一天 5760 次 fork 不算多，但在容器里有 PID 上限和 <code>TasksMax</code> 的场景仍要留意）。如果团队已有 JNA 依赖，直接调用 <code>socket(AF_UNIX, SOCK_DGRAM)</code> + <code>sendto</code> 即可；不想维护 JNI 代码就用路线一。</p>
+<h3 id="1-2-什么时候发-READY"><a href="#1-2-什么时候发-READY" class="headerlink" title="1.2 什么时候发 READY"></a>1.2 什么时候发 READY</h3><p>不要放在 <code>main()</code> 第一行。正确时机是 <strong>Spring 容器刷新完成、端口已监听、下游连接池预热完成之后</strong>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ReadinessNotifier</span> <span class="keyword">implements</span> <span class="title class_">ApplicationListener</span>&lt;ApplicationReadyEvent&gt; &#123;</span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">onApplicationEvent</span><span class="params">(ApplicationReadyEvent event)</span> &#123;</span><br><span class="line">        SystemdNotify.notify(<span class="string">&quot;READY=1&quot;</span>);</span><br><span class="line">        SystemdNotify.notify(<span class="string">&quot;STATUS=HTTP 8080 ready, profile=&quot;</span> + env);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>ApplicationReadyEvent</code> 在 <code>ContextRefreshedEvent</code> 之后、Web 服务器启动之后触发，是”可以接流量”的信号。用 <code>ContextRefreshedEvent</code> 早了半步（Tomcat 可能还没 bind 完）。</p>
+<h2 id="二、看门狗：把”假死”变成”自动重启”"><a href="#二、看门狗：把”假死”变成”自动重启”" class="headerlink" title="二、看门狗：把”假死”变成”自动重启”"></a>二、看门狗：把”假死”变成”自动重启”</h2><p>这是 systemd 对 Java 服务最有价值、也最少人用的功能。</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">WatchdogSec</span>=<span class="number">30</span></span><br><span class="line"><span class="attr">Restart</span>=always</span><br></pre></td></tr></table></figure>
+
+<p>语义：systemd 要求进程<strong>每 30 秒内至少发一次 <code>WATCHDOG=1</code></strong>，超时未收到 → 判定进程失活 → 发 <code>SIGABRT</code>（默认 <code>WatchdogSignal</code>）→ <code>Restart=always</code> 拉起。</p>
+<p>注意：<code>WatchdogSec</code> 不是”每 30 秒检查一次”，而是”距离上次心跳超过 30 秒就杀”。所以发送间隔要取一半左右：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">ScheduledExecutorService</span> <span class="variable">wd</span> <span class="operator">=</span> Executors.newSingleThreadScheduledExecutor(</span><br><span class="line">        r -&gt; &#123; <span class="type">Thread</span> <span class="variable">t</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">Thread</span>(r, <span class="string">&quot;sd-watchdog&quot;</span>); t.setDaemon(<span class="literal">true</span>); <span class="keyword">return</span> t; &#125;);</span><br><span class="line"></span><br><span class="line">wd.scheduleAtFixedRate(() -&gt; &#123;</span><br><span class="line">    <span class="keyword">if</span> (healthIsOk()) &#123;</span><br><span class="line">        SystemdNotify.notify(<span class="string">&quot;WATCHDOG=1&quot;</span>);</span><br><span class="line">    &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">        <span class="comment">// 故意不发：让 systemd 在 WatchdogSec 后杀掉并重启</span></span><br><span class="line">        log.error(<span class="string">&quot;health DOWN, withholding watchdog heartbeat&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;, <span class="number">15</span>, <span class="number">15</span>, TimeUnit.SECONDS);</span><br></pre></td></tr></table></figure>
+
+<p><strong>把心跳和健康检查绑在一起，是这个机制真正的价值</strong>：默认的 <code>Restart=on-failure</code> 只能处理”进程死了”，处理不了”进程活着但所有请求超时”。后者的典型原因是数据库连接池耗尽、线程池打满、下游全挂 —— 这些情况下进程 RSS 正常、CPU 可能还很低，Kubernetes 的 liveness 探针要额外配 HTTP 检查，而 systemd 场景下用看门狗是零成本的。</p>
+<h3 id="2-1-一个必须避免的写法"><a href="#2-1-一个必须避免的写法" class="headerlink" title="2.1 一个必须避免的写法"></a>2.1 一个必须避免的写法</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 反模式：无条件发心跳</span></span><br><span class="line">wd.scheduleAtFixedRate(() -&gt; SystemdNotify.notify(<span class="string">&quot;WATCHDOG=1&quot;</span>), <span class="number">15</span>, <span class="number">15</span>, SECONDS);</span><br></pre></td></tr></table></figure>
+
+<p>这就是”给死人接心电图”——心跳只证明调度线程活着，不证明服务可用。心跳函数里必须有实质判断：最近一次成功请求的时间戳、连接池可用连接数、事件循环延迟。</p>
+<h3 id="2-2-WATCHDOG-USEC-要读环境变量"><a href="#2-2-WATCHDOG-USEC-要读环境变量" class="headerlink" title="2.2 WATCHDOG_USEC 要读环境变量"></a>2.2 <code>WATCHDOG_USEC</code> 要读环境变量</h3><p>别把 15 秒硬编码。systemd 会把实际超时（微秒）放在 <code>WATCHDOG_USEC</code>，同时把应接收心跳的 PID 放在 <code>WATCHDOG_PID</code>（若设置了 <code>WatchdogSec</code> 且 unit 由 systemd 管理）。自定义配置改了 <code>WatchdogSec</code> 而代码没改，就会出现”永远差一点”的反复重启。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">String</span> <span class="variable">usec</span> <span class="operator">=</span> System.getenv(<span class="string">&quot;WATCHDOG_USEC&quot;</span>);</span><br><span class="line"><span class="type">long</span> <span class="variable">intervalMs</span> <span class="operator">=</span> usec == <span class="literal">null</span> ? <span class="number">15_000</span> : Long.parseLong(usec) / <span class="number">1000</span> / <span class="number">2</span>;</span><br></pre></td></tr></table></figure>
+
+<h2 id="三、优雅停机：KillMode-决定你是”优雅”还是”硬切”"><a href="#三、优雅停机：KillMode-决定你是”优雅”还是”硬切”" class="headerlink" title="三、优雅停机：KillMode 决定你是”优雅”还是”硬切”"></a>三、优雅停机：<code>KillMode</code> 决定你是”优雅”还是”硬切”</h2><p>Spring Boot 2.3+ 支持优雅停机：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">server:</span></span><br><span class="line">  <span class="attr">shutdown:</span> <span class="string">graceful</span></span><br><span class="line"><span class="attr">spring:</span></span><br><span class="line">  <span class="attr">lifecycle:</span></span><br><span class="line">    <span class="attr">timeout-per-shutdown-phase:</span> <span class="string">30s</span></span><br></pre></td></tr></table></figure>
+
+<p>但这段配置只有收到 <code>SIGTERM</code> 才生效。如果 systemd 直接 <code>SIGKILL</code>，Spring 根本没机会执行 <code>SmartLifecycle#stop</code>。</p>
+<h3 id="3-1-三层超时必须严格递增"><a href="#3-1-三层超时必须严格递增" class="headerlink" title="3.1 三层超时必须严格递增"></a>3.1 三层超时必须严格递增</h3><figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[Service]</span></span><br><span class="line"><span class="attr">KillSignal</span>=SIGTERM</span><br><span class="line"><span class="attr">KillMode</span>=mixed</span><br><span class="line"><span class="attr">TimeoutStopSec</span>=<span class="number">60</span></span><br></pre></td></tr></table></figure>
+
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>配置</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>应用内</td>
+<td><code>timeout-per-shutdown-phase: 30s</code></td>
+<td>等正在处理的请求结束</td>
+</tr>
+<tr>
+<td>systemd</td>
+<td><code>TimeoutStopSec=60</code></td>
+<td>等 60 秒还没退就 <code>SIGKILL</code></td>
+</tr>
+<tr>
+<td>上游</td>
+<td>LB <code>deregistration_delay</code></td>
+<td>先把流量摘掉，再发 SIGTERM</td>
+</tr>
+</tbody></table>
+<p>顺序必须是 <strong>LB 摘流量 → SIGTERM → 应用优雅停机 → 进程退出</strong>。如果 LB 摘流量和应用停机同时发生，就会有一批请求打到已经关掉的端口，表现为 502。</p>
+<h3 id="3-2-KillMode-的三种语义"><a href="#3-2-KillMode-的三种语义" class="headerlink" title="3.2 KillMode 的三种语义"></a>3.2 <code>KillMode</code> 的三种语义</h3><table>
+<thead>
+<tr>
+<th>值</th>
+<th>行为</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>control-group</code>（默认）</td>
+<td>向 cgroup 内<strong>所有</strong>进程发 SIGTERM</td>
+<td>如果服务 fork 了子进程（比如调用 <code>ffmpeg</code>、<code>python</code> 脚本），它们会被一起杀，可能来不及清理临时文件</td>
+</tr>
+<tr>
+<td><code>mixed</code></td>
+<td>只向主进程发 SIGTERM，超时后向整个 cgroup 发 SIGKILL</td>
+<td><strong>Java 服务推荐</strong>，主进程有机会优雅退出，超时后强制清场</td>
+</tr>
+<tr>
+<td><code>process</code></td>
+<td>只向主进程发信号，不碰其他进程</td>
+<td>有子进程时可能产生孤儿进程</td>
+</tr>
+</tbody></table>
+<p><code>mixed</code> 是折中方案：给主进程优雅退出的窗口，也给超时后的强杀兜底。</p>
+<h3 id="3-3-退出码的真相"><a href="#3-3-退出码的真相" class="headerlink" title="3.3 退出码的真相"></a>3.3 退出码的真相</h3><p><code>systemctl status</code> 里看到的退出码：</p>
+<ul>
+<li><code>0</code> &#x2F; <code>143</code>（128+15，SIGTERM）：正常。</li>
+<li><code>137</code>（128+9，SIGKILL）：被强杀 —— 要么 <code>TimeoutStopSec</code> 超了，要么内核 OOM killer。</li>
+<li><code>134</code>（128+6，SIGABRT）：JVM 崩溃或 <code>-XX:+CrashOnOutOfMemoryError</code>。</li>
+<li><code>1</code>：应用自己 <code>System.exit(1)</code>。</li>
+</ul>
+<p><strong><code>137</code> 是最需要警惕的</strong>：它可能是”优雅停机超时被 systemd 杀”，也可能是”cgroup OOM 被内核杀”。区分方法：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">journalctl -u myapp --since <span class="string">&quot;10 min ago&quot;</span> | grep -iE <span class="string">&quot;oom|killed process&quot;</span></span><br><span class="line">dmesg -T | grep -i <span class="string">&quot;killed process&quot;</span></span><br><span class="line">systemctl show myapp -p Result -p ExecMainStatus</span><br></pre></td></tr></table></figure>
+
+<p><code>Result=oom-kill</code> 是内核 OOM；<code>Result=timeout</code> 是 <code>TimeoutStopSec</code> 超时。两者的优化方向完全相反。</p>
+<h2 id="四、cgroup-限额与-JVM-的双重记账"><a href="#四、cgroup-限额与-JVM-的双重记账" class="headerlink" title="四、cgroup 限额与 JVM 的双重记账"></a>四、cgroup 限额与 JVM 的双重记账</h2><p>systemd 在 cgroup v2 上的资源控制项，会直接影响 JVM：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[Service]</span></span><br><span class="line"><span class="attr">MemoryHigh</span>=<span class="number">3</span>G</span><br><span class="line"><span class="attr">MemoryMax</span>=<span class="number">3.5</span>G</span><br><span class="line"><span class="attr">CPUQuota</span>=<span class="number">200</span>%</span><br><span class="line"><span class="attr">TasksMax</span>=<span class="number">4096</span></span><br><span class="line"><span class="attr">LimitNOFILE</span>=<span class="number">65535</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-1-MemoryMax-与堆大小的关系"><a href="#4-1-MemoryMax-与堆大小的关系" class="headerlink" title="4.1 MemoryMax 与堆大小的关系"></a>4.1 <code>MemoryMax</code> 与堆大小的关系</h3><p>JVM 在容器里通过 cgroup 读内存上限来算默认堆（<code>MaxRAMPercentage</code> 默认 25%）。但 <code>MemoryHigh</code>&#x2F;<code>MemoryMax</code> 的语义不同：</p>
+<ul>
+<li><code>MemoryHigh</code>：软限。超过后内核开始<strong>强制回收</strong>（直接 reclaim），进程会被限速但不会被杀。表现是”服务变慢、GC 变频繁”，非常隐蔽。</li>
+<li><code>MemoryMax</code>：硬限。超过 → cgroup OOM killer 杀进程，退出码 137。</li>
+</ul>
+<p>危险组合是：<code>MemoryMax=3.5G</code>，JVM 用默认 <code>MaxRAMPercentage=25%</code> → 堆只有 875M，浪费；如果手动设 <code>-Xmx3G</code>，则堆 + Metaspace + 线程栈 + Direct Buffer + JNI 很容易突破 3.5G。</p>
+<p>务实公式：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">MemoryMax ≈ heap / 0.7</span><br></pre></td></tr></table></figure>
+
+<p><code>-Xmx2.4G</code> 配 <code>MemoryMax=3.5G</code>，留 1.1G 给非堆。同时打开：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">-XX:+HeapDumpOnOutOfMemoryError</span><br><span class="line">-XX:HeapDumpPath=/var/log/myapp/heapdump.hprof</span><br><span class="line">-XX:+ExitOnOutOfMemoryError</span><br></pre></td></tr></table></figure>
+
+<p>⚠️ 但堆转储文件可能等于堆大小。如果 <code>/var/log</code> 和容器 writable layer 在同一块盘，一次 OOM 就能把磁盘打满，进而触发节点级故障。<strong>堆转储目录必须是独立挂载或独立磁盘</strong>，并且加 <code>ReadWritePaths</code> 白名单。</p>
+<h3 id="4-2-CPUQuota-不会改变-availableProcessors"><a href="#4-2-CPUQuota-不会改变-availableProcessors" class="headerlink" title="4.2 CPUQuota 不会改变 availableProcessors()"></a>4.2 <code>CPUQuota</code> 不会改变 <code>availableProcessors()</code></h3><p><code>CPUQuota=200%</code> 表示”最多用 2 个核的算力”，但 JVM 的 <code>Runtime.availableProcessors()</code> <strong>只认 cpuset（<code>cpuset.cpus</code>），不认 quota</strong>。所以 <code>nproc</code> 看到 32、JVM 也看到 32，于是 ForkJoinPool、GC 线程数、Netty 的 event loop 全按 32 开，然后被 quota 限到 2 核 —— 上下文切换暴增，延迟抖动。</p>
+<p>解法（任选）：</p>
+<figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">-XX:ActiveProcessorCount=2</span><br></pre></td></tr></table></figure>
+
+<p>或者用 cpuset 而不是 quota 限核（<code>AllowedCPUs=0-1</code>）。前者更常用，因为 quota 允许突发。</p>
+<h3 id="4-3-LimitNOFILE-与-fd-耗尽"><a href="#4-3-LimitNOFILE-与-fd-耗尽" class="headerlink" title="4.3 LimitNOFILE 与 fd 耗尽"></a>4.3 <code>LimitNOFILE</code> 与 fd 耗尽</h3><p>systemd unit 的默认 <code>LimitNOFILE</code> 继承 <code>DefaultLimitNOFILE</code>，很多发行版是 1024。对一个有 200 个下游 HTTP 连接 + 50 个 DB 连接 + 大量日志文件的服务，1024 很快不够，表现为 <code>Too many open files</code>。</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">LimitNOFILE</span>=<span class="number">65535</span></span><br><span class="line"><span class="attr">TasksMax</span>=<span class="number">4096</span></span><br></pre></td></tr></table></figure>
+
+<p><code>TasksMax</code> 是 cgroup 的 pids 上限（线程也算）。虚拟线程场景下，平台线程数没变化，但 <code>TasksMax</code> 仍然要留足；如果用了大量 <code>new Thread()</code> 或 <code>ForkJoinPool</code>，4096 是个安全起点。</p>
+<h2 id="五、安全加固：几行配置挡住大部分横向移动"><a href="#五、安全加固：几行配置挡住大部分横向移动" class="headerlink" title="五、安全加固：几行配置挡住大部分横向移动"></a>五、安全加固：几行配置挡住大部分横向移动</h2><figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[Service]</span></span><br><span class="line"><span class="attr">User</span>=app</span><br><span class="line"><span class="attr">Group</span>=app</span><br><span class="line"><span class="attr">NoNewPrivileges</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">PrivateTmp</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">ProtectSystem</span>=strict</span><br><span class="line"><span class="attr">ProtectHome</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">ReadWritePaths</span>=/var/log/myapp /var/lib/myapp</span><br><span class="line"><span class="attr">ProtectKernelTunables</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">ProtectKernelModules</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">ProtectControlGroups</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">RestrictAddressFamilies</span>=AF_INET AF_INET6 AF_UNIX</span><br></pre></td></tr></table></figure>
+
+<p>逐条说明容易踩的地方：</p>
+<ul>
+<li><code>ProtectSystem=strict</code> 把整个文件系统挂成只读（<code>/dev</code>、<code>/proc</code>、<code>/sys</code> 除外），<strong>包括 <code>/tmp</code></strong>？不，<code>/tmp</code> 由 <code>PrivateTmp</code> 管。但应用如果要写 <code>/opt/app/config</code> 或当前目录下的临时文件，就会 <code>Read-only file system</code>。必须用 <code>ReadWritePaths</code> 显式开洞。</li>
+<li><code>PrivateTmp=true</code> 给服务一个私有的 <code>/tmp</code>，<strong>跨服务共享 <code>/tmp</code> 文件的方案会立刻失效</strong>（比如某些 sidecar 通过 <code>/tmp</code> 传 socket）。</li>
+<li><code>ProtectHome=true</code> 让 <code>/home</code>、<code>/root</code> 不可见。如果 JVM 参数里 <code>-javaagent:/root/agent.jar</code>，会启动失败。</li>
+<li><code>RestrictAddressFamilies</code> 限制 socket 类型。用了 Unix domain socket 的（本地 Redis、Docker socket）必须包含 <code>AF_UNIX</code>；用了 <code>AF_NETLINK</code>（某些监控采集）也要加。</li>
+</ul>
+<h2 id="六、日志：journald-与-logback-的分工"><a href="#六、日志：journald-与-logback-的分工" class="headerlink" title="六、日志：journald 与 logback 的分工"></a>六、日志：journald 与 logback 的分工</h2><figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[Service]</span></span><br><span class="line"><span class="attr">StandardOutput</span>=journal</span><br><span class="line"><span class="attr">StandardError</span>=journal</span><br><span class="line"><span class="attr">SyslogIdentifier</span>=myapp</span><br></pre></td></tr></table></figure>
+
+<p>这里有一个高频事故：<strong>logback 写文件 + systemd 收 stdout，同一份日志写两遍</strong>，磁盘占用翻倍；更麻烦的是 journald 有速率限制：</p>
+<figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[Service]</span></span><br><span class="line"><span class="attr">LogRateLimitIntervalSec</span>=<span class="number">30</span>s</span><br><span class="line"><span class="attr">LogRateLimitBurst</span>=<span class="number">10000</span></span><br></pre></td></tr></table></figure>
+
+<p>超过后 journald 会<strong>丢弃</strong>日志并打一条 <code>Suppressed N messages</code>。这意味着故障时最关键的日志恰恰可能被丢 —— 因为故障时日志量最大。</p>
+<p>三种务实方案：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>全量 journald</td>
+<td>logback 只写 console，<code>StandardOutput=journal</code></td>
+<td>中小规模，统一用 <code>journalctl</code> 查</td>
+</tr>
+<tr>
+<td>全量文件</td>
+<td><code>StandardOutput=null</code>，logback 写文件 + logrotate</td>
+<td>已有 ELK&#x2F;Loki 采集</td>
+</tr>
+<tr>
+<td>混合（推荐）</td>
+<td>console 走 journald 做 <code>systemctl status</code> 速查；文件走采集做长期检索</td>
+<td>生产</td>
+</tr>
+</tbody></table>
+<p><code>journalctl</code> 的常用姿势：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">journalctl -u myapp -f                    <span class="comment"># 实时</span></span><br><span class="line">journalctl -u myapp --since <span class="string">&quot;10 min ago&quot;</span> -o <span class="built_in">cat</span></span><br><span class="line">journalctl -u myapp -p err --since today  <span class="comment"># 只要 error 及以上</span></span><br><span class="line">journalctl -u myapp -b -1                 <span class="comment"># 上一次启动</span></span><br><span class="line">journalctl --disk-usage &amp;&amp; journalctl --vacuum-size=2G</span><br></pre></td></tr></table></figure>
+
+<p><code>-o cat</code> 只输出消息体，去掉时间戳和主机名，读起来干净很多。</p>
+<h2 id="七、完整的-unit-模板"><a href="#七、完整的-unit-模板" class="headerlink" title="七、完整的 unit 模板"></a>七、完整的 unit 模板</h2><figure class="highlight ini"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">[Unit]</span></span><br><span class="line"><span class="attr">Description</span>=Order Service</span><br><span class="line"><span class="attr">After</span>=network-<span class="literal">on</span>line.target</span><br><span class="line"><span class="attr">Wants</span>=network-<span class="literal">on</span>line.target</span><br><span class="line"><span class="attr">StartLimitIntervalSec</span>=<span class="number">300</span></span><br><span class="line"><span class="attr">StartLimitBurst</span>=<span class="number">5</span></span><br><span class="line"></span><br><span class="line"><span class="section">[Service]</span></span><br><span class="line"><span class="attr">Type</span>=notify</span><br><span class="line"><span class="attr">NotifyAccess</span>=all</span><br><span class="line"><span class="attr">User</span>=app</span><br><span class="line"><span class="attr">Group</span>=app</span><br><span class="line"><span class="attr">WorkingDirectory</span>=/opt/order</span><br><span class="line"><span class="attr">EnvironmentFile</span>=-/etc/sysconfig/order</span><br><span class="line"><span class="attr">Environment</span>=<span class="string">&quot;JAVA_HOME=/usr/lib/jvm/jdk-21&quot;</span></span><br><span class="line"><span class="attr">ExecStart</span>=/usr/lib/jvm/jdk-<span class="number">21</span>/bin/java \</span><br><span class="line">  -XX:<span class="attr">MaxRAMPercentage</span>=<span class="number">70</span> \</span><br><span class="line">  -XX:<span class="attr">ActiveProcessorCount</span>=<span class="number">4</span> \</span><br><span class="line">  -XX:+ExitOnOutOfMemoryError \</span><br><span class="line">  -XX:+HeapDumpOnOutOfMemoryError \</span><br><span class="line">  -XX:<span class="attr">HeapDumpPath</span>=/var/lib/order/dump \</span><br><span class="line">  -jar /opt/order/order.jar</span><br><span class="line"></span><br><span class="line"><span class="attr">SuccessExitStatus</span>=<span class="number">143</span></span><br><span class="line"><span class="attr">Restart</span>=always</span><br><span class="line"><span class="attr">RestartSec</span>=<span class="number">5</span></span><br><span class="line"><span class="attr">KillSignal</span>=SIGTERM</span><br><span class="line"><span class="attr">KillMode</span>=mixed</span><br><span class="line"><span class="attr">TimeoutStopSec</span>=<span class="number">60</span></span><br><span class="line"><span class="attr">WatchdogSec</span>=<span class="number">30</span></span><br><span class="line"></span><br><span class="line"><span class="attr">MemoryHigh</span>=<span class="number">3</span>G</span><br><span class="line"><span class="attr">MemoryMax</span>=<span class="number">3.5</span>G</span><br><span class="line"><span class="attr">CPUQuota</span>=<span class="number">400</span>%</span><br><span class="line"><span class="attr">TasksMax</span>=<span class="number">4096</span></span><br><span class="line"><span class="attr">LimitNOFILE</span>=<span class="number">65535</span></span><br><span class="line"></span><br><span class="line"><span class="attr">NoNewPrivileges</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">PrivateTmp</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">ProtectSystem</span>=strict</span><br><span class="line"><span class="attr">ProtectHome</span>=<span class="literal">true</span></span><br><span class="line"><span class="attr">ReadWritePaths</span>=/var/log/order /var/lib/order</span><br><span class="line"><span class="attr">RestrictAddressFamilies</span>=AF_INET AF_INET6 AF_UNIX</span><br><span class="line"></span><br><span class="line"><span class="attr">StandardOutput</span>=journal</span><br><span class="line"><span class="attr">StandardError</span>=journal</span><br><span class="line"><span class="attr">SyslogIdentifier</span>=order</span><br><span class="line"></span><br><span class="line"><span class="section">[Install]</span></span><br><span class="line"><span class="attr">WantedBy</span>=multi-user.target</span><br></pre></td></tr></table></figure>
+
+<p><code>SuccessExitStatus=143</code> 其实非必需（systemd 默认把 SIGTERM 视为干净退出），但写上更明确，避免有人改 <code>KillSignal=SIGUSR2</code> 后行为变化。</p>
+<h2 id="八、排障命令速查"><a href="#八、排障命令速查" class="headerlink" title="八、排障命令速查"></a>八、排障命令速查</h2><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line">systemd-analyze verify /etc/systemd/system/order.service   <span class="comment"># 语法 + 依赖检查</span></span><br><span class="line">systemctl <span class="built_in">cat</span> order                                        <span class="comment"># 看最终生效配置（含 drop-in）</span></span><br><span class="line">systemctl show order -p MainPID -p Result -p ExecMainStatus -p NRestarts</span><br><span class="line">systemctl status order                                     <span class="comment"># 最近日志 + 退出码</span></span><br><span class="line">journalctl -u order -b --no-pager | <span class="built_in">tail</span> -100</span><br><span class="line">systemd-cgls /system.slice/order.service                   <span class="comment"># 看 cgroup 内进程树</span></span><br><span class="line">systemctl reset-failed order                               <span class="comment"># 触发 StartLimit 后必须重置</span></span><br></pre></td></tr></table></figure>
+
+<p><code>systemctl show -p Result</code> 的输出是最有价值的：</p>
+<table>
+<thead>
+<tr>
+<th><code>Result</code></th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>success</code></td>
+<td>正常退出</td>
+</tr>
+<tr>
+<td><code>exit-code</code></td>
+<td>应用返回非零</td>
+</tr>
+<tr>
+<td><code>signal</code></td>
+<td>被信号杀死（看 <code>ExecMainStatus</code> 是否 137&#x2F;143）</td>
+</tr>
+<tr>
+<td><code>oom-kill</code></td>
+<td>cgroup 内存超限被内核杀</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>启动或停止超时</td>
+</tr>
+<tr>
+<td><code>watchdog</code></td>
+<td>看门狗超时</td>
+</tr>
+</tbody></table>
+<h2 id="九、面试追问"><a href="#九、面试追问" class="headerlink" title="九、面试追问"></a>九、面试追问</h2><p><strong>Q：<code>Type=notify</code> 和健康检查探针（liveness）有什么区别？</strong></p>
+<p><code>Type=notify</code> 只解决”启动完成”这一个时刻的判定，属于一次性事件；liveness 探针是持续判定。systemd 的对应物是 <code>WatchdogSec</code> + 周期性 <code>WATCHDOG=1</code>。两者解决的是不同问题：前者防”启动失败被当成功”，后者防”运行中假死”。</p>
+<p><strong>Q：为什么 Java 服务推荐 <code>KillMode=mixed</code> 而不是默认的 <code>control-group</code>？</strong></p>
+<p>默认模式会把 SIGTERM 发给 cgroup 里所有进程。如果服务启动了子进程（外部工具、shell 脚本），它们会同时收到信号，可能在主进程还在优雅退出时就已经死掉，导致主进程等待子进程结果超时。<code>mixed</code> 只给主进程发 SIGTERM，超时后再对整个 cgroup 强杀。</p>
+<p><strong>Q：<code>MemoryHigh</code> 和 <code>MemoryMax</code> 哪个更危险？</strong></p>
+<p><code>MemoryHigh</code> 更阴险。它不杀进程，只触发强制回收和限速，表现为”服务变慢但监控没有明显错误”，很难归因。<code>MemoryMax</code> 至少会留下明确的 OOM 记录和 137 退出码。</p>
+<p><strong>Q：<code>Restart=always</code> 会不会导致无限重启风暴？</strong></p>
+<p>会被 <code>StartLimitBurst</code>&#x2F;<code>StartLimitIntervalSec</code> 拦住。默认是 5 次&#x2F;10 秒，超过后 unit 进入 <code>failed</code> 状态，<strong>不再自动重启</strong>，必须 <code>systemctl reset-failed</code>。这正是”启动配置错误”应该有的行为 —— 快速失败并告警，而不是无限刷日志。</p>
+<h2 id="十、落地清单"><a href="#十、落地清单" class="headerlink" title="十、落地清单"></a>十、落地清单</h2><ol>
+<li><code>Type=notify</code> + <code>NotifyAccess=all</code>，在 <code>ApplicationReadyEvent</code> 发 <code>READY=1</code>。</li>
+<li>看门狗间隔取 <code>WATCHDOG_USEC</code> 的一半，且心跳必须绑定健康判断。</li>
+<li><code>TimeoutStopSec</code> &gt; Spring <code>timeout-per-shutdown-phase</code>，上游先摘流量。</li>
+<li><code>KillMode=mixed</code>。</li>
+<li><code>MemoryMax ≈ heap / 0.7</code>，堆转储目录必须独立挂载。</li>
+<li><code>CPUQuota</code> 场景必须显式 <code>-XX:ActiveProcessorCount</code>。</li>
+<li><code>LimitNOFILE=65535</code>，<code>TasksMax</code> 留足。</li>
+<li><code>ProtectSystem=strict</code> 必须配 <code>ReadWritePaths</code>，否则应用写不了文件。</li>
+<li>日志选一条路，别双写；journald 速率限制要按峰值流量调。</li>
+<li>告警里带 <code>Result</code> 字段，别只报”服务挂了”。</li>
+</ol>
+<p>systemd 的这些能力，Kubernetes 里对应的是探针、<code>resources.limits</code>、<code>preStop</code>、<code>PDB</code>。但大量团队的真实环境仍是”物理机&#x2F;虚机 + systemd”，把这层配好，等于不花钱买到了 80% 的编排能力。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/21/systemd-java-service-governance-deep-practice/">https://jiweidong.github.io/2026/11/21/systemd-java-service-governance-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/%E8%BF%90%E7%BB%B4/">运维</a><a class="post-meta__tags" href="/tags/%E7%94%9F%E4%BA%A7%E5%AE%9E%E8%B7%B5/">生产实践</a><a class="post-meta__tags" href="/tags/systemd/">systemd</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/21/nginx-stream-layer4-proxy-tls-passthrough-deep-practice/" title="【Nginx 实战】stream 四层代理深度实战：TCP/UDP 转发、TLS 透传与 SNI 分流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Nginx 实战】stream 四层代理深度实战：TCP/UDP 转发、TLS 透传与 SNI 分流</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】stream 四层代理深度实战前言提到 Nginx，绝大多数人想的是 location、proxy_pass、upstream —— 那是 http 模块，工作在第七层。但在真实系统里还有一类需求它解决不了：  数据库（MySQL&#x2F;PostgreSQL）要经过统一入口，做故障转移和内网收敛。 Redis 集群要给外部租户暴露，但不能让租户直连节点。 多租户 SaaS，每个客户用自己的域名和证书，需要按 SNI 分流但不在网关解密。 一套入口同时承载 HTTPS 和 MQTT&#x2F;自定义二进制协议。  这些都得用 stream 模块 —— Nginx 的四层（TCP&#x2F;UDP）代理。它不理解应用协议，只搬字节，所以能力边界和 http 模块完全不同。这篇文章把这个边界讲清楚。 一、stream 模块的定位：它不懂协议，这是优点也是限制   能力 http 模块 stream 模块    理解请求 ✅ 解析 HTTP 头&#x2F;体 ❌ 只搬字节流   路由依据 URI、Header、Cookie、方法 源 IP、端口、SNI、ALPN ...</div></div></div></a><a class="pagination-related" href="/2026/11/21/redis-7-8-new-commands-migration-deep-practice/" title="【Redis 8 实战】Redis 7/8 新命令族深度解析：多 key 原子操作、WAITAOF 与客户端适配"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Redis 8 实战】Redis 7/8 新命令族深度解析：多 key 原子操作、WAITAOF 与客户端适配</div></div><div class="info-2"><div class="info-item-1">【Redis 8 实战】Redis 7&#x2F;8 新命令族深度解析前言大多数团队用 Redis 的方式，五年没变过：GET&#x2F;SET&#x2F;HSET&#x2F;EXPIRE&#x2F;ZADD，外加一个 SETNX 做分布式锁。但从 Redis 7.0 到 8.x，官方补了一大批”以前必须写 Lua 才能原子完成”的命令，也补了几个直接把线上事故概率降下来的运维命令。 问题在于：这些命令很多 Java 客户端没有第一时间封装，于是团队要么继续用 Lua，要么根本不知道有这些东西。更麻烦的是，有几个命令的返回值语义非常反直觉（比如 SINTERCARD 带 LIMIT、WAITAOF 返回两个数），照着自己想象用，会比不用更危险。 这篇文章按”能替代什么 Lua &#x2F; 能防什么事故”来梳理 Redis 7&#x2F;8 的新命令，并给出 Java 侧（Lettuce 6.x、Jedis 5.x）的落法与升级适配清单。 一、先给结论：哪些命令值得立刻用   命令 版本 替代了什么 立刻用的理由    LMPOP &#x2F; BLMPOP 7.0 多次 LPO...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/06/jmx-jvm-monitoring-deep-practice/" title="【JVM实战】JMX 与 JVM 远程监控实战：MBean 管理与生产级监控方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-06</div><div class="info-item-2">【JVM实战】JMX 与 JVM 远程监控实战：MBean 管理与生产级监控方案</div></div><div class="info-2"><div class="info-item-1">JMX 与 JVM 远程监控实战：从 MBean 到生产实践一、引言JMX（Java Management Extensions，Java 管理扩展）是 Java 平台内置的管理监控框架，从 JDK 1.5 开始成为 Java 标准的一部分。它提供了一种标准化的方式来监控和管理 Java 应用程序的运行状态。 无论是 JVM 内存使用情况、线程状态、GC 次数，还是自定义的业务指标，都可以通过 JMX 暴露出来。配合 JConsole、VisualVM、Prometheus 等工具，JMX 是 Java 应用监控的基石。 本文将深入解析 JMX 的核心架构、MBean 编程模型、远程连接配置，以及在生产环境中的最佳实践。  二、JMX 架构总览2.1 三层架构JMX 采用三层架构设计： 1234567891011┌─────────────────────────────────────┐│     管理层（Manageability Layer）    ││   JConsole / VisualVM / Prometheus   │├─────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/10/21/mysql-invisible-index-governance-deep-practice/" title="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战前言「索引加得越多，查询越快」——这是我在面试里最常听到、也最想纠正的一句话。 索引不是免费的。每一个二级索引在写入路径上都要付出代价：  INSERT：每多一个索引，就多一次 B+ 树定位插入，多一份 redo&#x2F;undo； UPDATE：只要被索引的列发生变化，就要删除旧记录 + 插入新记录（delete-mark + insert），而不是原地更新； DELETE：所有索引都要打删除标记； 优化器：候选索引越多，range 评估的组合越多，执行计划越容易走偏； 存储：一个千万级表的二级索引，随随便便几十 GB。  一个跑了三五年的业务库，SHOW INDEX 出来十几二十个索引是常态，其中至少三分之一是历史遗留：早期为了某个报表加的、某次慢查询临时加的、开发觉得「加了总没坏处」加的。问题是——你敢直接 DROP INDEX 吗？ 不敢。因为线上没人能保证这个索引真的没人用。白天不敢动，晚上动了出问题没人背。于是索引越堆越多，写入越来越慢，形成死循环。 MySQL 8.0 给的答案叫 不可见...</div></div></div></a><a class="pagination-related" href="/2026/11/12/linux-memory-reclaim-watermark-kswapd-deep-dive/" title="【性能调优】Linux 内存回收与水位线深度解析：kswapd、direct reclaim 与容器 OOM 归因"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-12</div><div class="info-item-2">【性能调优】Linux 内存回收与水位线深度解析：kswapd、direct reclaim 与容器 OOM 归因</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux 内存回收与水位线深度解析：kswapd、direct reclaim 与容器 OOM 归因前言两个经典现场：  机器 free -m 显示 available 还有 200MB，但 Java 服务的 TP99 突然从 30ms 飙到 800ms，日志里没有任何异常。 Pod 的 memory.limit 是 4Gi，memory.current 只有 3.2Gi，容器却被 OOMKilled 了。  两个现象都与”内存还够不够”的判断逻辑有关。Linux 判断内存压力的依据不是”剩余多少”，而是相对于三条水位线（watermark）的位置；容器的判断依据也不是 memory.current，而是回收失败后的 charge 失败。 本文讲清楚 zone 水位线、kswapd 与 direct reclaim 的触发链路、cgroup v2 的回收语义，最后给出 Java 服务的调优参数与归因清单。  一、三条水位线：zone 的”红黄绿”每个 NUMA node 下的每个 zone（DMA&#x2F;DMA32&#x2F;Normal&#x2F;Movabl...</div></div></div></a><a class="pagination-related" href="/2026/11/21/nginx-stream-layer4-proxy-tls-passthrough-deep-practice/" title="【Nginx 实战】stream 四层代理深度实战：TCP&#x2F;UDP 转发、TLS 透传与 SNI 分流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-21</div><div class="info-item-2">【Nginx 实战】stream 四层代理深度实战：TCP&#x2F;UDP 转发、TLS 透传与 SNI 分流</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】stream 四层代理深度实战前言提到 Nginx，绝大多数人想的是 location、proxy_pass、upstream —— 那是 http 模块，工作在第七层。但在真实系统里还有一类需求它解决不了：  数据库（MySQL&#x2F;PostgreSQL）要经过统一入口，做故障转移和内网收敛。 Redis 集群要给外部租户暴露，但不能让租户直连节点。 多租户 SaaS，每个客户用自己的域名和证书，需要按 SNI 分流但不在网关解密。 一套入口同时承载 HTTPS 和 MQTT&#x2F;自定义二进制协议。  这些都得用 stream 模块 —— Nginx 的四层（TCP&#x2F;UDP）代理。它不理解应用协议，只搬字节，所以能力边界和 http 模块完全不同。这篇文章把这个边界讲清楚。 一、stream 模块的定位：它不懂协议，这是优点也是限制   能力 http 模块 stream 模块    理解请求 ✅ 解析 HTTP 头&#x2F;体 ❌ 只搬字节流   路由依据 URI、Header、Cookie、方法 源 IP、端口、SNI、ALPN ...</div></div></div></a><a class="pagination-related" href="/2026/11/15/ext4-xfs-fsync-java-durability-deep-dive/" title="【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-15</div><div class="info-item-2">【性能调优】ext4 与 XFS 文件系统深度解析：延迟分配、fsync 代价与 Java 持久化语义</div></div><div class="info-2"><div class="info-item-1">【性能调优】ext4 与 XFS 文件系统深度解析前言Java 里写「持久化」看起来只有两行： 12fileChannel.write(buf);fileChannel.force(true);  但只要你在生产里认真对待过数据安全，就会撞上两个方向相反的问题：  方向一（丢数据）：force(true) 明明调了，断电后最后几条记录还是没了；或者文件在，但目录项不见了，重启后文件「消失」。 方向二（慢）：为了安全，每条记录都 force()，结果吞吐只有 800 条&#x2F;秒；改成每 100 条刷一次，吞吐上去了，但断电丢 100 条。  这两个问题的答案都不在 Java 里，而在文件系统层：ext4 的延迟分配、journal 的三种模式、fsync 到底触发了什么、XFS 的 extent 与预分配、以及「元数据」和「数据」是两条独立的持久化路径。  说明：脏页回写的三个水位线（dirty_ratio、dirty_background_ratio、dirty_expire_centisecs）以及 write/flush/force/close 四层语义已经在《Linu...</div></div></div></a><a class="pagination-related" href="/2026/11/13/cgroup-v2-io-throttling-java-deep-dive/" title="【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-13</div><div class="info-item-2">【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理</div></div><div class="info-2"><div class="info-item-1">【性能调优】cgroup v2 IO 控制深度解析：io.max、io.latency 与 Java 应用的磁盘争抢治理前言一个很典型的线上现象：某个 Java 服务部署到 K8s 之后，CPU 用了 limit 的 40%，堆内存稳定，GC 也正常，但接口 P99 从 80ms 涨到 900ms。查 iostat -x 发现磁盘 %util 接近 100%，aqu-sz 排队深度飙到几十。最后一查，同节点上另一个服务的日志疯狂刷盘，把本地盘的 IOPS 吃干净了。 CPU 有 cpu.max，内存有 memory.max，磁盘却没有天然的隔离——这是很多团队容器化踩得最深的一个坑。cgroup v1 时代的 blkio 控制器只做「权重」，v2 把 IO 控制重做成 io 控制器，提供了 io.max（硬上限）、io.latency（延迟保障）、io.weight（权重）、io.stat（用量统计）、io.pressure（压力失速）五件套，但默认一个都不生效，而且有几个反直觉的语义陷阱。 这篇文章按「原理 → 参数语义 → Java 落地 → 排查手册 → 面试追问」的顺序，...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">957</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1060</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">251</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E8%BF%90%E7%BB%B4%E5%AE%9E%E6%88%98%E3%80%91systemd-%E4%B8%8E-Java-%E6%9C%8D%E5%8A%A1%E6%B2%BB%E7%90%86"><span class="toc-number">1.</span> <span class="toc-text">【运维实战】systemd 与 Java 服务治理</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E9%80%89%E5%AF%B9-Type%EF%BC%9Asimple-exec-notify-forking"><span class="toc-number">1.2.</span> <span class="toc-text">一、先选对 Type：simple &#x2F; exec &#x2F; notify &#x2F; forking</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-Java-%E6%80%8E%E4%B9%88%E5%8F%91-READY-1"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 Java 怎么发 READY&#x3D;1</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#1-2-%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E5%8F%91-READY"><span class="toc-number">1.2.2.</span> <span class="toc-text">1.2 什么时候发 READY</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E7%9C%8B%E9%97%A8%E7%8B%97%EF%BC%9A%E6%8A%8A%E2%80%9D%E5%81%87%E6%AD%BB%E2%80%9D%E5%8F%98%E6%88%90%E2%80%9D%E8%87%AA%E5%8A%A8%E9%87%8D%E5%90%AF%E2%80%9D"><span class="toc-number">1.3.</span> <span class="toc-text">二、看门狗：把”假死”变成”自动重启”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E4%B8%80%E4%B8%AA%E5%BF%85%E9%A1%BB%E9%81%BF%E5%85%8D%E7%9A%84%E5%86%99%E6%B3%95"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 一个必须避免的写法</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-WATCHDOG-USEC-%E8%A6%81%E8%AF%BB%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 WATCHDOG_USEC 要读环境变量</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E4%BC%98%E9%9B%85%E5%81%9C%E6%9C%BA%EF%BC%9AKillMode-%E5%86%B3%E5%AE%9A%E4%BD%A0%E6%98%AF%E2%80%9D%E4%BC%98%E9%9B%85%E2%80%9D%E8%BF%98%E6%98%AF%E2%80%9D%E7%A1%AC%E5%88%87%E2%80%9D"><span class="toc-number">1.4.</span> <span class="toc-text">三、优雅停机：KillMode 决定你是”优雅”还是”硬切”</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%89%E5%B1%82%E8%B6%85%E6%97%B6%E5%BF%85%E9%A1%BB%E4%B8%A5%E6%A0%BC%E9%80%92%E5%A2%9E"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 三层超时必须严格递增</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-KillMode-%E7%9A%84%E4%B8%89%E7%A7%8D%E8%AF%AD%E4%B9%89"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 KillMode 的三种语义</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E9%80%80%E5%87%BA%E7%A0%81%E7%9A%84%E7%9C%9F%E7%9B%B8"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 退出码的真相</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81cgroup-%E9%99%90%E9%A2%9D%E4%B8%8E-JVM-%E7%9A%84%E5%8F%8C%E9%87%8D%E8%AE%B0%E8%B4%A6"><span class="toc-number">1.5.</span> <span class="toc-text">四、cgroup 限额与 JVM 的双重记账</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-MemoryMax-%E4%B8%8E%E5%A0%86%E5%A4%A7%E5%B0%8F%E7%9A%84%E5%85%B3%E7%B3%BB"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 MemoryMax 与堆大小的关系</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-CPUQuota-%E4%B8%8D%E4%BC%9A%E6%94%B9%E5%8F%98-availableProcessors"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 CPUQuota 不会改变 availableProcessors()</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-LimitNOFILE-%E4%B8%8E-fd-%E8%80%97%E5%B0%BD"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 LimitNOFILE 与 fd 耗尽</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%AE%89%E5%85%A8%E5%8A%A0%E5%9B%BA%EF%BC%9A%E5%87%A0%E8%A1%8C%E9%85%8D%E7%BD%AE%E6%8C%A1%E4%BD%8F%E5%A4%A7%E9%83%A8%E5%88%86%E6%A8%AA%E5%90%91%E7%A7%BB%E5%8A%A8"><span class="toc-number">1.6.</span> <span class="toc-text">五、安全加固：几行配置挡住大部分横向移动</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E6%97%A5%E5%BF%97%EF%BC%9Ajournald-%E4%B8%8E-logback-%E7%9A%84%E5%88%86%E5%B7%A5"><span class="toc-number">1.7.</span> <span class="toc-text">六、日志：journald 与 logback 的分工</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%AE%8C%E6%95%B4%E7%9A%84-unit-%E6%A8%A1%E6%9D%BF"><span class="toc-number">1.8.</span> <span class="toc-text">七、完整的 unit 模板</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E6%8E%92%E9%9A%9C%E5%91%BD%E4%BB%A4%E9%80%9F%E6%9F%A5"><span class="toc-number">1.9.</span> <span class="toc-text">八、排障命令速查</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.10.</span> <span class="toc-text">九、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%8D%81%E3%80%81%E8%90%BD%E5%9C%B0%E6%B8%85%E5%8D%95"><span class="toc-number">1.11.</span> <span class="toc-text">十、落地清单</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/21/llm-multilingual-localization-evaluation-deep-dive/" title="【AI 工程化】LLM 应用的多语言与本地化评测：Token 膨胀、语言漂移与质量门禁">【AI 工程化】LLM 应用的多语言与本地化评测：Token 膨胀、语言漂移与质量门禁</a><time datetime="2026-11-21T00:40:00.000Z" title="发表于 2026-11-21 08:40:00">2026-11-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/21/opentelemetry-genai-semantic-conventions-java-deep-practice/" title="【Java AI】OpenTelemetry GenAI 语义约定深度实战：gen_ai.* 属性、Token 指标与 Agent 链路">【Java AI】OpenTelemetry GenAI 语义约定深度实战：gen_ai.* 属性、Token 指标与 Agent 链路</a><time datetime="2026-11-21T00:30:00.000Z" title="发表于 2026-11-21 08:30:00">2026-11-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/21/nginx-stream-layer4-proxy-tls-passthrough-deep-practice/" title="【Nginx 实战】stream 四层代理深度实战：TCP/UDP 转发、TLS 透传与 SNI 分流">【Nginx 实战】stream 四层代理深度实战：TCP/UDP 转发、TLS 透传与 SNI 分流</a><time datetime="2026-11-21T00:20:00.000Z" title="发表于 2026-11-21 08:20:00">2026-11-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/21/systemd-java-service-governance-deep-practice/" title="【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机">【运维实战】systemd 与 Java 服务治理：sd_notify、看门狗、cgroup 限额与优雅停机</a><time datetime="2026-11-21T00:10:00.000Z" title="发表于 2026-11-21 08:10:00">2026-11-21</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/21/redis-7-8-new-commands-migration-deep-practice/" title="【Redis 8 实战】Redis 7/8 新命令族深度解析：多 key 原子操作、WAITAOF 与客户端适配">【Redis 8 实战】Redis 7/8 新命令族深度解析：多 key 原子操作、WAITAOF 与客户端适配</a><time datetime="2026-11-21T00:00:00.000Z" title="发表于 2026-11-21 08:00:00">2026-11-21</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
