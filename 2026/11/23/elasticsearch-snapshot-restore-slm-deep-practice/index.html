@@ -1,0 +1,319 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【ES 运维】Elasticsearch 快照与恢复深度实战面试官：ES 集群要备份，直接 cp -r data&#x2F; 行不行？不行，而且这是能把恢复窗口从”小时级”变成”永远”的错误。 Lucene 的段文件在写入过程中不断变化：refresh 生成新 segment、merge 合并旧段并删除文件、translog 记录未落盘的写操作。直接拷贝目录会拿到一个跨时刻的、不一致的文件集合，更别提 Lu">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【ES 运维】Elasticsearch 快照与恢复深度实战面试官：ES 集群要备份，直接 cp -r data&#x2F; 行不行？不行，而且这是能把恢复窗口从”小时级”变成”永远”的错误。 Lucene 的段文件在写入过程中不断变化：refresh 生成新 segment、merge 合并旧段并删除文件、translog 记录未落盘的写操作。直接拷贝目录会拿到一个跨时刻的、不一致的文件集合，更别提 Lu">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-23T00:40:00.000Z">
+<meta property="article:modified_time" content="2026-11-23T00:04:29.663Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Elasticsearch">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="数据备份">
+<meta property="article:tag" content="运维">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练",
+  "url": "https://jiweidong.github.io/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-23T00:40:00.000Z",
+  "dateModified": "2026-11-23T00:04:29.663Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">967</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1062</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-23T00:40:00.000Z" title="发表于 2026-11-23 08:40:00">2026-11-23</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-23T00:04:29.663Z" title="更新于 2026-11-23 08:04:29">2026-11-23</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【ES-运维】Elasticsearch-快照与恢复深度实战"><a href="#【ES-运维】Elasticsearch-快照与恢复深度实战" class="headerlink" title="【ES 运维】Elasticsearch 快照与恢复深度实战"></a>【ES 运维】Elasticsearch 快照与恢复深度实战</h1><h2 id="面试官：ES-集群要备份，直接-cp-r-data-行不行？"><a href="#面试官：ES-集群要备份，直接-cp-r-data-行不行？" class="headerlink" title="面试官：ES 集群要备份，直接 cp -r data/ 行不行？"></a>面试官：ES 集群要备份，直接 <code>cp -r data/</code> 行不行？</h2><p>不行，而且这是能把恢复窗口从”小时级”变成”永远”的错误。</p>
+<p>Lucene 的段文件在写入过程中不断变化：<code>refresh</code> 生成新 segment、<code>merge</code> 合并旧段并删除文件、<code>translog</code> 记录未落盘的写操作。<strong>直接拷贝目录会拿到一个跨时刻的、不一致的文件集合</strong>，更别提 Lucene 还依赖 <code>segments_N</code> 这类提交点文件的原子切换。你拷到的很可能是一个永远打不开的索引。</p>
+<p>ES 官方给的路径是 Snapshot &amp; Restore（下称快照）。它的正确理解方式是：<strong>快照不是”复制数据”，而是”记录一组不可变段文件的引用 + 集群元数据”</strong>。这个定义直接推出了它的全部特性：快照很快、增量天然成立、恢复只还原到快照时刻、和 translog 无关。</p>
+<h2 id="一、快照的物理本质"><a href="#一、快照的物理本质" class="headerlink" title="一、快照的物理本质"></a>一、快照的物理本质</h2><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">索引 = 多个 segment（不可变） + 一个 commit point（segments_N）</span><br><span class="line">                    ↑</span><br><span class="line">            写入只产生新段，从不改旧段</span><br><span class="line">merge 后：旧段被删除，新段生成</span><br></pre></td></tr></table></figure>
+
+<p>因为段不可变，快照只需要：</p>
+<ol>
+<li>触发一次 flush，确保当前写入落到段（或至少把 translog 里已 flush 的部分固化）。</li>
+<li>记录当前所有 segment 文件的<strong>文件名与大小</strong>（文件名里带 UUID，全局唯一）。</li>
+<li>把仓库里”还缺的段文件”上传上去。</li>
+</ol>
+<p>于是增量是<strong>天然</strong>的：第二次快照时，绝大多数段文件和上次同名同大小，仓库里已有，直接跳过；只有 merge 新产生的段需要上传，外加一个很小的元数据文件。这就是为什么”1TB 索引的每日快照”可能只传几十 GB——传的是<strong>变化量</strong>，不是全量。</p>
+<p>反过来说，<strong>merge 是增量大小的主要驱动</strong>。如果你的索引每天大量 merge，快照增量就会偏大；<code>forcemerge</code> 之后第一次快照会一次性上传大量新段，要避开业务高峰。</p>
+<h2 id="二、仓库配置：三种常见形态"><a href="#二、仓库配置：三种常见形态" class="headerlink" title="二、仓库配置：三种常见形态"></a>二、仓库配置：三种常见形态</h2><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1) 共享文件系统（所有节点必须能访问同一路径）</span></span><br><span class="line">PUT _snapshot/fs_backup</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;fs&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;location&quot;</span><span class="punctuation">:</span> <span class="string">&quot;/mnt/es-backup&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;compress&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;max_snapshot_bytes_per_sec&quot;</span><span class="punctuation">:</span> <span class="string">&quot;200mb&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;max_restore_bytes_per_sec&quot;</span><span class="punctuation">:</span> <span class="string">&quot;200mb&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 2) S3（需安装 repository-s3 插件）</span></span><br><span class="line">PUT _snapshot/s3_backup</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;s3&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;bucket&quot;</span><span class="punctuation">:</span> <span class="string">&quot;prod-es-snapshot&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;base_path&quot;</span><span class="punctuation">:</span> <span class="string">&quot;es/2026&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;server_side_encryption&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;storage_class&quot;</span><span class="punctuation">:</span> <span class="string">&quot;standard_ia&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 3) 只读 URL 仓库（用于跨集群分发/归档）</span></span><br><span class="line">PUT _snapshot/url_backup</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;type&quot;</span><span class="punctuation">:</span> <span class="string">&quot;url&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span> <span class="attr">&quot;url&quot;</span><span class="punctuation">:</span> <span class="string">&quot;file:/mnt/readonly-snapshots&quot;</span> <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>三个必须知道的约束：</p>
+<ul>
+<li><strong><code>path.repo</code> 必须在 <code>elasticsearch.yml</code> 里配置且重启生效</strong>，仓库路径必须是它的子目录。忘了配就会得到 <code>repository_verification_exception: path.repo not set</code>。</li>
+<li><strong>同一仓库同一时刻只能有一个快照在跑</strong>（<code>snapshot.max_concurrent_operations</code> 默认 1）。多个索引并行会分散到不同节点，但快照任务本身是串行的。</li>
+<li><strong>仓库元数据由 master 写</strong>：<code>_snapshot</code> 的写入是集群级操作，master 抖动会导致快照失败（<code>master_not_discovered_exception</code>），不是存储的问题。</li>
+</ul>
+<h2 id="三、快照与-SLM：把”记得备份”变成策略"><a href="#三、快照与-SLM：把”记得备份”变成策略" class="headerlink" title="三、快照与 SLM：把”记得备份”变成策略"></a>三、快照与 SLM：把”记得备份”变成策略</h2><p>手工快照一定会忘。SLM（Snapshot Lifecycle Management）就是定时器 + 保留策略：</p>
+<figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">PUT _slm/policy/daily-prod</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;schedule&quot;</span><span class="punctuation">:</span> <span class="string">&quot;0 30 2 * * ?&quot;</span><span class="punctuation">,</span>          <span class="comment">// 每天 02:30</span></span><br><span class="line">  <span class="attr">&quot;name&quot;</span><span class="punctuation">:</span> <span class="string">&quot;&lt;prod-&#123;now/d&#125;&gt;&quot;</span><span class="punctuation">,</span>            <span class="comment">// 索引名带日期</span></span><br><span class="line">  <span class="attr">&quot;repository&quot;</span><span class="punctuation">:</span> <span class="string">&quot;s3_backup&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;config&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;indices&quot;</span><span class="punctuation">:</span> <span class="punctuation">[</span><span class="string">&quot;orders-*&quot;</span><span class="punctuation">,</span> <span class="string">&quot;users-*&quot;</span><span class="punctuation">,</span> <span class="string">&quot;logs-*&quot;</span><span class="punctuation">]</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;ignore_unavailable&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;include_global_state&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">false</span></span><span class="punctuation">,</span>     <span class="comment">// 关键：不要把集群级状态一起回滚</span></span><br><span class="line">    <span class="attr">&quot;partial&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">false</span></span>                   <span class="comment">// 有索引不可用就整体失败，避免&quot;半份备份&quot;</span></span><br><span class="line">  <span class="punctuation">&#125;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;retention&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;expire_after&quot;</span><span class="punctuation">:</span> <span class="string">&quot;7d&quot;</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;min_count&quot;</span><span class="punctuation">:</span> <span class="number">3</span><span class="punctuation">,</span></span><br><span class="line">    <span class="attr">&quot;max_count&quot;</span><span class="punctuation">:</span> <span class="number">10</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>两个反直觉的点：</p>
+<p><strong>1. <code>include_global_state: true</code> 是危险默认。</strong> 它会把索引模板、ILM 策略、持久化集群设置一起写进快照。恢复时如果勾选它，可能把<strong>现在的</strong>模板覆盖成七天前的版本，导致新索引建错 mapping。生产建议 <code>false</code>，模板用 Git 管理。</p>
+<p><strong>2. <code>partial: false</code> 让失败变”可见”。</strong> 如果某个索引正好在 relocate，快照可能失败；<code>partial: true</code> 会跳过不可用索引生成”部分快照”，看起来很成功，恢复时才发现少了一个索引。宁可失败告警，也不要静默残缺——除非你明确知道自己在做什么。</p>
+<h2 id="四、恢复：三个硬约束"><a href="#四、恢复：三个硬约束" class="headerlink" title="四、恢复：三个硬约束"></a>四、恢复：三个硬约束</h2><figure class="highlight json"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line">POST _snapshot/s3_backup/prod<span class="number">-2026.11</span><span class="number">.23</span>/_restore</span><br><span class="line"><span class="punctuation">&#123;</span></span><br><span class="line">  <span class="attr">&quot;indices&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-2026.11&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;ignore_unavailable&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">true</span></span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;include_global_state&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">false</span></span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;rename_pattern&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-(.+)&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;rename_replacement&quot;</span><span class="punctuation">:</span> <span class="string">&quot;orders-restored-$1&quot;</span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;include_aliases&quot;</span><span class="punctuation">:</span> <span class="literal"><span class="keyword">false</span></span><span class="punctuation">,</span></span><br><span class="line">  <span class="attr">&quot;index_settings&quot;</span><span class="punctuation">:</span> <span class="punctuation">&#123;</span></span><br><span class="line">    <span class="attr">&quot;index.number_of_replicas&quot;</span><span class="punctuation">:</span> <span class="number">0</span></span><br><span class="line">  <span class="punctuation">&#125;</span></span><br><span class="line"><span class="punctuation">&#125;</span></span><br></pre></td></tr></table></figure>
+
+<p>约束一：<strong>目标索引必须不存在或已 close</strong>。想恢复到同名索引，先 close 或删掉；想保留原索引，就用 <code>rename_pattern</code> 改名。</p>
+<p>约束二：<strong>恢复顺序是”先主分片、后副本”</strong>，且副本在恢复期间不分配。所以恢复大索引时把 <code>number_of_replicas</code> 临时设为 0，恢复完再 <code>PUT settings</code> 调回来，能显著缩短时间——省掉的是”边恢复边复制”的双倍网络与磁盘 IO。</p>
+<p>约束三：<strong>恢复速度受 <code>max_restore_bytes_per_sec</code> 与磁盘吞吐双重限制</strong>。默认 40MB&#x2F;s 往往太保守；NVMe 集群可以调到 200~500MB&#x2F;s，但要先用一台节点测顺序读带宽，别把恢复流量和业务查询抢在一起。</p>
+<p>恢复不是 PITR（point-in-time recovery）：<strong>RPO 等于快照间隔</strong>。想要 5 分钟级 RPO，靠的是副本 + CCR，不是快照。</p>
+<h2 id="五、容量与成本算例"><a href="#五、容量与成本算例" class="headerlink" title="五、容量与成本算例"></a>五、容量与成本算例</h2><p>假设：<code>orders-*</code> 共 1.2TB，日增 40GB，merge 导致每天约 15% 的数据被重写，保留 7 天。</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">首次全量快照：    1.2TB（压缩后约 0.6~0.8TB，取决于字段类型）</span><br><span class="line">每日增量：        约 40GB 新增 + 1.2TB × 15% 的重写段</span><br><span class="line">                ≈ 40 + 180 = 220GB（未压缩）</span><br><span class="line">7 天总量：        约 0.8TB + 6 × 0.15TB ≈ 1.7TB（压缩后）</span><br></pre></td></tr></table></figure>
+
+<p>如果用的是 S3 Standard-IA，1.7TB 月成本约几十美元，比”多一套从库”便宜一个数量级。但如果索引是日志类且 <code>logsdb</code> 模式（合成 <code>_source</code>），快照体积会比原数据小很多——因为 <code>_source</code> 不再单独存。</p>
+<p>一个常被忽略的成本：<strong>快照流量</strong>。跨 AZ&#x2F;跨 region 写 S3 会产生出网费用，别把仓库配在另一个 region。</p>
+<h2 id="六、Java-侧：把恢复演练自动化"><a href="#六、Java-侧：把恢复演练自动化" class="headerlink" title="六、Java 侧：把恢复演练自动化"></a>六、Java 侧：把恢复演练自动化</h2><p>备份的价值只有在”恢复成功”时才成立。建议每月做一次自动演练：恢复到隔离集群 → 校验文档数与抽样内容 → 报告。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">SnapshotDrillJob</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> RestClient client;   <span class="comment">// 复用业务 ES 客户端</span></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">ObjectMapper</span> <span class="variable">mapper</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">ObjectMapper</span>();</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 1. 触发恢复到演练集群（不同 endpoint） */</span></span><br><span class="line">    <span class="keyword">public</span> String <span class="title function_">startRestore</span><span class="params">(String snapshot, String index, String target)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">String</span> <span class="variable">body</span> <span class="operator">=</span> <span class="string">&quot;&quot;&quot;</span></span><br><span class="line"><span class="string">            &#123;</span></span><br><span class="line"><span class="string">              &quot;indices&quot;: &quot;%s&quot;,</span></span><br><span class="line"><span class="string">              &quot;include_global_state&quot;: false,</span></span><br><span class="line"><span class="string">              &quot;rename_pattern&quot;: &quot;(.+)&quot;,</span></span><br><span class="line"><span class="string">              &quot;rename_replacement&quot;: &quot;%s-$1&quot;,</span></span><br><span class="line"><span class="string">              &quot;index_settings&quot;: &#123; &quot;index.number_of_replicas&quot;: 0 &#125;</span></span><br><span class="line"><span class="string">            &#125;</span></span><br><span class="line"><span class="string">            &quot;&quot;&quot;</span>.formatted(index, target);</span><br><span class="line"></span><br><span class="line">        <span class="type">Response</span> <span class="variable">resp</span> <span class="operator">=</span> client.performRequest(<span class="keyword">new</span> <span class="title class_">Request</span>(</span><br><span class="line">            <span class="string">&quot;POST&quot;</span>, <span class="string">&quot;/_snapshot/s3_backup/&quot;</span> + snapshot + <span class="string">&quot;/_restore&quot;</span>,</span><br><span class="line">            Map.of(<span class="string">&quot;wait_for_completion&quot;</span>, <span class="string">&quot;false&quot;</span>),</span><br><span class="line">            <span class="keyword">new</span> <span class="title class_">StringEntity</span>(body, ContentType.APPLICATION_JSON)));</span><br><span class="line"></span><br><span class="line">        <span class="keyword">return</span> mapper.readTree(resp.getEntity().getContent()).get(<span class="string">&quot;snapshot&quot;</span>).get(<span class="string">&quot;name&quot;</span>).asText();</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 2. 轮询恢复状态 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">waitDone</span><span class="params">(String index, Duration timeout)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">deadline</span> <span class="operator">=</span> System.nanoTime() + timeout.toNanos();</span><br><span class="line">        <span class="keyword">while</span> (System.nanoTime() &lt; deadline) &#123;</span><br><span class="line">            <span class="type">Response</span> <span class="variable">r</span> <span class="operator">=</span> client.performRequest(<span class="keyword">new</span> <span class="title class_">Request</span>(</span><br><span class="line">                <span class="string">&quot;GET&quot;</span>, <span class="string">&quot;/&quot;</span> + index + <span class="string">&quot;/_recovery&quot;</span>, Map.of(<span class="string">&quot;active_only&quot;</span>, <span class="string">&quot;true&quot;</span>)));</span><br><span class="line">            <span class="type">JsonNode</span> <span class="variable">root</span> <span class="operator">=</span> mapper.readTree(r.getEntity().getContent());</span><br><span class="line">            <span class="type">boolean</span> <span class="variable">active</span> <span class="operator">=</span> root.elements().next().get(<span class="string">&quot;shards&quot;</span>).elements().next()</span><br><span class="line">                                 .get(<span class="string">&quot;stage&quot;</span>).asText().equals(<span class="string">&quot;DONE&quot;</span>) == <span class="literal">false</span>;</span><br><span class="line">            <span class="keyword">if</span> (!active) <span class="keyword">return</span> <span class="literal">true</span>;</span><br><span class="line">            Thread.sleep(<span class="number">5_000</span>);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">false</span>;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 3. 校验：文档数 + 抽样主键存在性 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">verify</span><span class="params">(String index, <span class="type">long</span> expectedDocs)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="type">Response</span> <span class="variable">count</span> <span class="operator">=</span> client.performRequest(<span class="keyword">new</span> <span class="title class_">Request</span>(<span class="string">&quot;GET&quot;</span>, <span class="string">&quot;/&quot;</span> + index + <span class="string">&quot;/_count&quot;</span>));</span><br><span class="line">        <span class="type">long</span> <span class="variable">actual</span> <span class="operator">=</span> mapper.readTree(count.getEntity().getContent()).get(<span class="string">&quot;count&quot;</span>).asLong();</span><br><span class="line">        <span class="keyword">if</span> (actual != expectedDocs) &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(</span><br><span class="line">                <span class="string">&quot;doc count mismatch: expected=&quot;</span> + expectedDocs + <span class="string">&quot;, actual=&quot;</span> + actual);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>三个工程细节：</p>
+<ul>
+<li><strong><code>wait_for_completion=false</code></strong>：恢复可能几十分钟，同步等待会超时。用轮询 + 告警，而不是阻塞线程。</li>
+<li><strong>校验不要只比文档数</strong>：文档数相同但内容错位是可能的（比如恢复到了错误快照）。抽样 100 条按 <code>_id</code> 取回比对 <code>_source</code> 的哈希。</li>
+<li><strong>演练集群要真的隔离</strong>：不要在同集群用改名恢复做演练，<code>number_of_replicas: 0</code> 的临时设置如果忘了改回来，会造成副本缺失。</li>
+</ul>
+<h2 id="七、故障速查表"><a href="#七、故障速查表" class="headerlink" title="七、故障速查表"></a>七、故障速查表</h2><table>
+<thead>
+<tr>
+<th>现象</th>
+<th>根因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>path.repo not set</code></td>
+<td>未配置仓库根路径</td>
+<td>改 <code>elasticsearch.yml</code> 并滚动重启</td>
+</tr>
+<tr>
+<td><code>repository_verification_exception</code></td>
+<td>节点无写权限&#x2F;路径不可见</td>
+<td>检查挂载与 <code>chown elasticsearch</code></td>
+</tr>
+<tr>
+<td>快照成功但恢复缺索引</td>
+<td><code>partial: true</code> 跳过了不可用索引</td>
+<td>改 <code>false</code>，失败即告警</td>
+</tr>
+<tr>
+<td>恢复卡在 <code>INIT</code>&#x2F;<code>PEER</code></td>
+<td>磁盘水位超限、分片分配被禁</td>
+<td>检查 watermark 与 <code>cluster.routing.allocation.enable</code></td>
+</tr>
+<tr>
+<td>恢复后 alias 丢了</td>
+<td><code>include_aliases: false</code></td>
+<td>恢复后重建 alias，写进 Runbook</td>
+</tr>
+<tr>
+<td>恢复后 mapping 变了</td>
+<td><code>include_global_state: true</code> 覆盖了模板</td>
+<td>关掉它，模板走 Git</td>
+</tr>
+<tr>
+<td>快照体积暴涨</td>
+<td>merge 频繁 &#x2F; <code>forcemerge</code> 后首快照</td>
+<td>避开高峰，监控仓库增长速率</td>
+</tr>
+<tr>
+<td>快照超时</td>
+<td>master 抖动 &#x2F; 仓库限流</td>
+<td>看 master 日志与 <code>max_snapshot_bytes_per_sec</code></td>
+</tr>
+</tbody></table>
+<h2 id="八、面试追问"><a href="#八、面试追问" class="headerlink" title="八、面试追问"></a>八、面试追问</h2><p><strong>Q：快照是热备吗？能直接切流吗？</strong><br>不是。快照是冷备，RPO &#x3D; 间隔。要热备用 CCR（跨集群复制），但它复制的是操作而不是段，且不能替代归档。</p>
+<p><strong>Q：为什么快照不需要停写？</strong><br>因为段不可变，快照引用的段在快照期间不会被修改；merge 只会删除”未被引用”的旧段，仓库里的段文件仍然完整。</p>
+<p><strong>Q：快照期间 merge 会不会导致快照损坏？</strong><br>不会。快照开始时会固定一份段清单，merge 删掉本地文件不影响仓库里已上传的副本；如果某段还没上传就被 merge 删除，ES 会重新从新段上传。</p>
+<p><strong>Q：恢复 1TB 索引要多久？</strong><br>取决于磁盘顺序读带宽与 <code>max_restore_bytes_per_sec</code>。单节点 500MB&#x2F;s 顺序读，理想情况 30<del>40 分钟；实际受分片并行度、副本设置、网络影响，通常按 1</del>2 小时估算。</p>
+<p><strong>Q：能不能只恢复某几个文档？</strong><br>不能。快照是索引&#x2F;分片级。要文档级恢复，只能恢复到临时索引再用 <code>_reindex</code> 挑出来。</p>
+<h2 id="小结"><a href="#小结" class="headerlink" title="小结"></a>小结</h2><p>ES 快照的核心认知只有一句：<strong>快照记录的是不可变段的引用，所以又快又增量</strong>。围绕这句话，仓库配置、SLM 策略、恢复的副本技巧、以及”快照不是 PITR”的边界，都能自然推出来。真正拉开差距的是最后一步——<strong>定期演练恢复</strong>，因为没演练过的备份，只是一个占用存储的假设。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/">https://jiweidong.github.io/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/Elasticsearch/">Elasticsearch</a><a class="post-meta__tags" href="/tags/%E8%BF%90%E7%BB%B4/">运维</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E5%A4%87%E4%BB%BD/">数据备份</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/23/java-rag-parent-child-chunk-sentence-window-deep-practice/" title="【Java AI】RAG 父子块与句子窗口检索深度实战：Small-to-Big、上下文预算与召回评测"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java AI】RAG 父子块与句子窗口检索深度实战：Small-to-Big、上下文预算与召回评测</div></div><div class="info-2"><div class="info-item-1">【Java AI】RAG 父子块与句子窗口检索深度实战面试官：你的 RAG 切块多大？为什么？如果回答”512 token，大家都这么切”，基本会被追问三连：  切大了，向量被稀释，检索精度下降，怎么办？ 切小了，命中的片段只有半句话，模型答不全，怎么办？ 上下文只能放 8K，命中 10 个块塞不进去，怎么办？  这三个问题指向同一个工程矛盾：检索单元和生成单元的最优粒度不一样。检索要”短而准”，生成要”长而全”。Small-to-Big（小块检索、大块返回）就是解这个矛盾的标准手法，落地形态主要有三种：Parent-Child、Sentence Window、Auto-merging。 本文用 Java + Spring AI 的视角把它讲透，包括数据结构、检索链路、token 预算和评测方法。 一、三种 Small-to-Big 策略对比   策略 索引什么 返回什么 优点 代价    Parent-Child 子块（200~300 token） 子块所属父块（800~1500 token） 检索准、上下文完整 需存两层结构与映射   Sentence Window 单句 &...</div></div></div></a><a class="pagination-related" href="/2026/11/23/java-tls-session-resumption-certificate-rotation-deep-practice/" title="【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证</div></div><div class="info-2"><div class="info-item-1">【Java 网络】TLS 会话复用与证书热轮换深度实战面试官：你们的证书 90 天轮换一次，怎么做到不停机？握手能不能省掉？这两个问题其实是一枚硬币的两面：TLS 握手既是最贵的部分，也是证书生效的唯一时机。想省掉握手，就要理解会话复用；想不停机换证，就要理解 JSSE 在什么时候读取 keystore。 先说结论：  TLS 1.3 完整握手 1-RTT，TLS 1.2 需要 2-RTT；一次 ECDSA P-256 握手在服务端的 CPU 开销约为对称加密的两个数量级。 会话复用能把握手压到 0-RTT（TLS 1.3 PSK）或 1-RTT（TLS 1.2 session ticket），但复用的会话里没有”证书”这个概念——客户端认的是会话票据，不是新证书。 因此”轮换证书”和”复用会话”必须一起设计：换证要让旧会话可控地失效，否则新证书上线后仍有一批连接在跑旧会话。  下面按”握手 → 复用 → 换证 → 排障”四段拆。 一、握手成本到底花在哪   阶段 TLS 1.2 TLS 1.3 主要开销    协商 + 密钥交换 2-RTT 1-RTT ECDHE 点乘（最大头...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/19/elasticsearch-shard-allocation-rebalance-deep-practice/" title="【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析</div></div><div class="info-2"><div class="info-item-1">【ES 运维】分片分配与集群规划深度实战：unassigned shard、reroute 与再平衡全解析面试官：集群是 yellow 状态，你怎么办？Yellow 是 Elasticsearch 生产环境最常见的”半故障”：主分片全部就绪，副本分片没能分配。它不阻塞读写，所以很多人选择无视——直到某天一个节点宕机，yellow 变成 red，业务直接不可用。 要真正解决 yellow 和 red，必须理解 ES 的**分片分配（Shard Allocation）**机制：谁在决策、依据什么决策、什么时候会拒绝分配。这篇文章从集群规划讲到故障处置，把分配链路完整拆开。 一、先搞清楚：分片分配的决策者是谁ES 7.x 之后，分配决策由 Master 节点的 AllocationService 负责，配合三个组件：    组件 职责    AllocationDeciders 一串”是否允许分配”的过滤器（过滤器模式），任何一个否决就跳过   ShardsAllocator 在通过决策器的节点中，选一个”最合适”的（均衡度、磁盘水位）   BalancedShardsAllocato...</div></div></div></a><a class="pagination-related" href="/2026/11/11/lucene-tiered-merge-policy-forcemerge-deep-dive/" title="【Java 底层】Lucene 索引合并策略深度解析：TieredMergePolicy、写入放大与 forceMerge 治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-11</div><div class="info-item-2">【Java 底层】Lucene 索引合并策略深度解析：TieredMergePolicy、写入放大与 forceMerge 治理</div></div><div class="info-2"><div class="info-item-1">【Java 底层】Lucene 索引合并策略深度解析：TieredMergePolicy、写入放大与 forceMerge 治理前言线上 ES 集群最常见的一类”玄学问题”：白天写入正常，凌晨却出现查询 P99 翻倍、节点 IO util 打满、write 线程池队列堆积；运维看一眼监控说”段合并（merge）在跑，正常现象”，然后就没有然后了。 另一类更危险的操作是：为了让查询”更快”，有人对着线上索引执行 POST /idx/_forcemerge?max_num_segments=1。结果磁盘没降、内存 page cache 被大段挤爆、查询反而变慢，甚至触发集群熔断。 这两个现象背后是同一套机制：Lucene 的段（segment）不可变 + 后台合并（merge）。合并策略决定了写放大、查询延迟、磁盘占用三者的平衡点。本文从 IndexWriter 的 flush&#x2F;merge 主链路讲到 TieredMergePolicy 的打分公式，再给出一套可落地的 forceMerge 治理规范与监控指标。  一、段、flush 与 merge：先把链路走通Lucene...</div></div></div></a><a class="pagination-related" href="/2026/08/26/elasticsearch-deep-pagination-deep-dive/" title="【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-26</div><div class="info-item-2">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型</div></div><div class="info-2"><div class="info-item-1">【ES 实战】Elasticsearch 深度分页深度解析：from+size、Scroll 与 search_after 原理对比与生产选型面试官：ES 里为什么「深分页」性能差？from+size、scroll、search_after 有什么区别？很多人在 ES 里翻到第 10000 条就报错，或者直接用 scroll 做普通分页导致内存爆炸。深分页是 ES 面试和实战的高频痛点，本文从分布式查询原理出发，把三种分页方案的机制、代价和选型讲清楚。 一、先理解 ES 查询的分布式本质ES 的一个索引分布在多个分片（shard）上。执行一次搜索，流程是：  协调节点（Coordinating Node） 接收查询请求； 把请求广播到所有分片（主分片或副本）； 每个分片本地排序后返回前 size 条（以及聚合信息）； 协调节点归并排序所有分片的结果，取全局前 size 条返回。  关键结论：ES 的排序是「先分片排序、再全局归并」，不是全局一次性排序。这直接决定了深分页的代价。 二、from + size：最直观但最贵123456GET /order/_search&#123; ...</div></div></div></a><a class="pagination-related" href="/2026/10/19/vector-database-selection-deep-dive/" title="【AI 基础】向量数据库选型深度对比：Milvus、Qdrant、pgvector 与 Elasticsearch（Java 客户端视角）"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-19</div><div class="info-item-2">【AI 基础】向量数据库选型深度对比：Milvus、Qdrant、pgvector 与 Elasticsearch（Java 客户端视角）</div></div><div class="info-2"><div class="info-item-1">【AI 基础】向量数据库选型深度对比：Milvus、Qdrant、pgvector 与 Elasticsearch（Java 客户端视角）前言做 RAG 或语义检索，绕不开一个问题：向量存哪儿？ 网上的选型文章大多在比”谁家 benchmark 的 QPS 高”，但真正做工程的人知道，benchmark 里的 1000 万条 768 维向量、单条件过滤、无并发写入，和你线上”每天增量 200 万条、带 5 个元数据过滤条件、还要和业务库事务对齐”完全是两回事。 本文换一个视角：从 Java 后端的落地成本出发，对比四类主流方案：    方案 定位 一句话    Milvus 专用分布式向量数据库 大规模、可水平扩展，运维最重   Qdrant 专用向量数据库（Rust） 过滤能力强、单机性能好，部署轻   pgvector PostgreSQL 扩展 和业务数据同库同事务，最省心   Elasticsearch 搜索引擎 + 向量检索 已有 ES 集群时的自然选择，混合检索强   先说结论（不想看长文的可以拿走）：  数据量 &lt; 500 万、已有 PG → pgvector...</div></div></div></a><a class="pagination-related" href="/2026/07/06/jmx-jvm-monitoring-deep-practice/" title="【JVM实战】JMX 与 JVM 远程监控实战：MBean 管理与生产级监控方案"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-06</div><div class="info-item-2">【JVM实战】JMX 与 JVM 远程监控实战：MBean 管理与生产级监控方案</div></div><div class="info-2"><div class="info-item-1">JMX 与 JVM 远程监控实战：从 MBean 到生产实践一、引言JMX（Java Management Extensions，Java 管理扩展）是 Java 平台内置的管理监控框架，从 JDK 1.5 开始成为 Java 标准的一部分。它提供了一种标准化的方式来监控和管理 Java 应用程序的运行状态。 无论是 JVM 内存使用情况、线程状态、GC 次数，还是自定义的业务指标，都可以通过 JMX 暴露出来。配合 JConsole、VisualVM、Prometheus 等工具，JMX 是 Java 应用监控的基石。 本文将深入解析 JMX 的核心架构、MBean 编程模型、远程连接配置，以及在生产环境中的最佳实践。  二、JMX 架构总览2.1 三层架构JMX 采用三层架构设计： 1234567891011┌─────────────────────────────────────┐│     管理层（Manageability Layer）    ││   JConsole / VisualVM / Prometheus   │├─────────────────────...</div></div></div></a><a class="pagination-related" href="/2026/10/21/mysql-invisible-index-governance-deep-practice/" title="【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-21</div><div class="info-item-2">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战：冗余索引检测、灰度下线与上线前验证</div></div><div class="info-2"><div class="info-item-1">【MySQL 运维】不可见索引（Invisible Index）与索引治理实战前言「索引加得越多，查询越快」——这是我在面试里最常听到、也最想纠正的一句话。 索引不是免费的。每一个二级索引在写入路径上都要付出代价：  INSERT：每多一个索引，就多一次 B+ 树定位插入，多一份 redo&#x2F;undo； UPDATE：只要被索引的列发生变化，就要删除旧记录 + 插入新记录（delete-mark + insert），而不是原地更新； DELETE：所有索引都要打删除标记； 优化器：候选索引越多，range 评估的组合越多，执行计划越容易走偏； 存储：一个千万级表的二级索引，随随便便几十 GB。  一个跑了三五年的业务库，SHOW INDEX 出来十几二十个索引是常态，其中至少三分之一是历史遗留：早期为了某个报表加的、某次慢查询临时加的、开发觉得「加了总没坏处」加的。问题是——你敢直接 DROP INDEX 吗？ 不敢。因为线上没人能保证这个索引真的没人用。白天不敢动，晚上动了出问题没人背。于是索引越堆越多，写入越来越慢，形成死循环。 MySQL 8.0 给的答案叫 不可见...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">967</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1062</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90ES-%E8%BF%90%E7%BB%B4%E3%80%91Elasticsearch-%E5%BF%AB%E7%85%A7%E4%B8%8E%E6%81%A2%E5%A4%8D%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【ES 运维】Elasticsearch 快照与恢复深度实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9AES-%E9%9B%86%E7%BE%A4%E8%A6%81%E5%A4%87%E4%BB%BD%EF%BC%8C%E7%9B%B4%E6%8E%A5-cp-r-data-%E8%A1%8C%E4%B8%8D%E8%A1%8C%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：ES 集群要备份，直接 cp -r data&#x2F; 行不行？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%BF%AB%E7%85%A7%E7%9A%84%E7%89%A9%E7%90%86%E6%9C%AC%E8%B4%A8"><span class="toc-number">1.2.</span> <span class="toc-text">一、快照的物理本质</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E4%BB%93%E5%BA%93%E9%85%8D%E7%BD%AE%EF%BC%9A%E4%B8%89%E7%A7%8D%E5%B8%B8%E8%A7%81%E5%BD%A2%E6%80%81"><span class="toc-number">1.3.</span> <span class="toc-text">二、仓库配置：三种常见形态</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E5%BF%AB%E7%85%A7%E4%B8%8E-SLM%EF%BC%9A%E6%8A%8A%E2%80%9D%E8%AE%B0%E5%BE%97%E5%A4%87%E4%BB%BD%E2%80%9D%E5%8F%98%E6%88%90%E7%AD%96%E7%95%A5"><span class="toc-number">1.4.</span> <span class="toc-text">三、快照与 SLM：把”记得备份”变成策略</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E6%81%A2%E5%A4%8D%EF%BC%9A%E4%B8%89%E4%B8%AA%E7%A1%AC%E7%BA%A6%E6%9D%9F"><span class="toc-number">1.5.</span> <span class="toc-text">四、恢复：三个硬约束</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%AE%B9%E9%87%8F%E4%B8%8E%E6%88%90%E6%9C%AC%E7%AE%97%E4%BE%8B"><span class="toc-number">1.6.</span> <span class="toc-text">五、容量与成本算例</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E4%BE%A7%EF%BC%9A%E6%8A%8A%E6%81%A2%E5%A4%8D%E6%BC%94%E7%BB%83%E8%87%AA%E5%8A%A8%E5%8C%96"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 侧：把恢复演练自动化</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%95%85%E9%9A%9C%E9%80%9F%E6%9F%A5%E8%A1%A8"><span class="toc-number">1.8.</span> <span class="toc-text">七、故障速查表</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B0%8F%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/agent-sandbox-execution-environment-deep-dive/" title="【AI Agent】Agent 代码执行沙箱架构深度解析：隔离等级、资源限额与逃逸防护">【AI Agent】Agent 代码执行沙箱架构深度解析：隔离等级、资源限额与逃逸防护</a><time datetime="2026-11-23T01:20:00.000Z" title="发表于 2026-11-23 09:20:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/java-rag-parent-child-chunk-sentence-window-deep-practice/" title="【Java AI】RAG 父子块与句子窗口检索深度实战：Small-to-Big、上下文预算与召回评测">【Java AI】RAG 父子块与句子窗口检索深度实战：Small-to-Big、上下文预算与召回评测</a><time datetime="2026-11-23T01:00:00.000Z" title="发表于 2026-11-23 09:00:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/" title="【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练">【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练</a><time datetime="2026-11-23T00:40:00.000Z" title="发表于 2026-11-23 08:40:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/java-tls-session-resumption-certificate-rotation-deep-practice/" title="【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证">【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证</a><time datetime="2026-11-23T00:20:00.000Z" title="发表于 2026-11-23 08:20:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/" title="【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌">【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌</a><time datetime="2026-11-23T00:00:00.000Z" title="发表于 2026-11-23 08:00:00">2026-11-23</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>

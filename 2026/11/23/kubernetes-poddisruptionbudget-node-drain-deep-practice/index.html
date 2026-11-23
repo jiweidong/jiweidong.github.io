@@ -1,0 +1,366 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【云原生】PodDisruptionBudget 与节点维护全链路面试官：集群要升级内核，运维说”我们有 PDB，直接 drain 就行”，你怎么看？这道题的分水岭在于：你是否知道 PDB 只约束”自愿驱逐”，而线上真正把服务打挂的，往往是 PDB 管不到的那几类中断。 很多团队把 PDB 当成”高可用开关”：配一个 minAvailable: 50%，就以为节点维护期间业务无感。真实事故里常见的">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【云原生】PodDisruptionBudget 与节点维护全链路面试官：集群要升级内核，运维说”我们有 PDB，直接 drain 就行”，你怎么看？这道题的分水岭在于：你是否知道 PDB 只约束”自愿驱逐”，而线上真正把服务打挂的，往往是 PDB 管不到的那几类中断。 很多团队把 PDB 当成”高可用开关”：配一个 minAvailable: 50%，就以为节点维护期间业务无感。真实事故里常见的">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-23T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-23T00:03:30.520Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Kubernetes">
+<meta property="article:tag" content="云原生">
+<meta property="article:tag" content="高可用">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌",
+  "url": "https://jiweidong.github.io/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-23T00:00:00.000Z",
+  "dateModified": "2026-11-23T00:03:30.520Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">967</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1062</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-23T00:00:00.000Z" title="发表于 2026-11-23 08:00:00">2026-11-23</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-23T00:03:30.520Z" title="更新于 2026-11-23 08:03:30">2026-11-23</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【云原生】PodDisruptionBudget-与节点维护全链路"><a href="#【云原生】PodDisruptionBudget-与节点维护全链路" class="headerlink" title="【云原生】PodDisruptionBudget 与节点维护全链路"></a>【云原生】PodDisruptionBudget 与节点维护全链路</h1><h2 id="面试官：集群要升级内核，运维说”我们有-PDB，直接-drain-就行”，你怎么看？"><a href="#面试官：集群要升级内核，运维说”我们有-PDB，直接-drain-就行”，你怎么看？" class="headerlink" title="面试官：集群要升级内核，运维说”我们有 PDB，直接 drain 就行”，你怎么看？"></a>面试官：集群要升级内核，运维说”我们有 PDB，直接 drain 就行”，你怎么看？</h2><p>这道题的分水岭在于：你是否知道 <strong>PDB 只约束”自愿驱逐”</strong>，而线上真正把服务打挂的，往往是 PDB 管不到的那几类中断。</p>
+<p>很多团队把 PDB 当成”高可用开关”：配一个 <code>minAvailable: 50%</code>，就以为节点维护期间业务无感。真实事故里常见的是三种情况：</p>
+<ol>
+<li><code>drain</code> 卡在 <code>Cannot evict pod as it would violate the pod&#39;s disruption budget</code>，运维加了 <code>--force --grace-period=0</code>，直接把 Pod 打掉，请求 502。</li>
+<li>PDB 允许驱逐，但<strong>同一时刻</strong>滚动发布也在删 Pod，两股”合法”的中断叠加，可用副本瞬间掉到 1。</li>
+<li>节点是空的，但<strong>流量没摘干净</strong>：Endpoint 更新有延迟，Pod 收到 SIGTERM 后立刻关端口，几十秒的 5xx。</li>
+</ol>
+<p>所以这道题的正确答法是先分类，再算预算，最后讲编排顺序。</p>
+<h2 id="一、先把”驱逐”这个词拆开"><a href="#一、先把”驱逐”这个词拆开" class="headerlink" title="一、先把”驱逐”这个词拆开"></a>一、先把”驱逐”这个词拆开</h2><p>Kubernetes 里至少有四种让 Pod 消失的路径，语义完全不同：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>触发者</th>
+<th>是否尊重 PDB</th>
+<th>是否有优雅期</th>
+<th>典型场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Eviction API（<code>policy/v1 Eviction</code>）</td>
+<td><code>kubectl drain</code>、descheduler、集群升级</td>
+<td><strong>是</strong></td>
+<td>是（默认 grace）</td>
+<td>节点维护、主动腾挪</td>
+</tr>
+<tr>
+<td>kubelet 压力驱逐</td>
+<td>kubelet（memory&#x2F;nodefs&#x2F;pid 压力）</td>
+<td><strong>否</strong></td>
+<td>很短（软驱逐可配）</td>
+<td>节点内存打满、磁盘写满</td>
+</tr>
+<tr>
+<td>直接删除（<code>kubectl delete pod</code>、Deployment 滚动）</td>
+<td>控制器&#x2F;人</td>
+<td><strong>否</strong></td>
+<td>是</td>
+<td>发布、扩缩容</td>
+</tr>
+<tr>
+<td>节点失联 &#x2F; NotReady</td>
+<td>node controller</td>
+<td>否</td>
+<td><code>pod-eviction-timeout</code> 后强制删</td>
+<td>宕机、网络分区</td>
+</tr>
+</tbody></table>
+<p>这张表要能背下来。它直接解释了两个高频追问：</p>
+<ul>
+<li>“我们配了 PDB，为什么节点内存打满时还是全挂了？”——因为 kubelet 压力驱逐不查 PDB。</li>
+<li>“drain 为什么不动？”——因为 Eviction API 会查 PDB，<code>disruptionsAllowed == 0</code> 时返回 429。</li>
+</ul>
+<h2 id="二、PDB-的预算到底怎么算"><a href="#二、PDB-的预算到底怎么算" class="headerlink" title="二、PDB 的预算到底怎么算"></a>二、PDB 的预算到底怎么算</h2><p>PDB 只有两个字段二选一：<code>minAvailable</code>（最小可用）或 <code>maxUnavailable</code>（最大不可用），都支持百分比。核心是三个数：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">expectedPods        = selector 匹配到的 Pod 总数（只统计 Running/Ready，且必须有 controller）</span><br><span class="line">desiredHealthy      = minAvailable 或 (expectedPods - maxUnavailable)</span><br><span class="line">currentHealthy      = 当前 Ready 的 Pod 数</span><br><span class="line">disruptionsAllowed  = currentHealthy - desiredHealthy   // 小于 0 时按 0 处理</span><br></pre></td></tr></table></figure>
+
+<p>三个必须注意的细节：</p>
+<p><strong>1. 百分比取整方向相反。</strong> <code>minAvailable: 50%</code> 在 3 副本时向上取整为 2（只能驱逐 1 个）；<code>maxUnavailable: 50%</code> 在 3 副本时向下取整为 1（也只能驱逐 1 个）。副本数是奇数时，两种写法结果一样；副本数是偶数时就会分叉，别凭感觉写。</p>
+<p><strong>2. 没有 controller 的裸 Pod 不参与计算。</strong> PDB 只对 ReplicaSet&#x2F;StatefulSet&#x2F;Deployment 这类有 owner 的 Pod 生效。裸 Pod 会被算进 <code>expectedPods</code> 的干扰项，导致预算永远算不对。</p>
+<p><strong>3. <code>minAvailable: 100%</code> 是”永远不允许自愿驱逐”。</strong> 它看起来最安全，实际会让所有节点维护永久阻塞。3 副本服务想要”最多挂 1 个”，写 <code>maxUnavailable: 1</code>；想要”至少 2 个”，写 <code>minAvailable: 2</code>，语义清晰且不会被取整坑到。</p>
+<p>一个生产可用的写法：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">apiVersion:</span> <span class="string">policy/v1</span></span><br><span class="line"><span class="attr">kind:</span> <span class="string">PodDisruptionBudget</span></span><br><span class="line"><span class="attr">metadata:</span></span><br><span class="line">  <span class="attr">name:</span> <span class="string">order-service-pdb</span></span><br><span class="line"><span class="attr">spec:</span></span><br><span class="line">  <span class="attr">maxUnavailable:</span> <span class="number">1</span>          <span class="comment"># 明确表达&quot;一次最多少一个&quot;</span></span><br><span class="line">  <span class="attr">selector:</span></span><br><span class="line">    <span class="attr">matchLabels:</span></span><br><span class="line">      <span class="attr">app:</span> <span class="string">order-service</span></span><br><span class="line">  <span class="attr">unhealthyPodEvictionPolicy:</span> <span class="string">AlwaysAllow</span>   <span class="comment"># 1.27+：不健康 Pod 允许直接驱逐，避免卡死</span></span><br><span class="line"><span class="meta">---</span></span><br><span class="line"><span class="attr">apiVersion:</span> <span class="string">apps/v1</span></span><br><span class="line"><span class="attr">kind:</span> <span class="string">Deployment</span></span><br><span class="line"><span class="attr">metadata:</span></span><br><span class="line">  <span class="attr">name:</span> <span class="string">order-service</span></span><br><span class="line"><span class="attr">spec:</span></span><br><span class="line">  <span class="attr">replicas:</span> <span class="number">4</span></span><br><span class="line">  <span class="attr">strategy:</span></span><br><span class="line">    <span class="attr">rollingUpdate:</span></span><br><span class="line">      <span class="attr">maxUnavailable:</span> <span class="number">0</span>      <span class="comment"># 发布期间靠 surge 起新 Pod，不靠&quot;先删后建&quot;</span></span><br><span class="line">      <span class="attr">maxSurge:</span> <span class="number">1</span></span><br><span class="line">  <span class="attr">template:</span></span><br><span class="line">    <span class="attr">spec:</span></span><br><span class="line">      <span class="attr">terminationGracePeriodSeconds:</span> <span class="number">60</span></span><br><span class="line">      <span class="attr">containers:</span></span><br><span class="line">        <span class="bullet">-</span> <span class="attr">name:</span> <span class="string">app</span></span><br><span class="line">          <span class="attr">image:</span> <span class="string">registry/order-service:1.8.3</span></span><br><span class="line">          <span class="attr">readinessProbe:</span></span><br><span class="line">            <span class="attr">httpGet:</span> &#123; <span class="attr">path:</span> <span class="string">/actuator/health/readiness</span>, <span class="attr">port:</span> <span class="number">8080</span> &#125;</span><br><span class="line">            <span class="attr">periodSeconds:</span> <span class="number">5</span></span><br><span class="line">            <span class="attr">failureThreshold:</span> <span class="number">2</span></span><br><span class="line">          <span class="attr">lifecycle:</span></span><br><span class="line">            <span class="attr">preStop:</span></span><br><span class="line">              <span class="attr">exec:</span></span><br><span class="line">                <span class="attr">command:</span> [<span class="string">&quot;sh&quot;</span>, <span class="string">&quot;-c&quot;</span>, <span class="string">&quot;sleep 8&quot;</span>]   <span class="comment"># 等 Endpoint 摘干净</span></span><br></pre></td></tr></table></figure>
+
+<p>注意 <code>maxUnavailable: 0</code> 的含义：发布期不缺容量，但<strong>它不保护 drain</strong>。drain 走的是 Eviction API，看的是 PDB，不是 Deployment 的滚动参数。这是两套独立预算，很多事故就出在”以为是一套”。</p>
+<h2 id="三、drain-的完整流程与卡点"><a href="#三、drain-的完整流程与卡点" class="headerlink" title="三、drain 的完整流程与卡点"></a>三、drain 的完整流程与卡点</h2><p><code>kubectl drain node-7</code> 的实际动作顺序：</p>
+<ol>
+<li><code>cordon</code>：把节点标记为 <code>SchedulingDisabled</code>，不再调度新 Pod。</li>
+<li>逐个对 Pod 发 Eviction 请求（每个 Pod 一次，带 grace period）。</li>
+<li>DaemonSet 管理的 Pod 默认跳过；要驱逐必须显式 <code>--ignore-daemonsets</code>。</li>
+<li>使用 <code>emptyDir</code> 的 Pod 默认拒绝驱逐；要驱逐必须 <code>--delete-emptydir-data</code>（数据会丢，先确认无状态）。</li>
+<li>有本地存储（local PV）的 Pod 会直接拒绝，需要人工迁移数据。</li>
+</ol>
+<p>三个高频卡点及排查命令：</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 1) PDB 卡住</span></span><br><span class="line">kubectl get pdb -A</span><br><span class="line">kubectl describe pdb order-service-pdb -n prod</span><br><span class="line"><span class="comment"># 关注 DisruptionsAllowed 是否为 0，以及 Events 里的</span></span><br><span class="line"><span class="comment"># &quot;Cannot evict pod as it would violate the pod&#x27;s disruption budget&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 2) 到底是谁在占着预算</span></span><br><span class="line">kubectl get pods -n prod -l app=order-service \</span><br><span class="line">  -o custom-columns=NAME:.metadata.name,READY:.status.containerStatuses[0].ready,NODE:.spec.nodeName</span><br><span class="line"></span><br><span class="line"><span class="comment"># 3) drain 卡住时不要 --force，先看还有哪些 Pod 没走</span></span><br><span class="line">kubectl get pods -A --field-selector spec.nodeName=node-7</span><br></pre></td></tr></table></figure>
+
+<p>如果 <code>DisruptionsAllowed = 0</code> 且 <code>CurrentHealthy = ExpectedPods</code>，说明是<strong>副本数刚好等于 minAvailable</strong>——服务本身就没有冗余，drain 必然阻塞。这时候正确的做法是<strong>先扩容</strong>，而不是加 <code>--force</code>。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">kubectl scale deploy order-service -n prod --replicas=5</span><br><span class="line"><span class="comment"># 等 5 个 Ready 后 drain 会自然放行</span></span><br></pre></td></tr></table></figure>
+
+<p><code>--force --grace-period=0</code> 会绕过优雅期直接 SIGKILL，等于放弃所有在途请求。它应该只用于”确认无流量的测试集群”。</p>
+<h2 id="四、drain-期间的流量摘除时序"><a href="#四、drain-期间的流量摘除时序" class="headerlink" title="四、drain 期间的流量摘除时序"></a>四、drain 期间的流量摘除时序</h2><p>即使 PDB 放行、Pod 优雅退出，仍有一段<strong>必然的 5xx 窗口</strong>，原因在控制面延迟：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">t0  Eviction 请求被接受</span><br><span class="line">t1  Pod 进入 Terminating，同时从 Endpoints/EndpointSlice 标记 notReady</span><br><span class="line">t2  kube-proxy / ingress controller / client-side LB 感知变更   ← 延迟 1~10s</span><br><span class="line">t3  容器真正收到 SIGTERM                                        ← 与 t1 几乎同时</span><br></pre></td></tr></table></figure>
+
+<p>问题在于 t3 早于 t2。容器在 t1 就开始关连接，而还有一部分流量在往它身上打。解决办法就是 <code>preStop sleep</code>：让容器在收到 SIGTERM 后<strong>先继续服务几秒</strong>，等 Endpoint 传播完成再退出。</p>
+<p>经验取值：<code>preStop sleep ≈ 2 × (端点传播延迟)</code>，Ingress&#x2F;NLB 场景一般 5~15 秒。同时 <code>terminationGracePeriodSeconds</code> 必须大于 <code>preStop</code> + 应用自身关停时间，否则 kubelet 会在 grace 结束时 SIGKILL。</p>
+<p>Java 侧配套三件事：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 1. 优雅停机：先拒绝新请求，再等在途请求结束</span></span><br><span class="line"><span class="comment">// application.yml</span></span><br><span class="line"><span class="comment">// server.shutdown: graceful</span></span><br><span class="line"><span class="comment">// spring.lifecycle.timeout-per-shutdown-phase: 30s</span></span><br><span class="line"></span><br><span class="line"><span class="comment">// 2. readiness 先失败（配合 preStop 更稳）：让 LB 提前摘流量</span></span><br><span class="line"><span class="meta">@RestController</span></span><br><span class="line"><span class="keyword">class</span> <span class="title class_">ReadinessController</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> <span class="type">AtomicBoolean</span> <span class="variable">draining</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">AtomicBoolean</span>(<span class="literal">false</span>);</span><br><span class="line"></span><br><span class="line">    <span class="meta">@PostMapping(&quot;/internal/drain&quot;)</span></span><br><span class="line">    <span class="keyword">void</span> <span class="title function_">drain</span><span class="params">()</span> &#123; draining.set(<span class="literal">true</span>); &#125;</span><br><span class="line"></span><br><span class="line">    <span class="meta">@GetMapping(&quot;/actuator/health/readiness&quot;)</span></span><br><span class="line">    ResponseEntity&lt;String&gt; <span class="title function_">ready</span><span class="params">()</span> &#123;</span><br><span class="line">        <span class="keyword">return</span> draining.get()</span><br><span class="line">            ? ResponseEntity.status(<span class="number">503</span>).body(<span class="string">&quot;draining&quot;</span>)</span><br><span class="line">            : ResponseEntity.ok(<span class="string">&quot;UP&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// 3. 线程池/消费者要能被关停，而不是靠 JVM 退出了事</span></span><br><span class="line"><span class="meta">@PreDestroy</span></span><br><span class="line"><span class="keyword">void</span> <span class="title function_">shutdown</span><span class="params">()</span> <span class="keyword">throws</span> InterruptedException &#123;</span><br><span class="line">    executor.shutdown();</span><br><span class="line">    <span class="keyword">if</span> (!executor.awaitTermination(<span class="number">20</span>, TimeUnit.SECONDS)) &#123;</span><br><span class="line">        executor.shutdownNow();</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>Kafka 消费者还有一个额外点：drain 触发的实例下线会引发 rebalance。若用 <code>@KafkaListener</code>，务必配置 <code>spring.kafka.listener.immediate-stop: true</code> 与合适的 <code>max.poll.interval.ms</code>，否则 consumer 会在关闭前提交失败，导致重复消费。</p>
+<h2 id="五、容量预算：把”能不能维护”算出来"><a href="#五、容量预算：把”能不能维护”算出来" class="headerlink" title="五、容量预算：把”能不能维护”算出来"></a>五、容量预算：把”能不能维护”算出来</h2><p>面试里如果追问”一次能维护几台机器”，要给出可推导的答案，而不是拍脑袋。</p>
+<p>设某服务副本数 <code>R</code>、PDB <code>maxUnavailable = M</code>、单机承载能力为整机 QPS 的 <code>1/R</code>，则一次可同时维护的节点数上限是 <code>M</code>（因为 Eviction 是逐个 Pod 判定，同一时刻最多让 <code>M</code> 个不健康）。但真实的容量约束更严：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">单次维护窗口可用容量 = (R - M) / R</span><br><span class="line">需要的冗余度        = 1 / (1 - M/R)</span><br></pre></td></tr></table></figure>
+
+<p>4 副本、<code>maxUnavailable: 1</code> → 维护期只剩 75% 容量。如果节点本身水位已达 70%，这个窗口是危险的。所以节点维护前要做两件事：</p>
+<ol>
+<li><strong>确认剩余节点还有多少 headroom</strong>：<code>kubectl describe node</code> 看 Allocated resources，或用 VPA&#x2F;监控看实际 CPU&#x2F;内存峰值。</li>
+<li><strong>错开发布窗口</strong>：发布（滚动）+ 维护（drain）叠加时，两者的不可用量要合并计算。最保守的策略是维护期间冻结发布。</li>
+</ol>
+<p>还要注意<strong>跨可用区</strong>：如果 PDB 只按 <code>app</code> 选择，drain 可能把某 AZ 的副本全清空。多 AZ 部署应把 PDB selector 加上 <code>topology.kubernetes.io/zone</code> 维度，或用 <code>topologySpreadConstraints</code> 保证分布。</p>
+<h2 id="六、一份可执行的维护-Runbook"><a href="#六、一份可执行的维护-Runbook" class="headerlink" title="六、一份可执行的维护 Runbook"></a>六、一份可执行的维护 Runbook</h2><figure class="highlight text"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">[维护前 24h]</span><br><span class="line">  1. kubectl get pdb -A，确认所有业务 PDB 的 DisruptionsAllowed &gt; 0</span><br><span class="line">  2. 检查目标节点上的 Pod：是否有裸 Pod / local PV / emptyDir 有状态服务</span><br><span class="line">  3. 确认监控大盘：5xx 率、P99、Pending Pod 数、PDB 状态</span><br><span class="line">  4. 通知业务方冻结发布窗口</span><br><span class="line"></span><br><span class="line">[维护窗口]</span><br><span class="line">  5. kubectl cordon node-7</span><br><span class="line">  6. kubectl drain node-7 --ignore-daemonsets --delete-emptydir-data --timeout=15m</span><br><span class="line">     （不要 --force；超时就停下来看 PDB）</span><br><span class="line">  7. 观察 5xx 与 P99，超过阈值立即 kubectl uncordon 回滚</span><br><span class="line">  8. 执行节点操作（内核升级/重启）</span><br><span class="line"></span><br><span class="line">[恢复]</span><br><span class="line">  9. kubectl uncordon node-7</span><br><span class="line"> 10. 观察新 Pod 调度与 PDB 恢复；确认无 Pending</span><br><span class="line"> 11. 记录本次最大不可用 Pod 数与 5xx 峰值</span><br></pre></td></tr></table></figure>
+
+<h2 id="七、面试追问速答"><a href="#七、面试追问速答" class="headerlink" title="七、面试追问速答"></a>七、面试追问速答</h2><p><strong>Q：PDB 和 Deployment 的 maxUnavailable 有什么区别？</strong><br>PDB 约束<strong>自愿驱逐</strong>（Eviction API），Deployment 的 maxUnavailable 约束<strong>滚动更新</strong>时的删旧建新。两者互不感知，同时发生会叠加。</p>
+<p><strong>Q：为什么 drain 之后 Pod 一直 Pending？</strong><br>新节点没有足够资源、亲和性&#x2F;污点不匹配、或 PVC 的拓扑限制（local PV &#x2F; 单 AZ 云盘）。先看 <code>kubectl describe pod</code> 的 Events。</p>
+<p><strong>Q：DaemonSet 的 Pod 会阻塞 drain 吗？</strong><br>不会阻塞，但默认不驱逐。加 <code>--ignore-daemonsets</code> 表示”跳过它们”，节点上的 DaemonSet Pod 会随节点重启自然重建。</p>
+<p><strong>Q：PDB 能防住 OOMKilled 吗？</strong><br>不能。OOMKilled 是 cgroup 层杀进程，属于”非自愿中断”，PDB 完全不参与。这类保护要靠 QoS、<code>memory.high</code> 限流与堆外内存预算。</p>
+<p><strong>Q：StatefulSet 的 drain 有什么额外风险？</strong><br>有状态 Pod 通常不能并发重建，且可能绑定 PVC 的可用区；同时 PDB 对 StatefulSet 生效但 <code>podManagementPolicy: OrderedReady</code> 会拉长重建时间，维护窗口要按”最慢单副本恢复时间 × 副本数”估算。</p>
+<p><strong>Q：怎么验证 PDB 配置真的有效？</strong><br>在预发集群做一次 drain 演练，观察 <code>DisruptionsAllowed</code> 与 5xx；再故意把副本缩到 <code>minAvailable</code>，确认 drain 会阻塞——能阻塞才说明 PDB 真的在生效。</p>
+<h2 id="八、踩坑清单"><a href="#八、踩坑清单" class="headerlink" title="八、踩坑清单"></a>八、踩坑清单</h2><table>
+<thead>
+<tr>
+<th>坑</th>
+<th>表现</th>
+<th>正确做法</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>minAvailable: 100%</code></td>
+<td>drain 永久阻塞</td>
+<td>用 <code>maxUnavailable: 1</code></td>
+</tr>
+<tr>
+<td>直接 <code>--force</code></td>
+<td>502 尖峰</td>
+<td>先扩容再 drain</td>
+</tr>
+<tr>
+<td>PDB selector 写错 label</td>
+<td>PDB 匹配 0 个 Pod，形同虚设</td>
+<td><code>kubectl get pdb -o wide</code> 核对</td>
+</tr>
+<tr>
+<td>发布与维护同窗口</td>
+<td>可用副本腰斩</td>
+<td>冻结发布或分批</td>
+</tr>
+<tr>
+<td>没有 preStop</td>
+<td>drain 期间稳定 5xx</td>
+<td>preStop sleep 5~15s</td>
+</tr>
+<tr>
+<td>忽略 DaemonSet 的本地日志</td>
+<td>节点重启后日志丢失</td>
+<td>日志外送，别存 emptyDir</td>
+</tr>
+<tr>
+<td>只按 app 选</td>
+<td>单 AZ 副本被清空</td>
+<td>加 zone 维度 + 拓扑打散</td>
+</tr>
+</tbody></table>
+<h2 id="小结"><a href="#小结" class="headerlink" title="小结"></a>小结</h2><p>PDB 不是”高可用开关”，它只是<strong>自愿驱逐的预算闸门</strong>。真正的节点维护安全来自四件事的组合：正确的预算（<code>maxUnavailable</code> 而非 100%）、足够的冗余（维护前先扩容）、干净的流量摘除（preStop + readiness）、以及错开的变更窗口。把这条链路讲清楚，比背十个 kubectl 参数更能体现工程判断力。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/">https://jiweidong.github.io/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E9%AB%98%E5%8F%AF%E7%94%A8/">高可用</a><a class="post-meta__tags" href="/tags/Kubernetes/">Kubernetes</a><a class="post-meta__tags" href="/tags/%E4%BA%91%E5%8E%9F%E7%94%9F/">云原生</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/23/java-tls-session-resumption-certificate-rotation-deep-practice/" title="【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证</div></div><div class="info-2"><div class="info-item-1">【Java 网络】TLS 会话复用与证书热轮换深度实战面试官：你们的证书 90 天轮换一次，怎么做到不停机？握手能不能省掉？这两个问题其实是一枚硬币的两面：TLS 握手既是最贵的部分，也是证书生效的唯一时机。想省掉握手，就要理解会话复用；想不停机换证，就要理解 JSSE 在什么时候读取 keystore。 先说结论：  TLS 1.3 完整握手 1-RTT，TLS 1.2 需要 2-RTT；一次 ECDSA P-256 握手在服务端的 CPU 开销约为对称加密的两个数量级。 会话复用能把握手压到 0-RTT（TLS 1.3 PSK）或 1-RTT（TLS 1.2 session ticket），但复用的会话里没有”证书”这个概念——客户端认的是会话票据，不是新证书。 因此”轮换证书”和”复用会话”必须一起设计：换证要让旧会话可控地失效，否则新证书上线后仍有一批连接在跑旧会话。  下面按”握手 → 复用 → 换证 → 排障”四段拆。 一、握手成本到底花在哪   阶段 TLS 1.2 TLS 1.3 主要开销    协商 + 密钥交换 2-RTT 1-RTT ECDHE 点乘（最大头...</div></div></div></a><a class="pagination-related" href="/2026/11/22/ai-engineer-one-year-quarterly-learning-plan/" title="【AI 转型】Java 后端转 AI 应用开发的一年：四季度学习计划、项目阶梯与验收标准"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【AI 转型】Java 后端转 AI 应用开发的一年：四季度学习计划、项目阶梯与验收标准</div></div><div class="info-2"><div class="info-item-1">【AI 转型】Java 后端转 AI 应用开发的一年前言市面上不缺「30 天速成」「60 天入门」的计划。真正的问题是：速成之后呢？ 我见过太多 Java 后端的学习轨迹：花两周看完 Prompt 教程，跟着敲了一个 RAG Demo，买了本《大模型应用开发》，然后在第三个月卡住——Demo 能跑，但说不清为什么要重排、不知道 Token 成本怎么算、面试被问「你的 Agent 怎么评测」直接哑火。再往后，工作一忙，学习就断了。 转型不是短跑，是一年的结构性投入。这篇文章给出一份可执行的年度计划：四个季度，每季度一个明确的能力台阶、一个可交付的项目、一组可验证的验收标准。每周投入按 10 小时设计（工作日晚上 1 小时 + 周末半天），适合在职工程师。 先说结论：一年后你应该能独立设计并上线一个多租户的 RAG + Agent 应用，能说清每个技术选型的取舍，并有可展示的作品和可复述的踩坑。  一、先定义终点：目标岗位到底要什么把招聘 JD 拆开，AI 应用开发工程师（非算法岗）的高频要求集中在五块：    能力块 具体表现 权重    LLM 应用开发 Prompt、结构化输出...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/07/28/spring-cloud-kubernetes-deep-practice/" title="【云原生实战】Spring Cloud Kubernetes 微服务在 K8s 中的部署与服务治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-28</div><div class="info-item-2">【云原生实战】Spring Cloud Kubernetes 微服务在 K8s 中的部署与服务治理</div></div><div class="info-2"><div class="info-item-1">【云原生实战】Spring Cloud Kubernetes 微服务在 K8s 中的部署与服务治理一、为什么需要 Spring Cloud Kubernetes？Spring Cloud 在传统微服务架构中提供了服务发现（Eureka&#x2F;Nacos）、配置管理（Config Server）、负载均衡（Ribbon&#x2F;LoadBalancer）等能力。当微服务迁移到 Kubernetes 后，很多基础设施能力 K8s 已经内置：    能力 传统 Spring Cloud Kubernetes 原生 Spring Cloud K8s    服务发现 Eureka &#x2F; Nacos Service + DNS @K8sServiceDiscovery   配置管理 Config Server ConfigMap &#x2F; Secret @ConfigMapPropertySource   负载均衡 Ribbon Service (RoundRobin) 内置 K8s Service   健康检查 Actuator &#x2F; &#x2F;health L...</div></div></div></a><a class="pagination-related" href="/2026/11/01/jvm-container-cpu-limit-thread-sizing-deep-dive/" title="【JVM 云原生】容器 CPU Limit 与 JVM 并行度适配深度解析：ActiveProcessorCount、GC 线程与线程池 sizing"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-01</div><div class="info-item-2">【JVM 云原生】容器 CPU Limit 与 JVM 并行度适配深度解析：ActiveProcessorCount、GC 线程与线程池 sizing</div></div><div class="info-2"><div class="info-item-1">【JVM 云原生】容器 CPU Limit 与 JVM 并行度适配深度解析前言先说一个我亲历的事故。 一个 Spring Boot 服务迁到 K8s，Pod 配置 limits.cpu: 2。上线后 P99 从 80ms 涨到 900ms，CPU 使用率却只有 35%——监控上看”资源很闲”，业务上”响应很慢”。 排查了两天才定位：JVM 认为这台机器有 64 个核。 于是：  G1 开了 41 个 ParallelGCThreads（8 + (64-8)×5/8 = 43，受堆大小微调） ForkJoinPool.commonPool 并行度 &#x3D; 63 Netty EventLoop &#x3D; 128 个线程 虚拟线程的 carrier pool 并行度 &#x3D; 64 各种 Executors.newFixedThreadPool(availableProcessors) 全部按 64 起步  64 个线程抢 2 个核的 quota，每次 cgroup 周期（100ms）配额在 20ms 内就被打光，剩下 80ms 全部被 throttle（限流挂起）。表现...</div></div></div></a><a class="pagination-related" href="/2026/11/16/k8s-pod-eviction-jvm-memory-governance-deep-dive/" title="【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-16</div><div class="info-item-2">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析：QoS、memory.high 与 OOM 边界</div></div><div class="info-2"><div class="info-item-1">【云原生】Kubernetes Pod 驱逐与 JVM 内存治理深度解析一、前言把 Java 应用搬进 Kubernetes 之后，很多团队都遇到过这样的怪事：容器退出码 137，但翻遍应用日志找不到 OutOfMemoryError；明明堆只用了 60%，Pod 却被反复驱逐；调大了 -Xmx，重启反而更频繁。 根因是：容器里的内存死亡路径不止一条。JVM 堆 OOM、cgroup OOM Kill、kubelet 驱逐、节点内核 OOM Killer，四条路径的触发者、判断依据、退出表现都不一样。只盯着 -Xmx 调参，等于在四条并行的高速公路上只修了一条。 本文按「谁在什么条件下杀进程」这条主线，把 Pod 驱逐与 JVM 内存治理拆开讲清楚，并给出可直接落地的配置模板与 Java 侧代码。   二、四条内存死亡路径2.1 全景对比   路径 触发者 判断依据 进程信号 K8s 侧表现 应用日志    JVM 堆 OOM JVM 自身 堆&#x2F;元空间&#x2F;直接内存超限 抛 OutOfMemoryError 可能仍 Running，随后崩溃 有明确异常栈   cg...</div></div></div></a><a class="pagination-related" href="/2026/11/22/spring-boot-502-504-release-failure-deep-dive/" title="【生产实战】发布期 502&#x2F;504 全链路归因：Nginx upstream、Tomcat 队列、readiness 与流量排空"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-22</div><div class="info-item-2">【生产实战】发布期 502&#x2F;504 全链路归因：Nginx upstream、Tomcat 队列、readiness 与流量排空</div></div><div class="info-2"><div class="info-item-1">【生产实战】发布期 502&#x2F;504 全链路归因前言很多团队都有这样的经历：平时系统稳如老狗，一到发布就零星报错。监控上看到一小段 502&#x2F;504，持续 30 秒到 2 分钟，发布完成后自动恢复。因为「时间短、能自愈」，往往被当成正常现象记进发布须知。 但从用户视角，这几十秒就是下单失败、支付中断、页面白屏。而且这类问题的根因分布很广：Nginx 连接复用、Tomcat 接受队列、K8s 探针、注册中心摘除延迟、优雅停机顺序……任何一环配错都会复现。 这篇文章按请求链路逐跳拆解 502&#x2F;504，给出可落地的配置基线和排查命令。  一、先搞清 502 和 504 是谁返回的   状态码 语义 常见返回方    502 Bad Gateway 上游返回了非法响应 &#x2F; 连接被重置 &#x2F; 无法建连 Nginx、网关   504 Gateway Timeout 上游在超时时间内没有返回 Nginx、网关   499 客户端主动断开（Nginx 自定义） Nginx   503 服务不可用 &#x2F; 队列满 Tomcat、网关、应用   排查...</div></div></div></a><a class="pagination-related" href="/2026/09/20/micronaut-framework-deep-practice/" title="【云原生框架】Micronaut 深度解析：编译时依赖注入、AOT 与 Spring Boot 对比实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-20</div><div class="info-item-2">【云原生框架】Micronaut 深度解析：编译时依赖注入、AOT 与 Spring Boot 对比实战</div></div><div class="info-2"><div class="info-item-1">【云原生框架】Micronaut 深度解析：编译时依赖注入、AOT 与 Spring Boot 对比实战面试官：Spring Boot 启动慢、内存高，有什么办法？这是 Java 面试里越来越常见的一道“架构思维题”。常规答案有三条路：  JVM 层调优：AppCDS、分代 ZGC、-XX:TieredStopAtLevel=1、延迟加载； GraalVM Native Image：AOT 编译成原生镜像，启动毫秒级； 换框架：用编译时 DI 的框架，从根上消除反射扫描——Quarkus、Micronaut 就是这个路子。  第三条最容易被忽略，但恰恰是最“治本”的。而 Micronaut 又是其中把“编译时”贯彻得最彻底的一个：  Micronaut 在编译期通过注解处理器（Annotation Processor）生成所有 Bean 定义、AOP 代理、HTTP 路由表和客户端实现。运行期不扫描 classpath、不用反射做注入、不建动态代理。所以它启动快、内存小，且天然 GraalVM friendly。  这篇文章把 Micronaut 的核心机制（编译时 DI &#x...</div></div></div></a><a class="pagination-related" href="/2026/07/28/java-kubernetes-client-fabric8-practice/" title="【云原生实战】Java Kubernetes 客户端开发实战：Fabric8 从入门到生产级操作"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-07-28</div><div class="info-item-2">【云原生实战】Java Kubernetes 客户端开发实战：Fabric8 从入门到生产级操作</div></div><div class="info-2"><div class="info-item-1">【云原生实战】Java Kubernetes 客户端开发实战：Fabric8 从入门到生产级操作一、引言在云原生时代，越来越多的 Java 应用需要以编程方式与 Kubernetes 集群交互。无论是开发 CI&#x2F;CD 工具链、自定义调度器、Operator，还是构建内部 PaaS 平台，都需要一个强大易用的 Kubernetes Java 客户端。 目前主流的两个 Java K8s 客户端：    特性 Fabric8 Kubernetes Client Kubernetes Java Client (官方)    代码风格 Fluent Builder + DSL Builder 模式   OpenAPI 生成 ✅ 基于 HTTP ✅ 基于 HTTP   Mock 测试 ✅ 内置 Mock Server ❌ 需自建   CRD (CRUD 操作) ✅ 原生支持 ✅ 支持   Spring Boot 集成 ✅ starter ❌   Openshift 支持 ✅ 扩展 ❌   社区活跃度 ⭐ 高 中等   本文聚焦 Fabric8，因为它在 Jenkins、Spring...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">967</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1062</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E4%BA%91%E5%8E%9F%E7%94%9F%E3%80%91PodDisruptionBudget-%E4%B8%8E%E8%8A%82%E7%82%B9%E7%BB%B4%E6%8A%A4%E5%85%A8%E9%93%BE%E8%B7%AF"><span class="toc-number">1.</span> <span class="toc-text">【云原生】PodDisruptionBudget 与节点维护全链路</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E9%9D%A2%E8%AF%95%E5%AE%98%EF%BC%9A%E9%9B%86%E7%BE%A4%E8%A6%81%E5%8D%87%E7%BA%A7%E5%86%85%E6%A0%B8%EF%BC%8C%E8%BF%90%E7%BB%B4%E8%AF%B4%E2%80%9D%E6%88%91%E4%BB%AC%E6%9C%89-PDB%EF%BC%8C%E7%9B%B4%E6%8E%A5-drain-%E5%B0%B1%E8%A1%8C%E2%80%9D%EF%BC%8C%E4%BD%A0%E6%80%8E%E4%B9%88%E7%9C%8B%EF%BC%9F"><span class="toc-number">1.1.</span> <span class="toc-text">面试官：集群要升级内核，运维说”我们有 PDB，直接 drain 就行”，你怎么看？</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%85%88%E6%8A%8A%E2%80%9D%E9%A9%B1%E9%80%90%E2%80%9D%E8%BF%99%E4%B8%AA%E8%AF%8D%E6%8B%86%E5%BC%80"><span class="toc-number">1.2.</span> <span class="toc-text">一、先把”驱逐”这个词拆开</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81PDB-%E7%9A%84%E9%A2%84%E7%AE%97%E5%88%B0%E5%BA%95%E6%80%8E%E4%B9%88%E7%AE%97"><span class="toc-number">1.3.</span> <span class="toc-text">二、PDB 的预算到底怎么算</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81drain-%E7%9A%84%E5%AE%8C%E6%95%B4%E6%B5%81%E7%A8%8B%E4%B8%8E%E5%8D%A1%E7%82%B9"><span class="toc-number">1.4.</span> <span class="toc-text">三、drain 的完整流程与卡点</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81drain-%E6%9C%9F%E9%97%B4%E7%9A%84%E6%B5%81%E9%87%8F%E6%91%98%E9%99%A4%E6%97%B6%E5%BA%8F"><span class="toc-number">1.5.</span> <span class="toc-text">四、drain 期间的流量摘除时序</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E5%AE%B9%E9%87%8F%E9%A2%84%E7%AE%97%EF%BC%9A%E6%8A%8A%E2%80%9D%E8%83%BD%E4%B8%8D%E8%83%BD%E7%BB%B4%E6%8A%A4%E2%80%9D%E7%AE%97%E5%87%BA%E6%9D%A5"><span class="toc-number">1.6.</span> <span class="toc-text">五、容量预算：把”能不能维护”算出来</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E4%B8%80%E4%BB%BD%E5%8F%AF%E6%89%A7%E8%A1%8C%E7%9A%84%E7%BB%B4%E6%8A%A4-Runbook"><span class="toc-number">1.7.</span> <span class="toc-text">六、一份可执行的维护 Runbook</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE%E9%80%9F%E7%AD%94"><span class="toc-number">1.8.</span> <span class="toc-text">七、面试追问速答</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E8%B8%A9%E5%9D%91%E6%B8%85%E5%8D%95"><span class="toc-number">1.9.</span> <span class="toc-text">八、踩坑清单</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%B0%8F%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">小结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/agent-sandbox-execution-environment-deep-dive/" title="【AI Agent】Agent 代码执行沙箱架构深度解析：隔离等级、资源限额与逃逸防护">【AI Agent】Agent 代码执行沙箱架构深度解析：隔离等级、资源限额与逃逸防护</a><time datetime="2026-11-23T01:20:00.000Z" title="发表于 2026-11-23 09:20:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/java-rag-parent-child-chunk-sentence-window-deep-practice/" title="【Java AI】RAG 父子块与句子窗口检索深度实战：Small-to-Big、上下文预算与召回评测">【Java AI】RAG 父子块与句子窗口检索深度实战：Small-to-Big、上下文预算与召回评测</a><time datetime="2026-11-23T01:00:00.000Z" title="发表于 2026-11-23 09:00:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/elasticsearch-snapshot-restore-slm-deep-practice/" title="【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练">【ES 运维】Elasticsearch 快照与恢复深度实战：增量段去重、SLM 生命周期与恢复演练</a><time datetime="2026-11-23T00:40:00.000Z" title="发表于 2026-11-23 08:40:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/java-tls-session-resumption-certificate-rotation-deep-practice/" title="【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证">【Java 网络】TLS 会话复用与证书热轮换深度实战：握手成本、0-RTT 风险与不停机换证</a><time datetime="2026-11-23T00:20:00.000Z" title="发表于 2026-11-23 08:20:00">2026-11-23</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/23/kubernetes-poddisruptionbudget-node-drain-deep-practice/" title="【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌">【云原生】PodDisruptionBudget 与节点维护全链路：drain、驱逐预算与发布期容量坍塌</a><time datetime="2026-11-23T00:00:00.000Z" title="发表于 2026-11-23 08:00:00">2026-11-23</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
