@@ -1,0 +1,597 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌前言分布式系统里有一个默认前提几乎从不被写进设计文档：所有机器的时间是（近似）一致的。 这个前提一旦破了，坏得非常有迷惑性——不是服务不可用，而是各种「偶发」「无法复现」的怪事：  Redis SETNX 加锁，A 机器本地时间比 B 慢 30 秒，A 认为锁已过期，直接抢锁，两个客户端同时持锁。 JWT">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/25/linux-chrony-clock-sync-distributed-systems-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌前言分布式系统里有一个默认前提几乎从不被写进设计文档：所有机器的时间是（近似）一致的。 这个前提一旦破了，坏得非常有迷惑性——不是服务不可用，而是各种「偶发」「无法复现」的怪事：  Redis SETNX 加锁，A 机器本地时间比 B 慢 30 秒，A 认为锁已过期，直接抢锁，两个客户端同时持锁。 JWT">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-25T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-25T00:04:57.657Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Linux">
+<meta property="article:tag" content="chrony">
+<meta property="article:tag" content="分布式">
+<meta property="article:tag" content="时钟同步">
+<meta property="article:tag" content="生产实战">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌",
+  "url": "https://jiweidong.github.io/2026/11/25/linux-chrony-clock-sync-distributed-systems-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-25T00:00:00.000Z",
+  "dateModified": "2026-11-25T00:04:57.657Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/25/linux-chrony-clock-sync-distributed-systems-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">977</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1074</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-25T00:00:00.000Z" title="发表于 2026-11-25 08:00:00">2026-11-25</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-25T00:04:57.657Z" title="更新于 2026-11-25 08:04:57">2026-11-25</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98/">性能调优</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【性能调优】chrony-时钟同步深度解析：一次-30ms-时钟跳变如何打乱-TTL、锁与令牌"><a href="#【性能调优】chrony-时钟同步深度解析：一次-30ms-时钟跳变如何打乱-TTL、锁与令牌" class="headerlink" title="【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌"></a>【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>分布式系统里有一个默认前提几乎从不被写进设计文档：<strong>所有机器的时间是（近似）一致的</strong>。</p>
+<p>这个前提一旦破了，坏得非常有迷惑性——不是服务不可用，而是各种「偶发」「无法复现」的怪事：</p>
+<ul>
+<li>Redis <code>SETNX</code> 加锁，A 机器本地时间比 B 慢 30 秒，A 认为锁已过期，直接抢锁，两个客户端同时持锁。</li>
+<li>JWT 在 A 服务签发，<code>nbf</code> 是 A 的当前时间；B 服务时钟快 10 秒，校验直接失败，用户被踢下线。</li>
+<li>定时任务在 02:00 执行，NTP step 把时间从 02:00:15 跳回 01:59:45，同一批任务在一个小时内跑了两次。</li>
+<li>Kafka 消息时间戳比生产时刻早 5 分钟，基于时间的窗口聚合全部错位。</li>
+<li>证书「刚刚过期」，但 <code>date</code> 显示的日期是对的——因为 TLS 校验只差了几十秒。</li>
+</ul>
+<p>上一篇文章（Java 时钟语义）我们讲的是<strong>应用层应该用哪种时钟源</strong>（<code>nanoTime</code> 用于测量，<code>currentTimeMillis</code> 用于时间点）。这一篇讲另一半：<strong>机器时钟本身是怎么被校准的，以及校准过程会带来什么副作用</strong>。</p>
+<hr>
+<h2 id="一、NTP-一次同步到底发生了什么"><a href="#一、NTP-一次同步到底发生了什么" class="headerlink" title="一、NTP 一次同步到底发生了什么"></a>一、NTP 一次同步到底发生了什么</h2><p>chrony 与上游服务器交换四个时间戳：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">客户端                     服务端</span><br><span class="line">  T1 ──────── 请求 ────────→ T2</span><br><span class="line">  T4 ←─────── 响应 ────────  T3</span><br></pre></td></tr></table></figure>
+
+<ul>
+<li><code>T1</code>：客户端发送时刻（客户端时钟）</li>
+<li><code>T2</code>：服务端收到时刻（服务端时钟）</li>
+<li><code>T3</code>：服务端回复时刻（服务端时钟）</li>
+<li><code>T4</code>：客户端收到时刻（客户端时钟）</li>
+</ul>
+<p>推导：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">往返延迟 delay = (T4 - T1) - (T3 - T2)</span><br><span class="line">时钟偏差 offset = ((T2 - T1) + (T3 - T4)) / 2</span><br></pre></td></tr></table></figure>
+
+<p>这两个公式隐含了「去程与回程延迟对称」的假设。所以：</p>
+<ul>
+<li>跨公网同步，<code>delay</code> 通常 10~50ms，<code>offset</code> 精度大致在 <code>delay/2</code> 量级；</li>
+<li>同机房同步，<code>delay</code> 可以做到 0.1ms 级，<code>offset</code> 精度到几十微秒；</li>
+<li><strong>不对称路由</strong>（去程 10ms、回程 40ms）会直接引入 15ms 的系统性偏差，这是「明明同步了但时间还是不准」的常见原因。</li>
+</ul>
+<h3 id="1-1-stratum-与层级"><a href="#1-1-stratum-与层级" class="headerlink" title="1.1 stratum 与层级"></a>1.1 stratum 与层级</h3><table>
+<thead>
+<tr>
+<th>stratum</th>
+<th>含义</th>
+<th>精度量级</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>0</td>
+<td>参考时钟（原子钟、GPS）</td>
+<td>基准</td>
+</tr>
+<tr>
+<td>1</td>
+<td>直连参考钟的服务器</td>
+<td>微秒</td>
+</tr>
+<tr>
+<td>2</td>
+<td>同步自 stratum 1</td>
+<td>亚毫秒~毫秒</td>
+</tr>
+<tr>
+<td>3+</td>
+<td>逐级下传</td>
+<td>毫秒~几十毫秒</td>
+</tr>
+<tr>
+<td>16</td>
+<td>未同步（不可用）</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p><strong>生产环境不要直接指向公网池</strong>。容器&#x2F;云主机应指向云厂商的内网 NTP（通常 stratum 2~3，内网延迟低），或者自建一层 chrony 作为内网源，避免所有机器去打公网。</p>
+<hr>
+<h2 id="二、slew-与-step：两种校准方式的差别巨大"><a href="#二、slew-与-step：两种校准方式的差别巨大" class="headerlink" title="二、slew 与 step：两种校准方式的差别巨大"></a>二、slew 与 step：两种校准方式的差别巨大</h2><p>这是本文最关键的一节。</p>
+<h3 id="2-1-slew（平滑调整）"><a href="#2-1-slew（平滑调整）" class="headerlink" title="2.1 slew（平滑调整）"></a>2.1 slew（平滑调整）</h3><p>chrony 默认不会「跳时间」，而是<strong>把本地时钟走快或走慢一点</strong>，慢慢追上正确时间。最大调整速率由 <code>maxslewrate</code> 控制：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">maxslewrate 83333    # 单位 ppm，83333 ppm ≈ 8.33%，即每秒最多纠正 83ms</span><br></pre></td></tr></table></figure>
+
+<p>追上 1 秒偏差需要约 12 秒。好处是：时间<strong>单调</strong>，不会出现「同一秒过两次」或「时间倒流」。代价是：偏差收敛慢。</p>
+<h3 id="2-2-step（直接跳变）"><a href="#2-2-step（直接跳变）" class="headerlink" title="2.2 step（直接跳变）"></a>2.2 step（直接跳变）</h3><p>当偏差超过阈值时，chrony 会直接 set 系统时间（可能向前也可能向后）。默认策略：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">makestep 1.0 3    # 前 3 次更新中，若 |offset| &gt; 1 秒，则 step</span><br></pre></td></tr></table></figure>
+
+<p>这条配置的意思是「开机后的前 3 次同步允许跳变，之后即使偏差很大也只 slew」。很多发行版默认就是这个值。</p>
+<p><strong>为什么 step 危险</strong>：向后跳变会让「已经过去的时间」再走一遍，所有基于 wall clock 的逻辑都会重复执行或提前触发：</p>
+<table>
+<thead>
+<tr>
+<th>系统</th>
+<th>向后跳 1 秒的后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Redis 过期</td>
+<td>过期判断基于 wall clock，key 可能「复活」或延迟过期</td>
+</tr>
+<tr>
+<td>分布式锁租约</td>
+<td>持有者认为还有 5 秒，实际已过期，被他人抢占</td>
+</tr>
+<tr>
+<td>JWT <code>exp</code>&#x2F;<code>nbf</code></td>
+<td>令牌提前失效或被拒</td>
+</tr>
+<tr>
+<td>定时任务</td>
+<td><code>ScheduledExecutorService</code> 基于 <code>nanoTime</code>（不受影响），cron 基于 wall clock（会重复触发）</td>
+</tr>
+<tr>
+<td>TLS 证书</td>
+<td>有效期校验失败</td>
+</tr>
+<tr>
+<td>Kafka 时间索引</td>
+<td>时间戳与 offset 的对应关系错乱</td>
+</tr>
+<tr>
+<td>数据库</td>
+<td><code>NOW()</code> 回退，<code>created_at</code> 出现「未来数据」</td>
+</tr>
+</tbody></table>
+<h3 id="2-3-生产建议"><a href="#2-3-生产建议" class="headerlink" title="2.3 生产建议"></a>2.3 生产建议</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"># 允许开机阶段跳变，运行期只 slew</span><br><span class="line">makestep 0.5 3</span><br><span class="line">maxslewrate 500000      # 允许更快收敛（0.5s/s），但仍不跳变</span><br></pre></td></tr></table></figure>
+
+<p>对于延迟敏感、且已经稳定运行的系统，<code>maxslewrate</code> 可以放宽到 500000 ppm（每秒纠正 0.5 秒），这样几十毫秒的偏差能在 1 秒内平滑修正，而不会 step。</p>
+<p>对于<strong>虚拟机</strong>还有额外注意：VM 被暂停（快照恢复、热迁移、宿主机休眠）后，时钟会一次性落后很多。这时只能 step。建议：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"># 恢复后若偏差过大，允许跳一次</span><br><span class="line">makestep 1.0 -1     # -1 表示不限制次数（慎用，仅适合可容忍跳变的机器）</span><br></pre></td></tr></table></figure>
+
+<p><code>makestep ... -1</code> 不要用在数据库、消息队列节点上。</p>
+<hr>
+<h2 id="三、chrony-配置与诊断"><a href="#三、chrony-配置与诊断" class="headerlink" title="三、chrony 配置与诊断"></a>三、chrony 配置与诊断</h2><h3 id="3-1-一份生产可用的配置"><a href="#3-1-一份生产可用的配置" class="headerlink" title="3.1 一份生产可用的配置"></a>3.1 一份生产可用的配置</h3><figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"># /etc/chrony.conf</span><br><span class="line"># 内网源优先，公网兜底</span><br><span class="line">server 10.0.0.11 iburst minpoll 4 maxpoll 6</span><br><span class="line">server 10.0.0.12 iburst minpoll 4 maxpoll 6</span><br><span class="line">pool ntp.aliyun.com iburst</span><br><span class="line"></span><br><span class="line">driftfile /var/lib/chrony/drift</span><br><span class="line">rtcsync                       # 定期把系统时间写回 RTC</span><br><span class="line">makestep 0.5 3</span><br><span class="line">maxslewrate 500000</span><br><span class="line">logdir /var/log/chrony</span><br><span class="line">log tracking statistics measurements</span><br><span class="line">bindcmdaddress 127.0.0.1      # 只允许本机 chronyc，避免被外部探测</span><br></pre></td></tr></table></figure>
+
+<p><code>minpoll 4 / maxpoll 6</code> 表示 16s<del>64s 一次轮询。默认范围更宽（64s</del>1024s），收敛更慢；内网源可以调紧。</p>
+<h3 id="3-2-chronyc-三件套"><a href="#3-2-chronyc-三件套" class="headerlink" title="3.2 chronyc 三件套"></a>3.2 chronyc 三件套</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line">$ chronyc tracking</span><br><span class="line">Reference ID    : 0A00000B (10.0.0.11)</span><br><span class="line">Stratum         : 3</span><br><span class="line">Ref <span class="keyword">time</span> (UTC)  : Wed Nov 25 00:00:01 2026</span><br><span class="line">System <span class="keyword">time</span>     : 0.000123456 seconds fast of NTP <span class="keyword">time</span></span><br><span class="line">Last offset     : +0.000098765 seconds</span><br><span class="line">RMS offset      : 0.000234567 seconds</span><br><span class="line">Frequency       : 12.345 ppm slow</span><br><span class="line">Residual freq   : +0.001 ppm</span><br><span class="line">Skew            : 0.012 ppm</span><br><span class="line">Root delay      : 0.000987 seconds</span><br><span class="line">Root dispersion : 0.001234 seconds</span><br><span class="line">Update interval : 64.0 seconds</span><br><span class="line">Leap status     : Normal</span><br></pre></td></tr></table></figure>
+
+<p>字段解读：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>关注点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>System time</code></td>
+<td>当前系统时间与 NTP 的偏差</td>
+<td><strong>核心指标</strong>，&gt;100ms 告警</td>
+</tr>
+<tr>
+<td><code>Last offset</code></td>
+<td>最近一次测量的偏差</td>
+<td>反映瞬时抖动</td>
+</tr>
+<tr>
+<td><code>RMS offset</code></td>
+<td>长期偏差的均方根</td>
+<td>反映稳定性</td>
+</tr>
+<tr>
+<td><code>Frequency</code></td>
+<td>本地晶振频率偏差（ppm）</td>
+<td>持续增大说明晶振老化或虚拟机时钟不稳</td>
+</tr>
+<tr>
+<td><code>Root delay</code></td>
+<td>到 stratum 1 的往返延迟</td>
+<td>跨公网通常 &gt;10ms</td>
+</tr>
+<tr>
+<td><code>Root dispersion</code></td>
+<td>累积误差</td>
+<td>与 delay 一起决定「可信区间」</td>
+</tr>
+<tr>
+<td><code>Leap status</code></td>
+<td>闰秒状态</td>
+<td><code>Insert second</code> &#x2F; <code>Delete second</code> 要关注</td>
+</tr>
+<tr>
+<td><code>Update interval</code></td>
+<td>当前轮询间隔</td>
+<td>突然变大说明源不稳</td>
+</tr>
+</tbody></table>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line">$ chronyc sources -v</span><br><span class="line">MS Name/IP address   Stratum Poll Reach LastRx Last sample</span><br><span class="line">===============================================================</span><br><span class="line">^* 10.0.0.11            3    4   377    32   +12us[ +18us] +/-  210us</span><br><span class="line">^+ 10.0.0.12            3    4   377    30   -45us[ -38us] +/-  240us</span><br><span class="line">^- ntp.aliyun.com       2    6   377   120  -1.2ms[-1.1ms] +/-   18ms</span><br></pre></td></tr></table></figure>
+
+<p>首列标记含义：</p>
+<table>
+<thead>
+<tr>
+<th>标记</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>*</code></td>
+<td>当前选中的同步源</td>
+</tr>
+<tr>
+<td><code>+</code></td>
+<td>可用的备选源</td>
+</tr>
+<tr>
+<td><code>-</code></td>
+<td>被合并算法排除的源</td>
+</tr>
+<tr>
+<td><code>?</code></td>
+<td>不可达 &#x2F; 未通过测试</td>
+</tr>
+<tr>
+<td><code>x</code></td>
+<td>被判定为 falseticker（时间明显错误）</td>
+</tr>
+</tbody></table>
+<p><code>Reach</code> 是八进制位图（377 &#x3D; 最近 8 次全部成功，0 &#x3D; 全失败）。<code>LastRx</code> 是距上次收到响应的秒数。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">$ chronyc sourcestats -v</span><br></pre></td></tr></table></figure>
+
+<p>用来判断「源本身是否稳定」：<code>Std Dev</code> 大说明该源抖动大，应降权或移除。</p>
+<h3 id="3-3-常见故障对照表"><a href="#3-3-常见故障对照表" class="headerlink" title="3.3 常见故障对照表"></a>3.3 常见故障对照表</h3><table>
+<thead>
+<tr>
+<th>现象</th>
+<th>可能原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Reach=0</code></td>
+<td>防火墙挡 UDP 123 &#x2F; 源不可达</td>
+<td><code>nc -u -z &lt;ip&gt; 123</code> 验证</td>
+</tr>
+<tr>
+<td><code>Stratum=16</code></td>
+<td>未同步成功</td>
+<td>检查源配置与网络</td>
+</tr>
+<tr>
+<td>offset 持续单向增长</td>
+<td>本地晶振偏差大 &#x2F; 源频率不准</td>
+<td>看 <code>Frequency</code>，必要时换源</td>
+</tr>
+<tr>
+<td>offset 忽正忽负大幅抖动</td>
+<td>网络不对称 &#x2F; 源负载高</td>
+<td>改用内网源，缩短 poll</td>
+</tr>
+<tr>
+<td><code>System time</code> 正常但业务报时间错</td>
+<td>容器&#x2F;进程时区（<code>TZ</code>）问题，不是时钟问题</td>
+<td>区分「时区」与「时钟」</td>
+</tr>
+<tr>
+<td>从库&#x2F;节点间时间差固定 8 小时</td>
+<td>时区配置（UTC vs Asia&#x2F;Shanghai）</td>
+<td>统一 <code>timedatectl set-timezone</code></td>
+</tr>
+<tr>
+<td>chronyd 启动后立即 step</td>
+<td><code>makestep</code> 生效</td>
+<td>属正常，注意首次启动窗口</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="四、容器与虚拟机：时钟的边界"><a href="#四、容器与虚拟机：时钟的边界" class="headerlink" title="四、容器与虚拟机：时钟的边界"></a>四、容器与虚拟机：时钟的边界</h2><h3 id="4-1-容器没有自己的时钟"><a href="#4-1-容器没有自己的时钟" class="headerlink" title="4.1 容器没有自己的时钟"></a>4.1 容器没有自己的时钟</h3><p>容器共享宿主内核，<code>CLOCK_REALTIME</code> 是<strong>全局的</strong>，per-container 无法修改（<code>clock_settime</code> 需要 <code>CAP_SYS_TIME</code>，且影响整个宿主机）。所以：</p>
+<ul>
+<li>「在容器里装 chrony」通常无效（除非 privileged + 独立 time namespace，K8s 很少这么干）；</li>
+<li>正确做法是<strong>保证宿主机&#x2F;节点时钟正确</strong>，容器继承；</li>
+<li>容器里的 <code>date</code> 看起来不对，99% 是<strong>时区</strong>问题（<code>TZ</code> 环境变量或镜像里没装 tzdata），不是时钟问题。</li>
+</ul>
+<figure class="highlight dockerfile"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">ENV</span> TZ=Asia/Shanghai</span><br><span class="line"><span class="keyword">RUN</span><span class="language-bash"> <span class="built_in">ln</span> -snf /usr/share/zoneinfo/<span class="variable">$TZ</span> /etc/localtime &amp;&amp; <span class="built_in">echo</span> <span class="variable">$TZ</span> &gt; /etc/timezone</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-虚拟机时钟漂移的四个来源"><a href="#4-2-虚拟机时钟漂移的四个来源" class="headerlink" title="4.2 虚拟机时钟漂移的四个来源"></a>4.2 虚拟机时钟漂移的四个来源</h3><table>
+<thead>
+<tr>
+<th>来源</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CPU steal time</td>
+<td>虚拟 CPU 被抢占，guest 内时钟走慢</td>
+</tr>
+<tr>
+<td>宿主负载高</td>
+<td>同上，且延迟抖动</td>
+</tr>
+<tr>
+<td>快照恢复 &#x2F; 热迁移</td>
+<td>时钟一次性落后几分钟</td>
+</tr>
+<tr>
+<td>宿主休眠</td>
+<td>同上，可能几小时</td>
+</tr>
+</tbody></table>
+<p>对策：</p>
+<ol>
+<li>节点上启用 chrony，并把 <code>maxslewrate</code> 调大；</li>
+<li>K8s 场景用 DaemonSet 部署 node-exporter 采集 <code>node_timex_offset_seconds</code>，offset &gt; 100ms 告警；</li>
+<li>关键有状态服务（MySQL、Kafka、etcd）避免与高负载任务混部；</li>
+<li>云厂商提供「时钟同步服务」时优先使用（如内网 NTP 域名）。</li>
+</ol>
+<hr>
+<h2 id="五、时钟不准会打坏哪些中间件"><a href="#五、时钟不准会打坏哪些中间件" class="headerlink" title="五、时钟不准会打坏哪些中间件"></a>五、时钟不准会打坏哪些中间件</h2><h3 id="5-1-Redis"><a href="#5-1-Redis" class="headerlink" title="5.1 Redis"></a>5.1 Redis</h3><ul>
+<li><code>EXPIRE</code>&#x2F;<code>TTL</code> 基于服务端 wall clock，主从之间若时间差大，从库的过期判断会与主库不一致（读到「已过期但未删」的 key）。</li>
+<li><code>SET key val NX PX 30000</code> 做锁：持锁方与抢锁方时钟不一致时，租约失去意义。<strong>这就是 Redlock 争议的核心之一</strong>。</li>
+<li>解决：锁场景不要依赖绝对时间，用「fencing token + 单调递增版本」；或者接受「时钟偏差 &lt; 锁租约&#x2F;10」的前提并监控。</li>
+</ul>
+<h3 id="5-2-MySQL"><a href="#5-2-MySQL" class="headerlink" title="5.2 MySQL"></a>5.2 MySQL</h3><ul>
+<li><code>NOW()</code>、<code>CURRENT_TIMESTAMP</code> 来自服务器时钟；主从时间不一致会导致 <code>created_at</code> 乱序、基于时间的增量同步漏数据。</li>
+<li><code>binlog</code> 的 <code>timestamp</code> 影响 CDC 工具（Debezium 等）的事件时间。</li>
+<li>建议：<code>--log_timestamps=SYSTEM</code> 并统一时区为 UTC 存储、展示层转换；监控主从 <code>TIMESTAMPDIFF(SECOND, NOW(), ...)</code>。</li>
+</ul>
+<h3 id="5-3-Kafka"><a href="#5-3-Kafka" class="headerlink" title="5.3 Kafka"></a>5.3 Kafka</h3><ul>
+<li>消息 <code>timestamp</code> 用于时间索引（<code>kafka-log-dirs</code> 按时间段删除、Streams 窗口、KSQL 时间语义）。</li>
+<li>生产端时钟慢 10 分钟，基于 event-time 的窗口会全部延迟触发。</li>
+<li>建议：<code>log.message.timestamp.type=CreateTime</code>（默认）时严格保证 broker 与 producer 时钟；对时间敏感场景可改用 <code>LogAppendTime</code>，由 broker 统一打时间戳。</li>
+</ul>
+<h3 id="5-4-TLS-JWT"><a href="#5-4-TLS-JWT" class="headerlink" title="5.4 TLS &#x2F; JWT"></a>5.4 TLS &#x2F; JWT</h3><ul>
+<li>证书 <code>notBefore</code>&#x2F;<code>notAfter</code> 校验直接比较系统时间；偏差几秒就可能「刚签发的证书不可用」。</li>
+<li>JWT 的 <code>exp</code>&#x2F;<code>nbf</code>&#x2F;<code>iat</code> 同理。<strong>建议在服务端校验时留 30~60s 的 clock skew 容忍</strong>：</li>
+</ul>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">JwtParser</span> <span class="variable">parser</span> <span class="operator">=</span> Jwts.parser()</span><br><span class="line">    .clockSkewSeconds(<span class="number">60</span>)     <span class="comment">// 允许 60 秒偏差</span></span><br><span class="line">    .verifyWith(publicKey)</span><br><span class="line">    .build();</span><br></pre></td></tr></table></figure>
+
+<p>这不是「掩盖问题」，而是分布式系统的必要容错。</p>
+<hr>
+<h2 id="六、Java-侧：正确测量与偏差感知"><a href="#六、Java-侧：正确测量与偏差感知" class="headerlink" title="六、Java 侧：正确测量与偏差感知"></a>六、Java 侧：正确测量与偏差感知</h2><h3 id="6-1-测量耗时永远用-nanoTime"><a href="#6-1-测量耗时永远用-nanoTime" class="headerlink" title="6.1 测量耗时永远用 nanoTime"></a>6.1 测量耗时永远用 nanoTime</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">long</span> <span class="variable">start</span> <span class="operator">=</span> System.nanoTime();</span><br><span class="line">doWork();</span><br><span class="line"><span class="type">long</span> <span class="variable">costMs</span> <span class="operator">=</span> (System.nanoTime() - start) / <span class="number">1_000_000</span>;</span><br></pre></td></tr></table></figure>
+
+<p><code>currentTimeMillis</code> 会被 NTP slew&#x2F;step 影响，跨机器比较更是不可靠；<code>nanoTime</code> 是单调的（JVM 保证不倒退），适合测量「经过时间」。</p>
+<h3 id="6-2-可注入时钟，便于测试"><a href="#6-2-可注入时钟，便于测试" class="headerlink" title="6.2 可注入时钟，便于测试"></a>6.2 可注入时钟，便于测试</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TokenService</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> Clock clock;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="title function_">TokenService</span><span class="params">(Clock clock)</span> &#123;</span><br><span class="line">        <span class="built_in">this</span>.clock = clock;   <span class="comment">// 生产用 Clock.systemUTC()，测试用 Clock.fixed(...)</span></span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">public</span> <span class="type">boolean</span> <span class="title function_">isExpired</span><span class="params">(Instant exp)</span> &#123;</span><br><span class="line">        <span class="comment">// 留 30 秒容忍，避免节点间小偏差造成误判</span></span><br><span class="line">        <span class="keyword">return</span> Instant.now(clock).minusSeconds(<span class="number">30</span>).isAfter(exp);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-启动自检：把时钟偏差暴露出来"><a href="#6-3-启动自检：把时钟偏差暴露出来" class="headerlink" title="6.3 启动自检：把时钟偏差暴露出来"></a>6.3 启动自检：把时钟偏差暴露出来</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">ClockSkewGuard</span> <span class="keyword">implements</span> <span class="title class_">ApplicationRunner</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">final</span> <span class="type">Duration</span> <span class="variable">MAX_SKEW</span> <span class="operator">=</span> Duration.ofMillis(<span class="number">500</span>);</span><br><span class="line"></span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">run</span><span class="params">(ApplicationArguments args)</span> <span class="keyword">throws</span> Exception &#123;</span><br><span class="line">        <span class="comment">// 用一次 HTTP HEAD 请求的 Date 头估算偏差（粗粒度，够用）</span></span><br><span class="line">        HttpResponse&lt;Void&gt; resp = HttpClient.newHttpClient().send(</span><br><span class="line">                HttpRequest.newBuilder(URI.create(<span class="string">&quot;https://www.baidu.com&quot;</span>))</span><br><span class="line">                        .method(<span class="string">&quot;HEAD&quot;</span>, HttpRequest.BodyPublishers.noBody()).build(),</span><br><span class="line">                HttpResponse.BodyHandlers.discarding());</span><br><span class="line"></span><br><span class="line">        <span class="type">long</span> <span class="variable">serverMillis</span> <span class="operator">=</span> ZonedDateTime</span><br><span class="line">                .parse(resp.headers().firstValue(<span class="string">&quot;date&quot;</span>).orElseThrow(),</span><br><span class="line">                       DateTimeFormatter.RFC_1123_DATE_TIME)</span><br><span class="line">                .toInstant().toEpochMilli();</span><br><span class="line">        <span class="type">long</span> <span class="variable">skew</span> <span class="operator">=</span> System.currentTimeMillis() - serverMillis;</span><br><span class="line"></span><br><span class="line">        <span class="keyword">if</span> (Math.abs(skew) &gt; MAX_SKEW.toMillis()) &#123;</span><br><span class="line">            log.error(<span class="string">&quot;clock skew detected: &#123;&#125; ms, 请检查 chrony/节点时间同步&quot;</span>, skew);</span><br><span class="line">            <span class="comment">// 可配置为 fail-fast，避免带着错误时间对外提供服务</span></span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>更严谨的做法是解析 <code>chronyc tracking</code> 的 <code>System time</code>，通过 node-exporter 的 <code>node_timex_offset_seconds</code> 上报 Prometheus。</p>
+<h3 id="6-4-雪花-ID-的回拨保护"><a href="#6-4-雪花-ID-的回拨保护" class="headerlink" title="6.4 雪花 ID 的回拨保护"></a>6.4 雪花 ID 的回拨保护</h3><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> <span class="type">long</span> <span class="variable">lastTimestamp</span> <span class="operator">=</span> -<span class="number">1L</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">synchronized</span> <span class="type">long</span> <span class="title function_">nextId</span><span class="params">()</span> &#123;</span><br><span class="line">    <span class="type">long</span> <span class="variable">now</span> <span class="operator">=</span> System.currentTimeMillis();</span><br><span class="line">    <span class="keyword">if</span> (now &lt; lastTimestamp) &#123;</span><br><span class="line">        <span class="type">long</span> <span class="variable">drift</span> <span class="operator">=</span> lastTimestamp - now;</span><br><span class="line">        <span class="keyword">if</span> (drift &lt;= <span class="number">5</span>) &#123;</span><br><span class="line">            <span class="comment">// 小幅回拨：自旋等待</span></span><br><span class="line">            now = waitUntil(lastTimestamp);</span><br><span class="line">        &#125; <span class="keyword">else</span> &#123;</span><br><span class="line">            <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">IllegalStateException</span>(<span class="string">&quot;clock moved backwards: &quot;</span> + drift + <span class="string">&quot;ms&quot;</span>);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="comment">// ... 正常生成</span></span><br><span class="line">    lastTimestamp = now;</span><br><span class="line">    <span class="keyword">return</span> id;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>关键</strong>：回拨超过阈值必须抛异常而不是「继续用旧时间戳」，否则会生成重复 ID。</p>
+<hr>
+<h2 id="七、观测与告警方案"><a href="#七、观测与告警方案" class="headerlink" title="七、观测与告警方案"></a>七、观测与告警方案</h2><p>Node Exporter 已经采集了时钟指标，直接可用：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 告警规则示例</span></span><br><span class="line"><span class="bullet">-</span> <span class="attr">alert:</span> <span class="string">NodeClockSkewHigh</span></span><br><span class="line">  <span class="attr">expr:</span> <span class="string">abs(node_timex_offset_seconds)</span> <span class="string">&gt;</span> <span class="number">0.1</span></span><br><span class="line">  <span class="attr">for:</span> <span class="string">5m</span></span><br><span class="line">  <span class="attr">labels:</span></span><br><span class="line">    <span class="attr">severity:</span> <span class="string">warning</span></span><br><span class="line">  <span class="attr">annotations:</span></span><br><span class="line">    <span class="attr">summary:</span> <span class="string">&quot;节点 <span class="template-variable">&#123;&#123; $labels.instance &#125;&#125;</span> 时钟偏差 <span class="template-variable">&#123;&#123; $value &#125;&#125;</span>s&quot;</span></span><br><span class="line"></span><br><span class="line"><span class="bullet">-</span> <span class="attr">alert:</span> <span class="string">NodeClockNotSynchronising</span></span><br><span class="line">  <span class="attr">expr:</span> <span class="string">node_timex_sync_status</span> <span class="string">==</span> <span class="number">0</span></span><br><span class="line">  <span class="attr">for:</span> <span class="string">10m</span></span><br><span class="line">  <span class="attr">labels:</span></span><br><span class="line">    <span class="attr">severity:</span> <span class="string">critical</span></span><br></pre></td></tr></table></figure>
+
+<p>关键指标：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>node_timex_offset_seconds</code></td>
+<td>当前偏差（核心）</td>
+</tr>
+<tr>
+<td><code>node_timex_sync_status</code></td>
+<td>1 &#x3D; 已同步，0 &#x3D; 未同步</td>
+</tr>
+<tr>
+<td><code>node_timex_maxerror_seconds</code></td>
+<td>最大误差上界</td>
+</tr>
+<tr>
+<td><code>node_timex_estimated_error_seconds</code></td>
+<td>估计误差</td>
+</tr>
+<tr>
+<td><code>node_timex_frequency_adjustment_ratio</code></td>
+<td>频率调整量，突变说明晶振&#x2F;虚拟化异常</td>
+</tr>
+</tbody></table>
+<p>分级阈值建议：</p>
+<ul>
+<li><code>&gt; 50ms</code>：warning（可能影响毫秒级 TTL&#x2F;锁）</li>
+<li><code>&gt; 500ms</code>：critical（JWT、证书、定时任务开始出问题）</li>
+<li><code>sync_status == 0</code> 持续 10 分钟：critical（可能已经 step 或未同步）</li>
+</ul>
+<hr>
+<h2 id="八、面试追问"><a href="#八、面试追问" class="headerlink" title="八、面试追问"></a>八、面试追问</h2><p><strong>Q1：NTP 能保证多精确？</strong><br>取决于网络。同机房内网 0.1<del>1ms，跨公网 10</del>50ms。跨机房做「强一致时间」不可行，需要逻辑时钟（Lamport&#x2F;HLC）或版本号。</p>
+<p><strong>Q2：slew 和 step 怎么选？</strong><br>运行期只 slew（保持单调），只在开机初始化或 VM 恢复时允许 step。数据库&#x2F;消息队列节点必须禁用运行期 step。</p>
+<p><strong>Q3：容器时间不准怎么办？</strong><br>容器共享宿主时钟，改容器没用。修宿主机 chrony，并检查容器 <code>TZ</code> 时区配置。K8s 节点用 DaemonSet 采集 <code>node_timex_offset_seconds</code>。</p>
+<p><strong>Q4：Redis 分布式锁为什么和时钟有关？</strong><br>锁的过期依赖服务端 TTL（相对时间，基于 monotonic 计时更可靠），但「客户端认为锁还有多久」依赖本地时钟。Redlock 的争议点之一就是多节点时钟漂移假设。工程上更稳的是 fencing token。</p>
+<p><strong>Q5：<code>System.currentTimeMillis()</code> 会被 NTP 影响吗？</strong><br>会。它读 <code>CLOCK_REALTIME</code>，NTP slew 会让它走得稍快&#x2F;稍慢，step 会直接跳变。所以测量耗时用 <code>nanoTime</code>（<code>CLOCK_MONOTONIC</code>），它不受 NTP 调整影响。</p>
+<p><strong>Q6：闰秒怎么处理？</strong><br>两种主流方案：<code>leapsecmode slew</code>（chrony 把 1 秒分摊到一段时间，推荐）或 leap smear（Google 方案，把 1 秒摊到 24 小时）。绝不要让内核直接插入 23:59:60，2012 年那次闰秒导致大量 Java&#x2F;MySQL 服务卡死。</p>
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><ul>
+<li>时间同步不是「装个 NTP 就完事」，<strong>校准方式（slew vs step）比校准精度更影响业务</strong>。</li>
+<li>运行期永远优先 slew；step 只留给开机和 VM 恢复，并且要评估影响面。</li>
+<li>容器没有独立时钟，K8s 场景的治理点在节点；虚拟机要额外防 steal time 与快照恢复。</li>
+<li>应用层要做的三件事：测量用 <code>nanoTime</code>、时间点用可注入 <code>Clock</code>、跨节点校验留 30~60s 的 skew 容忍。</li>
+<li>监控只有两个核心指标：<code>node_timex_offset_seconds</code> 与 <code>node_timex_sync_status</code>，但必须真的配上告警。</li>
+</ul>
+<p>时钟这种东西，正常时你永远想不起它；出问题时，它会让所有「看起来正确」的代码同时出错。把它当成一个需要被监控的基础依赖，而不是操作系统的一个默认行为。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/25/linux-chrony-clock-sync-distributed-systems-deep-dive/">https://jiweidong.github.io/2026/11/25/linux-chrony-clock-sync-distributed-systems-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/%E5%88%86%E5%B8%83%E5%BC%8F/">分布式</a><a class="post-meta__tags" href="/tags/Linux/">Linux</a><a class="post-meta__tags" href="/tags/%E7%94%9F%E4%BA%A7%E5%AE%9E%E6%88%98/">生产实战</a><a class="post-meta__tags" href="/tags/%E6%97%B6%E9%92%9F%E5%90%8C%E6%AD%A5/">时钟同步</a><a class="post-meta__tags" href="/tags/chrony/">chrony</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/25/redis-client-connection-governance-client-kill-deep-practice/" title="【Redis 运维】连接治理深度实战：CLIENT LIST/KILL、输出缓冲与 maxmemory-clients"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【Redis 运维】连接治理深度实战：CLIENT LIST/KILL、输出缓冲与 maxmemory-clients</div></div><div class="info-2"><div class="info-item-1">【Redis 运维】连接治理深度实战：CLIENT LIST&#x2F;KILL、输出缓冲与 maxmemory-clients前言大多数 Redis 事故的第一现场不是「key 太多」或「内存不够」，而是连接。 典型的两类故事：  某个服务发布时 pod 从 20 个扩到 120 个，每个 pod 的 Jedis 池 maxTotal=50，瞬间连上 6000 个连接，Redis connected_clients 打到 maxclients，新连接被拒，所有服务开始报 ERR max number of clients reached。 某个 Pub&#x2F;Sub 消费者因为下游变慢不再读 socket，Redis 侧该连接的输出缓冲（omem）一路涨到 2GB，触发 client-output-buffer-limit 被杀；重连后重新订阅，再次堆积，形成「断开—重连—再堆积」的循环，最终把实例内存打爆。  这两类问题的共同点是：Redis 有完整的连接治理工具，但很多人只会 INFO clients 看一眼数字。本文把 CLIENT LIST &#x2F; CLIEN...</div></div></div></a><a class="pagination-related" href="/2026/11/25/kafka-partition-expansion-key-skew-deep-practice/" title="【Kafka 实战】分区扩容与 Key 倾斜治理：为什么加分区会让订单乱序，以及怎么补救"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Kafka 实战】分区扩容与 Key 倾斜治理：为什么加分区会让订单乱序，以及怎么补救</div></div><div class="info-2"><div class="info-item-1">【Kafka 实战】分区扩容与 Key 倾斜治理前言Kafka 的分区数是一个「看起来可以改、实际上很难改」的参数。 运维同学在监控上看到某个 topic 的写入打满、消费 lag 堆积，第一反应通常是「加分区」——命令也确实简单，一条 kafka-topics.sh --alter --partitions 12 就完事，不需要数据搬迁，不需要重启 broker。但很多人不知道的是：这一条命令会瞬间改变所有 key 的分区归属。如果业务依赖 key 保证同一订单、同一用户的消息有序，那么扩容那一刻起，同一个 key 的新消息会落到另一个分区，与旧消息彻底失去顺序关系。 我见过一个真实事故：订单状态 topic 从 6 分区扩到 12 分区，当晚出现 300 多笔「已支付」被「待支付」覆盖——因为两条消息进了不同分区，被两个消费者线程并发处理，后写的旧状态把新状态盖掉了。 这篇文章把两件事讲透：  分区扩容的破坏性边界：为什么加分区会乱序，哪些组件会受影响，有没有安全的扩容姿势； Key 倾斜的识别与治理：分区数够但数据全挤在几个分区上，加分区根本没用。   一、分区数到底决定了...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/11/10/linux-file-descriptor-exhaustion-java-deep-dive/" title="【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-10</div><div class="info-item-2">【性能调优】文件描述符耗尽深度治理：Too many open files 的 Java 根因定位、fd 泄漏排查与容量估算</div></div><div class="info-2"><div class="info-item-1">【性能调优】文件描述符耗尽深度治理前言java.io.IOException: Too many open files 这个异常，几乎每个 Java 工程师都在某次深夜告警里见过。它的迷惑性在于：代码看起来没问题，连接池也配了上限，但 fd 就是一直涨。 更麻烦的是，它的表现形式千奇百怪：  接口偶发 500，重启就好，过几天再犯 accept 失败但 connect 正常（新连接进不来，老连接还在用） 日志突然不写了（logback 打不开新文件） 明明 lsof 只有 3000 个 fd，ulimit -n 是 65535，却还是报错  这篇把 fd 从内核数据结构讲到 Java 侧泄漏点，给一套能在 5 分钟内定位到具体泄漏源的排查方法论，最后给容量估算公式。  一、fd 到底是什么：三层配额先建立一个模型。一个进程能打开多少文件，受三层限制，任何一层撞墙都会报 EMFILE 或 ENFILE：    层级 限制项 查看方式 超出后果    进程级（soft） RLIMIT_NOFILE ulimit -Sn &#x2F; cat /proc/&lt;pid&gt;/lim...</div></div></div></a><a class="pagination-related" href="/2026/11/16/java-block-layer-blk-mq-io-scheduler-deep-dive/" title="【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-16</div><div class="info-item-2">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析：从 mq-deadline 到 Java 落盘延迟</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux 块层 blk-mq 与 IO 调度器深度解析一、前言Java 应用「写日志慢」「刷盘抖动」「数据库 fsync 延迟高」，很多人第一反应是换 SSD、加 IOPS。但一块 NVMe 在 fio 里能跑 50 万 IOPS，业务侧 fsync 的 P99 却是 80ms —— 差距往往不在硬件，而在块层的排队方式。 从 FileChannel.force() 返回到数据真正落到介质，中间要穿过：page cache → 文件系统 → 块层 blk-mq → 设备队列 → 控制器缓存 → 介质。blk-mq 是 Linux 4.x 之后的重写，把「每 CPU 一个软件队列 + 多硬件队列」变成了默认模型；IO 调度器（none&#x2F;mq-deadline&#x2F;kyber&#x2F;bfq）则决定了请求怎么合并、排序、限流。 本文把这层拆开，讲清楚三件事：请求怎么排队、调度器怎么选、Java 侧怎么量。   二、IO 路径全景12345678910write(2)  └─ VFS → page cache（脏页）       └─ writeback...</div></div></div></a><a class="pagination-related" href="/2026/09/12/paxos-consensus-algorithm-deep-dive/" title="【分布式理论】Paxos 算法深度解析：从 Basic Paxos 到 Multi-Paxos 与工程落地"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-12</div><div class="info-item-2">【分布式理论】Paxos 算法深度解析：从 Basic Paxos 到 Multi-Paxos 与工程落地</div></div><div class="info-2"><div class="info-item-1">【分布式理论】Paxos 算法深度解析：从 Basic Paxos 到 Multi-Paxos 与工程落地面试官：Raft 你讲得挺清楚，那 Paxos 呢？Paxos 和 Raft 什么关系？这是分布式面试的一道分水岭。Raft 因为「可理解性优先」的设计，资料多、好讲；而 Paxos 因为论文过于抽象，很多人只能背出「两阶段、Proposer、Acceptor」几个名词。 但只要你能说清 Paxos 要解决什么问题、两阶段到底在防什么、以及它和 Raft 的本质差异，这道题就是加分项。这篇我们从问题出发，把 Basic Paxos、Multi-Paxos 和工程落地一次讲透。 一、Paxos 要解决什么问题分布式系统里有一个基本需求：让多个节点对某个值达成一致（consensus），即使有节点宕机、网络分区、消息延迟或重复。 约束条件是：  节点可能崩溃（非拜占庭：节点不会撒谎，只会沉默）； 消息可能丢失、延迟、重复，但不会被篡改； 网络是异步的（没有可靠的超时上界）。  理论上有个著名的结论 —— FLP 不可能定理：在完全异步的网络中，只要有一个节点可能崩溃，就不存在既保...</div></div></div></a><a class="pagination-related" href="/2026/11/04/linux-page-cache-java-file-io-deep-dive/" title="【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-04</div><div class="info-item-2">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析：脏页回写、fsync 语义与写放大</div></div><div class="info-2"><div class="info-item-1">【性能调优】Linux Page Cache 与 Java 文件 IO 深度解析前言一个很典型的现象：Java 服务写日志&#x2F;写文件，代码里 fileChannel.write() 返回成功、耗时 0.1ms，看起来磁盘快得离谱；但某天机器内存紧张，同一个写入突然变成 20ms，甚至出现大量 kswapd CPU 占用。 还有人问：FileOutputStream.write() 之后数据到底在哪？flush() 和 fsync() 有什么区别？为什么用 BufferedOutputStream 快 10 倍，但数据丢了？为什么 Kafka 号称”用页缓存所以快”，而 MySQL 却要自己管 buffer pool？ 这些问题的答案都在同一层：Linux Page Cache（页缓存）。这篇从内核机制讲到 Java API 语义，把”写文件”这件事彻底拆开。  一、Page Cache 是什么：内核的”第二层内存”1.1 一切皆页Linux 用 4KB 的页（page）管理物理内存，Page Cache 就是文件内容在内存中的副本，以 struct page 组织，用 a...</div></div></div></a><a class="pagination-related" href="/2026/09/27/jvm-class-unloading-metaspace-reclaim-deep-dive/" title="【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-27</div><div class="info-item-2">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战</div></div><div class="info-2"><div class="info-item-1">【JVM 底层】类卸载（Class Unloading）与元空间回收深度解析：ClassLoader 泄漏排查实战面试官：Java 的类会被卸载吗？这是一个「听起来简单，答起来很难」的问题。 大多数人的回答是：「类加载后就一直存在，直到 JVM 结束。」 这个答案只对了一半。准确地说：  类是可以被卸载的，但条件非常苛刻。 类卸载的前提是它的 ClassLoader 被回收，而 ClassLoader 被回收的前提是「它加载的所有类都不再被引用，且它自己也不被引用」。  而现实中，ClassLoader 泄漏是 Java 应用中非常隐蔽、后果非常严重的一类内存问题，尤其在：  Tomcat &#x2F; Jetty 热部署（reload&#x2F;undeploy）场景； OSGi、插件化框架； 频繁使用脚本引擎（Nashorn&#x2F;GraalJS）、字节码生成（CGLIB&#x2F;ASM&#x2F;ByteBuddy）、动态代理； 自定义 ClassLoader 做隔离（如 Dubbo 的 SPI 类隔离、Arthas）。  这些场景下，元空间（Metaspace）会持...</div></div></div></a><a class="pagination-related" href="/2026/11/14/overlayfs-container-write-amplification-deep-dive/" title="【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-14</div><div class="info-item-2">【性能调优】overlayfs 与容器写放大深度解析：copy-up、page cache 双份与 Java 应用 ENOSPC 归因</div></div><div class="info-2"><div class="info-item-1">【性能调优】overlayfs 与容器写放大深度解析前言一个很典型的生产故障：Java 服务在虚拟机里跑得好好的，迁到 Kubernetes 之后，日志一多就 No space left on device，节点磁盘明明还有空间；或者某个服务启动特别慢，strace 一看全耗在 openat 上；再或者容器内存莫名其妙翻倍，jcmd GC.heap_info 显示堆只用了 1G，cgroup 却记账 2.5G。 这三个现象背后经常是同一个东西：overlayfs 的写时复制（copy-up）。 容器镜像分层是 Docker 的核心设计，但很多人只记住了「分层省空间」，没意识到任何对镜像层文件的写操作，都会先把整个文件复制到可写层。这个「整文件复制」就是写放大的源头。 这篇从 overlay2 的目录结构讲起，把 copy-up 的触发条件、放大倍数、page cache 双份、观测手段和 Java 侧治理讲透。  一、overlay2 的四层结构12345$ mount | grep overlayoverlay on /var/lib/docker/overlay2/xxxx/...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">977</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1074</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90%E6%80%A7%E8%83%BD%E8%B0%83%E4%BC%98%E3%80%91chrony-%E6%97%B6%E9%92%9F%E5%90%8C%E6%AD%A5%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%EF%BC%9A%E4%B8%80%E6%AC%A1-30ms-%E6%97%B6%E9%92%9F%E8%B7%B3%E5%8F%98%E5%A6%82%E4%BD%95%E6%89%93%E4%B9%B1-TTL%E3%80%81%E9%94%81%E4%B8%8E%E4%BB%A4%E7%89%8C"><span class="toc-number">1.</span> <span class="toc-text">【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81NTP-%E4%B8%80%E6%AC%A1%E5%90%8C%E6%AD%A5%E5%88%B0%E5%BA%95%E5%8F%91%E7%94%9F%E4%BA%86%E4%BB%80%E4%B9%88"><span class="toc-number">1.2.</span> <span class="toc-text">一、NTP 一次同步到底发生了什么</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-stratum-%E4%B8%8E%E5%B1%82%E7%BA%A7"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 stratum 与层级</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81slew-%E4%B8%8E-step%EF%BC%9A%E4%B8%A4%E7%A7%8D%E6%A0%A1%E5%87%86%E6%96%B9%E5%BC%8F%E7%9A%84%E5%B7%AE%E5%88%AB%E5%B7%A8%E5%A4%A7"><span class="toc-number">1.3.</span> <span class="toc-text">二、slew 与 step：两种校准方式的差别巨大</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-slew%EF%BC%88%E5%B9%B3%E6%BB%91%E8%B0%83%E6%95%B4%EF%BC%89"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 slew（平滑调整）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-step%EF%BC%88%E7%9B%B4%E6%8E%A5%E8%B7%B3%E5%8F%98%EF%BC%89"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 step（直接跳变）</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E7%94%9F%E4%BA%A7%E5%BB%BA%E8%AE%AE"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 生产建议</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81chrony-%E9%85%8D%E7%BD%AE%E4%B8%8E%E8%AF%8A%E6%96%AD"><span class="toc-number">1.4.</span> <span class="toc-text">三、chrony 配置与诊断</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E4%B8%80%E4%BB%BD%E7%94%9F%E4%BA%A7%E5%8F%AF%E7%94%A8%E7%9A%84%E9%85%8D%E7%BD%AE"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 一份生产可用的配置</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-chronyc-%E4%B8%89%E4%BB%B6%E5%A5%97"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 chronyc 三件套</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%B8%B8%E8%A7%81%E6%95%85%E9%9A%9C%E5%AF%B9%E7%85%A7%E8%A1%A8"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 常见故障对照表</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%AE%B9%E5%99%A8%E4%B8%8E%E8%99%9A%E6%8B%9F%E6%9C%BA%EF%BC%9A%E6%97%B6%E9%92%9F%E7%9A%84%E8%BE%B9%E7%95%8C"><span class="toc-number">1.5.</span> <span class="toc-text">四、容器与虚拟机：时钟的边界</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E5%AE%B9%E5%99%A8%E6%B2%A1%E6%9C%89%E8%87%AA%E5%B7%B1%E7%9A%84%E6%97%B6%E9%92%9F"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 容器没有自己的时钟</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-%E8%99%9A%E6%8B%9F%E6%9C%BA%E6%97%B6%E9%92%9F%E6%BC%82%E7%A7%BB%E7%9A%84%E5%9B%9B%E4%B8%AA%E6%9D%A5%E6%BA%90"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 虚拟机时钟漂移的四个来源</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%97%B6%E9%92%9F%E4%B8%8D%E5%87%86%E4%BC%9A%E6%89%93%E5%9D%8F%E5%93%AA%E4%BA%9B%E4%B8%AD%E9%97%B4%E4%BB%B6"><span class="toc-number">1.6.</span> <span class="toc-text">五、时钟不准会打坏哪些中间件</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-Redis"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 Redis</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-MySQL"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 MySQL</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-Kafka"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 Kafka</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-TLS-JWT"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 TLS &#x2F; JWT</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E4%BE%A7%EF%BC%9A%E6%AD%A3%E7%A1%AE%E6%B5%8B%E9%87%8F%E4%B8%8E%E5%81%8F%E5%B7%AE%E6%84%9F%E7%9F%A5"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 侧：正确测量与偏差感知</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E6%B5%8B%E9%87%8F%E8%80%97%E6%97%B6%E6%B0%B8%E8%BF%9C%E7%94%A8-nanoTime"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 测量耗时永远用 nanoTime</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%8F%AF%E6%B3%A8%E5%85%A5%E6%97%B6%E9%92%9F%EF%BC%8C%E4%BE%BF%E4%BA%8E%E6%B5%8B%E8%AF%95"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 可注入时钟，便于测试</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E5%90%AF%E5%8A%A8%E8%87%AA%E6%A3%80%EF%BC%9A%E6%8A%8A%E6%97%B6%E9%92%9F%E5%81%8F%E5%B7%AE%E6%9A%B4%E9%9C%B2%E5%87%BA%E6%9D%A5"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 启动自检：把时钟偏差暴露出来</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E9%9B%AA%E8%8A%B1-ID-%E7%9A%84%E5%9B%9E%E6%8B%A8%E4%BF%9D%E6%8A%A4"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 雪花 ID 的回拨保护</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E8%A7%82%E6%B5%8B%E4%B8%8E%E5%91%8A%E8%AD%A6%E6%96%B9%E6%A1%88"><span class="toc-number">1.8.</span> <span class="toc-text">七、观测与告警方案</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/25/agent-memory-forgetting-consolidation-deep-dive/" title="【AI Agent】Agent 记忆的遗忘与巩固深度解析：不会忘的记忆系统，迟早会变成负债">【AI Agent】Agent 记忆的遗忘与巩固深度解析：不会忘的记忆系统，迟早会变成负债</a><time datetime="2026-11-25T00:00:00.000Z" title="发表于 2026-11-25 08:00:00">2026-11-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/25/java-multi-turn-coreference-context-rewrite-deep-practice/" title="【Java AI】多轮对话指代消解与上下文改写深度实战：把「那它呢」变成一个能检索的问题">【Java AI】多轮对话指代消解与上下文改写深度实战：把「那它呢」变成一个能检索的问题</a><time datetime="2026-11-25T00:00:00.000Z" title="发表于 2026-11-25 08:00:00">2026-11-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/25/kafka-partition-expansion-key-skew-deep-practice/" title="【Kafka 实战】分区扩容与 Key 倾斜治理：为什么加分区会让订单乱序，以及怎么补救">【Kafka 实战】分区扩容与 Key 倾斜治理：为什么加分区会让订单乱序，以及怎么补救</a><time datetime="2026-11-25T00:00:00.000Z" title="发表于 2026-11-25 08:00:00">2026-11-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/25/linux-chrony-clock-sync-distributed-systems-deep-dive/" title="【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌">【性能调优】chrony 时钟同步深度解析：一次 30ms 时钟跳变如何打乱 TTL、锁与令牌</a><time datetime="2026-11-25T00:00:00.000Z" title="发表于 2026-11-25 08:00:00">2026-11-25</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/25/redis-client-connection-governance-client-kill-deep-practice/" title="【Redis 运维】连接治理深度实战：CLIENT LIST/KILL、输出缓冲与 maxmemory-clients">【Redis 运维】连接治理深度实战：CLIENT LIST/KILL、输出缓冲与 maxmemory-clients</a><time datetime="2026-11-25T00:00:00.000Z" title="发表于 2026-11-25 08:00:00">2026-11-25</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
