@@ -1,0 +1,442 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【Nginx 实战】proxy_buffering 深度实战前言proxy_buffering 是 Nginx 里最容易被忽略、又最容易在半夜炸掉的指令之一。 它默认是 on。对普通 JSON 接口，这是好事：Nginx 先把上游响应收进内存缓冲，再慢慢发给客户端，上游连接可以尽快释放。但对下面这些场景，它就是灾难：  SSE &#x2F; 流式对话：前端一个字都不出来，等模型全部生成完才一次性刷">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/26/nginx-proxy-buffering-streaming-response-deep-practice/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【Nginx 实战】proxy_buffering 深度实战前言proxy_buffering 是 Nginx 里最容易被忽略、又最容易在半夜炸掉的指令之一。 它默认是 on。对普通 JSON 接口，这是好事：Nginx 先把上游响应收进内存缓冲，再慢慢发给客户端，上游连接可以尽快释放。但对下面这些场景，它就是灾难：  SSE &#x2F; 流式对话：前端一个字都不出来，等模型全部生成完才一次性刷">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-26T00:00:00.000Z">
+<meta property="article:modified_time" content="2026-11-26T00:04:06.336Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="Java">
+<meta property="article:tag" content="Nginx">
+<meta property="article:tag" content="SSE">
+<meta property="article:tag" content="中间件">
+<meta property="article:tag" content="性能优化">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线",
+  "url": "https://jiweidong.github.io/2026/11/26/nginx-proxy-buffering-streaming-response-deep-practice/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-26T00:00:00.000Z",
+  "dateModified": "2026-11-26T00:04:06.336Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/26/nginx-proxy-buffering-streaming-response-deep-practice/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">982</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1077</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-26T00:00:00.000Z" title="发表于 2026-11-26 08:00:00">2026-11-26</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-26T00:04:06.336Z" title="更新于 2026-11-26 08:04:06">2026-11-26</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【Nginx-实战】proxy-buffering-深度实战"><a href="#【Nginx-实战】proxy-buffering-深度实战" class="headerlink" title="【Nginx 实战】proxy_buffering 深度实战"></a>【Nginx 实战】proxy_buffering 深度实战</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p><code>proxy_buffering</code> 是 Nginx 里最容易被忽略、又最容易在半夜炸掉的指令之一。</p>
+<p>它默认是 <code>on</code>。对普通 JSON 接口，这是好事：Nginx 先把上游响应收进内存缓冲，再慢慢发给客户端，上游连接可以尽快释放。但对下面这些场景，它就是灾难：</p>
+<ul>
+<li>SSE &#x2F; 流式对话：前端一个字都不出来，等模型全部生成完才一次性刷屏；</li>
+<li>大文件下载：Nginx 把响应当成缓冲对象，磁盘 <code>proxy_temp</code> 目录被写满；</li>
+<li>慢客户端：一个 2G 的手机用户挂着下载，占住上游连接和缓冲，拖垮整个 upstream；</li>
+<li>上游超时：明明上游 200ms 就返回了，客户端却等了 30 秒。</li>
+</ul>
+<p>这些现象背后是同一套缓冲链路。本文把 <code>proxy_buffering</code> 的完整路径、参数计算、关闭时机、排障方法讲清楚，最后给出 Java 侧的配合方式。</p>
+<blockquote>
+<p>分工说明：站内已有《Nginx proxy_cache 缓存实战》《Nginx location&#x2F;rewrite》《Nginx stream 四层代理》等文章。本篇只讲<strong>响应缓冲（buffering）</strong>，不讲缓存（caching），两者是不同机制。</p>
+</blockquote>
+<hr>
+<h2 id="一、响应从上游到客户端，经过了几道手"><a href="#一、响应从上游到客户端，经过了几道手" class="headerlink" title="一、响应从上游到客户端，经过了几道手"></a>一、响应从上游到客户端，经过了几道手</h2><p>一个请求进来，Nginx 作为反向代理，响应路径大致是：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line">upstream socket</span><br><span class="line">   │  recv()</span><br><span class="line">   ▼</span><br><span class="line">proxy_buffer_size        ← 先读响应头（header）</span><br><span class="line">   │</span><br><span class="line">   ▼</span><br><span class="line">proxy_buffers            ← 响应体进入内存缓冲（若干块）</span><br><span class="line">   │  缓冲写满</span><br><span class="line">   ▼</span><br><span class="line">proxy_busy_buffers_size  ← 正在往客户端发的部分</span><br><span class="line">   │  还不够</span><br><span class="line">   ▼</span><br><span class="line">proxy_temp_file          ← 落磁盘临时文件</span><br><span class="line">   │</span><br><span class="line">   ▼</span><br><span class="line">client socket            ← 按客户端消费速度发送</span><br></pre></td></tr></table></figure>
+
+<p>关键点：<strong>Nginx 会尽可能快地从上游读完响应</strong>，然后把「发给客户端」这件事解耦。这样上游连接能快速归还，不被慢客户端拖住。这就是 buffering 的价值。</p>
+<p>代价是：响应的实时性没了。对 SSE 这种「服务端持续产出、客户端持续消费」的协议，缓冲直接破坏了语义。</p>
+<h3 id="1-1-核心指令表"><a href="#1-1-核心指令表" class="headerlink" title="1.1 核心指令表"></a>1.1 核心指令表</h3><table>
+<thead>
+<tr>
+<th>指令</th>
+<th>默认值</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>proxy_buffering</code></td>
+<td><code>on</code></td>
+<td>总开关</td>
+</tr>
+<tr>
+<td><code>proxy_buffer_size</code></td>
+<td>4k&#x2F;8k</td>
+<td>存放响应头的缓冲区大小，也是 buffer 关闭时唯一使用的缓冲</td>
+</tr>
+<tr>
+<td><code>proxy_buffers</code></td>
+<td>8 4k&#x2F;8k</td>
+<td>响应体缓冲区的数量和单块大小</td>
+</tr>
+<tr>
+<td><code>proxy_busy_buffers_size</code></td>
+<td>2×buffer_size</td>
+<td>正在发送给客户端的缓冲上限</td>
+</tr>
+<tr>
+<td><code>proxy_max_temp_file_size</code></td>
+<td>1024m</td>
+<td>单个响应允许写多少临时文件，0 表示禁用</td>
+</tr>
+<tr>
+<td><code>proxy_temp_file_write_size</code></td>
+<td>2×buffer_size</td>
+<td>一次写临时文件的块大小</td>
+</tr>
+<tr>
+<td><code>proxy_temp_path</code></td>
+<td><code>proxy_temp</code></td>
+<td>临时文件目录</td>
+</tr>
+<tr>
+<td><code>proxy_ignore_client_abort</code></td>
+<td><code>off</code></td>
+<td>客户端断开后是否继续读上游</td>
+</tr>
+</tbody></table>
+<p>一个常见的误解是：<code>proxy_buffers 8 4k</code> 意味着「最多缓冲 32k」。实际上 <code>proxy_busy_buffers_size</code> 通常按 2 倍单块计算，而且缓冲写满后会转临时文件，总缓冲量受 <code>proxy_max_temp_file_size</code> 限制，不是 32k。</p>
+<hr>
+<h2 id="二、默认配置在什么情况下会出事"><a href="#二、默认配置在什么情况下会出事" class="headerlink" title="二、默认配置在什么情况下会出事"></a>二、默认配置在什么情况下会出事</h2><h3 id="2-1-SSE：流式变成「一次性」"><a href="#2-1-SSE：流式变成「一次性」" class="headerlink" title="2.1 SSE：流式变成「一次性」"></a>2.1 SSE：流式变成「一次性」</h3><p>Java 侧用 <code>SseEmitter</code>：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@GetMapping(value = &quot;/chat/stream&quot;, produces = MediaType.TEXT_EVENT_STREAM_VALUE)</span></span><br><span class="line"><span class="keyword">public</span> SseEmitter <span class="title function_">stream</span><span class="params">(<span class="meta">@RequestParam</span> String q)</span> &#123;</span><br><span class="line">    <span class="type">SseEmitter</span> <span class="variable">emitter</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">SseEmitter</span>(<span class="number">0L</span>);</span><br><span class="line">    executor.execute(() -&gt; &#123;</span><br><span class="line">        <span class="keyword">try</span> &#123;</span><br><span class="line">            <span class="keyword">for</span> (String token : llmClient.stream(q)) &#123;</span><br><span class="line">                emitter.send(SseEmitter.event().data(token));</span><br><span class="line">            &#125;</span><br><span class="line">            emitter.complete();</span><br><span class="line">        &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">            emitter.completeWithError(e);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;);</span><br><span class="line">    <span class="keyword">return</span> emitter;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>本地测试一切正常，上了 Nginx 之后前端只收到一个「大包」。原因就是 <code>proxy_buffering on</code>：Nginx 把每个 chunk 攒进缓冲，直到缓冲满或响应结束才发给客户端。8k 缓冲对短回答来说，基本等于「全部结束才发」。</p>
+<p>解决方式有两种：</p>
+<p><strong>方式一：在 Nginx 关掉缓冲</strong></p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> /api/chat/stream &#123;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">    <span class="attribute">proxy_http_version</span> <span class="number">1</span>.<span class="number">1</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> Connection <span class="string">&quot;&quot;</span>;</span><br><span class="line"></span><br><span class="line">    <span class="attribute">proxy_buffering</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">proxy_cache</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">gzip</span> <span class="literal">off</span>;</span><br><span class="line"></span><br><span class="line">    <span class="attribute">proxy_read_timeout</span> <span class="number">300s</span>;</span><br><span class="line">    <span class="attribute">proxy_send_timeout</span> <span class="number">300s</span>;</span><br><span class="line">    <span class="attribute">add_header</span> X-Accel-Buffering <span class="literal">no</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><strong>方式二：由应用返回响应头</strong></p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">response.setHeader(<span class="string">&quot;X-Accel-Buffering&quot;</span>, <span class="string">&quot;no&quot;</span>);</span><br></pre></td></tr></table></figure>
+
+<p>Nginx 识别这个响应头后，会对该响应关闭缓冲，不需要改 <code>location</code>。适合「同一个接口有时流式、有时普通」的场景。</p>
+<h3 id="2-2-大文件下载：临时文件打满磁盘"><a href="#2-2-大文件下载：临时文件打满磁盘" class="headerlink" title="2.2 大文件下载：临时文件打满磁盘"></a>2.2 大文件下载：临时文件打满磁盘</h3><p>如果上游返回一个 5GB 的文件，而客户端很慢，Nginx 会把响应体写到 <code>proxy_temp_path</code>。默认上限是 1GB&#x2F;响应，但并发 10 个就是 10GB。磁盘打满后，Nginx 会报：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">write() to &quot;/var/lib/nginx/proxy/...&quot; failed (28: No space left on device)</span><br></pre></td></tr></table></figure>
+
+<p>对下载类接口，正确做法是：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> /files/ &#123;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">    <span class="attribute">proxy_buffering</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">proxy_max_temp_file_size</span> <span class="number">0</span>;</span><br><span class="line">    <span class="attribute">proxy_read_timeout</span> <span class="number">600s</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p><code>proxy_max_temp_file_size 0</code> 表示完全不落盘；配合 <code>proxy_buffering off</code>，响应边收边发，内存占用也小。</p>
+<h3 id="2-3-慢客户端拖住上游"><a href="#2-3-慢客户端拖住上游" class="headerlink" title="2.3 慢客户端拖住上游"></a>2.3 慢客户端拖住上游</h3><p>即使开了 buffering，如果响应一直写不完，上游连接仍然可能被占用。典型场景是「上游是流式接口，但 Nginx 没关缓冲」：Nginx 一边读上游、一边写临时文件，客户端越慢，临时文件越大，上游连接保持越久。</p>
+<p>监控上看：</p>
+<ul>
+<li><code>$upstream_response_time</code> 很小（上游很快就返回了）；</li>
+<li><code>$request_time</code> 很大（客户端侧耗了很久）；</li>
+<li><code>proxy_temp</code> 目录持续增长。</li>
+</ul>
+<p>这三个信号同时出现，基本可以确定是缓冲 + 慢客户端。</p>
+<hr>
+<h2 id="三、gzip-和-buffering-的叠加陷阱"><a href="#三、gzip-和-buffering-的叠加陷阱" class="headerlink" title="三、gzip 和 buffering 的叠加陷阱"></a>三、gzip 和 buffering 的叠加陷阱</h2><p><code>gzip on</code> 要求 Nginx 拿到完整响应（或足够大的块）才能压缩，所以 <strong>gzip 天然需要缓冲</strong>。如果你在 SSE 接口上只关了 <code>proxy_buffering</code>，却忘了 <code>gzip off</code>，可能会出现：</p>
+<ul>
+<li>响应被 gzip 模块缓冲，流式仍然不实时；</li>
+<li><code>Content-Encoding: gzip</code> 下，SSE 的 <code>data:</code> 分块被合并；</li>
+<li>某些客户端不 flush，前端解析器卡住。</li>
+</ul>
+<p>SSE 接口的标准配置应该是「三关」：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_buffering</span> <span class="literal">off</span>;</span><br><span class="line"><span class="attribute">gzip</span> <span class="literal">off</span>;</span><br><span class="line"><span class="attribute">proxy_cache</span> <span class="literal">off</span>;</span><br></pre></td></tr></table></figure>
+
+<p>如果全局开了 gzip，可以用 <code>gzip_types</code> 排除 <code>text/event-stream</code>，或在 location 里单独 <code>gzip off</code>。</p>
+<hr>
+<h2 id="四、配置模板：三类接口分开治理"><a href="#四、配置模板：三类接口分开治理" class="headerlink" title="四、配置模板：三类接口分开治理"></a>四、配置模板：三类接口分开治理</h2><p>不要用一个 <code>location /</code> 打天下。按响应特征拆成三类：</p>
+<h3 id="4-1-普通-JSON-API"><a href="#4-1-普通-JSON-API" class="headerlink" title="4.1 普通 JSON API"></a>4.1 普通 JSON API</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> /api/ &#123;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">    <span class="attribute">proxy_http_version</span> <span class="number">1</span>.<span class="number">1</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> Connection <span class="string">&quot;&quot;</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> Host <span class="variable">$host</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> X-Real-IP <span class="variable">$remote_addr</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> X-Forwarded-For <span class="variable">$proxy_add_x_forwarded_for</span>;</span><br><span class="line"></span><br><span class="line">    <span class="attribute">proxy_buffering</span> <span class="literal">on</span>;</span><br><span class="line">    <span class="attribute">proxy_buffer_size</span> <span class="number">8k</span>;</span><br><span class="line">    <span class="attribute">proxy_buffers</span> <span class="number">16</span> <span class="number">8k</span>;</span><br><span class="line">    <span class="attribute">proxy_busy_buffers_size</span> <span class="number">32k</span>;</span><br><span class="line">    <span class="attribute">proxy_max_temp_file_size</span> <span class="number">64m</span>;</span><br><span class="line"></span><br><span class="line">    <span class="attribute">proxy_connect_timeout</span> <span class="number">3s</span>;</span><br><span class="line">    <span class="attribute">proxy_send_timeout</span> <span class="number">30s</span>;</span><br><span class="line">    <span class="attribute">proxy_read_timeout</span> <span class="number">30s</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-2-SSE-流式"><a href="#4-2-SSE-流式" class="headerlink" title="4.2 SSE &#x2F; 流式"></a>4.2 SSE &#x2F; 流式</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> /api/chat/stream &#123;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">    <span class="attribute">proxy_http_version</span> <span class="number">1</span>.<span class="number">1</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> Connection <span class="string">&quot;&quot;</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> Host <span class="variable">$host</span>;</span><br><span class="line"></span><br><span class="line">    <span class="attribute">proxy_buffering</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">gzip</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">proxy_cache</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">proxy_max_temp_file_size</span> <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">    <span class="comment"># 流式接口不要用 30s 的读超时</span></span><br><span class="line">    <span class="attribute">proxy_read_timeout</span> <span class="number">600s</span>;</span><br><span class="line">    <span class="attribute">proxy_send_timeout</span> <span class="number">600s</span>;</span><br><span class="line">    <span class="attribute">send_timeout</span> <span class="number">600s</span>;</span><br><span class="line"></span><br><span class="line">    <span class="attribute">add_header</span> X-Accel-Buffering <span class="literal">no</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="4-3-大文件下载"><a href="#4-3-大文件下载" class="headerlink" title="4.3 大文件下载"></a>4.3 大文件下载</h3><figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line"><span class="section">location</span> /files/ &#123;</span><br><span class="line">    <span class="attribute">proxy_pass</span> http://backend;</span><br><span class="line">    <span class="attribute">proxy_buffering</span> <span class="literal">off</span>;</span><br><span class="line">    <span class="attribute">proxy_max_temp_file_size</span> <span class="number">0</span>;</span><br><span class="line">    <span class="attribute">proxy_read_timeout</span> <span class="number">1800s</span>;</span><br><span class="line">    <span class="attribute">send_timeout</span> <span class="number">1800s</span>;</span><br><span class="line"></span><br><span class="line">    <span class="comment"># 让 Nginx 直接走 sendfile（如果上游也是文件）</span></span><br><span class="line">    <span class="attribute">proxy_set_header</span> Range <span class="variable">$http_range</span>;</span><br><span class="line">    <span class="attribute">proxy_set_header</span> If-Range <span class="variable">$http_if_range</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="五、排障：怎么证明是-buffering-的锅"><a href="#五、排障：怎么证明是-buffering-的锅" class="headerlink" title="五、排障：怎么证明是 buffering 的锅"></a>五、排障：怎么证明是 buffering 的锅</h2><h3 id="5-1-看时间和大小"><a href="#5-1-看时间和大小" class="headerlink" title="5.1 看时间和大小"></a>5.1 看时间和大小</h3><p>在 <code>log_format</code> 里加上这些变量：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">log_format</span> upstream <span class="string">&#x27;<span class="variable">$remote_addr</span> &quot;<span class="variable">$request</span>&quot; status=<span class="variable">$status</span> &#x27;</span></span><br><span class="line">                    <span class="string">&#x27;req_time=<span class="variable">$request_time</span> up_time=<span class="variable">$upstream_response_time</span> &#x27;</span></span><br><span class="line">                    <span class="string">&#x27;bytes=<span class="variable">$body_bytes_sent</span> up_bytes=<span class="variable">$upstream_response_length</span> &#x27;</span></span><br><span class="line">                    <span class="string">&#x27;buf=<span class="variable">$upstream_bytes_received</span>&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p>判读：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>up_time</code> 小、<code>req_time</code> 大</td>
+<td>上游快，客户端慢，可能被缓冲&#x2F;慢客户端拖住</td>
+</tr>
+<tr>
+<td><code>up_bytes</code> 远大于 <code>bytes</code></td>
+<td>响应在 Nginx 侧积压</td>
+</tr>
+<tr>
+<td><code>up_time</code> 大</td>
+<td>上游本身慢，与 buffering 无关</td>
+</tr>
+</tbody></table>
+<h3 id="5-2-看临时文件"><a href="#5-2-看临时文件" class="headerlink" title="5.2 看临时文件"></a>5.2 看临时文件</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">lsof +D /var/lib/nginx/proxy 2&gt;/dev/null | <span class="built_in">head</span></span><br><span class="line"><span class="built_in">du</span> -sh /var/lib/nginx/proxy</span><br></pre></td></tr></table></figure>
+
+<p>如果请求进行中能看到大量 <code>proxy</code> 临时文件，说明响应在落盘。</p>
+<h3 id="5-3-看-error-log"><a href="#5-3-看-error-log" class="headerlink" title="5.3 看 error.log"></a>5.3 看 error.log</h3><p>典型日志：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">a client request body is buffered to a temporary file</span><br></pre></td></tr></table></figure>
+
+<p>注意这是 <strong>request body</strong>（客户端上传），对应 <code>client_body_buffer_size</code>，不是 <code>proxy_buffering</code>。响应侧一般不会主动打日志，只能靠临时文件和耗时判断。</p>
+<h3 id="5-4-用-curl-验证是否流式"><a href="#5-4-用-curl-验证是否流式" class="headerlink" title="5.4 用 curl 验证是否流式"></a>5.4 用 curl 验证是否流式</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">curl -N -H <span class="string">&quot;Accept: text/event-stream&quot;</span> https://api.example.com/api/chat/stream</span><br></pre></td></tr></table></figure>
+
+<p><code>-N</code> 关闭 curl 自己的缓冲。如果本地直连后端是逐行输出，经过 Nginx 变成一次性输出，问题就在 Nginx。</p>
+<hr>
+<h2 id="六、Java-侧要配合的四件事"><a href="#六、Java-侧要配合的四件事" class="headerlink" title="六、Java 侧要配合的四件事"></a>六、Java 侧要配合的四件事</h2><h3 id="6-1-正确设置-Content-Type"><a href="#6-1-正确设置-Content-Type" class="headerlink" title="6.1 正确设置 Content-Type"></a>6.1 正确设置 Content-Type</h3><p>SSE 必须是：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">produces = MediaType.TEXT_EVENT_STREAM_VALUE</span><br></pre></td></tr></table></figure>
+
+<p>如果写成 <code>application/json</code>，Nginx 和浏览器都可能按普通响应处理，缓冲行为更不可控。</p>
+<h3 id="6-2-及时-flush"><a href="#6-2-及时-flush" class="headerlink" title="6.2 及时 flush"></a>6.2 及时 flush</h3><p>Spring MVC 的 <code>SseEmitter.send()</code> 会 flush；但如果用 <code>ResponseBodyEmitter</code> 或原生 <code>OutputStream</code>，要显式 flush：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line">response.setContentType(<span class="string">&quot;text/event-stream&quot;</span>);</span><br><span class="line">response.setCharacterEncoding(<span class="string">&quot;UTF-8&quot;</span>);</span><br><span class="line">response.setHeader(<span class="string">&quot;Cache-Control&quot;</span>, <span class="string">&quot;no-cache&quot;</span>);</span><br><span class="line">response.setHeader(<span class="string">&quot;X-Accel-Buffering&quot;</span>, <span class="string">&quot;no&quot;</span>);</span><br><span class="line"></span><br><span class="line"><span class="type">PrintWriter</span> <span class="variable">writer</span> <span class="operator">=</span> response.getWriter();</span><br><span class="line"><span class="keyword">for</span> (String token : tokens) &#123;</span><br><span class="line">    writer.write(<span class="string">&quot;data: &quot;</span> + token + <span class="string">&quot;\n\n&quot;</span>);</span><br><span class="line">    writer.flush();</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="6-3-不要用-gzip-压缩流式响应"><a href="#6-3-不要用-gzip-压缩流式响应" class="headerlink" title="6.3 不要用 gzip 压缩流式响应"></a>6.3 不要用 gzip 压缩流式响应</h3><p>如果 Java 侧用了 <code>CompressionFilter</code> 或 Spring Boot 的 <code>server.compression.enabled=true</code>，要排除 SSE：</p>
+<figure class="highlight yaml"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="attr">server:</span></span><br><span class="line">  <span class="attr">compression:</span></span><br><span class="line">    <span class="attr">enabled:</span> <span class="literal">true</span></span><br><span class="line">    <span class="attr">mime-types:</span> <span class="string">application/json,text/html,text/css,application/javascript</span></span><br><span class="line">    <span class="comment"># 不要包含 text/event-stream</span></span><br></pre></td></tr></table></figure>
+
+<h3 id="6-4-超时要大于业务最长耗时"><a href="#6-4-超时要大于业务最长耗时" class="headerlink" title="6.4 超时要大于业务最长耗时"></a>6.4 超时要大于业务最长耗时</h3><p>流式对话可能持续几分钟。Java 侧：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="type">SseEmitter</span> <span class="variable">emitter</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">SseEmitter</span>(<span class="number">600_000L</span>); <span class="comment">// 10 分钟</span></span><br></pre></td></tr></table></figure>
+
+<p>Nginx 侧 <code>proxy_read_timeout</code> 要大于等于这个值，否则 Nginx 会先断开，前端收到「网络错误」。</p>
+<hr>
+<h2 id="七、几个容易搞混的指令"><a href="#七、几个容易搞混的指令" class="headerlink" title="七、几个容易搞混的指令"></a>七、几个容易搞混的指令</h2><table>
+<thead>
+<tr>
+<th>指令</th>
+<th>管什么</th>
+<th>常见误用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>proxy_buffering</code></td>
+<td>响应体是否缓冲</td>
+<td>以为关了就不读上游</td>
+</tr>
+<tr>
+<td><code>proxy_buffer_size</code></td>
+<td>响应头缓冲</td>
+<td>调很大以为能缓冲响应体</td>
+</tr>
+<tr>
+<td><code>client_body_buffer_size</code></td>
+<td>请求体缓冲</td>
+<td>和响应缓冲混淆</td>
+</tr>
+<tr>
+<td><code>proxy_cache</code></td>
+<td>是否缓存响应</td>
+<td>以为关了 buffering 就不缓存</td>
+</tr>
+<tr>
+<td><code>proxy_request_buffering</code></td>
+<td>请求体是否先收完再转发</td>
+<td>大上传要关</td>
+</tr>
+<tr>
+<td><code>sendfile</code></td>
+<td>零拷贝发文件</td>
+<td>对代理响应无效</td>
+</tr>
+</tbody></table>
+<p>特别是 <code>proxy_request_buffering</code>：上传大文件时，Nginx 默认会先把整个请求体收完再转发给上游，这会让上传看起来「卡住很久然后突然完成」。需要流式上传时要关：</p>
+<figure class="highlight nginx"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="attribute">proxy_request_buffering</span> <span class="literal">off</span>;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="八、面试追问"><a href="#八、面试追问" class="headerlink" title="八、面试追问"></a>八、面试追问</h2><p><strong>Q1：<code>proxy_buffering off</code> 后，Nginx 还读上游吗？</strong></p>
+<p>读，但变成「边读边发」，不再积压。此时 <code>proxy_buffer_size</code> 仍然用于响应头，响应体基本不占大缓冲。</p>
+<p><strong>Q2：为什么 SSE 要关 gzip？</strong></p>
+<p>gzip 压缩需要攒数据才能出块，会破坏 SSE 的实时性；而且 <code>Content-Encoding: gzip</code> 下，浏览器的事件流解析器可能拿不到完整的 <code>data:</code> 边界。</p>
+<p><strong>Q3：<code>proxy_buffering on</code> 一定比 off 快吗？</strong></p>
+<p>对「上游快、客户端慢」的场景，on 更快，因为上游连接能尽快释放；对「上游持续产出」的流式场景，on 会破坏实时性；对「大文件」场景，on 可能写满磁盘。没有绝对优劣，要看响应形态。</p>
+<p><strong>Q4：<code>X-Accel-Buffering: no</code> 和 <code>proxy_buffering off</code> 有什么区别？</strong></p>
+<p>前者是应用级、按响应生效；后者是 location 级、对该 location 所有响应生效。多租户或混合接口用前者更灵活。</p>
+<p><strong>Q5：临时文件目录应该放哪？</strong></p>
+<p>放独立磁盘或 tmpfs（如果内存足够），不要和系统盘、日志盘共用。要监控目录大小和 inode，避免打满根分区。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>记住四句话：</p>
+<ol>
+<li><code>proxy_buffering</code> 默认开，普通 API 受益，流式接口受害；</li>
+<li>SSE 要「三关」：<code>proxy_buffering off</code>、<code>gzip off</code>、<code>proxy_cache off</code>；</li>
+<li>大文件要 <code>proxy_max_temp_file_size 0</code>，否则临时文件能打满磁盘；</li>
+<li>排障看 <code>$request_time</code> 与 <code>$upstream_response_time</code> 的差值，再看临时文件。</li>
+</ol>
+<p>缓冲本身不是问题，问题是「用默认配置应对所有响应形态」。把接口按 JSON、流式、下载三类拆开，这类事故基本可以绝迹。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/26/nginx-proxy-buffering-streaming-response-deep-practice/">https://jiweidong.github.io/2026/11/26/nginx-proxy-buffering-streaming-response-deep-practice/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/Java/">Java</a><a class="post-meta__tags" href="/tags/%E4%B8%AD%E9%97%B4%E4%BB%B6/">中间件</a><a class="post-meta__tags" href="/tags/Nginx/">Nginx</a><a class="post-meta__tags" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/">性能优化</a><a class="post-meta__tags" href="/tags/SSE/">SSE</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/26/postgresql-mvcc-autovacuum-bloat-deep-dive/" title="【PostgreSQL 深挖】MVCC、VACUUM 与表膨胀治理：从 xmin/xmax 到事务 ID 回卷"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【PostgreSQL 深挖】MVCC、VACUUM 与表膨胀治理：从 xmin/xmax 到事务 ID 回卷</div></div><div class="info-2"><div class="info-item-1">【PostgreSQL 深挖】MVCC、VACUUM 与表膨胀治理前言MySQL 背景的工程师第一次接手 PostgreSQL，最容易产生一种错觉：SQL 差不多、事务差不多、索引也差不多，应该很快就能上手。 然后线上就会出现这些现象：  一张只有 200 万行的表，物理大小 40GB，SELECT count(*) 越来越慢； 磁盘监控天天告警，DELETE 了 80% 的数据，空间一点没释放； 某天凌晨数据库突然只能读不能写，日志里出现 database is not accepting commands to avoid wraparound data loss； pg_stat_activity 里一堆 idle in transaction，autovacuum 明明在跑，死元组却越积越多。  这些问题的根都在同一个地方：PostgreSQL 的 MVCC 是「原地写新版本」，旧版本必须靠 VACUUM 回收。而 MySQL InnoDB 的 MVCC 是「undo 回滚段 + 原地更新」，旧版本由 purge 线程在后台清理。两套机制的运维心智完全不同。 本文从元组结...</div></div></div></a><a class="pagination-related" href="/2026/11/26/java-agent-parallel-tool-calls-orchestration-deep-practice/" title="【Java AI】Agent 并行工具调用深度实战：依赖分析、虚拟线程编排与部分失败治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java AI】Agent 并行工具调用深度实战：依赖分析、虚拟线程编排与部分失败治理</div></div><div class="info-2"><div class="info-item-1">【Java AI】Agent 并行工具调用深度实战前言一个查订单的 Agent，用户问：「帮我看看订单 A1001 和 A1002 哪个先到，顺便查下这两个包裹的物流。」 模型很聪明，一次返回了三个工具调用：  getOrder(A1001) getOrder(A1002) getLogistics(A1001)、getLogistics(A1002)  如果串行执行，每个 600ms，总耗时 2.4s；如果全部并行，理论上 600ms 就能完成。但很多团队做完并行之后，反而出现了新问题：  两个工具同时改同一个订单，后写的覆盖先写的； 工具结果回填顺序错乱，模型把 A1001 的物流安到了 A1002 上； 一个工具超时，整个 CompletableFuture.allOf 抛异常，其他已经成功的结果全丢了； 并行度不设上限，一次 20 个工具把下游数据库打挂。  并行工具调用不是「把 for 循环换成 parallelStream」。它涉及协议语义、依赖分析、并发控制、结果组装、失败策略五个层面。  分工说明：站内已有《Agent 工作流编排》（跨步骤 DAG、状态机、人工介...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/10/27/nginx-proxy-cache-deep-practice/" title="【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-27</div><div class="info-item-2">【Nginx 实战】proxy_cache 缓存深度实战：缓存键设计、缓存穿透与多级缓存治理</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】proxy_cache 缓存深度实战前言很多团队一提到缓存，第一反应就是 Redis。但在真实的高并发系统里，最便宜、最近、最有效的一层缓存，往往是 Nginx 的 proxy_cache。 它挡在 Tomcat 前面，命中时连 Java 进程都不用碰：一次请求在 Nginx 内部完成磁盘（或内存）读取并直接返回，省掉了内核态到用户态的多次拷贝、省掉了 Spring 的一整条 Filter&#x2F;Interceptor&#x2F;AOP 链路，也省掉了数据库连接。 但 proxy_cache 是典型的「配置五行能跑，生产半年出事故」的组件：缓存键设计不当导致串号、Set-Cookie 被缓存导致用户串登录、proxy_cache_lock 没开导致缓存击穿打爆回源、磁盘 IO 打满导致 Nginx 自己变成瓶颈。 这篇文章把 proxy_cache 从原理到生产配置讲透，最后给出一套可以直接抄的配置模板和排查手册。  一、proxy_cache 的工作模型先建立一个正确的心理模型。Nginx 的缓存是反向代理层的响应缓存，它缓存的是「上游返回的 HTTP ...</div></div></div></a><a class="pagination-related" href="/2026/10/25/nginx-upstream-load-balancing-keepalive-deep-practice/" title="【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-25</div><div class="info-item-2">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】upstream 负载均衡、长连接与被动健康检查深度实战前言一个很典型的生产事故：Java 服务扩到 8 个实例，QPS 上去了，但 P99 延迟反而从 40ms 涨到 300ms，netstat 一看 TIME_WAIT 上万，Nginx error.log 里零星出现： 1upstream prematurely closed connection while reading response header from upstream  排查半天发现三个配置问题叠在一起：upstream 没开 keepalive、proxy_http_version 还是 1.0、后端 Tomcat 的 keep-alive-timeout 比 Nginx 短。于是每次请求都是「新建 TCP → 后端已经准备关连接 → 撞上关闭窗口」的恶性组合。 这篇把 Nginx upstream 这一层从算法选型 → 长连接池 → 健康检查 → 故障排查串起来，重点讲清楚「配置项之间的相互制约」，而不是罗列指令。  一、负载均衡算法：不是选最花的，是选最匹配的1234567upstr...</div></div></div></a><a class="pagination-related" href="/2026/10/25/nginx-rate-limiting-connection-governance-deep-practice/" title="【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-25</div><div class="info-item-2">【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】限流与连接治理深度实战：limit_req、limit_conn 与集群限流的精度陷阱前言一个让人印象深刻的故障：有人为了「保护后端」，在大促前给 Nginx 加了： 12limit_req zone=api burst=5 nodelay;limit_conn addr 2;  结果大促一开始，首页的雪碧图（当时还有 sprite）+ 十几个静态资源请求并发打到同一个 location，limit_conn addr 2 直接把正常用户的图片请求全拒了。监控上是「429 激增」，用户看到的是「页面空白」。 限流参数从来不是「加上就安全」，而是必须回答三个问题：限谁（key 是什么）、限多严（rate + burst）、超了怎么办（拒绝 &#x2F; 排队 &#x2F; 降级）。 这篇文章讲 Nginx 两把限流武器（limit_req 漏桶、limit_conn 并发连接数）的真实语义、参数之间的数学关系、集群限流的精度陷阱，以及它和 Java 侧（Sentinel）的分工。  一、limit_req：不是令牌桶，是漏桶1234567891011121314...</div></div></div></a><a class="pagination-related" href="/2026/08/12/object-pool-commons-pool2-deep-dive/" title="【Java 实战】对象池技术深度解析：从 commons-pool2 源码到 Jedis 连接池的实现原理"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-12</div><div class="info-item-2">【Java 实战】对象池技术深度解析：从 commons-pool2 源码到 Jedis 连接池的实现原理</div></div><div class="info-2"><div class="info-item-1">【Java 实战】对象池技术深度解析：从 commons-pool2 源码到 Jedis 连接池的实现原理面试官：Redis 客户端为什么要用连接池？连接池是怎么实现”池”的？候选人：因为创建连接开销大，复用连接能提升性能…… 面试官追问：“如果池里没有空闲连接了，新请求是排队等待还是直接失败？池里的连接怎么检测有没有失效？这些在 commons-pool2 里分别对应什么机制？” 对象池（Object Pool）是生产环境无处不在的底层技术——数据库连接池、Redis 连接池、线程池、Netty 的 ByteBuf 池、Apache HttpClient 的连接池，底层思想同源。今天以 Apache Commons Pool2（Jedis、Druid 早期、Elasticsearch 客户端都在用）为主线，把对象池的原理、源码、配置调优一次讲透。  一、为什么需要对象池1.1 池化的本质对象池：预先创建一批对象放在池中，使用时借出（borrow），用完归还（return），避免频繁创建销毁。 池化解决的痛点是创建&#x2F;销毁成本高的对象：    对象 创建成本 不池化的后果...</div></div></div></a><a class="pagination-related" href="/2026/08/04/java-timing-wheel-algorithm-deep-dive/" title="【中间件原理】时间轮算法（TimingWheel）深度解析：从 Kafka 到 Netty 的延迟任务实现"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-04</div><div class="info-item-2">【中间件原理】时间轮算法（TimingWheel）深度解析：从 Kafka 到 Netty 的延迟任务实现</div></div><div class="info-2"><div class="info-item-1">【中间件原理】时间轮算法（TimingWheel）深度解析：从 Kafka 到 Netty 的延迟任务实现引子：延迟任务为什么难做？面试官： 假如你要实现一个延迟消息队列——用户下单 30 分钟后未支付就自动关闭订单，你会怎么做？ 候选人： 最简单的方案是用 ScheduledExecutorService.schedule()，或者用一个后台线程定时扫描数据库里的订单表…… 面试官： 那如果订单量是百万级、千万级呢？每 1 秒扫一次全表？延迟精度怎么保证？定时任务线程怎么管理？ 候选人： ……这就引出今天的主角了——时间轮（TimingWheel）算法。 一、传统延迟任务方案的痛点1.1 方案一：定时扫描数据库123456@Scheduled(fixedDelay = 1000)public void scanExpiredOrders() &#123;    // 每 1 秒扫描一次超时未支付订单    List&lt;Order&gt; orders = orderMapper.selectExpiredOrders(now);    orders.forEach(orde...</div></div></div></a><a class="pagination-related" href="/2026/11/21/nginx-stream-layer4-proxy-tls-passthrough-deep-practice/" title="【Nginx 实战】stream 四层代理深度实战：TCP&#x2F;UDP 转发、TLS 透传与 SNI 分流"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-21</div><div class="info-item-2">【Nginx 实战】stream 四层代理深度实战：TCP&#x2F;UDP 转发、TLS 透传与 SNI 分流</div></div><div class="info-2"><div class="info-item-1">【Nginx 实战】stream 四层代理深度实战前言提到 Nginx，绝大多数人想的是 location、proxy_pass、upstream —— 那是 http 模块，工作在第七层。但在真实系统里还有一类需求它解决不了：  数据库（MySQL&#x2F;PostgreSQL）要经过统一入口，做故障转移和内网收敛。 Redis 集群要给外部租户暴露，但不能让租户直连节点。 多租户 SaaS，每个客户用自己的域名和证书，需要按 SNI 分流但不在网关解密。 一套入口同时承载 HTTPS 和 MQTT&#x2F;自定义二进制协议。  这些都得用 stream 模块 —— Nginx 的四层（TCP&#x2F;UDP）代理。它不理解应用协议，只搬字节，所以能力边界和 http 模块完全不同。这篇文章把这个边界讲清楚。 一、stream 模块的定位：它不懂协议，这是优点也是限制   能力 http 模块 stream 模块    理解请求 ✅ 解析 HTTP 头&#x2F;体 ❌ 只搬字节流   路由依据 URI、Header、Cookie、方法 源 IP、端口、SNI、ALPN ...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">982</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1077</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90Nginx-%E5%AE%9E%E6%88%98%E3%80%91proxy-buffering-%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98"><span class="toc-number">1.</span> <span class="toc-text">【Nginx 实战】proxy_buffering 深度实战</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E5%93%8D%E5%BA%94%E4%BB%8E%E4%B8%8A%E6%B8%B8%E5%88%B0%E5%AE%A2%E6%88%B7%E7%AB%AF%EF%BC%8C%E7%BB%8F%E8%BF%87%E4%BA%86%E5%87%A0%E9%81%93%E6%89%8B"><span class="toc-number">1.2.</span> <span class="toc-text">一、响应从上游到客户端，经过了几道手</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#1-1-%E6%A0%B8%E5%BF%83%E6%8C%87%E4%BB%A4%E8%A1%A8"><span class="toc-number">1.2.1.</span> <span class="toc-text">1.1 核心指令表</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E9%BB%98%E8%AE%A4%E9%85%8D%E7%BD%AE%E5%9C%A8%E4%BB%80%E4%B9%88%E6%83%85%E5%86%B5%E4%B8%8B%E4%BC%9A%E5%87%BA%E4%BA%8B"><span class="toc-number">1.3.</span> <span class="toc-text">二、默认配置在什么情况下会出事</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-SSE%EF%BC%9A%E6%B5%81%E5%BC%8F%E5%8F%98%E6%88%90%E3%80%8C%E4%B8%80%E6%AC%A1%E6%80%A7%E3%80%8D"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 SSE：流式变成「一次性」</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E5%A4%A7%E6%96%87%E4%BB%B6%E4%B8%8B%E8%BD%BD%EF%BC%9A%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6%E6%89%93%E6%BB%A1%E7%A3%81%E7%9B%98"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 大文件下载：临时文件打满磁盘</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E6%85%A2%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%8B%96%E4%BD%8F%E4%B8%8A%E6%B8%B8"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 慢客户端拖住上游</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81gzip-%E5%92%8C-buffering-%E7%9A%84%E5%8F%A0%E5%8A%A0%E9%99%B7%E9%98%B1"><span class="toc-number">1.4.</span> <span class="toc-text">三、gzip 和 buffering 的叠加陷阱</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E9%85%8D%E7%BD%AE%E6%A8%A1%E6%9D%BF%EF%BC%9A%E4%B8%89%E7%B1%BB%E6%8E%A5%E5%8F%A3%E5%88%86%E5%BC%80%E6%B2%BB%E7%90%86"><span class="toc-number">1.5.</span> <span class="toc-text">四、配置模板：三类接口分开治理</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E6%99%AE%E9%80%9A-JSON-API"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 普通 JSON API</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-2-SSE-%E6%B5%81%E5%BC%8F"><span class="toc-number">1.5.2.</span> <span class="toc-text">4.2 SSE &#x2F; 流式</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#4-3-%E5%A4%A7%E6%96%87%E4%BB%B6%E4%B8%8B%E8%BD%BD"><span class="toc-number">1.5.3.</span> <span class="toc-text">4.3 大文件下载</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81%E6%8E%92%E9%9A%9C%EF%BC%9A%E6%80%8E%E4%B9%88%E8%AF%81%E6%98%8E%E6%98%AF-buffering-%E7%9A%84%E9%94%85"><span class="toc-number">1.6.</span> <span class="toc-text">五、排障：怎么证明是 buffering 的锅</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#5-1-%E7%9C%8B%E6%97%B6%E9%97%B4%E5%92%8C%E5%A4%A7%E5%B0%8F"><span class="toc-number">1.6.1.</span> <span class="toc-text">5.1 看时间和大小</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-2-%E7%9C%8B%E4%B8%B4%E6%97%B6%E6%96%87%E4%BB%B6"><span class="toc-number">1.6.2.</span> <span class="toc-text">5.2 看临时文件</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-3-%E7%9C%8B-error-log"><span class="toc-number">1.6.3.</span> <span class="toc-text">5.3 看 error.log</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#5-4-%E7%94%A8-curl-%E9%AA%8C%E8%AF%81%E6%98%AF%E5%90%A6%E6%B5%81%E5%BC%8F"><span class="toc-number">1.6.4.</span> <span class="toc-text">5.4 用 curl 验证是否流式</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81Java-%E4%BE%A7%E8%A6%81%E9%85%8D%E5%90%88%E7%9A%84%E5%9B%9B%E4%BB%B6%E4%BA%8B"><span class="toc-number">1.7.</span> <span class="toc-text">六、Java 侧要配合的四件事</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#6-1-%E6%AD%A3%E7%A1%AE%E8%AE%BE%E7%BD%AE-Content-Type"><span class="toc-number">1.7.1.</span> <span class="toc-text">6.1 正确设置 Content-Type</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-2-%E5%8F%8A%E6%97%B6-flush"><span class="toc-number">1.7.2.</span> <span class="toc-text">6.2 及时 flush</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-3-%E4%B8%8D%E8%A6%81%E7%94%A8-gzip-%E5%8E%8B%E7%BC%A9%E6%B5%81%E5%BC%8F%E5%93%8D%E5%BA%94"><span class="toc-number">1.7.3.</span> <span class="toc-text">6.3 不要用 gzip 压缩流式响应</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#6-4-%E8%B6%85%E6%97%B6%E8%A6%81%E5%A4%A7%E4%BA%8E%E4%B8%9A%E5%8A%A1%E6%9C%80%E9%95%BF%E8%80%97%E6%97%B6"><span class="toc-number">1.7.4.</span> <span class="toc-text">6.4 超时要大于业务最长耗时</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E5%87%A0%E4%B8%AA%E5%AE%B9%E6%98%93%E6%90%9E%E6%B7%B7%E7%9A%84%E6%8C%87%E4%BB%A4"><span class="toc-number">1.8.</span> <span class="toc-text">七、几个容易搞混的指令</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/26/agent-clarification-question-generation-deep-dive/" title="【AI Agent】澄清与追问深度解析：什么时候该问用户，什么时候必须猜">【AI Agent】澄清与追问深度解析：什么时候该问用户，什么时候必须猜</a><time datetime="2026-11-26T00:00:00.000Z" title="发表于 2026-11-26 08:00:00">2026-11-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/26/elasticsearch-mapping-explosion-field-limit-deep-practice/" title="【ES 实战】Mapping 膨胀与字段爆炸治理：dynamic mapping、1000 字段上限与 flattened 落地">【ES 实战】Mapping 膨胀与字段爆炸治理：dynamic mapping、1000 字段上限与 flattened 落地</a><time datetime="2026-11-26T00:00:00.000Z" title="发表于 2026-11-26 08:00:00">2026-11-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/26/java-agent-parallel-tool-calls-orchestration-deep-practice/" title="【Java AI】Agent 并行工具调用深度实战：依赖分析、虚拟线程编排与部分失败治理">【Java AI】Agent 并行工具调用深度实战：依赖分析、虚拟线程编排与部分失败治理</a><time datetime="2026-11-26T00:00:00.000Z" title="发表于 2026-11-26 08:00:00">2026-11-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/26/nginx-proxy-buffering-streaming-response-deep-practice/" title="【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线">【Nginx 实战】proxy_buffering 深度实战：响应缓冲、临时文件与流式接口的生死线</a><time datetime="2026-11-26T00:00:00.000Z" title="发表于 2026-11-26 08:00:00">2026-11-26</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/26/postgresql-mvcc-autovacuum-bloat-deep-dive/" title="【PostgreSQL 深挖】MVCC、VACUUM 与表膨胀治理：从 xmin/xmax 到事务 ID 回卷">【PostgreSQL 深挖】MVCC、VACUUM 与表膨胀治理：从 xmin/xmax 到事务 ID 回卷</a><time datetime="2026-11-26T00:00:00.000Z" title="发表于 2026-11-26 08:00:00">2026-11-26</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
