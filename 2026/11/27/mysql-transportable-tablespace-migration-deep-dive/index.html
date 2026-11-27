@@ -1,0 +1,458 @@
+<!DOCTYPE html><html lang="zh-CN" data-theme="light"><head><meta charset="UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=edge"><meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover"><title>【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验 | 东哥的技术博客</title><meta name="author" content="东哥"><meta name="copyright" content="东哥"><meta name="format-detection" content="telephone=no"><meta name="theme-color" content="#ffffff"><meta name="description" content="【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd&#x2F;.cfg 与一致性校验前言一张 480GB 的订单明细表要从老集群搬到新集群。 先算一下常规方案的时间账：  mysqldump：单线程导出约 40MB&#x2F;s，480GB 需要 3.3 小时，导入再 5 小时以上，还得考虑 binlog 追平； XtraBackup 全量：快，但整个实例 3TB，为了搬一张表要复">
+<meta property="og:type" content="article">
+<meta property="og:title" content="【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd&#x2F;.cfg 与一致性校验">
+<meta property="og:url" content="https://jiweidong.github.io/2026/11/27/mysql-transportable-tablespace-migration-deep-dive/index.html">
+<meta property="og:site_name" content="东哥的技术博客">
+<meta property="og:description" content="【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd&#x2F;.cfg 与一致性校验前言一张 480GB 的订单明细表要从老集群搬到新集群。 先算一下常规方案的时间账：  mysqldump：单线程导出约 40MB&#x2F;s，480GB 需要 3.3 小时，导入再 5 小时以上，还得考虑 binlog 追平； XtraBackup 全量：快，但整个实例 3TB，为了搬一张表要复">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:image" content="https://jiweidong.github.io/img/butterfly-icon.png">
+<meta property="article:published_time" content="2026-11-27T00:05:00.000Z">
+<meta property="article:modified_time" content="2026-11-27T00:04:19.848Z">
+<meta property="article:author" content="东哥">
+<meta property="article:tag" content="InnoDB">
+<meta property="article:tag" content="MySQL">
+<meta property="article:tag" content="数据迁移">
+<meta property="article:tag" content="生产实战">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:image" content="https://jiweidong.github.io/img/butterfly-icon.png"><script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验",
+  "url": "https://jiweidong.github.io/2026/11/27/mysql-transportable-tablespace-migration-deep-dive/",
+  "image": "https://jiweidong.github.io/img/butterfly-icon.png",
+  "datePublished": "2026-11-27T00:05:00.000Z",
+  "dateModified": "2026-11-27T00:04:19.848Z",
+  "author": [
+    {
+      "@type": "Person",
+      "name": "东哥",
+      "url": "https://jiweidong.github.io"
+    }
+  ]
+}</script><link rel="shortcut icon" href="/img/favicon.png"><link rel="canonical" href="https://jiweidong.github.io/2026/11/27/mysql-transportable-tablespace-migration-deep-dive/index.html"><link rel="preconnect" href="//cdn.jsdelivr.net"/><link rel="preconnect" href="//busuanzi.ibruce.info"/><link rel="stylesheet" href="/css/index.css?v=5.6.1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@7.3.1/css/all.min.css"><script>
+    (() => {
+      
+    const saveToLocal = {
+      set: (key, value, ttl) => {
+        const data = { value }
+
+        if (ttl != null) {
+          data.expiry = Date.now() + ttl * 86400000
+        }
+
+        localStorage.setItem(key, JSON.stringify(data))
+      },
+      get: key => {
+        const itemStr = localStorage.getItem(key)
+        if (!itemStr) return
+
+        try {
+          const data = JSON.parse(itemStr)
+
+          if (data.expiry && Date.now() > data.expiry) {
+            localStorage.removeItem(key)
+            return
+          }
+
+          return data.value
+        } catch {
+          localStorage.removeItem(key)
+        }
+      }
+    }
+
+    const scriptCache = new Map()
+    const cssCache = new Map()
+    window.btf = {
+      saveToLocal,
+      getScript: (url, attr = {}) => {
+        if (scriptCache.has(url)) {
+          return scriptCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const script = document.createElement('script')
+
+          script.src = url
+          script.async = true
+
+          for (const key in attr) {
+            script.setAttribute(key, attr[key])
+          }
+
+          script.onload = resolve
+          script.onerror = reject
+
+          document.head.appendChild(script)
+        })
+
+        scriptCache.set(url, promise)
+
+        return promise
+      },
+      getCSS: (url, id) => {
+        if (cssCache.has(url)) {
+          return cssCache.get(url)
+        }
+
+        const promise = new Promise((resolve, reject) => {
+          const link = document.createElement('link')
+
+          link.rel = 'stylesheet'
+          link.href = url
+
+          if (id) {
+            link.id = id
+          }
+
+          link.onload = resolve
+          link.onerror = reject
+
+          document.head.appendChild(link)
+        })
+
+        cssCache.set(url, promise)
+
+        return promise
+      },
+      addGlobalFn: (key, fn, name = false, parent = window) => {
+        if (!false && key.startsWith('pjax')) return
+        const globalFn = parent.globalFn || {}
+        globalFn[key] = globalFn[key] || {}
+        globalFn[key][name || Object.keys(globalFn[key]).length] = fn
+        parent.globalFn = globalFn
+      }
+    }
+  
+      
+      const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+      const activateDarkMode = () => {
+        document.documentElement.dataset.theme = 'dark'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#0d0d0d')
+        }
+      }
+      const activateLightMode = () => {
+        document.documentElement.dataset.theme = 'light'
+        if (metaThemeColor !== null) {
+          metaThemeColor.setAttribute('content', '#ffffff')
+        }
+      }
+
+      btf.activateDarkMode = activateDarkMode
+      btf.activateLightMode = activateLightMode
+
+      const theme = saveToLocal.get('theme')
+    
+          theme === 'dark' ? activateDarkMode() : theme === 'light' ? activateLightMode() : null
+        
+      
+      const asideStatus = saveToLocal.get('aside-status')
+      if (asideStatus !== undefined) {
+        document.documentElement.classList.toggle('hide-aside', asideStatus === 'hide')
+      }
+    
+      
+    const detectApple = () => {
+      if (/iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent)) {
+        document.documentElement.classList.add('apple')
+      }
+    }
+    detectApple()
+  
+    })()
+  </script><script>const GLOBAL_CONFIG = {
+  root: '/',
+  algolia: undefined,
+  localSearch: undefined,
+  translate: undefined,
+  highlight: {"plugin":"highlight.js","highlightCopy":true,"highlightLang":true,"highlightHeightLimit":false,"highlightFullpage":false,"highlightMacStyle":false},
+  copy: {
+    success: '复制成功',
+    error: '复制失败',
+    noSupport: '浏览器不支持'
+  },
+  relativeDate: {
+    homepage: false,
+    post: false
+  },
+  runtime: '',
+  dateSuffix: {
+    just: '刚刚',
+    min: '分钟前',
+    hour: '小时前',
+    day: '天前',
+    month: '个月前'
+  },
+  copyright: undefined,
+  lightbox: 'null',
+  Snackbar: undefined,
+  infinitegrid: {
+    js: 'https://cdn.jsdelivr.net/npm/@egjs/infinitegrid@4.13.0/dist/infinitegrid.min.js',
+    buttonText: '加载更多'
+  },
+  isPhotoFigcaption: false,
+  islazyloadPlugin: false,
+  isAnchor: false,
+  percent: {
+    toc: true,
+    rightside: false,
+  },
+  autoDarkmode: false
+}</script><script id="config-diff">var GLOBAL_CONFIG_SITE = {
+  title: '【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验',
+  isHighlightShrink: false,
+  isToc: true,
+  pageType: 'post'
+}</script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css"><meta name="generator" content="Hexo 8.1.2"></head><body><div id="sidebar"><div id="menu-mask"></div><div id="sidebar-menus"><div class="avatar-img text-center"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="site-data text-center"><a href="/archives/"><div class="headline">文章</div><div class="length-num">987</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1083</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div></div></div><div class="post" id="body-wrap"><header class="post-bg" id="page-header"><nav id="nav"><span id="blog-info"><a class="nav-site-title" href="/"><span class="site-name">东哥的技术博客</span></a><a class="nav-page-title" href="/"><span class="site-name">【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验</span><span class="site-name"><i class="fa-solid fa-circle-arrow-left"></i><span>  返回首页</span></span></a></span><div id="menus"><div class="menus_items"><div class="menus_item"><a class="site-page" href="/"><i class="fa-fw fas fa-home"></i><span> 首页</span></a></div><div class="menus_item"><a class="site-page" href="/archives/"><i class="fa-fw fas fa-archive"></i><span> 归档</span></a></div><div class="menus_item"><a class="site-page" href="/categories/"><i class="fa-fw fas fa-folder-open"></i><span> 分类</span></a></div><div class="menus_item"><a class="site-page" href="/tags/"><i class="fa-fw fas fa-tags"></i><span> 标签</span></a></div><div class="menus_item"><a class="site-page" href="/about/"><i class="fa-fw fas fa-heart"></i><span> 关于</span></a></div></div><div id="toggle-menu"><span class="site-page"><i class="fas fa-bars fa-fw"></i></span></div></div></nav><div id="post-info"><h1 class="post-title">【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验</h1><div id="post-meta"><div class="meta-firstline"><span class="post-meta-date"><i class="far fa-calendar-alt fa-fw post-meta-icon"></i><span class="post-meta-label">发表于</span><time class="post-meta-date-created" datetime="2026-11-27T00:05:00.000Z" title="发表于 2026-11-27 08:05:00">2026-11-27</time><span class="post-meta-separator">|</span><i class="fas fa-history fa-fw post-meta-icon"></i><span class="post-meta-label">更新于</span><time class="post-meta-date-updated" datetime="2026-11-27T00:04:19.848Z" title="更新于 2026-11-27 08:04:19">2026-11-27</time></span><span class="post-meta-categories"><span class="post-meta-separator">|</span><i class="fas fa-inbox fa-fw post-meta-icon"></i><a class="post-meta-categories" href="/categories/%E6%95%B0%E6%8D%AE%E5%BA%93/">数据库</a></span></div><div class="meta-secondline"><span class="post-meta-separator">|</span><span class="post-meta-pv-cv" id="" data-flag-title=""><i class="far fa-eye fa-fw post-meta-icon"></i><span class="post-meta-label">浏览量:</span><span id="busuanzi_value_page_pv"><i class="fa-solid fa-spinner fa-spin"></i></span></span></div></div></div></header><main class="layout" id="content-inner"><div id="post"><article class="container post-content" id="article-container"><h1 id="【MySQL-实战】可传输表空间深度实战：大表跨实例迁移、-ibd-cfg-与一致性校验"><a href="#【MySQL-实战】可传输表空间深度实战：大表跨实例迁移、-ibd-cfg-与一致性校验" class="headerlink" title="【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd&#x2F;.cfg 与一致性校验"></a>【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd&#x2F;.cfg 与一致性校验</h1><h2 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h2><p>一张 480GB 的订单明细表要从老集群搬到新集群。</p>
+<p>先算一下常规方案的时间账：</p>
+<ul>
+<li><code>mysqldump</code>：单线程导出约 40MB&#x2F;s，480GB 需要 3.3 小时，导入再 5 小时以上，还得考虑 binlog 追平；</li>
+<li>XtraBackup 全量：快，但整个实例 3TB，为了搬一张表要复制 3TB，网络和存储都不划算；</li>
+<li>逻辑复制（CDC 双写）：最平滑，但要改应用、要处理 DDL、要保证顺序，工期两周。</li>
+</ul>
+<p>这时候正确工具是 <strong>InnoDB 可传输表空间（Transportable Tablespace）</strong>：直接把 <code>.ibd</code> 文件拷过去，<code>IMPORT TABLESPACE</code> 挂载，480GB 在千兆网络下约 1.5 小时，停机窗口只需要最后切换的几秒。</p>
+<p>但它有一堆”看起来能用、实际上会炸”的边界：版本、页大小、加密、全文索引、外键、统计信息、space id。这篇文章把原理、完整流程、校验与踩坑全部讲透。</p>
+<hr>
+<h2 id="一、为什么-ibd-不能直接-cp"><a href="#一、为什么-ibd-不能直接-cp" class="headerlink" title="一、为什么 .ibd 不能直接 cp"></a>一、为什么 <code>.ibd</code> 不能直接 <code>cp</code></h2><p>很多人第一反应：既然 <code>innodb_file_per_table=ON</code>，一张表就是一个 <code>.ibd</code>，那我直接拷贝文件再重启不就行了？</p>
+<p>不行。原因是 InnoDB 的表空间文件里<strong>没有完整的”我是谁”信息</strong>，数据页只记录 <code>SPACE ID</code>（4 字节），页内不存表名。实例启动时，InnoDB 通过数据字典（MySQL 8.0 之后是 <code>mysql.ibd</code> 里的 SDI）把 <code>space id → 表名 → 文件路径</code> 关联起来。</p>
+<p>直接拷贝会导致两个问题：</p>
+<ol>
+<li><strong>space id 冲突</strong>：源实例的 <code>space id=137</code> 和目标实例已有的 <code>137</code> 撞车，InnoDB 会拒绝启动或报错；</li>
+<li><strong>元数据缺失</strong>：目标实例的数据字典里没有这张表的定义，文件成了”孤儿”。</li>
+</ol>
+<p>所以官方流程的核心是：<strong>先在目标端建好表（占位 + 生成字典项），<code>DISCARD</code> 掉它的表空间（保留字典项、删掉文件），再把源端的 <code>.ibd</code> 放到目标路径，最后 <code>IMPORT</code> 让 InnoDB 校验并接管。</strong></p>
+<p>中间那个 <code>.cfg</code> 文件（MySQL 5.7 起）携带了表结构校验信息（列类型、列顺序、索引定义），导入时用来做一致性比对，防止”文件是 A 表、字典是 B 表”这种灾难。</p>
+<hr>
+<h2 id="二、完整流程（同版本、非加密、file-per-table）"><a href="#二、完整流程（同版本、非加密、file-per-table）" class="headerlink" title="二、完整流程（同版本、非加密、file-per-table）"></a>二、完整流程（同版本、非加密、file-per-table）</h2><h3 id="2-1-目标端：建表并-DISCARD"><a href="#2-1-目标端：建表并-DISCARD" class="headerlink" title="2.1 目标端：建表并 DISCARD"></a>2.1 目标端：建表并 DISCARD</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 1) 表结构必须与源端完全一致（建议直接 SHOW CREATE TABLE 复制）</span></span><br><span class="line"><span class="keyword">CREATE TABLE</span> `order_detail` (</span><br><span class="line">  `id` <span class="type">bigint</span> unsigned <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `order_no` <span class="type">varchar</span>(<span class="number">64</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `sku_id` <span class="type">bigint</span> unsigned <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `qty` <span class="type">int</span> <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `amount` <span class="type">decimal</span>(<span class="number">18</span>,<span class="number">2</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">  `created_at` datetime(<span class="number">3</span>) <span class="keyword">NOT NULL</span>,</span><br><span class="line">  <span class="keyword">PRIMARY KEY</span> (`id`),</span><br><span class="line">  KEY `idx_order_no` (`order_no`),</span><br><span class="line">  KEY `idx_created` (`created_at`)</span><br><span class="line">) ENGINE<span class="operator">=</span>InnoDB <span class="keyword">DEFAULT</span> CHARSET<span class="operator">=</span>utf8mb4 <span class="keyword">COLLATE</span><span class="operator">=</span>utf8mb4_0900_ai_ci;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 2) 丢弃空表空间（会删除目标端的 .ibd，保留字典项）</span></span><br><span class="line"><span class="keyword">ALTER TABLE</span> order_detail DISCARD TABLESPACE;</span><br></pre></td></tr></table></figure>
+
+<p><code>DISCARD</code> 之后目标端的 <code>.ibd</code> 不存在了，此时<strong>不要</strong>对该表做任何 DML，否则会报 <code>Tablespace is missing</code>。</p>
+<h3 id="2-2-源端：加锁导出"><a href="#2-2-源端：加锁导出" class="headerlink" title="2.2 源端：加锁导出"></a>2.2 源端：加锁导出</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 会话 A：持有导出锁，期间该表只读</span></span><br><span class="line">FLUSH TABLES order_detail <span class="keyword">FOR</span> EXPORT;</span><br></pre></td></tr></table></figure>
+
+<p>这条命令做了三件事：</p>
+<ol>
+<li>等待该表上的所有事务结束，加表级共享锁（阻塞写，允许读）；</li>
+<li>把该表的脏页全部刷盘；</li>
+<li>在数据目录生成 <code>order_detail.cfg</code>（表结构元数据）。</li>
+</ol>
+<p><strong>注意：<code>FOR EXPORT</code> 期间该表不可写</strong>，这是整个方案唯一的”业务可见”影响。对大表来说，刷脏页可能需要几十秒到几分钟，务必在低峰期做，并提前用 <code>SHOW ENGINE INNODB STATUS</code> 看 <code>Pending writes</code> 估算。</p>
+<figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 会话 A 保持不关闭！锁释放 = UNLOCK TABLES 或会话断开</span></span><br><span class="line"><span class="comment"># 会话 B：拷贝文件（此时文件是静态的）</span></span><br><span class="line"><span class="built_in">cp</span> /var/lib/mysql/orderdb/order_detail.ibd /transfer/</span><br><span class="line"><span class="built_in">cp</span> /var/lib/mysql/orderdb/order_detail.cfg /transfer/</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-3-目标端：导入"><a href="#2-3-目标端：导入" class="headerlink" title="2.3 目标端：导入"></a>2.3 目标端：导入</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 文件属主必须是 mysql:mysql，权限 640，否则导入报权限错误</span></span><br><span class="line"><span class="built_in">chown</span> mysql:mysql /var/lib/mysql/orderdb/order_detail.&#123;ibd,cfg&#125;</span><br></pre></td></tr></table></figure>
+
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">ALTER TABLE</span> order_detail IMPORT TABLESPACE;</span><br></pre></td></tr></table></figure>
+
+<p>导入时 InnoDB 会：</p>
+<ol>
+<li>读取 <code>.cfg</code>，与数据字典中的表定义逐列比对（列名、类型、顺序、索引）；</li>
+<li>检查 <code>.ibd</code> 头部页的 <code>space id</code>、页大小、server 版本标记；</li>
+<li>把文件”注册”进当前实例，更新数据字典；</li>
+<li>打开表，此时可以正常读写。</li>
+</ol>
+<h3 id="2-4-校验（别跳过这一步）"><a href="#2-4-校验（别跳过这一步）" class="headerlink" title="2.4 校验（别跳过这一步）"></a>2.4 校验（别跳过这一步）</h3><figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">-- 行数（大表用近似值先看量级）</span></span><br><span class="line"><span class="keyword">SELECT</span> table_rows <span class="keyword">FROM</span> information_schema.tables</span><br><span class="line"><span class="keyword">WHERE</span> table_schema<span class="operator">=</span><span class="string">&#x27;orderdb&#x27;</span> <span class="keyword">AND</span> table_name<span class="operator">=</span><span class="string">&#x27;order_detail&#x27;</span>;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 精确行数（会走索引/全表，大表慎用）</span></span><br><span class="line"><span class="keyword">SELECT</span> <span class="built_in">COUNT</span>(<span class="operator">*</span>) <span class="keyword">FROM</span> order_detail;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 统计信息必须重建，否则执行计划可能劣化</span></span><br><span class="line">ANALYZE <span class="keyword">TABLE</span> order_detail;</span><br><span class="line"></span><br><span class="line"><span class="comment">-- 表空间归属确认</span></span><br><span class="line"><span class="keyword">SELECT</span> name, space_type, row_format, space</span><br><span class="line"><span class="keyword">FROM</span> information_schema.innodb_tablespaces</span><br><span class="line"><span class="keyword">WHERE</span> name <span class="keyword">LIKE</span> <span class="string">&#x27;%order_detail%&#x27;</span>;</span><br></pre></td></tr></table></figure>
+
+<p><strong>强烈建议做业务级校验</strong>：抽样 1000 行按主键比对关键字段，或者按时间分区做分段 <code>CHECKSUM TABLE</code>（<code>CHECKSUM TABLE</code> 对 InnoDB 是实时计算，480GB 可能跑很久，务必分片）。</p>
+<hr>
+<h2 id="三、五个必须提前确认的兼容性条件"><a href="#三、五个必须提前确认的兼容性条件" class="headerlink" title="三、五个必须提前确认的兼容性条件"></a>三、五个必须提前确认的兼容性条件</h2><p>这张表如果有一条不满足，流程就会在 <code>IMPORT</code> 阶段失败（而且报错信息往往很含糊）。</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>检查方式</th>
+<th>不满足的后果</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>页大小一致</strong></td>
+<td><code>SHOW VARIABLES LIKE &#39;innodb_page_size&#39;</code></td>
+<td>报错，无法导入（页大小是物理格式）</td>
+</tr>
+<tr>
+<td><strong>版本兼容</strong></td>
+<td>源 ≤ 目标，且不跨大版本降级</td>
+<td>8.0 → 5.7 一定失败；5.7 → 8.0 需先升级格式</td>
+</tr>
+<tr>
+<td><strong>行格式</strong></td>
+<td><code>SHOW TABLE STATUS</code> 看 <code>Row_format</code></td>
+<td><code>COMPACT</code>&#x2F;<code>DYNAMIC</code> 混用可能报 schema mismatch</td>
+</tr>
+<tr>
+<td><strong>加密状态</strong></td>
+<td><code>SHOW CREATE TABLE</code> 看 <code>ENCRYPTION</code></td>
+<td>加密表空间需要目标端持有<strong>同一把 master key</strong></td>
+</tr>
+<tr>
+<td><strong>无 DATA DIRECTORY</strong></td>
+<td><code>SHOW CREATE TABLE</code></td>
+<td>使用独立目录的表空间不支持 export</td>
+</tr>
+</tbody></table>
+<h3 id="3-1-加密表空间是最常见的坑"><a href="#3-1-加密表空间是最常见的坑" class="headerlink" title="3.1 加密表空间是最常见的坑"></a>3.1 加密表空间是最常见的坑</h3><p>如果源表是 <code>ENCRYPTION=&#39;Y&#39;</code>，<code>.ibd</code> 是用表空间密钥加密的，而表空间密钥又被 master key 加密后存在源实例的 keyring 里。<strong>只拷 <code>.ibd</code> 过去，目标端没有对应的 master key，文件就是一堆随机字节。</strong></p>
+<p>三个可行方案：</p>
+<ol>
+<li><strong>迁移 keyring</strong>（最彻底）：把源实例 keyring 里的 master key 导入目标 keyring，需要 keyring 组件支持导出；</li>
+<li><strong>先解密再迁移</strong>（最简单）：<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">ALTER TABLE</span> order_detail ENCRYPTION<span class="operator">=</span><span class="string">&#x27;N&#x27;</span>;  <span class="comment">-- 会重建表，480GB 需要很久</span></span><br></pre></td></tr></table></figure></li>
+<li><strong>用逻辑复制</strong>：加密是物理层特性，逻辑导出天然没有这个问题。</li>
+</ol>
+<p>如果选择方案 2，记得评估重建期间的磁盘空间（需要额外一份表大小的空间）和 IO 影响。</p>
+<h3 id="3-2-全文索引不跟着走"><a href="#3-2-全文索引不跟着走" class="headerlink" title="3.2 全文索引不跟着走"></a>3.2 全文索引不跟着走</h3><p>InnoDB 的全文索引有一批辅助表（<code>FTS_DOC_ID_INDEX</code>、<code>FTS_*_INDEX_1~6</code> 等），它们<strong>不在同一个 <code>.ibd</code> 里</strong>，<code>IMPORT TABLESPACE</code> 不会带过来。导入后表能读，但全文检索会失效或直接报错。</p>
+<p>正确做法：导入完成后重建全文索引。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">ALTER TABLE</span> article <span class="keyword">DROP</span> INDEX ft_content;</span><br><span class="line"><span class="keyword">ALTER TABLE</span> article <span class="keyword">ADD</span> FULLTEXT INDEX ft_content (title, content) <span class="keyword">WITH</span> PARSER ngram;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-3-外键与触发器"><a href="#3-3-外键与触发器" class="headerlink" title="3.3 外键与触发器"></a>3.3 外键与触发器</h3><ul>
+<li><strong>外键</strong>：InnoDB 在导入时会检查外键引用的表是否存在。建议导入前 <code>SET foreign_key_checks=0</code>，导入后再打开并校验数据完整性（<code>pt-online-schema-change</code> &#x2F; <code>gh-ost</code> 也是同样处理）。</li>
+<li><strong>触发器</strong>：触发器属于数据字典，不在 <code>.ibd</code> 里，需要在目标端单独创建。这是最容易被遗漏的一项——迁移完发现”审计日志不写了”，查半天才发现触发器没建。</li>
+</ul>
+<h3 id="3-4-分区表"><a href="#3-4-分区表" class="headerlink" title="3.4 分区表"></a>3.4 分区表</h3><p>分区表的每个分区是独立的表空间文件（<code>order_detail#p#p202601.ibd</code>），导出时需要逐个处理，或者直接对整个表做 <code>FLUSH TABLES ... FOR EXPORT</code>（会生成每个分区的 <code>.cfg</code>）。导入时用 <code>ALTER TABLE ... IMPORT PARTITION p202601 TABLESPACE</code> 逐个导入，<strong>不能一条命令导入整个分区表</strong>。</p>
+<figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">ALTER TABLE</span> order_detail IMPORT <span class="keyword">PARTITION</span> p202601 TABLESPACE;</span><br><span class="line"><span class="keyword">ALTER TABLE</span> order_detail IMPORT <span class="keyword">PARTITION</span> p202602 TABLESPACE;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="四、在线迁移：把停机窗口压到秒级"><a href="#四、在线迁移：把停机窗口压到秒级" class="headerlink" title="四、在线迁移：把停机窗口压到秒级"></a>四、在线迁移：把停机窗口压到秒级</h2><p><code>FOR EXPORT</code> 期间表只读，480GB 刷脏 + 拷贝 1.5 小时，业务不可接受。所以真实的大表迁移都是**”全量 + 增量追平”**：</p>
+<figure class="highlight plaintext"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line">T0: 记录源端 binlog 位点（GTID 或 file+pos）</span><br><span class="line">T1: FLUSH TABLES ... FOR EXPORT，拷贝 .ibd/.cfg，UNLOCK（源端恢复读写）</span><br><span class="line">T2: 目标端 IMPORT，ANALYZE</span><br><span class="line">T3: 用 CDC（Canal/Debezium）从 T0 位点开始回放增量到目标端</span><br><span class="line">T4: 业务低峰，短暂停写（秒级）→ 追平最后一点增量 → 校验 → 切流量</span><br></pre></td></tr></table></figure>
+
+<p>关键点：</p>
+<ul>
+<li><strong>T1 的锁只持续到文件拷贝完成</strong>。如果拷贝 1.5 小时，锁就持 1.5 小时，所以更常见的做法是”打快照 + 从快照拷贝”（云盘快照&#x2F;LVM），把锁时间压到秒级；</li>
+<li><strong>T3 的增量必须幂等</strong>：CDC 回放用 <code>INSERT ... ON DUPLICATE KEY UPDATE</code> 或按主键 <code>REPLACE</code>，避免重复应用；</li>
+<li><strong>T4 的停写窗口</strong>要提前演练，包含”追平 → 校验 → DNS&#x2F;配置切换 → 回滚预案”。</li>
+</ul>
+<h3 id="4-1-用快照规避长锁"><a href="#4-1-用快照规避长锁" class="headerlink" title="4.1 用快照规避长锁"></a>4.1 用快照规避长锁</h3><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># LVM 场景：先加锁，创建快照，立刻解锁，再从快照挂载拷贝</span></span><br><span class="line">mysql -e <span class="string">&quot;FLUSH TABLES order_detail FOR EXPORT;&quot;</span> &amp;</span><br><span class="line"><span class="comment"># 等 .cfg 出现</span></span><br><span class="line">lvm lvcreate -L 600G -s -n order_snap /dev/vg0/mysql</span><br><span class="line">mysql -e <span class="string">&quot;UNLOCK TABLES;&quot;</span></span><br><span class="line"><span class="comment"># 从快照挂载后慢慢拷，不影响线上</span></span><br></pre></td></tr></table></figure>
+
+<p>这样源表的只读窗口从 1.5 小时降到几十秒。</p>
+<hr>
+<h2 id="五、Java-侧编排与校验代码"><a href="#五、Java-侧编排与校验代码" class="headerlink" title="五、Java 侧编排与校验代码"></a>五、Java 侧编排与校验代码</h2><p>把整个流程做成可重跑的运维工具，比手工敲 SQL 可靠得多。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Component</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">TablespaceMigrator</span> &#123;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> JdbcTemplate source;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> JdbcTemplate target;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 目标端：建表 + DISCARD，幂等 */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">prepare</span><span class="params">(String ddl)</span> &#123;</span><br><span class="line">        target.execute(<span class="string">&quot;SET foreign_key_checks = 0&quot;</span>);</span><br><span class="line">        target.execute(ddl); <span class="comment">// CREATE TABLE IF NOT EXISTS 语义需自行保证</span></span><br><span class="line">        target.execute(<span class="string">&quot;ALTER TABLE order_detail DISCARD TABLESPACE&quot;</span>);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 源端：导出（返回后必须尽快 UNLOCK） */</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">exportOnSource</span><span class="params">()</span> &#123;</span><br><span class="line">        source.execute(<span class="string">&quot;FLUSH TABLES order_detail FOR EXPORT&quot;</span>);</span><br><span class="line">        <span class="comment">// 注意：此方法返回后连接仍在池里，锁不会自动释放！</span></span><br><span class="line">        <span class="comment">// 生产中应使用独立连接并在 finally 中 UNLOCK TABLES</span></span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="comment">/** 目标端：导入 + 重建统计信息 + 校验 */</span></span><br><span class="line">    <span class="keyword">public</span> ImportResult <span class="title function_">importAndVerify</span><span class="params">()</span> &#123;</span><br><span class="line">        target.execute(<span class="string">&quot;ALTER TABLE order_detail IMPORT TABLESPACE&quot;</span>);</span><br><span class="line">        target.execute(<span class="string">&quot;ANALYZE TABLE order_detail&quot;</span>);</span><br><span class="line"></span><br><span class="line">        <span class="type">Long</span> <span class="variable">rows</span> <span class="operator">=</span> target.queryForObject(</span><br><span class="line">            <span class="string">&quot;SELECT COUNT(*) FROM order_detail&quot;</span>, Long.class);</span><br><span class="line"></span><br><span class="line">        <span class="comment">// 抽样校验：按主键区间各取 1000 行做字段级对比</span></span><br><span class="line">        List&lt;Map&lt;String, Object&gt;&gt; sample = target.queryForList(</span><br><span class="line">            <span class="string">&quot;SELECT * FROM order_detail ORDER BY id LIMIT 1000&quot;</span>);</span><br><span class="line">        <span class="type">boolean</span> <span class="variable">sampleOk</span> <span class="operator">=</span> sample.stream().allMatch(<span class="built_in">this</span>::rowMatchesSource);</span><br><span class="line"></span><br><span class="line">        <span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">ImportResult</span>(rows, sampleOk);</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">private</span> <span class="type">boolean</span> <span class="title function_">rowMatchesSource</span><span class="params">(Map&lt;String, Object&gt; row)</span> &#123;</span><br><span class="line">        Map&lt;String, Object&gt; src = source.queryForMap(</span><br><span class="line">            <span class="string">&quot;SELECT * FROM order_detail WHERE id = ?&quot;</span>, row.get(<span class="string">&quot;id&quot;</span>));</span><br><span class="line">        <span class="keyword">return</span> src.equals(row);</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>三个工程细节：</p>
+<ol>
+<li><strong><code>FLUSH TABLES ... FOR EXPORT</code> 的锁绑定在连接上</strong>。如果用连接池，方法返回后连接归还，锁的归属就变得不可控。务必用 <code>DataSource.getConnection()</code> 拿独立连接，<code>finally</code> 里 <code>UNLOCK TABLES</code> 并关闭。</li>
+<li><strong><code>IMPORT</code> 期间目标表不可访问</strong>，要在发布系统里做成”维护模式”的一部分，避免健康检查打到该表。</li>
+<li><strong><code>COUNT(*)</code> 在大表上是全索引扫描</strong>，480GB 可能要十几分钟。用 <code>information_schema.tables.table_rows</code> 做量级校验，精确校验放到业务低峰。</li>
+</ol>
+<hr>
+<h2 id="六、六个真实踩坑"><a href="#六、六个真实踩坑" class="headerlink" title="六、六个真实踩坑"></a>六、六个真实踩坑</h2><table>
+<thead>
+<tr>
+<th>报错 &#x2F; 现象</th>
+<th>根因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>ERROR 1808 (HY000): Schema mismatch</code></td>
+<td><code>.cfg</code> 与字典定义不一致（列顺序、字符集、行格式）</td>
+<td>用源端 <code>SHOW CREATE TABLE</code> 原样建表，别手写</td>
+</tr>
+<tr>
+<td><code>ERROR 1812: Tablespace is missing</code></td>
+<td>忘了 <code>DISCARD</code>，或文件路径&#x2F;权限不对</td>
+<td>确认 <code>innodb_file_per_table=ON</code>、属主 <code>mysql:mysql</code></td>
+</tr>
+<tr>
+<td><code>ERROR 1813: Tablespace exists</code></td>
+<td>目标端 <code>.ibd</code> 还在</td>
+<td>必须先 <code>DISCARD</code> 再放文件</td>
+</tr>
+<tr>
+<td>导入成功但全文检索报错</td>
+<td>FTS 辅助表没跟过来</td>
+<td>重建 FULLTEXT 索引</td>
+</tr>
+<tr>
+<td>导入后查询突然走全表扫描</td>
+<td>统计信息为空&#x2F;过期</td>
+<td><code>ANALYZE TABLE</code>，确认 <code>innodb_stats_persistent=ON</code></td>
+</tr>
+<tr>
+<td>导入后写入报 <code>Duplicate entry</code></td>
+<td>增量回放重复应用</td>
+<td>CDC 侧做幂等（主键 upsert）</td>
+</tr>
+</tbody></table>
+<p>还有一个隐蔽的坑：<strong><code>lower_case_table_names</code> 不一致</strong>。Linux 默认 0（大小写敏感），如果源端是 0、目标端是 1，表名大小写会在字典里被归一化，<code>.cfg</code> 校验可能通过但后续访问路径对不上。跨平台迁移（Linux → Windows 容器）时尤其要注意，这个参数<strong>只能在初始化时设置</strong>，事后改需要重建实例。</p>
+<hr>
+<h2 id="七、方案对比：什么时候该用它"><a href="#七、方案对比：什么时候该用它" class="headerlink" title="七、方案对比：什么时候该用它"></a>七、方案对比：什么时候该用它</h2><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>停机时间</th>
+<th>适合数据量</th>
+<th>跨版本</th>
+<th>复杂度</th>
+<th>主要限制</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>mysqldump</code> &#x2F; <code>mydumper</code></td>
+<td>小时级</td>
+<td>&lt; 100GB</td>
+<td>支持</td>
+<td>低</td>
+<td>慢、锁表&#x2F;一致性快照</td>
+</tr>
+<tr>
+<td>XtraBackup 全量</td>
+<td>小时级</td>
+<td>整实例</td>
+<td>部分支持</td>
+<td>中</td>
+<td>搬整实例，不能单表</td>
+</tr>
+<tr>
+<td><strong>可传输表空间</strong></td>
+<td><strong>秒级（配合快照）</strong></td>
+<td><strong>100GB~TB</strong></td>
+<td><strong>仅向上兼容</strong></td>
+<td>中</td>
+<td>页大小&#x2F;加密&#x2F;版本限制</td>
+</tr>
+<tr>
+<td>CDC 双写</td>
+<td>分钟级</td>
+<td>任意</td>
+<td>支持</td>
+<td>高</td>
+<td>要处理 DDL、顺序、幂等</td>
+</tr>
+<tr>
+<td>云 DMS</td>
+<td>分钟级</td>
+<td>任意</td>
+<td>支持</td>
+<td>低（付费）</td>
+<td>成本、厂商绑定</td>
+</tr>
+</tbody></table>
+<p><strong>决策建议</strong>：</p>
+<ul>
+<li>单表 100GB 以上、同大版本、非加密 → 可传输表空间是性价比最高的；</li>
+<li>需要跨大版本升级 → 老老实实逻辑复制或原地升级；</li>
+<li>表有复杂外键&#x2F;触发器&#x2F;全文索引 → 先评估重建成本，必要时退回逻辑方案；</li>
+<li>业务完全不能停 → CDC 双写是唯一解，可传输表空间只用来”打底”（先搬历史，再追增量）。</li>
+</ul>
+<hr>
+<h2 id="八、面试高频追问"><a href="#八、面试高频追问" class="headerlink" title="八、面试高频追问"></a>八、面试高频追问</h2><p><strong>Q1：可传输表空间为什么需要 <code>.cfg</code>？</strong><br><code>.ibd</code> 里只有 space id 和数据页，没有表结构。<code>.cfg</code> 由 <code>FLUSH TABLES ... FOR EXPORT</code> 生成，记录了列定义、索引、行格式等元数据，导入时用于与目标端数据字典比对，防止表结构不匹配导致数据错乱。</p>
+<p><strong>Q2：为什么必须先 <code>DISCARD</code>？</strong><br><code>IMPORT</code> 的语义是”用一个外部文件替换现有表空间”。目标端必须先有字典项（建表）且没有物理文件（DISCARD），InnoDB 才能把文件注册进去。直接放文件会被认为文件已存在或孤儿文件。</p>
+<p><strong>Q3：<code>FOR EXPORT</code> 期间能读吗？</strong><br>能读不能写。它加的是共享锁，会阻塞 DML，并强制刷脏页、生成 <code>.cfg</code>。锁跟着会话走，<code>UNLOCK TABLES</code> 或会话断开才释放。</p>
+<p><strong>Q4：跨版本能迁吗？</strong><br>只能”低版本 → 高版本”，且需要目标版本能识别源端的表空间格式。8.0 → 5.7 绝对不行；5.7 → 8.0 通常可行，但建议先在测试环境验证 <code>.cfg</code> 校验。</p>
+<p><strong>Q5：加密表怎么办？</strong><br>表空间密钥被 master key 加密，必须让目标实例能解出同一把 master key（迁移 keyring），或者先在源端 <code>ENCRYPTION=&#39;N&#39;</code> 解密重建后再迁。</p>
+<hr>
+<h2 id="九、总结"><a href="#九、总结" class="headerlink" title="九、总结"></a>九、总结</h2><p>可传输表空间的本质是**”物理文件 + 字典注册”**，它把”搬数据”变成了”搬文件”，因此绕过了 SQL 层的所有开销，但也因此对物理格式（页大小、版本、加密、行格式）极度敏感。</p>
+<p>落地清单：</p>
+<ol>
+<li>迁前三查：页大小、版本方向、是否加密；</li>
+<li>目标端严格按源端 <code>SHOW CREATE TABLE</code> 建表，再 <code>DISCARD</code>；</li>
+<li><code>FOR EXPORT</code> 的锁绑会话，用独立连接 + <code>finally UNLOCK</code>；</li>
+<li>大表用”快照 + 增量 CDC”把只读窗口压到秒级；</li>
+<li>导入后必做 <code>ANALYZE TABLE</code> + 抽样校验 + 重建 FTS&#x2F;触发器；</li>
+<li>把 <code>lower_case_table_names</code>、<code>foreign_key_checks</code> 这类”环境差异”写进检查清单。</li>
+</ol>
+<p>搬 480GB 表的正确姿势，不是找一个更快的 <code>mysqldump</code>，而是<strong>别用逻辑导出</strong>。</p>
+</article><div class="post-copyright"><div class="post-copyright__author"><span class="post-copyright-meta"><i class="fas fa-circle-user fa-fw"></i>文章作者: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io">东哥</a></span></div><div class="post-copyright__type"><span class="post-copyright-meta"><i class="fas fa-square-arrow-up-right fa-fw"></i>文章链接: </span><span class="post-copyright-info"><a href="https://jiweidong.github.io/2026/11/27/mysql-transportable-tablespace-migration-deep-dive/">https://jiweidong.github.io/2026/11/27/mysql-transportable-tablespace-migration-deep-dive/</a></span></div><div class="post-copyright__notice"><span class="post-copyright-meta"><i class="fas fa-circle-exclamation fa-fw"></i>版权声明: </span><span class="post-copyright-info">本博客所有文章除特别声明外，均采用 <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" target="_blank">CC BY-NC-SA 4.0</a> 许可协议。转载请注明来源 <a href="https://jiweidong.github.io" target="_blank">东哥的技术博客</a>！</span></div></div><div class="tag_share"><div class="post-meta__tag-list"><a class="post-meta__tags" href="/tags/MySQL/">MySQL</a><a class="post-meta__tags" href="/tags/%E7%94%9F%E4%BA%A7%E5%AE%9E%E6%88%98/">生产实战</a><a class="post-meta__tags" href="/tags/InnoDB/">InnoDB</a><a class="post-meta__tags" href="/tags/%E6%95%B0%E6%8D%AE%E8%BF%81%E7%A7%BB/">数据迁移</a></div><div class="post-share"><div class="social-share" data-image="/img/butterfly-icon.png" data-sites="facebook,x,wechat,weibo,qq"></div><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/css/share.min.css" media="print" onload="this.media='all'"><script src="https://cdn.jsdelivr.net/npm/butterfly-extsrc@1.1.6/sharejs/dist/js/social-share.min.js" defer></script></div></div><nav class="pagination-post" id="pagination"><a class="pagination-related" href="/2026/11/27/prometheus-metrics-cardinality-explosion-governance-deep-practice/" title="【可观测性】Prometheus 指标基数爆炸治理：从 label 设计到 Micrometer 注册表"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info"><div class="info-1"><div class="info-item-1">上一篇</div><div class="info-item-2">【可观测性】Prometheus 指标基数爆炸治理：从 label 设计到 Micrometer 注册表</div></div><div class="info-2"><div class="info-item-1">【可观测性】Prometheus 指标基数爆炸治理：从 label 设计到 Micrometer 注册表前言一个周五下午，监控大盘突然大片空白，Prometheus 报 out of memory，被 OOMKilled 重启；重启后加载 WAL 又 OOM，循环了四次。 排查到最后，罪魁祸首是一行看起来很正常的 Spring Boot 代码： 1@Timed(value = &quot;http.requests&quot;, extraTags = &#123;&quot;path&quot;&#125;)  不，真正的元凶是 path 这个 tag 取到了原始 URI： 12http_requests_total&#123;path=&quot;/order/2026112700012345&quot;, status=&quot;200&quot;&#125; 1http_requests_total&#123;path=&quot;/order/2026112700012346&quot;, status=&quot;200&quot;&#125; 1  每天 200 ...</div></div></div></a><a class="pagination-related" href="/2026/11/27/linux-tcp-socket-buffer-autotuning-deep-dive/" title="【Java 网络】TCP 收发缓冲区与自动调优深度解析：tcp_rmem/wmem、BDP 与零窗口排障"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-right"><div class="info-1"><div class="info-item-1">下一篇</div><div class="info-item-2">【Java 网络】TCP 收发缓冲区与自动调优深度解析：tcp_rmem/wmem、BDP 与零窗口排障</div></div><div class="info-2"><div class="info-item-1">【Java 网络】TCP 收发缓冲区与自动调优深度解析：tcp_rmem&#x2F;wmem、BDP 与零窗口排障前言先看一个几乎每个后端都遇到过的现场： 服务从同机房搬到跨可用区，RTT 从 0.5ms 涨到 30ms。带宽是 10Gbps，理论上单个 TCP 连接应该能跑满几个 G，但实测一个连接只有 3.2MB&#x2F;s。运维查了半天交换机、查了网卡队列，都没问题。 真正的原因往往是一行代码： 1socket.setReceiveBufferSize(64 * 1024); // &quot;优化&quot;一下  这一行把内核的接收窗口自动调优关掉了，窗口被钉死在 64KB（叠加内核翻倍与 win_scale 的实际占用后更小）。用小学算术就能算出天花板： 1吞吐上限 ≈ 窗口 / RTT = 64KB / 30ms ≈ 2.1MB/s  再叠加发送侧的缓冲区与拥塞窗口，实测 3MB&#x2F;s 完全对得上。 这篇文章把 TCP 缓冲区这条链路完整拆开：缓冲区在内核里到底是什么、自动调优怎么工作、为什么 SO_RCVBUF 是”性能开关”而不是”调优旋钮”、零窗口卡...</div></div></div></a></nav><div class="relatedPosts"><div class="headline"><i class="fas fa-thumbs-up fa-fw"></i><span>相关推荐</span></div><div class="relatedPosts-list"><a class="pagination-related" href="/2026/09/08/mysql-innodb-row-format-page-deep-dive/" title="【MySQL 底层】InnoDB 行格式与数据页结构深度解析：从 Compact&#x2F;Dynamic 到页存储物理布局"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-08</div><div class="info-item-2">【MySQL 底层】InnoDB 行格式与数据页结构深度解析：从 Compact&#x2F;Dynamic 到页存储物理布局</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 行格式与数据页结构深度解析：从 Compact&#x2F;Dynamic 到页存储物理布局面试官：知道一条 INSERT 语句在磁盘上是怎么存的吗？很多人背了 B+ 树、背了聚簇索引，但问到「一行记录在磁盘上的物理结构长什么样」就卡壳了。今天我们从 InnoDB 的**行格式（Row Format）和数据页（Page）**两个层面，把「一行数据 + 一页数据」彻底讲透。这才是理解索引、碎片、大字段存储的基础。  一、行格式的演进：Redundant → Compact → DynamicInnoDB 历史上主要有四种行格式：    行格式 出现版本 特点 适用场景    Redundant MySQL 5.0 之前 老格式，字段偏移量用 2 字节存，存储冗余大 基本淘汰   Compact MySQL 5.0 紧凑行格式，变长字段长度列表 + NULL 位图 5.6 前默认   Dynamic MySQL 5.7 默认 Compact 的改进版，大字段（TEXT&#x2F;BLOB）全部溢出存储，行内只留 20 字节指针 当前主流默认   Com...</div></div></div></a><a class="pagination-related" href="/2026/11/14/mysql-innodb-tablespace-encryption-tde-deep-dive/" title="【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo&#x2F;binlog 加密边界与密钥轮换"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-11-14</div><div class="info-item-2">【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析：双层密钥、redo&#x2F;binlog 加密边界与密钥轮换</div></div><div class="info-2"><div class="info-item-1">【MySQL 安全】InnoDB 表空间加密与 TDE 深度解析前言很多团队做「数据加密」时，第一反应是在应用层给手机号、身份证号加个 AES 字段加密。这能解决一部分问题，但它防的是「库被人拖走之后看不懂数据」，防不住运维人员直接用 SELECT 查、也防不住备份文件被人从对象存储里拉走。 真要做数据静态加密（Data at Rest），落点通常在存储层：InnoDB 表空间加密（TDE，Transparent Data Encryption）。它最大的特点是「透明」——SQL 不用改、索引不用改、Java 代码不用改，页写入磁盘时加密、读入 buffer pool 时解密。 但它有非常多「配了以为就安全了」的坑：keyring 组件没在启动时加载、从库没跟着加密、binlog 和 redo 还是明文、备份工具没带密钥导致恢复失败、密钥轮换以为是重加密数据页。 这篇把 InnoDB TDE 从密钥体系、配置、边界、性能、轮换到 Java 侧巡检讲透。  一、威胁模型：TDE 到底防什么、不防什么先把边界说清楚，否则很容易「合规过了，安全没提升」。    场景 TDE 是否有效 ...</div></div></div></a><a class="pagination-related" href="/2026/08/08/mysql-innodb-redo-undo-binlog-deep-dive/" title="【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-08-08</div><div class="info-item-2">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 三大日志深度解析：redo log、undo log 与 binlog 的协作与恢复面试官：一条 UPDATE 语句在 InnoDB 里是怎么执行的？宕机了数据怎么不丢？这是 MySQL 面试的”必考压轴题”。要答好它，必须吃透 InnoDB 的三大日志：redo log（重做日志）、undo log（回滚日志）和 binlog（归档日志）。它们分别解决了崩溃恢复、事务回滚、主从复制三个核心问题。 本文从一条 UPDATE 的执行链路讲起，深入源码与磁盘结构，最后用”两阶段提交”串起整个故事。   一、先看全局：一条 UPDATE 的执行链路1UPDATE user SET age = 30 WHERE id = 1;  这条语句在 InnoDB 中的完整执行流程： 1234567891011121. 连接器：校验权限2. 分析器：词法/语法解析3. 优化器：选择索引，生成执行计划4. 执行器：调用 InnoDB 引擎接口   │   ├─ ① 从 Buffer Pool 读取 id=1 的页（若不在则从磁盘加载）   ├─ ② 在 undo l...</div></div></div></a><a class="pagination-related" href="/2026/09/19/mysql-innodb-tablespace-file-structure-deep-dive/" title="【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-19</div><div class="info-item-2">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】InnoDB 表空间体系深度解析：系统表空间、独立表空间、undo 与临时表空间的完整物理布局面试官：删了 2000 万行数据，为什么磁盘文件一点都没变小？这是我被问过最多次的问题之一。候选人通常答”因为 InnoDB 是页管理的，删除只是打标记”。这个答案对了一半，但要真正说清楚，必须把 InnoDB 的表空间（Tablespace）体系讲透：数据到底存在哪个文件里、页怎么分配、空闲空间为什么不还给操作系统、ibdata1 为什么越涨越大。 表空间是 InnoDB 存储引擎的逻辑-物理映射层。它向上承接表、索引这些逻辑对象，向下管理文件、区、页这些物理单位。这篇文章从磁盘文件一路拆到页，把 InnoDB 的表空间体系完整梳理一遍。 一、先建立坐标系：从文件到行记录的六层结构InnoDB 的数据组织是一条自顶向下的链路，理解这条链路，后面所有概念都能挂上去：    层级 名称 典型大小 说明    1 表空间 Tablespace 文件级别 逻辑上可包含多张表，物理上对应一个或多个 .ibd 文件   2 段 Segment 逻辑概念 一个索引对应两个段：叶子...</div></div></div></a><a class="pagination-related" href="/2026/10/25/mysql-current-read-locking-scope-deep-practice/" title="【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-10-25</div><div class="info-item-2">【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查</div></div><div class="info-2"><div class="info-item-1">【MySQL 实战】一致性读与当前读深度实战：FOR UPDATE 加锁范围、库存扣减选型与锁等待排查前言库存扣减这个场景，把 MySQL 的「读语义」暴露得干干净净： 1234-- 方案 A：先查后改（90% 的人第一版代码）SELECT stock FROM sku WHERE id = 100;-- Java 里判断 stock &gt;= 1UPDATE sku SET stock = stock - 1 WHERE id = 100;  单机测试永远没问题，压测一上就超卖。因为它读的是快照（一致性读），查到的 stock 可能是 5 秒前的值；改的时候也没有「stock &gt;&#x3D; 1」的条件。 修完超卖之后，第二个问题来了：错误地加了 FOR UPDATE 但 WHERE 条件没走索引，锁从「行锁」升级成「表锁」，整个库的写操作全被堵住——这比超卖更致命。 这篇文章讲清楚：两种读语义到底差在哪、FOR UPDATE 的加锁范围由什么决定、库存扣减该选哪个方案、锁等待怎么定位。  一、一致性读 vs 当前读InnoDB 有两种完全不同的读：     一致性读（...</div></div></div></a><a class="pagination-related" href="/2026/09/22/mysql-group-commit-redo-binlog-flush-deep-dive/" title="【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍"><div class="cover" style="background: var(--default-bg-color)"></div><div class="info text-center"><div class="info-1"><div class="info-item-1"><i class="far fa-calendar-alt fa-fw"></i> 2026-09-22</div><div class="info-item-2">【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍</div></div><div class="info-2"><div class="info-item-1">【MySQL 底层】组提交（Group Commit）深度解析：redo&#x2F;binlog 刷盘与两阶段提交的性能取舍面试官：每次事务提交都要 fsync 两次，MySQL 为什么还能跑到几万 TPS？这个问题几乎是我面试 MySQL 方向必问的一道。候选人一般能答出”有 WAL，先写日志再写数据”，但当我追问下面三个问题时，能答清楚的就不多了：  一次提交到底要落几次盘？分别落的是什么？ 如果是”每提交一次就 fsync 一次”，那 QPS 上限就是磁盘 IOPS 上限，几千都到不了，为什么实际能到几万？ redo log 和 binlog 是两份日志，怎么保证它们的一致性？  答案的核心是 两阶段提交（2PC） 加 组提交（Group Commit）。前者解决”两份日志不能写一半”，后者解决”每次提交都 fsync 太慢”。这两件事经常被混在一起讲，其实它们解决的问题完全不同，下面拆开说。  一、先看清楚一次提交要落几次盘假设 innodb_flush_log_at_trx_commit=1、sync_binlog=1（双 1 配置，最常用也最安全的配置），一次普通的事...</div></div></div></a></div></div></div><div class="aside-content" id="aside-content"><div class="card-widget card-info text-center"><div class="avatar-img"><img src="/img/butterfly-icon.png" onerror="this.onerror=null;this.src='/img/friend_404.gif'" alt="avatar"/></div><div class="author-info-name">东哥</div><div class="author-info-description">Java、SpringBoot、后端技术分享</div><div class="site-data"><a href="/archives/"><div class="headline">文章</div><div class="length-num">987</div></a><a href="/tags/"><div class="headline">标签</div><div class="length-num">1083</div></a><a href="/categories/"><div class="headline">分类</div><div class="length-num">252</div></a></div><a id="card-info-btn" target="_blank" rel="noopener" href="https://github.com/jiweidong"><i class="fab fa-github"></i><span>关注我</span></a><div class="card-info-social-icons"><a class="social-icon" href="https://github.com/jiweidong" target="_blank" title="GitHub"><i class="fab fa-github" style="color: #24292e;"></i></a></div></div><div class="card-widget card-announcement"><div class="item-headline"><i class="fas fa-bullhorn fa-shake"></i><span>公告</span></div><div class="announcement_content">欢迎来到我的博客！分享技术和生活。</div></div><div class="sticky_layout"><div class="card-widget" id="card-toc"><div class="item-headline"><i class="fas fa-stream"></i><span>目录</span><span class="toc-percentage"></span></div><div class="toc-content"><ol class="toc"><li class="toc-item toc-level-1"><a class="toc-link" href="#%E3%80%90MySQL-%E5%AE%9E%E6%88%98%E3%80%91%E5%8F%AF%E4%BC%A0%E8%BE%93%E8%A1%A8%E7%A9%BA%E9%97%B4%E6%B7%B1%E5%BA%A6%E5%AE%9E%E6%88%98%EF%BC%9A%E5%A4%A7%E8%A1%A8%E8%B7%A8%E5%AE%9E%E4%BE%8B%E8%BF%81%E7%A7%BB%E3%80%81-ibd-cfg-%E4%B8%8E%E4%B8%80%E8%87%B4%E6%80%A7%E6%A0%A1%E9%AA%8C"><span class="toc-number">1.</span> <span class="toc-text">【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd&#x2F;.cfg 与一致性校验</span></a><ol class="toc-child"><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%89%8D%E8%A8%80"><span class="toc-number">1.1.</span> <span class="toc-text">前言</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%80%E3%80%81%E4%B8%BA%E4%BB%80%E4%B9%88-ibd-%E4%B8%8D%E8%83%BD%E7%9B%B4%E6%8E%A5-cp"><span class="toc-number">1.2.</span> <span class="toc-text">一、为什么 .ibd 不能直接 cp</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%8C%E3%80%81%E5%AE%8C%E6%95%B4%E6%B5%81%E7%A8%8B%EF%BC%88%E5%90%8C%E7%89%88%E6%9C%AC%E3%80%81%E9%9D%9E%E5%8A%A0%E5%AF%86%E3%80%81file-per-table%EF%BC%89"><span class="toc-number">1.3.</span> <span class="toc-text">二、完整流程（同版本、非加密、file-per-table）</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#2-1-%E7%9B%AE%E6%A0%87%E7%AB%AF%EF%BC%9A%E5%BB%BA%E8%A1%A8%E5%B9%B6-DISCARD"><span class="toc-number">1.3.1.</span> <span class="toc-text">2.1 目标端：建表并 DISCARD</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-2-%E6%BA%90%E7%AB%AF%EF%BC%9A%E5%8A%A0%E9%94%81%E5%AF%BC%E5%87%BA"><span class="toc-number">1.3.2.</span> <span class="toc-text">2.2 源端：加锁导出</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-3-%E7%9B%AE%E6%A0%87%E7%AB%AF%EF%BC%9A%E5%AF%BC%E5%85%A5"><span class="toc-number">1.3.3.</span> <span class="toc-text">2.3 目标端：导入</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#2-4-%E6%A0%A1%E9%AA%8C%EF%BC%88%E5%88%AB%E8%B7%B3%E8%BF%87%E8%BF%99%E4%B8%80%E6%AD%A5%EF%BC%89"><span class="toc-number">1.3.4.</span> <span class="toc-text">2.4 校验（别跳过这一步）</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%89%E3%80%81%E4%BA%94%E4%B8%AA%E5%BF%85%E9%A1%BB%E6%8F%90%E5%89%8D%E7%A1%AE%E8%AE%A4%E7%9A%84%E5%85%BC%E5%AE%B9%E6%80%A7%E6%9D%A1%E4%BB%B6"><span class="toc-number">1.4.</span> <span class="toc-text">三、五个必须提前确认的兼容性条件</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#3-1-%E5%8A%A0%E5%AF%86%E8%A1%A8%E7%A9%BA%E9%97%B4%E6%98%AF%E6%9C%80%E5%B8%B8%E8%A7%81%E7%9A%84%E5%9D%91"><span class="toc-number">1.4.1.</span> <span class="toc-text">3.1 加密表空间是最常见的坑</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-2-%E5%85%A8%E6%96%87%E7%B4%A2%E5%BC%95%E4%B8%8D%E8%B7%9F%E7%9D%80%E8%B5%B0"><span class="toc-number">1.4.2.</span> <span class="toc-text">3.2 全文索引不跟着走</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-3-%E5%A4%96%E9%94%AE%E4%B8%8E%E8%A7%A6%E5%8F%91%E5%99%A8"><span class="toc-number">1.4.3.</span> <span class="toc-text">3.3 外键与触发器</span></a></li><li class="toc-item toc-level-3"><a class="toc-link" href="#3-4-%E5%88%86%E5%8C%BA%E8%A1%A8"><span class="toc-number">1.4.4.</span> <span class="toc-text">3.4 分区表</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%9B%9B%E3%80%81%E5%9C%A8%E7%BA%BF%E8%BF%81%E7%A7%BB%EF%BC%9A%E6%8A%8A%E5%81%9C%E6%9C%BA%E7%AA%97%E5%8F%A3%E5%8E%8B%E5%88%B0%E7%A7%92%E7%BA%A7"><span class="toc-number">1.5.</span> <span class="toc-text">四、在线迁移：把停机窗口压到秒级</span></a><ol class="toc-child"><li class="toc-item toc-level-3"><a class="toc-link" href="#4-1-%E7%94%A8%E5%BF%AB%E7%85%A7%E8%A7%84%E9%81%BF%E9%95%BF%E9%94%81"><span class="toc-number">1.5.1.</span> <span class="toc-text">4.1 用快照规避长锁</span></a></li></ol></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%BA%94%E3%80%81Java-%E4%BE%A7%E7%BC%96%E6%8E%92%E4%B8%8E%E6%A0%A1%E9%AA%8C%E4%BB%A3%E7%A0%81"><span class="toc-number">1.6.</span> <span class="toc-text">五、Java 侧编排与校验代码</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AD%E3%80%81%E5%85%AD%E4%B8%AA%E7%9C%9F%E5%AE%9E%E8%B8%A9%E5%9D%91"><span class="toc-number">1.7.</span> <span class="toc-text">六、六个真实踩坑</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B8%83%E3%80%81%E6%96%B9%E6%A1%88%E5%AF%B9%E6%AF%94%EF%BC%9A%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99%E8%AF%A5%E7%94%A8%E5%AE%83"><span class="toc-number">1.8.</span> <span class="toc-text">七、方案对比：什么时候该用它</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E5%85%AB%E3%80%81%E9%9D%A2%E8%AF%95%E9%AB%98%E9%A2%91%E8%BF%BD%E9%97%AE"><span class="toc-number">1.9.</span> <span class="toc-text">八、面试高频追问</span></a></li><li class="toc-item toc-level-2"><a class="toc-link" href="#%E4%B9%9D%E3%80%81%E6%80%BB%E7%BB%93"><span class="toc-number">1.10.</span> <span class="toc-text">九、总结</span></a></li></ol></li></ol></div></div><div class="card-widget card-recent-post"><div class="item-headline"><i class="fas fa-history"></i><span>最新文章</span></div><div class="aside-list"><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/27/multi-hop-rag-query-decomposition-deep-dive/" title="【RAG 进阶】多跳检索与查询分解深度解析：子问题拆解、证据聚合与充分性判断">【RAG 进阶】多跳检索与查询分解深度解析：子问题拆解、证据聚合与充分性判断</a><time datetime="2026-11-27T00:20:00.000Z" title="发表于 2026-11-27 08:20:00">2026-11-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/27/java-onnxruntime-djl-local-embedding-inference-deep-practice/" title="【Java AI】JVM 内本地推理深度实战：DJL + ONNX Runtime 跑 Embedding 与 Reranker">【Java AI】JVM 内本地推理深度实战：DJL + ONNX Runtime 跑 Embedding 与 Reranker</a><time datetime="2026-11-27T00:15:00.000Z" title="发表于 2026-11-27 08:15:00">2026-11-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/27/prometheus-metrics-cardinality-explosion-governance-deep-practice/" title="【可观测性】Prometheus 指标基数爆炸治理：从 label 设计到 Micrometer 注册表">【可观测性】Prometheus 指标基数爆炸治理：从 label 设计到 Micrometer 注册表</a><time datetime="2026-11-27T00:10:00.000Z" title="发表于 2026-11-27 08:10:00">2026-11-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/27/mysql-transportable-tablespace-migration-deep-dive/" title="【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验">【MySQL 实战】可传输表空间深度实战：大表跨实例迁移、.ibd/.cfg 与一致性校验</a><time datetime="2026-11-27T00:05:00.000Z" title="发表于 2026-11-27 08:05:00">2026-11-27</time></div></div><div class="aside-list-item no-cover"><div class="content"><a class="title" href="/2026/11/27/linux-tcp-socket-buffer-autotuning-deep-dive/" title="【Java 网络】TCP 收发缓冲区与自动调优深度解析：tcp_rmem/wmem、BDP 与零窗口排障">【Java 网络】TCP 收发缓冲区与自动调优深度解析：tcp_rmem/wmem、BDP 与零窗口排障</a><time datetime="2026-11-27T00:00:00.000Z" title="发表于 2026-11-27 08:00:00">2026-11-27</time></div></div></div></div></div></div></main><footer id="footer"><div class="footer-other"><div class="footer-copyright"><span class="copyright">&copy;&nbsp;2025 - 2026 By 东哥</span></div><div class="footer_custom_text"><div style="line-height: 1.8;">
+  <span>❤️ 分享Java、SpringBoot、后端技术</span><br>
+  <span><a href="https://github.com/jiweidong/" target="_blank" rel="noopener">京ICP备2026000001号</a></span><br>
+  <span><a href="https://github.com/jiweidong" target="_blank" rel="noopener">GitHub</a> | 
+  <a href="/sitemap.xml" target="_blank">站点地图</a></span>
+</div>
+</div></div></footer></div><div id="rightside"><div id="rightside-config-hide"><button id="readmode" type="button" title="阅读模式"><i class="fas fa-book-open"></i></button><button id="darkmode" type="button" title="日间和夜间模式切换"><i class="fas fa-adjust"></i></button><button id="hide-aside-btn" type="button" title="单栏和双栏切换"><i class="fas fa-arrows-alt-h"></i></button></div><div id="rightside-config-show"><button id="rightside-config" type="button" title="设置"><i class="fas fa-cog fa-spin"></i></button><button class="close" id="mobile-toc-button" type="button" title="目录"><i class="fas fa-list-ul"></i></button><button id="go-up" type="button" title="回到顶部"><span class="scroll-percent"></span><i class="fas fa-arrow-up"></i></button></div></div><div><script src="/js/utils.js?v=5.6.1"></script><script src="/js/main.js?v=5.6.1"></script><div class="js-pjax"></div><script async data-pjax src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script></div></body></html>
